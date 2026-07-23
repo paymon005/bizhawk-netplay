@@ -105,24 +105,24 @@ namespace BizHawkNetplay.Tool
 
         public void SetInputs(InputSet inputs)
         {
-            // One combined override for every port, using FULL button names with controller=null.
-            // BizHawk's Joypad.Set expects short names when given a controller index and re-qualifies
-            // them ("P{n} " + name); passing full names WITH an index makes every lookup miss and
-            // silently UNSETs the override, letting the physical pad leak into the local core and
-            // desync against the remote. Full names + null is the correct combination.
-            var buttons = new Dictionary<string, bool>();
-            var axes = new Dictionary<string, int?>();
-            for (int p = 0; p < _layouts.Length && p < inputs.Ports.Length; p++)
-            {
-                var layout = _layouts[p];
-                var port = inputs.Ports[p];
-                for (int i = 0; i < layout.Buttons.Count; i++)
-                    buttons[layout.Buttons[i]] = port.Buttons[i];
-                for (int j = 0; j < layout.Axes.Count; j++)
-                    axes[layout.Axes[j].Name] = port.Axes[j];
-            }
-            _apis.Joypad.Set(buttons, null);
-            if (axes.Count > 0) _apis.Joypad.SetAnalog(axes, null);
+            // Intentionally a no-op. The session injects inputs by stepping the core directly with a
+            // controller built from the merged InputSet (see AdvanceFrame) rather than via
+            // Joypad.Set: BizHawk's joypad overrides are applied outside the main loop's input phase
+            // and don't reliably survive DoFrameAdvance, so the physical pad leaked into the local
+            // core and desynced against the remote. AdvanceFrame bypasses EmuHawk's input chain
+            // entirely, which is the only way to honour "input interception is absolute".
+        }
+
+        /// <summary>
+        /// Step the core exactly one frame using <paramref name="inputs"/> as the ONLY input source,
+        /// bypassing EmuHawk's input chain (and thus the physical controller). Identical inputs on
+        /// both peers therefore produce identical state. Render flags don't affect determinism, so
+        /// video is drawn and audio skipped for now.
+        /// </summary>
+        public void AdvanceFrame(InputSet inputs, bool render)
+        {
+            var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
+            _emulator.FrameAdvance(controller, render, renderSound: false);
         }
 
         // --- State --------------------------------------------------------------------

@@ -253,7 +253,9 @@ namespace BizHawkNetplay.Tool
             {
                 if (_driver.OnPreFrame() == FrameStep.Ran)
                 {
-                    APIs.EmuClient.DoFrameAdvance(); // advance one rendered frame with injected inputs
+                    // Step the core with our merged inputs directly — never EmuHawk's DoFrameAdvance,
+                    // whose input chain would let the local physical pad reach the core undelayed.
+                    _adapter!.AdvanceFrame(_driver.LastAppliedInputs!, render: true);
                     _driver.OnPostFrame();
                     MaybeSendChecksum();
                     if (_driver.CurrentFrame % 120 == 0)
