@@ -17,7 +17,7 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 |---|---|
 | **M0 — Probe harness** | ✅ Done. Runs the §5 probe + three API experiments. Validated on Genesis/GPGX (see below) |
 | Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, lockstep strategy — unit-tested |
-| **M1 — 2-player lockstep** | In progress: FrameDriver, redundant input codec, **real UDP transport**, **TCP handshake + state transfer**, negotiation, and clock/RTT estimation all built & tested (incl. over real localhost sockets). Remaining: wire it into a `NetplayToolForm` in EmuHawk |
+| **M1 — 2-player lockstep** | Code-complete: `NetplayToolForm` (host/join, off-thread handshake + state transfer, timer-driven frames, desync checksums) builds against BizHawk 2.11. **Pending two-machine testing on a real ROM.** |
 | M2–M4 | Not started |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
@@ -68,6 +68,30 @@ dotnet build src/BizHawkNetplay.Tool -p:BizHawkHome="X:\path\to\BizHawk"
 
 A successful Tool build copies `BizHawkNetplay.Tool.dll` + `BizHawkNetplay.Core.dll` into
 `<BizHawkHome>\ExternalTools\`. Disable with `-p:DeployToExternalTools=false`.
+
+## Running netplay (M1)
+
+Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), then open
+**Tools → External Tools → BizHawk Netplay**.
+
+- **Host:** pick *Host*, choose a port (default 47800), *Start Hosting*.
+- **Join:** pick *Join*, enter the host's IP + port, *Join*.
+
+On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason
+otherwise), transfers the host's savestate so both sims start identical, then runs. It trades
+memory-hash checksums every 60 frames and halts with a frame number if a desync is ever detected.
+
+**Frame-driving model:** the tool pauses EmuHawk and advances exactly one confirmed frame per
+timer tick via `DoFrameAdvance` — it *owns the clock* rather than fighting EmuHawk's own loop
+(which pausing would silence). This is what makes lockstep stalls safe.
+
+**Current limitations (M1):**
+- Pacing uses a WinForms timer (~coarse), so speed may sit a hair under 100%. Smooth
+  `speedmode`/drift-corrected pacing is M2.
+- Direct IP / LAN / port-forward only; NAT punch-through is M4 (patterns already scouted in the
+  RemotePlay app).
+- Lockstep only; rollback negotiation is stubbed off until the RollbackStrategy lands in M3.
+- Refuses to run sensibly alongside movies/TAStudio/Lua is not yet enforced — avoid those during a session.
 
 ## Running the M0 probe
 

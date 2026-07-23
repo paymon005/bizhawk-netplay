@@ -117,12 +117,13 @@ namespace BizHawkNetplay.Core.Sync
             var decision = _strategy.BeginFrame(CurrentFrame);
             if (decision.Stall)
             {
-                _adapter.SetPaused(true);
+                // Do NOT pause the emulator here: in EmuHawk, pausing stops the very callbacks
+                // we'd need to un-stall. The host owns the frame clock (paused + DoFrameAdvance
+                // per confirmed frame), so a stall simply means "don't advance this tick".
                 IsStalled = true;
                 return FrameStep.Stalled;
             }
 
-            _adapter.SetPaused(false);
             IsStalled = false;
             LastAppliedInputs = decision.Inputs;
             _adapter.SetInputs(decision.Inputs!);

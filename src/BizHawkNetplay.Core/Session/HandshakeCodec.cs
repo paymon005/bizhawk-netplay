@@ -13,7 +13,7 @@ namespace BizHawkNetplay.Core.Session
     /// </summary>
     public static class HandshakeCodec
     {
-        public static byte[] Encode(PeerIdentity id, SessionPreferences prefs)
+        public static byte[] Encode(PeerIdentity id, SessionPreferences prefs, int udpPort)
         {
             var sb = new StringBuilder();
             sb.Append("proto=").Append(id.ProtocolVersion).Append('\n');
@@ -26,10 +26,11 @@ namespace BizHawkNetplay.Core.Session
             sb.Append("depth=").Append(id.MaxRollbackDepth).Append('\n');
             sb.Append("delay=").Append(prefs.InputDelay).Append('\n');
             sb.Append("rollback=").Append(prefs.WantRollback ? '1' : '0').Append('\n');
+            sb.Append("udpport=").Append(udpPort).Append('\n');
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
-        public static (PeerIdentity id, SessionPreferences prefs) Decode(byte[] body)
+        public static (PeerIdentity id, SessionPreferences prefs, int udpPort) Decode(byte[] body)
         {
             var map = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var line in Encoding.UTF8.GetString(body).Split('\n'))
@@ -55,7 +56,8 @@ namespace BizHawkNetplay.Core.Session
 
             // Clamp delay to a sane floor so a malformed peer can't request delay < 1.
             var prefs = new SessionPreferences(Math.Max(1, GetInt(map, "delay", 1)), Get(map, "rollback") == "1");
-            return (id, prefs);
+            int udpPort = GetInt(map, "udpport", 0);
+            return (id, prefs, udpPort);
         }
 
         private static string Get(Dictionary<string, string> m, string k) => m.TryGetValue(k, out var v) ? v : "";

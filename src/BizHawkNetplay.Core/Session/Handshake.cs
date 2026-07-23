@@ -12,12 +12,14 @@ namespace BizHawkNetplay.Core.Session
     /// <summary>The agreed parameters a FrameDriver needs after a successful handshake.</summary>
     public sealed class SessionParams
     {
-        public SessionParams(SyncMode mode, int inputDelay, int localPort, int remotePort, byte[]? initialState)
+        public SessionParams(SyncMode mode, int inputDelay, int localPort, int remotePort,
+            int remoteUdpPort, byte[]? initialState)
         {
             Mode = mode;
             InputDelay = inputDelay;
             LocalPort = localPort;
             RemotePort = remotePort;
+            RemoteUdpPort = remoteUdpPort;
             InitialState = initialState;
         }
 
@@ -25,6 +27,9 @@ namespace BizHawkNetplay.Core.Session
         public int InputDelay { get; }
         public int LocalPort { get; }
         public int RemotePort { get; }
+
+        /// <summary>The peer's UDP port for the input channel (combine with the peer IP from the control socket).</summary>
+        public int RemoteUdpPort { get; }
 
         /// <summary>Whole-core state to import before starting; null for the host (it keeps its own).</summary>
         public byte[]? InitialState { get; }
@@ -41,14 +46,15 @@ namespace BizHawkNetplay.Core.Session
     {
         /// <summary>Host side: accept a joiner, transfer initial state, agree on parameters.</summary>
         public static SessionParams RunHost(
-            ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs, byte[] hostState)
+            ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs,
+            byte[] hostState, int localUdpPort)
         {
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs));
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, localUdpPort));
 
             var (type, body) = channel.Receive();
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from joiner, got {type}");
-            var (clientId, clientPrefs) = HandshakeCodec.Decode(body);
+            var (clientId, clientPrefs, clientUdpPort) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(hostId, clientId, hostPrefs, clientPrefs);
             if (!result.Accepted)
@@ -61,14 +67,15 @@ namespace BizHawkNetplay.Core.Session
             channel.Send(ControlMessageType.State, hostState ?? Array.Empty<byte>());
             channel.Send(ControlMessageType.Start, Array.Empty<byte>());
 
-            return new SessionParams(result.Mode, result.InputDelay, localPort: 0, remotePort: 1, initialState: null);
+            return new SessionParams(result.Mode, result.InputDelay, localPort: 0, remotePort: 1,
+                remoteUdpPort: clientUdpPort, initialState: null);
         }
 
         /// <summary>Client side: join a host, receive initial state, agree on parameters.</summary>
         public static SessionParams RunClient(
-            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs)
+            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort)
         {
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs));
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort));
 
             // First frame back is the host's HELLO (or an early ERROR).
             var (type, body) = channel.Receive();
@@ -76,7 +83,7 @@ namespace BizHawkNetplay.Core.Session
                 throw new HandshakeException(Encoding.UTF8.GetString(body));
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from host, got {type}");
-            var (hostId, hostPrefs) = HandshakeCodec.Decode(body);
+            var (hostId, hostPrefs, hostUdpPort) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
             if (!result.Accepted)
@@ -95,7 +102,8 @@ namespace BizHawkNetplay.Core.Session
                 throw new HandshakeException("host never sent the initial state");
 
             // Client owns port 1.
-            return new SessionParams(result.Mode, result.InputDelay, localPort: 1, remotePort: 0, initialState);
+            return new SessionParams(result.Mode, result.InputDelay, localPort: 1, remotePort: 0,
+                remoteUdpPort: hostUdpPort, initialState);
         }
     }
 }

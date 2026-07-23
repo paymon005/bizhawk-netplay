@@ -44,8 +44,8 @@ namespace BizHawkNetplay.Core.Tests
                 new Random(1234).NextBytes(hostState);
 
                 var hostTask = Task.Run(() =>
-                    Handshake.RunHost(hostCh, Id(), new SessionPreferences(3, wantRollback: true), hostState));
-                var clientParams = Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, wantRollback: true));
+                    Handshake.RunHost(hostCh, Id(), new SessionPreferences(3, wantRollback: true), hostState, 47800));
+                var clientParams = Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, wantRollback: true), 51000);
                 var hostParams = hostTask.GetAwaiter().GetResult();
 
                 // Both sides derived the same negotiated parameters.
@@ -63,6 +63,10 @@ namespace BizHawkNetplay.Core.Tests
                 // State transferred byte-for-byte to the client; host keeps its own.
                 Assert.Null(hostParams.InitialState);
                 Assert.Equal(hostState, clientParams.InitialState);
+
+                // UDP ports were exchanged so each side knows where to send inputs.
+                Assert.Equal(51000, hostParams.RemoteUdpPort);
+                Assert.Equal(47800, clientParams.RemoteUdpPort);
             }
             finally { dispose(); }
         }
@@ -74,10 +78,10 @@ namespace BizHawkNetplay.Core.Tests
             try
             {
                 var hostTask = Task.Run(() =>
-                    Handshake.RunHost(hostCh, Id(rom: "HOSTROM"), new SessionPreferences(2, false), new byte[10]));
+                    Handshake.RunHost(hostCh, Id(rom: "HOSTROM"), new SessionPreferences(2, false), new byte[10], 47800));
 
                 var clientEx = Assert.Throws<HandshakeException>(() =>
-                    Handshake.RunClient(clientCh, Id(rom: "CLIENTROM"), new SessionPreferences(2, false)));
+                    Handshake.RunClient(clientCh, Id(rom: "CLIENTROM"), new SessionPreferences(2, false), 51000));
                 var hostEx = Assert.Throws<HandshakeException>(() => hostTask.GetAwaiter().GetResult());
 
                 Assert.Contains("ROM", clientEx.Message);
@@ -93,8 +97,8 @@ namespace BizHawkNetplay.Core.Tests
             try
             {
                 var hostTask = Task.Run(() =>
-                    Handshake.RunHost(hostCh, Id(depth: 30), new SessionPreferences(2, wantRollback: true), new byte[10]));
-                var clientParams = Handshake.RunClient(clientCh, Id(depth: 2), new SessionPreferences(2, wantRollback: true));
+                    Handshake.RunHost(hostCh, Id(depth: 30), new SessionPreferences(2, wantRollback: true), new byte[10], 47800));
+                var clientParams = Handshake.RunClient(clientCh, Id(depth: 2), new SessionPreferences(2, wantRollback: true), 51000);
                 var hostParams = hostTask.GetAwaiter().GetResult();
 
                 Assert.Equal(SyncMode.Lockstep, hostParams.Mode);
