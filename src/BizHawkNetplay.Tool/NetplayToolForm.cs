@@ -144,12 +144,17 @@ namespace BizHawkNetplay.Tool
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback: false); // rollback is M3
                 int port = (int)_portBox.Value;
 
+                // Freeze the emulator NOW. Otherwise the host keeps free-running between exporting
+                // its state and the joiner arriving, so the two sims start on different frames and
+                // desync immediately. Paused here == the frame both peers resume from.
+                APIs.EmuClient.Pause();
+
                 SetBusy(true);
                 if (_hostRadio.Checked)
                 {
                     _udp = UdpTransport.Bind(port);
                     var state = _adapter.ExportState();
-                    Log($"exported {state.Length / 1024}KiB initial state");
+                    Log($"exported {state.Length / 1024}KiB initial state (frozen until a player joins)");
                     StartThread(() => HostThread(port, id, prefs, state, _udp.LocalPort));
                 }
                 else
@@ -213,8 +218,10 @@ namespace BizHawkNetplay.Tool
                 if (sp.InitialState != null)
                 {
                     _adapter!.ImportState(sp.InitialState);
-                    Log($"imported {sp.InitialState.Length / 1024}KiB host state — sims aligned at frame 0");
+                    Log($"imported {sp.InitialState.Length / 1024}KiB host state");
                 }
+                // Both peers should print the SAME number here; if not, the start is misaligned.
+                Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
 
                 _udp!.SetRemote(new IPEndPoint(remoteIp, sp.RemoteUdpPort));
                 _driver = new FrameDriver(_adapter!, _udp, p => new LockstepStrategy(p),
@@ -311,6 +318,8 @@ namespace BizHawkNetplay.Tool
         {
             Log("connection failed: " + reason);
             TeardownNetwork();
+            ApplyBackgroundConfig(false);
+            try { APIs.EmuClient.Unpause(); } catch { } // undo the freeze from OnGo
             SetBusy(false);
             Status("Idle.", Color.DimGray);
         }
