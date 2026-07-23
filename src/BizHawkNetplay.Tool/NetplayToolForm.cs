@@ -46,6 +46,7 @@ namespace BizHawkNetplay.Tool
         private readonly Button _goButton;
         private readonly Button _disconnectButton;
         private readonly Button _probeButton;
+        private readonly Button _testInputButton;
         private readonly CheckBox _verboseCheck;
         private readonly CheckBox _freezeInputCheck;
         private readonly Label _status;
@@ -104,12 +105,15 @@ namespace BizHawkNetplay.Tool
             _probeButton = new Button { Text = "Capability Probe", Location = new Point(268, 108), Width = 130 };
             _probeButton.Click += (_, __) => RunProbe();
 
+            _testInputButton = new Button { Text = "Test Input", Location = new Point(12, 140), Width = 130 };
+            _testInputButton.Click += (_, __) => RunInputTest();
+
             _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(410, 100) };
             _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(410, 122) };
             _freezeInputCheck.CheckedChanged += (_, __) =>
                 EmuHawkAdapter.ForceNeutralInput = _freezeInputCheck.Checked;
 
-            _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(12, 148), ForeColor = Color.DimGray };
+            _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(150, 145), ForeColor = Color.DimGray };
 
             _log = new TextBox
             {
@@ -122,7 +126,7 @@ namespace BizHawkNetplay.Tool
             Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton,
+                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _testInputButton,
                 _verboseCheck, _freezeInputCheck, _status, _log,
             });
             ResumeLayout(false);
@@ -243,6 +247,7 @@ namespace BizHawkNetplay.Tool
                     sp.LocalPort, sp.InputDelay, redundancy: 8);
 
                 ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
+                try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
                 APIs.EmuClient.Pause(); // we own the clock now
                 _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
                 _driver.Start();
@@ -280,8 +285,11 @@ namespace BizHawkNetplay.Tool
                 int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
                 if (emuDelta != _driver.CurrentFrame)
                 {
-                    EndSession($"EmuHawk advanced {emuDelta - _driver.CurrentFrame} extra frame(s) " +
-                               "— don't unpause during a session (the tool drives the clock)");
+                    int diff = emuDelta - _driver.CurrentFrame;
+                    string why = diff > 0
+                        ? $"EmuHawk advanced {diff} extra frame(s) — did you unpause?"
+                        : $"the core's frame count jumped back {-diff} — a rewind/load-state hotkey fired?";
+                    EndSession(why + " The tool must own the frame clock; avoid EmuHawk hotkeys during a session.");
                     return;
                 }
 
@@ -448,6 +456,23 @@ namespace BizHawkNetplay.Tool
             }
         }
 
+        /// <summary>
+        /// Dumps what BizHawk sees for input: the controller/binding keys we resolve against, and
+        /// the host inputs pressed right now vs how they map to P1. Hold a button and click.
+        /// </summary>
+        private void RunInputTest()
+        {
+            if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
+            if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
+            try
+            {
+                var adapter = _adapter ?? new EmuHawkAdapter(APIs, _emulator, _statable);
+                Log("=== input test (hold a button while clicking) ===");
+                Log(adapter.DescribeInputState());
+            }
+            catch (Exception ex) { Log("input test failed: " + ex.Message); }
+        }
+
         // ------------------------------------------------------------------ helpers
 
         private PeerIdentity BuildIdentity(EmuHawkAdapter a)
@@ -530,6 +555,7 @@ namespace BizHawkNetplay.Tool
             _portBox.Enabled = _delayBox.Enabled = !busy;
             _probeButton.Enabled = !busy;
             _disconnectButton.Enabled = busy;
+            // _testInputButton stays enabled (useful to check bindings before and during a session)
         }
 
         private void Status(string text, Color color)

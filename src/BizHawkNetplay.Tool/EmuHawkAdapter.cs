@@ -166,6 +166,43 @@ namespace BizHawkNetplay.Tool
         /// <summary>Human-readable note on why bindings were/weren't found (for the UI log).</summary>
         public string BindingDiagnostic { get; private set; } = "";
 
+        /// <summary>
+        /// One-shot input diagnostic for the UI: what controller/bindings we found, and what host
+        /// inputs are pressed right now vs how they resolve to P1 buttons.
+        /// </summary>
+        public string DescribeInputState()
+        {
+            var sb = new StringBuilder();
+            sb.Append("controllerDef='").Append(_emulator.ControllerDefinition.Name)
+              .Append("', system='").Append(_emulator.SystemId).Append("'\n");
+            sb.Append("bindings: ").Append(HasBindings ? "FOUND" : "MISSING");
+            if (!string.IsNullOrEmpty(BindingDiagnostic)) sb.Append("  ").Append(BindingDiagnostic);
+            sb.Append('\n');
+
+            if (_layouts.Length > 0)
+            {
+                var l0 = _layouts[0];
+                for (int i = 0; i < l0.Buttons.Count && i < 8; i++)
+                    sb.Append("  ").Append(l0.Buttons[i]).Append(" <- '").Append(_bindings[0][i]).Append("'\n");
+            }
+
+            IReadOnlyList<string> pressed;
+            try { pressed = _apis.Input.GetPressedButtons(); }
+            catch (Exception ex) { return sb.Append("GetPressedButtons error: ").Append(ex.Message).ToString(); }
+            sb.Append("pressed host inputs now: [").Append(string.Join(", ", pressed)).Append("]\n");
+
+            if (_layouts.Length > 0)
+            {
+                var set = new HashSet<string>(pressed);
+                var l0 = _layouts[0];
+                var on = new List<string>();
+                for (int i = 0; i < l0.Buttons.Count; i++)
+                    if (EvaluateBinding(_bindings[0][i], set)) on.Add(l0.Buttons[i]);
+                sb.Append("resolved P1 pressed: [").Append(string.Join(", ", on)).Append("]");
+            }
+            return sb.ToString();
+        }
+
         private string[][] BuildBindings()
         {
             Dictionary<string, string>? map = null;
