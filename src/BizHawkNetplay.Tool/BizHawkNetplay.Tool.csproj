@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>BizHawkNetplay.Tool</RootNamespace>
+    <AssemblyName>BizHawkNetplay.Tool</AssemblyName>
+    <!-- We reference EmuHawk's assemblies but never ship copies of them. -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BizHawkNetplay.Core\BizHawkNetplay.Core.csproj" />
+  </ItemGroup>
+
+  <!-- BizHawk assemblies to compile against, resolved from the local install.
+       Never copied to output: EmuHawk loads the tool from its own ExternalTools dir
+       where these already live. -->
+  <ItemGroup>
+    <Reference Include="BizHawk.Client.Common">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.Client.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BizHawk.Common">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BizHawk.Emulation.Common">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.Emulation.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BizHawk.WinForms.Controls">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.WinForms.Controls.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BizHawk.Bizware.Graphics">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.Bizware.Graphics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BizHawk.Client.EmuHawk">
+      <HintPath>$(BizHawkHome)\EmuHawk.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- After build, drop the tool DLL into the install's ExternalTools folder so EmuHawk
+       picks it up. Toggle off with -p:DeployToExternalTools=false. -->
+  <PropertyGroup>
+    <DeployToExternalTools Condition="'$(DeployToExternalTools)' == ''">true</DeployToExternalTools>
+  </PropertyGroup>
+  <Target Name="DeployToExternalTools" AfterTargets="Build"
+          Condition="'$(DeployToExternalTools)' == 'true' and Exists('$(BizHawkHome)\ExternalTools')">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(BizHawkHome)\ExternalTools" />
+    <Copy SourceFiles="$(TargetDir)BizHawkNetplay.Core.dll" DestinationFolder="$(BizHawkHome)\ExternalTools" />
+    <Message Importance="high" Text="Deployed $(TargetName) to $(BizHawkHome)\ExternalTools" />
+  </Target>
+
+</Project>
