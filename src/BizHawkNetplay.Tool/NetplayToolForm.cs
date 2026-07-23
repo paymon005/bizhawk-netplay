@@ -66,6 +66,7 @@ namespace BizHawkNetplay.Tool
         private Thread? _controlReader;
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
+        private bool _isHost;      // this instance hosted the session (authoritative for desync capture)
         private int _stallLog;     // throttles verbose stall messages
 
         private readonly object _hashLock = new object();
@@ -163,6 +164,7 @@ namespace BizHawkNetplay.Tool
                 if (!_adapter.HasBindings)
                     Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
+                _isHost = _hostRadio.Checked;
                 var id = BuildIdentity(_adapter);
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback: false); // rollback is M3
                 int port = (int)_portBox.Value;
@@ -256,6 +258,11 @@ namespace BizHawkNetplay.Tool
                 _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
                 _driver.Start();
                 _sessionActive = true;
+
+                // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
+                // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
+                _adapter!.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
+                Log(_adapter.AudioReady ? "audio enabled" : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
 
                 _controlReader = new Thread(ControlReaderLoop) { IsBackground = true, Name = "BizHawkNetplay-control" };
                 _controlReader.Start();
@@ -380,10 +387,28 @@ namespace BizHawkNetplay.Tool
                 if (!_remoteHashes.TryGetValue(frame, out remote)) return;
             }
             if (local != remote)
-                BeginInvokeUi(() => EndSession($"DESYNC detected at frame {frame} " +
-                                               $"(local {local:X8} != remote {remote:X8})"));
+                BeginInvokeUi(() => OnDesync(frame, local, remote));
             else if (Verbose)
                 BeginInvokeUi(() => Log($"checksum frame {frame}: MATCH ({local:X8})"));
+        }
+
+        /// <summary>
+        /// A checksum mismatch means the two sims have diverged. On the host (the authoritative
+        /// side) capture the current core state to quick-slot 10 so the desync can be reloaded and
+        /// inspected afterwards, then tear the session down.
+        /// </summary>
+        private void OnDesync(int frame, uint local, uint remote)
+        {
+            if (_isHost)
+            {
+                try
+                {
+                    APIs.SaveState.SaveSlot(10, suppressOSD: false);
+                    Log($"desync — saved host state to slot 10 (near frame {frame})");
+                }
+                catch (Exception ex) { Log("(warning) couldn't save desync state to slot 10: " + ex.Message); }
+            }
+            EndSession($"DESYNC detected at frame {frame} (local {local:X8} != remote {remote:X8})");
         }
 
         private void FailSession(string reason)

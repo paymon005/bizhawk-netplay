@@ -28,6 +28,10 @@ namespace BizHawkNetplay.Tool
         private readonly CoreLayout[] _layouts;
         private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
 
+        // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame).
+        private BizHawk.Client.EmuHawk.Sound? _sound;
+        private bool _audioReady;
+
         public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
         {
             _apis = apis ?? throw new ArgumentNullException(nameof(apis));
@@ -137,6 +141,47 @@ namespace BizHawkNetplay.Tool
         {
             var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
             _emulator.FrameAdvance(controller, render: true, renderSound: true);
+
+            // We hold EmuHawk paused, so its main loop never pumps its sound output. Drive the
+            // output device ourselves right after the core buffers this frame's samples — the same
+            // FrameAdvance-then-UpdateSound sequence EmuHawk's own single-step frame-advance uses.
+            // atten = 1 (full volume; the configured master volume is still applied inside Sound).
+            if (_audioReady)
+            {
+                try { _sound!.UpdateSound(1.0f, isSecondaryThrottlingDisabled: false); }
+                catch { _audioReady = false; } // give up quietly if the device goes away
+            }
+        }
+
+        /// <summary>True once <see cref="EnableAudio"/> has wired up the sound output for the session.</summary>
+        public bool AudioReady => _audioReady;
+
+        /// <summary>Human-readable note on why audio was/wasn't wired up (for the UI log).</summary>
+        public string AudioDiagnostic { get; private set; } = "";
+
+        /// <summary>
+        /// Wire up audio for a driven session. Because we keep EmuHawk paused and step the core
+        /// ourselves, EmuHawk's main loop never pumps its sound output — so we grab its Sound device
+        /// (the private <c>MainForm.Sound</c>) and pump it after each frame in <see cref="AdvanceFrame"/>.
+        /// The input pin was already wired to the core at ROM load, so single-stepping produces sound
+        /// exactly the way EmuHawk's own frame-advance does; we just supply the pump it isn't running.
+        /// </summary>
+        public void EnableAudio(BizHawk.Client.EmuHawk.MainForm? mainForm)
+        {
+            _audioReady = false;
+            AudioDiagnostic = "";
+            try
+            {
+                if (mainForm == null) { AudioDiagnostic = "no MainForm reference"; return; }
+                // MainForm.Sound is public-type but private-getter, so reflect it once up front.
+                var prop = typeof(BizHawk.Client.EmuHawk.MainForm)
+                    .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                _sound = prop?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;
+                if (_sound == null) { AudioDiagnostic = "couldn't reach MainForm.Sound"; return; }
+                if (!_sound.IsStarted) _sound.StartSound();
+                _audioReady = true;
+            }
+            catch (Exception ex) { _sound = null; AudioDiagnostic = "audio init failed: " + ex.Message; }
         }
 
         /// <summary>
