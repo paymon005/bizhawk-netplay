@@ -47,9 +47,12 @@ namespace BizHawkNetplay.Tool
         private readonly Button _disconnectButton;
         private readonly Button _probeButton;
         private readonly CheckBox _verboseCheck;
+        private readonly CheckBox _freezeInputCheck;
         private readonly Label _status;
 
         private bool Verbose => _verboseCheck.Checked;
+
+        private int _startEmuFrame; // emulator FrameCount at session start, for drift detection
         private readonly TextBox _log;
 
         // --- Session state (all touched on the UI thread except where noted) ---
@@ -102,9 +105,12 @@ namespace BizHawkNetplay.Tool
             _probeButton = new Button { Text = "Capability Probe", Location = new Point(268, 108), Width = 130 };
             _probeButton.Click += (_, __) => RunProbe();
 
-            _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(410, 112) };
+            _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(410, 100) };
+            _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(410, 122) };
+            _freezeInputCheck.CheckedChanged += (_, __) =>
+                EmuHawkAdapter.ForceNeutralInput = _freezeInputCheck.Checked;
 
-            _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(12, 144), ForeColor = Color.DimGray };
+            _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(12, 148), ForeColor = Color.DimGray };
 
             _log = new TextBox
             {
@@ -117,7 +123,8 @@ namespace BizHawkNetplay.Tool
             Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _verboseCheck, _status, _log,
+                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton,
+                _verboseCheck, _freezeInputCheck, _status, _log,
             });
             ResumeLayout(false);
 
@@ -236,6 +243,7 @@ namespace BizHawkNetplay.Tool
 
                 ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
                 APIs.EmuClient.Pause(); // we own the clock now
+                _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
                 _driver.Start();
                 _sessionActive = true;
 
@@ -258,6 +266,14 @@ namespace BizHawkNetplay.Tool
             if (!_sessionActive || _driver == null) return;
             try
             {
+                // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
+                // its own loop would advance the core on top of ours and desync — snap it back.
+                if (!APIs.EmuClient.IsPaused())
+                {
+                    APIs.EmuClient.Pause();
+                    if (Verbose) Log("re-paused (the session owns the frame clock — don't unpause)");
+                }
+
                 _driver.PumpNetwork(); // drain remote input + resend our redundant window (every tick)
 
                 if (_driver.CurrentFrameReady())
@@ -310,7 +326,14 @@ namespace BizHawkNetplay.Tool
             lock (_hashLock) { _localHashes[frame] = hash; }
             try { _control!.Send(ControlMessageType.Checksum, EncodeChecksum(frame, hash)); }
             catch { /* control channel gone; the reader loop will end the session */ }
-            if (Verbose) Log($"checksum frame {frame}: local {hash:X8}");
+            if (Verbose)
+            {
+                int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
+                // emuΔ should always equal frame; if not, DoFrameAdvance stepped the core an unequal
+                // number of times on this side — the smoking gun for a frame-advance drift desync.
+                string drift = emuDelta == frame ? "" : $"  !! emuΔ={emuDelta} (expected {frame})";
+                Log($"checksum frame {frame}: local {hash:X8}{drift}");
+            }
             CompareChecksum(frame);
         }
 
