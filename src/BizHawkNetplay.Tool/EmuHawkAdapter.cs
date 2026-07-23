@@ -28,8 +28,12 @@ namespace BizHawkNetplay.Tool
         private readonly CoreLayout[] _layouts;
         private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
 
-        // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame).
+        // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame / PumpAudio).
         private BizHawk.Client.EmuHawk.Sound? _sound;
+        private BizHawk.Client.EmuHawk.MainForm? _mainForm;
+        private ISoundProvider? _coreSound;
+        private NetplaySoundBuffer? _soundBuffer;
+        private int _soundChannels = 2;
         private bool _audioReady;
 
         public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
@@ -142,15 +146,33 @@ namespace BizHawkNetplay.Tool
             var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
             _emulator.FrameAdvance(controller, render: true, renderSound: true);
 
-            // We hold EmuHawk paused, so its main loop never pumps its sound output. Drive the
-            // output device ourselves right after the core buffers this frame's samples — the same
-            // FrameAdvance-then-UpdateSound sequence EmuHawk's own single-step frame-advance uses.
-            // atten = 1 (full volume; the configured master volume is still applied inside Sound).
+            // Drain the samples the core just generated into our ring buffer. EmuHawk's audio device
+            // pulls from that ring at the steady real-time rate (PumpAudio → UpdateSound), so the ring
+            // absorbs the mismatch between this bursty manual stepping and smooth playback. Producing
+            // here and consuming there is what keeps audio clean despite the coarse WinForms timer.
             if (_audioReady)
             {
-                try { _sound!.UpdateSound(1.0f, isSecondaryThrottlingDisabled: false); }
-                catch { _audioReady = false; } // give up quietly if the device goes away
+                try
+                {
+                    _coreSound!.GetSamplesSync(out var samples, out var nSampPairs);
+                    _soundBuffer!.Enqueue(samples, nSampPairs * _soundChannels);
+                }
+                catch { /* a sample-pull hiccup must never break emulation */ }
             }
+        }
+
+        /// <summary>
+        /// Top up EmuHawk's audio device from our ring buffer. Call every frame-timer tick — whether
+        /// or not a frame advanced — so the device stays fed at the real playback rate, decoupled from
+        /// our (bursty, occasionally stalled) frame stepping. The async path in <c>Sound.UpdateSound</c>
+        /// just moves buffered samples to the device: no resampling, no blocking.
+        /// </summary>
+        public void PumpAudio()
+        {
+            if (!_audioReady) return;
+            // atten = 1 → full volume (EmuHawk applies the user's master volume at the device).
+            try { _sound!.UpdateSound(1.0f, isSecondaryThrottlingDisabled: false); }
+            catch { _audioReady = false; }
         }
 
         /// <summary>True once <see cref="EnableAudio"/> has wired up the sound output for the session.</summary>
@@ -161,10 +183,12 @@ namespace BizHawkNetplay.Tool
 
         /// <summary>
         /// Wire up audio for a driven session. Because we keep EmuHawk paused and step the core
-        /// ourselves, EmuHawk's main loop never pumps its sound output — so we grab its Sound device
-        /// (the private <c>MainForm.Sound</c>) and pump it after each frame in <see cref="AdvanceFrame"/>.
-        /// The input pin was already wired to the core at ROM load, so single-stepping produces sound
-        /// exactly the way EmuHawk's own frame-advance does; we just supply the pump it isn't running.
+        /// ourselves, EmuHawk's main loop never pumps its sound output. We grab its Sound device (the
+        /// private <c>MainForm.Sound</c>) and re-point its input pin at a ring buffer we own
+        /// (<see cref="NetplaySoundBuffer"/>, in async mode → the jitter-tolerant buffered path), then
+        /// feed that ring from the core each frame in <see cref="AdvanceFrame"/> and drain it to the
+        /// device each tick in <see cref="PumpAudio"/>. <see cref="DisableAudio"/> restores EmuHawk's
+        /// own wiring when the session ends.
         /// </summary>
         public void EnableAudio(BizHawk.Client.EmuHawk.MainForm? mainForm)
         {
@@ -173,15 +197,59 @@ namespace BizHawkNetplay.Tool
             try
             {
                 if (mainForm == null) { AudioDiagnostic = "no MainForm reference"; return; }
-                // MainForm.Sound is public-type but private-getter, so reflect it once up front.
+                _mainForm = mainForm;
+
+                // MainForm.Sound is a public type but has a private getter, so reflect it once up front.
                 var prop = typeof(BizHawk.Client.EmuHawk.MainForm)
                     .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 _sound = prop?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;
                 if (_sound == null) { AudioDiagnostic = "couldn't reach MainForm.Sound"; return; }
+
+                _coreSound = _emulator.ServiceProvider.GetService<ISoundProvider>();
+                if (_coreSound == null) { AudioDiagnostic = "core exposes no ISoundProvider"; return; }
+
+                // We pull the core's samples synchronously right after each FrameAdvance.
+                if (_coreSound.SyncMode != SyncSoundMode.Sync)
+                {
+                    try { _coreSound.SetSyncMode(SyncSoundMode.Sync); }
+                    catch { AudioDiagnostic = "core sound is async-only (unsupported for driven audio)"; return; }
+                }
+
+                // Make sure the device is running before we touch its input pin (so a bail leaves
+                // EmuHawk's wiring untouched). StartSound no-ops if the user disabled sound.
                 if (!_sound.IsStarted) _sound.StartSound();
+                if (!_sound.IsStarted) { AudioDiagnostic = "EmuHawk sound output is off (enable Config → Sound)"; return; }
+
+                _soundChannels = _sound.ChannelCount;
+                _soundBuffer = new NetplaySoundBuffer(_sound.SampleRate, _soundChannels, capacityMs: 200);
+                // Prime a small standing cushion of silence so pump jitter doesn't underrun the ring.
+                int prime = _sound.SampleRate * _soundChannels * 50 / 1000;
+                _soundBuffer.Enqueue(new short[prime], prime);
+
+                _sound.SetInputPin(_soundBuffer); // route the device to pull from our async ring
                 _audioReady = true;
             }
             catch (Exception ex) { _sound = null; AudioDiagnostic = "audio init failed: " + ex.Message; }
+        }
+
+        /// <summary>
+        /// Restore EmuHawk's own audio wiring so normal sound resumes after the session. Prefers
+        /// EmuHawk's <c>RewireSound</c> (re-establishes the correct pin per core/config); falls back to
+        /// re-pinning the core provider directly.
+        /// </summary>
+        public void DisableAudio()
+        {
+            _audioReady = false;
+            if (_sound == null) return;
+            try
+            {
+                _soundBuffer?.DiscardSamples();
+                var rewire = typeof(BizHawk.Client.EmuHawk.MainForm)
+                    .GetMethod("RewireSound", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                if (_mainForm != null && rewire != null) rewire.Invoke(_mainForm, null);
+                else if (_coreSound != null) _sound.SetInputPin(_coreSound);
+            }
+            catch { try { if (_coreSound != null) _sound.SetInputPin(_coreSound); } catch { } }
         }
 
         /// <summary>

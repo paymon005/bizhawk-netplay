@@ -287,6 +287,10 @@ namespace BizHawkNetplay.Tool
             if (!_sessionActive || _driver == null) return;
             try
             {
+                // Keep the audio device fed every tick, independent of how many frames we step this
+                // tick (or none, during a stall) — the ring buffer decouples playback from stepping.
+                _adapter?.PumpAudio();
+
                 // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
                 // its own loop would advance the core on top of ours and desync — snap it back.
                 if (!APIs.EmuClient.IsPaused())
@@ -415,6 +419,7 @@ namespace BizHawkNetplay.Tool
         {
             Log("connection failed: " + reason);
             TeardownNetwork();
+            try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false);
             try { APIs.EmuClient.Unpause(); } catch { } // undo the freeze from OnGo
             SetBusy(false);
@@ -430,6 +435,7 @@ namespace BizHawkNetplay.Tool
             try { _control?.Send(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
             TeardownNetwork();
 
+            try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
             try { APIs.EmuClient.Unpause(); } catch { }
             lock (_hashLock) { _localHashes.Clear(); _remoteHashes.Clear(); }
