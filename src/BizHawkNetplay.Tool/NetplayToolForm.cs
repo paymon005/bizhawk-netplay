@@ -76,7 +76,11 @@ namespace BizHawkNetplay.Tool
         private Config? _config;
         private bool _prevRunInBackground;
         private bool _prevAcceptBackgroundInput;
+        private bool _prevAcceptBackgroundInputControllerOnly;
         private bool _configApplied;
+
+        private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
+        private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
 
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
@@ -256,7 +260,11 @@ namespace BizHawkNetplay.Tool
                 _controlReader = new Thread(ControlReaderLoop) { IsBackground = true, Name = "BizHawkNetplay-control" };
                 _controlReader.Start();
 
-                _frameTimer.Interval = Math.Max(1, (int)Math.Round(FrameMs()));
+                // Real-time pacing: tick often and advance however many frames wall-clock demands,
+                // so irregular WinForms-timer firing doesn't run the game slow.
+                _frameMs = FrameMs();
+                _paceClock.Restart();
+                _frameTimer.Interval = 2;
                 _frameTimer.Start();
 
                 Status($"in session — {(sp.Mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
@@ -293,23 +301,27 @@ namespace BizHawkNetplay.Tool
                     return;
                 }
 
-                _driver.PumpNetwork();       // drain remote input + resend our redundant window
-                _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
-
-                if (_driver.CurrentFrameReady())
+                // Advance up to where wall-clock says we should be, bounded so a late tick doesn't
+                // burst into a huge catch-up. Each frame: drain network, capture local, gate, step.
+                int target = (int)(_paceClock.Elapsed.TotalMilliseconds / _frameMs);
+                int budget = 8;
+                while (_driver.CurrentFrame < target && budget-- > 0)
                 {
+                    _driver.PumpNetwork();       // drain remote input + resend our redundant window
+                    _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
+                    if (!_driver.CurrentFrameReady())
+                    {
+                        if (Verbose && (++_stallLog % 30 == 0))
+                            Log($"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
+                        break; // retry next tick
+                    }
                     // Step the core with ONLY our merged inputs — deterministic, bypasses EmuHawk's
-                    // input chain and hotkeys. Gated: we advance only when the frame is confirmed.
+                    // input chain and hotkeys.
                     _adapter!.AdvanceFrame(_driver.CurrentInputs());
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
-                    if (_driver.CurrentFrame % 120 == 0)
-                        Status($"in session — frame {_driver.CurrentFrame}", Color.Green);
                 }
-                else if (Verbose && (++_stallLog % 30 == 0))
-                {
-                    Log($"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
-                }
+                Status($"in session — frame {_driver.CurrentFrame}", Color.Green);
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
         }
@@ -500,15 +512,21 @@ namespace BizHawkNetplay.Tool
                     if (_config == null) { Log("(note) couldn't reach config to disable pause-on-unfocus"); return; }
                     _prevRunInBackground = _config.RunInBackground;
                     _prevAcceptBackgroundInput = _config.AcceptBackgroundInput;
+                    _prevAcceptBackgroundInputControllerOnly = _config.AcceptBackgroundInputControllerOnly;
                     _config.RunInBackground = true;
                     _config.AcceptBackgroundInput = true;
+                    // Controller-only: the unfocused window still reads its gamepad, but background
+                    // KEYBOARD is ignored — so typing in another window can't fire an EmuHawk hotkey
+                    // (rewind/load-state) that would desync the session.
+                    _config.AcceptBackgroundInputControllerOnly = true;
                     _configApplied = true;
-                    Log("run-in-background enabled for this session (unfocused window keeps running)");
+                    Log("run-in-background enabled (controller-only) for this session");
                 }
                 else if (_configApplied && _config != null)
                 {
                     _config.RunInBackground = _prevRunInBackground;
                     _config.AcceptBackgroundInput = _prevAcceptBackgroundInput;
+                    _config.AcceptBackgroundInputControllerOnly = _prevAcceptBackgroundInputControllerOnly;
                     _configApplied = false;
                 }
             }
