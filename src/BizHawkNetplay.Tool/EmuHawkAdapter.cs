@@ -84,11 +84,11 @@ namespace BizHawkNetplay.Tool
         public CoreLayout GetControllerLayout(int port) => _layouts[port];
 
         /// <summary>
-        /// DIAGNOSTIC: when true, ReadLocalInput returns neutral and never touches the pad. Lets us
-        /// prove whether a no-input session holds sync (isolating the core/netcode from the
-        /// paused-input-capture path). Set false to restore real capture.
+        /// DIAGNOSTIC: when true, ReadLocalInput returns neutral and never touches the pad. Proved
+        /// the no-input session holds sync (isolating netcode/core from input). Left as a toggle
+        /// for future debugging; normal play reads the real pad.
         /// </summary>
-        public static bool ForceNeutralInput = true;
+        public static bool ForceNeutralInput = false;
 
         public PortInput ReadLocalInput(int port)
         {
@@ -114,24 +114,25 @@ namespace BizHawkNetplay.Tool
 
         public void SetInputs(InputSet inputs)
         {
-            // Intentionally a no-op. The session injects inputs by stepping the core directly with a
-            // controller built from the merged InputSet (see AdvanceFrame) rather than via
-            // Joypad.Set: BizHawk's joypad overrides are applied outside the main loop's input phase
-            // and don't reliably survive DoFrameAdvance, so the physical pad leaked into the local
-            // core and desynced against the remote. AdvanceFrame bypasses EmuHawk's input chain
-            // entirely, which is the only way to honour "input interception is absolute".
-        }
-
-        /// <summary>
-        /// Step the core exactly one frame using <paramref name="inputs"/> as the ONLY input source,
-        /// bypassing EmuHawk's input chain (and thus the physical controller). Identical inputs on
-        /// both peers therefore produce identical state. Render flags don't affect determinism, so
-        /// video is drawn and audio skipped for now.
-        /// </summary>
-        public void AdvanceFrame(InputSet inputs, bool render)
-        {
-            var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
-            _emulator.FrameAdvance(controller, render, renderSound: false);
+            // Injects the synchronized inputs for the frame about to run. MUST be called from the
+            // frame callback (UpdateBefore), the only place BizHawk applies joypad overrides — set
+            // from outside the main loop's input phase they don't stick and the physical pad leaks
+            // in. One combined override for every port, FULL button names, controller=null: with a
+            // controller index BizHawk expects short names and re-qualifies them, so full names +
+            // an index silently no-op the override.
+            var buttons = new Dictionary<string, bool>();
+            var axes = new Dictionary<string, int?>();
+            for (int p = 0; p < _layouts.Length && p < inputs.Ports.Length; p++)
+            {
+                var layout = _layouts[p];
+                var port = inputs.Ports[p];
+                for (int i = 0; i < layout.Buttons.Count; i++)
+                    buttons[layout.Buttons[i]] = port.Buttons[i];
+                for (int j = 0; j < layout.Axes.Count; j++)
+                    axes[layout.Axes[j].Name] = port.Axes[j];
+            }
+            _apis.Joypad.Set(buttons, null);
+            if (axes.Count > 0) _apis.Joypad.SetAnalog(axes, null);
         }
 
         // --- State --------------------------------------------------------------------

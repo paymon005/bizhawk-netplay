@@ -138,6 +138,55 @@ namespace BizHawkNetplay.Core.Sync
             if (prune > 0) _pipeline.PruneBefore(prune);
         }
 
+        // --- Split API for the EmuHawk driver ----------------------------------------
+        // In EmuHawk the network pump + gate run on the frame timer, while the local-input
+        // capture and injection must run inside the frame callback (the only place input is
+        // actually polled and where joypad overrides stick). These decompose OnPreFrame so the
+        // form can straddle that boundary; the loopback tests keep using OnPreFrame/OnPostFrame.
+
+        /// <summary>Drain remote inputs into the pipeline and (re)send our redundant window. Safe every tick, including stalls.</summary>
+        public void PumpNetwork()
+        {
+            if (!_started) Start();
+            DrainNetwork();
+            SendWindow();
+        }
+
+        /// <summary>True when every port's input for the current frame is confirmed (ready to advance).</summary>
+        public bool CurrentFrameReady()
+        {
+            var decision = _strategy.BeginFrame(CurrentFrame);
+            IsStalled = decision.Stall;
+            return !decision.Stall;
+        }
+
+        /// <summary>
+        /// Capture the local pad for CurrentFrame+delay, enqueue and send it. Call from inside the
+        /// frame callback, where input has actually been polled.
+        /// </summary>
+        public void CaptureLocalInput()
+        {
+            int stamp = CurrentFrame + _delay;
+            if (stamp > _lastStamp)
+            {
+                var local = _adapter.ReadLocalInput(_localPort);
+                ProduceLocal(stamp, local);
+            }
+            SendWindow();
+        }
+
+        /// <summary>Merged inputs to apply for the current frame (only valid once <see cref="CurrentFrameReady"/> is true).</summary>
+        public InputSet CurrentInputs() => _pipeline.Merge(CurrentFrame);
+
+        /// <summary>Advance the frame counter after the core has stepped the current frame.</summary>
+        public void CompleteFrame()
+        {
+            _strategy.EndFrame(CurrentFrame);
+            CurrentFrame++;
+            int prune = CurrentFrame - _historyKeep;
+            if (prune > 0) _pipeline.PruneBefore(prune);
+        }
+
         // --- internals ----------------------------------------------------------------
 
         private void DrainNetwork()

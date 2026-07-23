@@ -46,7 +46,10 @@ namespace BizHawkNetplay.Tool
         private readonly Button _goButton;
         private readonly Button _disconnectButton;
         private readonly Button _probeButton;
+        private readonly CheckBox _verboseCheck;
         private readonly Label _status;
+
+        private bool Verbose => _verboseCheck.Checked;
         private readonly TextBox _log;
 
         // --- Session state (all touched on the UI thread except where noted) ---
@@ -59,6 +62,8 @@ namespace BizHawkNetplay.Tool
         private Thread? _controlReader;
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
+        private bool _advancing;   // true only while our DoFrameAdvance is running (guards UpdateBefore)
+        private int _stallLog;     // throttles verbose stall messages
 
         private readonly object _hashLock = new object();
         private readonly Dictionary<int, uint> _localHashes = new Dictionary<int, uint>();
@@ -97,6 +102,8 @@ namespace BizHawkNetplay.Tool
             _probeButton = new Button { Text = "Capability Probe", Location = new Point(268, 108), Width = 130 };
             _probeButton.Click += (_, __) => RunProbe();
 
+            _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(410, 112) };
+
             _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(12, 144), ForeColor = Color.DimGray };
 
             _log = new TextBox
@@ -110,7 +117,7 @@ namespace BizHawkNetplay.Tool
             Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _status, _log,
+                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _verboseCheck, _status, _log,
             });
             ResumeLayout(false);
 
@@ -251,19 +258,48 @@ namespace BizHawkNetplay.Tool
             if (!_sessionActive || _driver == null) return;
             try
             {
-                if (_driver.OnPreFrame() == FrameStep.Ran)
+                _driver.PumpNetwork(); // drain remote input + resend our redundant window (every tick)
+
+                if (_driver.CurrentFrameReady())
                 {
-                    // Step the core with our merged inputs directly — never EmuHawk's DoFrameAdvance,
-                    // whose input chain would let the local physical pad reach the core undelayed.
-                    _adapter!.AdvanceFrame(_driver.LastAppliedInputs!, render: true);
-                    _driver.OnPostFrame();
+                    // Step one frame through EmuHawk's real loop: it polls input, presents video and
+                    // outputs audio, and fires UpdateBefore (below) where we capture + inject. We only
+                    // call it when the frame's inputs are confirmed, which preserves lockstep gating.
+                    _advancing = true;
+                    try { APIs.EmuClient.DoFrameAdvance(); }
+                    finally { _advancing = false; }
+
+                    _driver.CompleteFrame();
                     MaybeSendChecksum();
                     if (_driver.CurrentFrame % 120 == 0)
                         Status($"in session — frame {_driver.CurrentFrame}", Color.Green);
                 }
-                // stall: skip this tick; the redundant window will fill in and we retry next tick
+                else if (Verbose && (++_stallLog % 30 == 0))
+                {
+                    Log($"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
+                }
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// Fires inside DoFrameAdvance, at the point BizHawk builds the frame's input — the only
+        /// place the pad has been polled and where joypad overrides actually stick (same hook Lua
+        /// uses). We capture the local pad for a future frame and inject the synchronized inputs for
+        /// this one. Guarded so it does nothing during EmuHawk's own (non-session) frame advances.
+        /// </summary>
+        protected override void UpdateBefore()
+        {
+            if (!_advancing || _driver == null || _adapter == null) return;
+            try
+            {
+                _driver.CaptureLocalInput();                    // read local pad (now polled), stamp+send
+                _adapter.SetInputs(_driver.CurrentInputs());    // override all ports for this frame
+            }
+            catch (Exception ex)
+            {
+                if (Verbose) Log("UpdateBefore error: " + ex.Message);
+            }
         }
 
         private void MaybeSendChecksum()
@@ -274,6 +310,7 @@ namespace BizHawkNetplay.Tool
             lock (_hashLock) { _localHashes[frame] = hash; }
             try { _control!.Send(ControlMessageType.Checksum, EncodeChecksum(frame, hash)); }
             catch { /* control channel gone; the reader loop will end the session */ }
+            if (Verbose) Log($"checksum frame {frame}: local {hash:X8}");
             CompareChecksum(frame);
         }
 
@@ -314,6 +351,8 @@ namespace BizHawkNetplay.Tool
             if (local != remote)
                 BeginInvokeUi(() => EndSession($"DESYNC detected at frame {frame} " +
                                                $"(local {local:X8} != remote {remote:X8})"));
+            else if (Verbose)
+                BeginInvokeUi(() => Log($"checksum frame {frame}: MATCH ({local:X8})"));
         }
 
         private void FailSession(string reason)
