@@ -1,0 +1,30 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / VS
+.vs/
+.idea/
+*.dll.config
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# BizHawk runtime / dumps
+*.State
+*.savestate
+*.wch
+config.ini
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
