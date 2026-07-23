@@ -93,11 +93,9 @@ timer tick via `DoFrameAdvance` — it *owns the clock* rather than fighting Emu
 - Lockstep only; rollback negotiation is stubbed off until the RollbackStrategy lands in M3.
 - Refuses to run sensibly alongside movies/TAStudio/Lua is not yet enforced — avoid those during a session.
 
-## Running the M0 probe
+## Capability probe
 
-1. Build the Tool (deploys to `ExternalTools\` by default).
-2. Launch EmuHawk, load a ROM.
-3. **Tools → External Tool → BizHawk Netplay — Capability Probe**.
-4. *Run Capability Probe* times save/load/frame-advance and prints the per-core rollback
-   verdict. *Run API Experiments* answers the reentrant-frame-advance question and checks the
-   speed/hide controls the repair path depends on.
+The M0 probe lives inside the netplay tool as the **Capability Probe** button (EmuHawk requires
+exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It
+times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving
+and restoring your position so it doesn't disturb play.

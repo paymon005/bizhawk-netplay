@@ -9,6 +9,7 @@ using BizHawk.Client.Common;
 using BizHawk.Client.EmuHawk;
 using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Net;
+using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
 
@@ -44,6 +45,7 @@ namespace BizHawkNetplay.Tool
         private readonly NumericUpDown _delayBox;
         private readonly Button _goButton;
         private readonly Button _disconnectButton;
+        private readonly Button _probeButton;
         private readonly Label _status;
         private readonly TextBox _log;
 
@@ -86,6 +88,9 @@ namespace BizHawkNetplay.Tool
             _disconnectButton = new Button { Text = "Disconnect", Location = new Point(150, 108), Width = 110, Enabled = false };
             _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
 
+            _probeButton = new Button { Text = "Capability Probe", Location = new Point(268, 108), Width = 130 };
+            _probeButton.Click += (_, __) => RunProbe();
+
             _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(12, 144), ForeColor = Color.DimGray };
 
             _log = new TextBox
@@ -99,7 +104,7 @@ namespace BizHawkNetplay.Tool
             Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _goButton, _disconnectButton, _status, _log,
+                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _status, _log,
             });
             ResumeLayout(false);
 
@@ -338,6 +343,42 @@ namespace BizHawkNetplay.Tool
             }
         }
 
+        // ------------------------------------------------------------------ probe
+
+        /// <summary>
+        /// M0 capability probe, folded in as a diagnostic: times save/load/frame-advance on the
+        /// loaded core and reports whether it qualifies for rollback (§5). Saves and restores the
+        /// current position so it doesn't disturb play. Only runs when idle.
+        /// </summary>
+        private void RunProbe()
+        {
+            if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
+            if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
+            if (_sessionActive) { Log("Can't probe during a session."); return; }
+
+            Log("=== capability probe ===");
+            string? restore = null;
+            try
+            {
+                var adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
+                restore = APIs.MemorySaveState.SaveCoreStateToMemory();
+                double budget = FrameMs();
+                var probe = new CapabilityProbe(adapter, new StopwatchClock(), samples: 100);
+                var result = probe.Run(budget, budget * 0.25);
+                Log(result.ToString());
+            }
+            catch (Exception ex) { Log("probe failed: " + ex.Message); }
+            finally
+            {
+                if (restore != null)
+                {
+                    try { APIs.MemorySaveState.LoadCoreStateFromMemory(restore); APIs.MemorySaveState.DeleteState(restore); }
+                    catch (Exception ex) { Log("(warning) could not restore pre-probe state: " + ex.Message); }
+                }
+                Log("=== done ===");
+            }
+        }
+
         // ------------------------------------------------------------------ helpers
 
         private PeerIdentity BuildIdentity(EmuHawkAdapter a)
@@ -388,6 +429,7 @@ namespace BizHawkNetplay.Tool
             _hostRadio.Enabled = _joinRadio.Enabled = !busy;
             _ipBox.Enabled = !busy && _joinRadio.Checked;
             _portBox.Enabled = _delayBox.Enabled = !busy;
+            _probeButton.Enabled = !busy;
             _disconnectButton.Enabled = busy;
         }
 
