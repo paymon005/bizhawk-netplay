@@ -15,10 +15,16 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 
 | Milestone | State |
 |---|---|
-| **M0 — Probe harness** | External tool builds & loads; runs the §5 capability probe and the three API experiments |
-| Core sync logic (M1 groundwork) | Input serialization, controller-layout negotiation, input pipeline / confirmed-frontier, lockstep strategy — all unit-tested |
-| M1 — 2-player lockstep | Not started (transport, session handshake, FrameDriver) |
+| **M0 — Probe harness** | ✅ Done. Runs the §5 probe + three API experiments. Validated on Genesis/GPGX (see below) |
+| Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, lockstep strategy — unit-tested |
+| **M1 — 2-player lockstep** | In progress: FrameDriver + transport + redundant input codec built & tested over loopback; real UDP + host/join UI next |
 | M2–M4 | Not started |
+
+### M0 findings (Genesis / GPGX, Contra Hard Corps)
+
+- **Rollback qualifies**: ~787 KiB state, save/load/frame ≈ 0.2 ms vs a 16.688 ms budget → maxDepth ≈ 20–29. Probe reads the real console frame period, not 60.000 Hz.
+- **Reentrant `FrameAdvance` from a frame callback works** (the doc's §6.2 "deciding experiment") → **synchronous** rollback repair is available for M3, not just catch-up mode.
+- No `InvisibleEmulation` API → DispSpeedupFeatures/SoundThrottle hide path, as designed; `SpeedMode`/`LimitFramerate` modulation confirmed.
 
 ## Layout
 

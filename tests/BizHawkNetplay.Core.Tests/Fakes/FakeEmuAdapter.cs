@@ -39,9 +39,25 @@ namespace BizHawkNetplay.Core.Tests.Fakes
 
         public int PortCount { get; }
         public ControllerLayout GetControllerLayout(int port) => _layout;
-        public PortInput ReadLocalInput(int port) => PortInput.Neutral(_layout);
+
+        /// <summary>Scripted local controller, keyed by the current sim frame; neutral if unset.</summary>
+        public Func<int, PortInput>? LocalInputScript { get; set; }
+
+        public PortInput ReadLocalInput(int port) =>
+            LocalInputScript?.Invoke(_frame) ?? PortInput.Neutral(_layout);
 
         public void SetInputs(InputSet inputs) => AppliedInputs.Add(inputs);
+
+        /// <summary>
+        /// Model EmuHawk running one frame with the inputs the driver just injected: fold the
+        /// last applied <see cref="InputSet"/> into memory and advance. Two instances that apply
+        /// identical merged inputs evolve identical memory — so hash equality proves lockstep.
+        /// </summary>
+        public void AdvanceAppliedFrame()
+        {
+            if (AppliedInputs.Count == 0) throw new InvalidOperationException("No inputs applied yet");
+            Step(AppliedInputs[AppliedInputs.Count - 1]);
+        }
 
         public StateHandle SaveStateToMemory()
         {
