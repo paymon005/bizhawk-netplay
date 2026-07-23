@@ -83,9 +83,18 @@ namespace BizHawkNetplay.Tool
 
         public CoreLayout GetControllerLayout(int port) => _layouts[port];
 
+        /// <summary>
+        /// DIAGNOSTIC: when true, ReadLocalInput returns neutral and never touches the pad. Lets us
+        /// prove whether a no-input session holds sync (isolating the core/netcode from the
+        /// paused-input-capture path). Set false to restore real capture.
+        /// </summary>
+        public static bool ForceNeutralInput = true;
+
         public PortInput ReadLocalInput(int port)
         {
             var layout = _layouts[port];
+            if (ForceNeutralInput)
+                return PortInput.Neutral(layout);
             // Refresh the active controller from the real pad, clearing our prior-frame overrides,
             // so we capture the player's actual input this frame rather than the value we injected
             // last frame. SetInputs re-applies the synchronized overrides immediately after, before
