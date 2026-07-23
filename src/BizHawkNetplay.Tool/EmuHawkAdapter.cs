@@ -22,6 +22,8 @@ namespace BizHawkNetplay.Tool
     /// </summary>
     internal sealed class EmuHawkAdapter : IEmuAdapter
     {
+        private static readonly IReadOnlyDictionary<string, bool> EmptyButtons = new Dictionary<string, bool>();
+
         private readonly ApiContainer _apis;
         private readonly IEmulator _emulator;
         private readonly IStatable _statable;
@@ -84,7 +86,12 @@ namespace BizHawkNetplay.Tool
         public PortInput ReadLocalInput(int port)
         {
             var layout = _layouts[port];
-            var current = _apis.Joypad.GetImmediate(port + 1); // BizHawk controllers are 1-based
+            // Refresh the active controller from the real pad, clearing our prior-frame overrides,
+            // so we capture the player's actual input this frame rather than the value we injected
+            // last frame. SetInputs re-applies the synchronized overrides immediately after, before
+            // the core advances — so the core never sees this cleared state.
+            _apis.Joypad.Set(EmptyButtons, null);
+            var current = _apis.Joypad.GetImmediate(null); // null => full button names, all ports
             var buttons = new bool[layout.Buttons.Count];
             for (int i = 0; i < buttons.Length; i++)
                 buttons[i] = current.TryGetValue(layout.Buttons[i], out var v) && v is bool b && b;
@@ -98,23 +105,24 @@ namespace BizHawkNetplay.Tool
 
         public void SetInputs(InputSet inputs)
         {
+            // One combined override for every port, using FULL button names with controller=null.
+            // BizHawk's Joypad.Set expects short names when given a controller index and re-qualifies
+            // them ("P{n} " + name); passing full names WITH an index makes every lookup miss and
+            // silently UNSETs the override, letting the physical pad leak into the local core and
+            // desync against the remote. Full names + null is the correct combination.
+            var buttons = new Dictionary<string, bool>();
+            var axes = new Dictionary<string, int?>();
             for (int p = 0; p < _layouts.Length && p < inputs.Ports.Length; p++)
             {
                 var layout = _layouts[p];
                 var port = inputs.Ports[p];
-                var boolDict = new Dictionary<string, bool>(layout.Buttons.Count);
                 for (int i = 0; i < layout.Buttons.Count; i++)
-                    boolDict[layout.Buttons[i]] = port.Buttons[i];
-                _apis.Joypad.Set(boolDict, p + 1);
-
-                if (layout.Axes.Count > 0)
-                {
-                    var axisDict = new Dictionary<string, int?>(layout.Axes.Count);
-                    for (int j = 0; j < layout.Axes.Count; j++)
-                        axisDict[layout.Axes[j].Name] = port.Axes[j];
-                    _apis.Joypad.SetAnalog(axisDict, p + 1);
-                }
+                    buttons[layout.Buttons[i]] = port.Buttons[i];
+                for (int j = 0; j < layout.Axes.Count; j++)
+                    axes[layout.Axes[j].Name] = port.Axes[j];
             }
+            _apis.Joypad.Set(buttons, null);
+            if (axes.Count > 0) _apis.Joypad.SetAnalog(axes, null);
         }
 
         // --- State --------------------------------------------------------------------
