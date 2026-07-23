@@ -22,12 +22,11 @@ namespace BizHawkNetplay.Tool
     /// </summary>
     internal sealed class EmuHawkAdapter : IEmuAdapter
     {
-        private static readonly IReadOnlyDictionary<string, bool> EmptyButtons = new Dictionary<string, bool>();
-
         private readonly ApiContainer _apis;
         private readonly IEmulator _emulator;
         private readonly IStatable _statable;
         private readonly CoreLayout[] _layouts;
+        private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
 
         public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
         {
@@ -35,6 +34,19 @@ namespace BizHawkNetplay.Tool
             _emulator = emulator ?? throw new ArgumentNullException(nameof(emulator));
             _statable = statable ?? throw new ArgumentNullException(nameof(statable));
             _layouts = BuildLayouts(emulator.ControllerDefinition);
+            _bindings = BuildBindings();
+        }
+
+        /// <summary>True if we found the user's controller bindings (needed to capture input).</summary>
+        public bool HasBindings
+        {
+            get
+            {
+                foreach (var port in _bindings)
+                    foreach (var b in port)
+                        if (!string.IsNullOrEmpty(b)) return true;
+                return false;
+            }
         }
 
         // --- Identity & determinism ---------------------------------------------------
@@ -95,44 +107,83 @@ namespace BizHawkNetplay.Tool
             var layout = _layouts[port];
             if (ForceNeutralInput)
                 return PortInput.Neutral(layout);
-            // Refresh the active controller from the real pad, clearing our prior-frame overrides,
-            // so we capture the player's actual input this frame rather than the value we injected
-            // last frame. SetInputs re-applies the synchronized overrides immediately after, before
-            // the core advances — so the core never sees this cleared state.
-            _apis.Joypad.Set(EmptyButtons, null);
-            var current = _apis.Joypad.GetImmediate(null); // null => full button names, all ports
+
+            // Read raw host input directly (IInputApi.Get works while the emulator is paused and does
+            // NOT run EmuHawk's controller/hotkey chain), then resolve to core buttons via the user's
+            // bindings. Input capture thus stays entirely out of the emulation path — the core only
+            // ever sees the merged inputs we feed in AdvanceFrame, so there is no physical leak, no
+            // hotkey firing, and both peers stay deterministic.
+            var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
+            var binds = _bindings[port];
             var buttons = new bool[layout.Buttons.Count];
             for (int i = 0; i < buttons.Length; i++)
-                buttons[i] = current.TryGetValue(layout.Buttons[i], out var v) && v is bool b && b;
+                buttons[i] = EvaluateBinding(binds[i], pressed);
             var axes = new int[layout.Axes.Count];
             for (int j = 0; j < axes.Length; j++)
-                axes[j] = current.TryGetValue(layout.Axes[j].Name, out var v) && v is int iv
-                    ? iv
-                    : layout.Axes[j].Neutral;
+                axes[j] = layout.Axes[j].Neutral; // analog capture is M2
             return new PortInput(buttons, axes);
         }
 
-        public void SetInputs(InputSet inputs)
+        // The real session injects inputs by stepping the core with a controller built from the
+        // merged InputSet (AdvanceFrame), not via Joypad.Set — so this is unused.
+        public void SetInputs(InputSet inputs) { }
+
+        /// <summary>
+        /// Step the core exactly one frame using <paramref name="inputs"/> as the ONLY input source
+        /// (bypasses EmuHawk's input chain and hotkeys). Identical inputs on both peers therefore
+        /// produce identical state — the proven-deterministic stepping path.
+        /// </summary>
+        public void AdvanceFrame(InputSet inputs)
         {
-            // Injects the synchronized inputs for the frame about to run. MUST be called from the
-            // frame callback (UpdateBefore), the only place BizHawk applies joypad overrides — set
-            // from outside the main loop's input phase they don't stick and the physical pad leaks
-            // in. One combined override for every port, FULL button names, controller=null: with a
-            // controller index BizHawk expects short names and re-qualifies them, so full names +
-            // an index silently no-op the override.
-            var buttons = new Dictionary<string, bool>();
-            var axes = new Dictionary<string, int?>();
-            for (int p = 0; p < _layouts.Length && p < inputs.Ports.Length; p++)
+            var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
+            _emulator.FrameAdvance(controller, render: true, renderSound: true);
+        }
+
+        /// <summary>
+        /// True if the host-input expression <paramref name="binding"/> is satisfied by the pressed
+        /// set. Handles comma-separated alternatives and '+'-separated combos (the common BizHawk
+        /// forms); exotic modifiers may not resolve (M2).
+        /// </summary>
+        private static bool EvaluateBinding(string binding, HashSet<string> pressed)
+        {
+            if (string.IsNullOrEmpty(binding)) return false;
+            foreach (var alt in binding.Split(','))
+            {
+                var one = alt.Trim();
+                if (one.Length == 0) continue;
+                bool all = true;
+                foreach (var part in one.Split('+'))
+                {
+                    var key = part.Trim();
+                    if (key.Length == 0) continue;
+                    if (!pressed.Contains(key)) { all = false; break; }
+                }
+                if (all) return true;
+            }
+            return false;
+        }
+
+        private string[][] BuildBindings()
+        {
+            Dictionary<string, string>? map = null;
+            try
+            {
+                var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                if (config != null && config.AllTrollers.TryGetValue(_emulator.SystemId, out var m))
+                    map = m;
+            }
+            catch { /* fall through to empty bindings */ }
+
+            var result = new string[_layouts.Length][];
+            for (int p = 0; p < _layouts.Length; p++)
             {
                 var layout = _layouts[p];
-                var port = inputs.Ports[p];
-                for (int i = 0; i < layout.Buttons.Count; i++)
-                    buttons[layout.Buttons[i]] = port.Buttons[i];
-                for (int j = 0; j < layout.Axes.Count; j++)
-                    axes[layout.Axes[j].Name] = port.Axes[j];
+                var arr = new string[layout.Buttons.Count];
+                for (int i = 0; i < arr.Length; i++)
+                    arr[i] = (map != null && map.TryGetValue(layout.Buttons[i], out var b)) ? b : "";
+                result[p] = arr;
             }
-            _apis.Joypad.Set(buttons, null);
-            if (axes.Count > 0) _apis.Joypad.SetAnalog(axes, null);
+            return result;
         }
 
         // --- State --------------------------------------------------------------------

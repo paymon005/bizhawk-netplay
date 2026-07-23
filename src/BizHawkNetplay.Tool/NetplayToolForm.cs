@@ -65,7 +65,6 @@ namespace BizHawkNetplay.Tool
         private Thread? _controlReader;
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
-        private bool _advancing;   // true only while our DoFrameAdvance is running (guards UpdateBefore)
         private int _stallLog;     // throttles verbose stall messages
 
         private readonly object _hashLock = new object();
@@ -153,6 +152,8 @@ namespace BizHawkNetplay.Tool
                 _adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
                 if (!_adapter.VerifyDeterministicMode())
                     Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
+                if (!_adapter.HasBindings)
+                    Log($"WARNING: no controller bindings found for '{_emulator.SystemId}' — your input may not register.");
 
                 var id = BuildIdentity(_adapter);
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback: false); // rollback is M3
@@ -274,17 +275,14 @@ namespace BizHawkNetplay.Tool
                     if (Verbose) Log("re-paused (the session owns the frame clock — don't unpause)");
                 }
 
-                _driver.PumpNetwork(); // drain remote input + resend our redundant window (every tick)
+                _driver.PumpNetwork();       // drain remote input + resend our redundant window
+                _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
 
                 if (_driver.CurrentFrameReady())
                 {
-                    // Step one frame through EmuHawk's real loop: it polls input, presents video and
-                    // outputs audio, and fires UpdateBefore (below) where we capture + inject. We only
-                    // call it when the frame's inputs are confirmed, which preserves lockstep gating.
-                    _advancing = true;
-                    try { APIs.EmuClient.DoFrameAdvance(); }
-                    finally { _advancing = false; }
-
+                    // Step the core with ONLY our merged inputs — deterministic, bypasses EmuHawk's
+                    // input chain and hotkeys. Gated: we advance only when the frame is confirmed.
+                    _adapter!.AdvanceFrame(_driver.CurrentInputs());
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
                     if (_driver.CurrentFrame % 120 == 0)
@@ -296,26 +294,6 @@ namespace BizHawkNetplay.Tool
                 }
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
-        }
-
-        /// <summary>
-        /// Fires inside DoFrameAdvance, at the point BizHawk builds the frame's input — the only
-        /// place the pad has been polled and where joypad overrides actually stick (same hook Lua
-        /// uses). We capture the local pad for a future frame and inject the synchronized inputs for
-        /// this one. Guarded so it does nothing during EmuHawk's own (non-session) frame advances.
-        /// </summary>
-        protected override void UpdateBefore()
-        {
-            if (!_advancing || _driver == null || _adapter == null) return;
-            try
-            {
-                _driver.CaptureLocalInput();                    // read local pad (now polled), stamp+send
-                _adapter.SetInputs(_driver.CurrentInputs());    // override all ports for this frame
-            }
-            catch (Exception ex)
-            {
-                if (Verbose) Log("UpdateBefore error: " + ex.Message);
-            }
         }
 
         private void MaybeSendChecksum()
