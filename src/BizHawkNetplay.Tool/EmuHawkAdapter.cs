@@ -163,16 +163,28 @@ namespace BizHawkNetplay.Tool
             return false;
         }
 
+        /// <summary>Human-readable note on why bindings were/weren't found (for the UI log).</summary>
+        public string BindingDiagnostic { get; private set; } = "";
+
         private string[][] BuildBindings()
         {
             Dictionary<string, string>? map = null;
             try
             {
                 var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
-                if (config != null && config.AllTrollers.TryGetValue(_emulator.SystemId, out var m))
-                    map = m;
+                if (config != null)
+                {
+                    // Config.AllTrollers is keyed by the controller-definition name, not the system id.
+                    var defName = _emulator.ControllerDefinition.Name;
+                    if (!config.AllTrollers.TryGetValue(defName, out map))
+                        config.AllTrollers.TryGetValue(_emulator.SystemId, out map);
+                    if (map == null)
+                        BindingDiagnostic = $"no bindings for '{defName}' or '{_emulator.SystemId}'. " +
+                            $"available: [{string.Join(", ", config.AllTrollers.Keys)}]";
+                }
+                else BindingDiagnostic = "config reference unavailable";
             }
-            catch { /* fall through to empty bindings */ }
+            catch (Exception ex) { BindingDiagnostic = "binding lookup error: " + ex.Message; }
 
             var result = new string[_layouts.Length][];
             for (int p = 0; p < _layouts.Length; p++)

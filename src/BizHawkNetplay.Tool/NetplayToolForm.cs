@@ -153,7 +153,7 @@ namespace BizHawkNetplay.Tool
                 if (!_adapter.VerifyDeterministicMode())
                     Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
                 if (!_adapter.HasBindings)
-                    Log($"WARNING: no controller bindings found for '{_emulator.SystemId}' — your input may not register.");
+                    Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
                 var id = BuildIdentity(_adapter);
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback: false); // rollback is M3
@@ -273,6 +273,16 @@ namespace BizHawkNetplay.Tool
                 {
                     APIs.EmuClient.Pause();
                     if (Verbose) Log("re-paused (the session owns the frame clock — don't unpause)");
+                }
+
+                // If EmuHawk's own loop slipped in extra core frames (e.g. a brief unpause), our
+                // counter and the core have diverged — report it plainly rather than as a desync.
+                int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
+                if (emuDelta != _driver.CurrentFrame)
+                {
+                    EndSession($"EmuHawk advanced {emuDelta - _driver.CurrentFrame} extra frame(s) " +
+                               "— don't unpause during a session (the tool drives the clock)");
+                    return;
                 }
 
                 _driver.PumpNetwork();       // drain remote input + resend our redundant window
