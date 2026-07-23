@@ -17,7 +17,7 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 |---|---|
 | **M0 — Probe harness** | ✅ Done. Runs the §5 probe + three API experiments. Validated on Genesis/GPGX (see below) |
 | Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, lockstep strategy — unit-tested |
-| **M1 — 2-player lockstep** | In progress: FrameDriver + transport + redundant input codec built & tested over loopback; real UDP + host/join UI next |
+| **M1 — 2-player lockstep** | In progress: FrameDriver, redundant input codec, **real UDP transport**, **TCP handshake + state transfer**, negotiation, and clock/RTT estimation all built & tested (incl. over real localhost sockets). Remaining: wire it into a `NetplayToolForm` in EmuHawk |
 | M2–M4 | Not started |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
@@ -26,6 +26,13 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 - **Reentrant `FrameAdvance` from a frame callback works** (the doc's §6.2 "deciding experiment") → **synchronous** rollback repair is available for M3, not just catch-up mode.
 - No `InvisibleEmulation` API → DispSpeedupFeatures/SoundThrottle hide path, as designed; `SpeedMode`/`LimitFramerate` modulation confirmed.
 
+### Networking (adapted from the RemotePlay app)
+
+- **UDP for the input hot path, TCP for the reliable control channel** (handshake, state transfer, checksums) — the proven split from RemotePlay, rather than hand-rolling reliable-over-UDP.
+- UDP datagrams carry a `MAGIC + version` envelope and are **pinned to the peer's exact ip:port** (foreign/off-path packets dropped).
+- Handshake **verifies rather than trusts**: ROM/core/version/sync-settings/layout must match and both cores must be deterministic, or the session is refused with a reason.
+- Known gotcha inherited from RemotePlay: on a **"Public" Windows network profile, the firewall silently drops inbound UDP** while the TCP handshake still connects — i.e. "connected but permanently stalling." An inbound allow-rule for the port fixes it.
+
 ## Layout
 
 ```
@@ -33,9 +40,10 @@ src/
   BizHawkNetplay.Core/    netstandard2.0 — no BizHawk dependency, fully unit-testable
     Emu/    IEmuAdapter, StateHandle          (the seam BizHawk sits behind)
     Input/  ControllerLayout, InputSerializer (generic-over-any-core packing)
-    Sync/   ISyncStrategy, LockstepStrategy, InputPipeline, FrameDecision
+    Sync/   ISyncStrategy, LockstepStrategy, InputPipeline, FrameDecision, FrameDriver
     Probe/  CapabilityProbe, ProbeResult      (§5 rollback-feasibility math)
-    Net/    PacingInfo
+    Net/    ITransport, LoopbackTransport, UdpTransport, InputPacketCodec, PacingInfo
+    Session/ PeerIdentity, SessionNegotiator, ControlChannel, Handshake, ClockEstimator
   BizHawkNetplay.Tool/    net48 — the only project that references BizHawk
     ProbeToolForm.cs      [ExternalTool] entry point (the M0 harness)
     EmuHawkAdapter.cs     IEmuAdapter bridged onto ApiHawk + emulator services
