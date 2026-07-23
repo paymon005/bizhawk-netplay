@@ -64,6 +64,12 @@ namespace BizHawkNetplay.Tool
         private readonly Dictionary<int, uint> _localHashes = new Dictionary<int, uint>();
         private readonly Dictionary<int, uint> _remoteHashes = new Dictionary<int, uint>();
 
+        // Saved EmuHawk config we override for the session's duration (keep running while unfocused).
+        private Config? _config;
+        private bool _prevRunInBackground;
+        private bool _prevAcceptBackgroundInput;
+        private bool _configApplied;
+
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
         public NetplayToolForm()
@@ -214,6 +220,7 @@ namespace BizHawkNetplay.Tool
                 _driver = new FrameDriver(_adapter!, _udp, p => new LockstepStrategy(p),
                     sp.LocalPort, sp.InputDelay, redundancy: 8);
 
+                ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
                 APIs.EmuClient.Pause(); // we own the clock now
                 _driver.Start();
                 _sessionActive = true;
@@ -317,6 +324,7 @@ namespace BizHawkNetplay.Tool
             try { _control?.Send(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
             TeardownNetwork();
 
+            ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
             try { APIs.EmuClient.Unpause(); } catch { }
             lock (_hashLock) { _localHashes.Clear(); _remoteHashes.Clear(); }
 
@@ -389,6 +397,36 @@ namespace BizHawkNetplay.Tool
             // Depth 0 for M1: only LockstepStrategy exists yet, so rollback is never negotiated.
             return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
                 a.SyncSettingsDigest, layouts, a.VerifyDeterministicMode(), maxRollbackDepth: 0);
+        }
+
+        /// <summary>
+        /// While a session is live, keep EmuHawk running and accepting input even when its window
+        /// isn't focused — otherwise two instances on one screen pause each other (only one can be
+        /// focused). Restores the user's original settings when the session ends.
+        /// </summary>
+        private void ApplyBackgroundConfig(bool enable)
+        {
+            try
+            {
+                if (enable)
+                {
+                    _config = (APIs.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                    if (_config == null) { Log("(note) couldn't reach config to disable pause-on-unfocus"); return; }
+                    _prevRunInBackground = _config.RunInBackground;
+                    _prevAcceptBackgroundInput = _config.AcceptBackgroundInput;
+                    _config.RunInBackground = true;
+                    _config.AcceptBackgroundInput = true;
+                    _configApplied = true;
+                    Log("run-in-background enabled for this session (unfocused window keeps running)");
+                }
+                else if (_configApplied && _config != null)
+                {
+                    _config.RunInBackground = _prevRunInBackground;
+                    _config.AcceptBackgroundInput = _prevAcceptBackgroundInput;
+                    _configApplied = false;
+                }
+            }
+            catch (Exception ex) { Log("(note) background-config adjust failed: " + ex.Message); }
         }
 
         private double FrameMs()
