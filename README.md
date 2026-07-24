@@ -16,9 +16,12 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | Milestone | State |
 |---|---|
 | **M0 — Probe harness** | ✅ Done. Runs the §5 probe + three API experiments. Validated on Genesis/GPGX (see below) |
-| Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, lockstep strategy — unit-tested |
-| **M1 — 2-player lockstep** | Code-complete: `NetplayToolForm` (host/join, off-thread handshake + state transfer, timer-driven frames, desync checksums) builds against BizHawk 2.11. **Pending two-machine testing on a real ROM.** |
-| M2–M4 | Not started |
+| Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, **lockstep + rollback** strategies — unit-tested |
+| **M1 — 2-player lockstep** | ✅ Verified on hardware (two EmuHawk instances, Genesis/GPGX): real-time pacing, working audio, desync detection (host saves quick-slot 10 on mismatch), configurable delay + packet redundancy |
+| **M2 — hardening** | ✅ Live ping/RTT + delay hints, **desync auto-recovery** (mismatch → resync from an authoritative state instead of ending), alt-tab audio resilience |
+| **3–4 players** | ✅ Code-complete — host-relay (star) topology; player count = the core's controller-port count. *Untested on hardware.* |
+| **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated; 2-player. *Untested on hardware.* |
+| M4 (NAT punch-through) | Not started |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
@@ -90,7 +93,9 @@ timer tick via `DoFrameAdvance` — it *owns the clock* rather than fighting Emu
   `speedmode`/drift-corrected pacing is M2.
 - Direct IP / LAN / port-forward only; NAT punch-through is M4 (patterns already scouted in the
   RemotePlay app).
-- Lockstep only; rollback negotiation is stubbed off until the RollbackStrategy lands in M3.
+- Rollback (M3) is available for 2-player sessions: tick **Prefer rollback** on both ends. It's
+  granted only if the capability probe clears the depth threshold on both cores; otherwise the
+  session falls back to lockstep automatically. 3–4 players are always lockstep.
 - Refuses to run sensibly alongside movies/TAStudio/Lua is not yet enforced — avoid those during a session.
 
 ## Capability probe

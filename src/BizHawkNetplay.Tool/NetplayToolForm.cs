@@ -50,6 +50,7 @@ namespace BizHawkNetplay.Tool
         private readonly CheckBox _verboseCheck;
         private readonly CheckBox _freezeInputCheck;
         private readonly CheckBox _forceDesyncCheck;
+        private readonly CheckBox _rollbackCheck;
         private readonly Label _status;
 
         private bool Verbose => _verboseCheck.Checked;
@@ -102,6 +103,12 @@ namespace BizHawkNetplay.Tool
         private int _sessionDelay;    // the input delay this session negotiated
         private bool _delayHintShown; // one-time "raise your delay" hint per session
 
+        // Sync mode + rollback config for the live session.
+        private SyncMode _mode = SyncMode.Lockstep;   // negotiated; drives which strategy the driver builds
+        private int _probeDepth = -1;                 // cached capability-probe depth (frames); -1 = not measured
+        private int _rollbackDepth;                   // this session's savestate-ring depth when in rollback
+        private const int RollbackDepthCap = 16;      // clamp the ring so resim cost + memory stay bounded
+
         // Saved EmuHawk config we override for the session's duration (keep running while unfocused).
         private Config? _config;
         private bool _prevRunInBackground;
@@ -137,6 +144,10 @@ namespace BizHawkNetplay.Tool
             _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 41), Width = 70 };
             var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 76) };
             _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 73), Width = 50 };
+            _rollbackCheck = new CheckBox
+            {
+                Text = "Prefer rollback (2P, if core qualifies)", AutoSize = true, Location = new Point(155, 75),
+            };
 
             _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 108), Width = 130 };
             _goButton.Click += (_, __) => OnGo();
@@ -176,7 +187,7 @@ namespace BizHawkNetplay.Tool
             Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _testInputButton,
+                delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton, _probeButton, _testInputButton,
                 _verboseCheck, _freezeInputCheck, _forceDesyncCheck, _status, _log,
             });
             ResumeLayout(false);
@@ -216,14 +227,21 @@ namespace BizHawkNetplay.Tool
                     Log($"this core exposes only {players} controller port — configure at least 2 controllers to host netplay.");
                     SetBusy(false); return;
                 }
-                var id = BuildIdentity(_adapter);
-                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback: false); // rollback is M3
-                int port = (int)_portBox.Value;
 
-                // Freeze the emulator NOW. Otherwise the host keeps free-running between exporting
-                // its state and the joiners arriving, so the sims start on different frames and
-                // desync immediately. Paused here == the frame all peers resume from.
+                // Freeze the emulator NOW. Otherwise it keeps free-running between probing/exporting
+                // its state and the peers arriving, so the sims start on different frames and desync
+                // immediately. Paused here == the frame all peers resume from. (Probing below advances
+                // frames invisibly and restores, so it must be paused first.)
                 APIs.EmuClient.Pause();
+
+                // Rollback is a 2-player upgrade only; for 3–4 players we always run lockstep. It's also
+                // gated on the capability probe + the peer opting in (the negotiator has the final say).
+                bool wantRollback = _rollbackCheck.Checked && players == 2;
+                if (_rollbackCheck.Checked && players != 2)
+                    Log($"rollback is 2-player only; this core exposes {players} ports — using lockstep.");
+                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback);
+                var id = BuildIdentity(_adapter, wantRollback);
+                int port = (int)_portBox.Value;
 
                 SetBusy(true);
                 if (_hostRadio.Checked)
@@ -286,14 +304,21 @@ namespace BizHawkNetplay.Tool
                 int finalDelay = prefs.InputDelay;
                 foreach (var g in greetings) finalDelay = Math.Max(finalDelay, g.Prefs.InputDelay);
 
+                // The host is authoritative on sync mode too. Rollback only for a single joiner (2P):
+                // ask the negotiator, which grants it only if both peers opted in and both cleared the
+                // probe depth threshold. Anything else (or 3–4 players) stays lockstep.
+                SyncMode mode = SyncMode.Lockstep;
+                if (players == 2 && greetings.Count == 1)
+                    mode = SessionNegotiator.Negotiate(id, greetings[0].Id, prefs, greetings[0].Prefs).Mode;
+
                 foreach (var link in links)
-                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, SyncMode.Lockstep, state);
+                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state);
 
                 var eps = new List<IPEndPoint>();
                 foreach (var link in links) eps.Add(link.UdpEndpoint);
                 _relay!.SetPeers(eps);
 
-                BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay));
+                BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay, mode));
             }
             catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
         }
@@ -324,7 +349,7 @@ namespace BizHawkNetplay.Tool
 
         // ------------------------------------------------------------------ session
 
-        private void BeginSessionHost(List<PeerLink> links, int players, int delay)
+        private void BeginSessionHost(List<PeerLink> links, int players, int delay, SyncMode mode)
         {
             try
             {
@@ -332,7 +357,7 @@ namespace BizHawkNetplay.Tool
                 _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 Log($"all {players} players connected — you are P1 (host)");
-                BeginSessionCommon(SyncMode.Lockstep, $"{links.Count} peer(s)");
+                BeginSessionCommon(mode, $"{links.Count} peer(s)");
             }
             catch (Exception ex) { FailSession(ex.Message); }
         }
@@ -360,8 +385,15 @@ namespace BizHawkNetplay.Tool
         /// <summary>The role-independent session bring-up: driver, audio, per-link readers, pacing.</summary>
         private void BeginSessionCommon(SyncMode mode, string remoteLabel)
         {
-            _driver = new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
-                _localPort, _sessionDelay, redundancy: 8);
+            _mode = mode;
+            if (mode == SyncMode.Rollback)
+            {
+                // Ring depth = this peer's probe depth, clamped so resim cost + memory stay bounded.
+                // Each peer bounds its own ring independently; correctness never needs them equal.
+                int d = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
+                _rollbackDepth = Math.Max(ProbeResult.RollbackDepthThreshold, Math.Min(d, RollbackDepthCap));
+            }
+            _driver = CreateDriver();
 
             ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
             try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
@@ -471,16 +503,31 @@ namespace BizHawkNetplay.Tool
                 double ping = -1;
                 lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
                 string pingStr = ping < 0 ? "" : $" — ping {ping:F0}ms{(_peers.Count > 1 ? " (worst)" : "")}";
-                Status($"in session — frame {_driver.CurrentFrame}{pingStr}", Color.Green);
+                string rbStr = _driver.Strategy is RollbackStrategy rbs
+                    ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen})"
+                    : "";
+                Status($"in session — frame {_driver.CurrentFrame}{pingStr}{rbStr}", Color.Green);
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
         }
 
         private void MaybeSendChecksum()
         {
-            int frame = _driver!.CurrentFrame;
-            if (frame % ChecksumInterval != 0) return;
-            uint hash = _adapter!.HashMainMemory();
+            int frame;
+            uint hash;
+            if (_driver!.Strategy is RollbackStrategy rb)
+            {
+                // Under rollback the current frame may be a prediction that legitimately differs
+                // between peers — checksum the newest FINAL interval boundary instead. Both peers
+                // quantize to the same boundary, so their reports line up for the host to compare.
+                if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
+            }
+            else
+            {
+                frame = _driver.CurrentFrame;
+                if (frame % ChecksumInterval != 0) return;
+                hash = _adapter!.HashMainMemory();
+            }
             if (_forceDesyncOnce)
             {
                 // Diagnostic: corrupt the reported hash (not the actual state) so the peers disagree
@@ -492,7 +539,8 @@ namespace BizHawkNetplay.Tool
             if (Verbose)
             {
                 int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
-                string drift = emuDelta == frame ? "" : $"  !! emuΔ={emuDelta} (expected {frame})";
+                // In rollback `frame` is a past boundary, so compare drift against the live frame.
+                string drift = emuDelta == _driver.CurrentFrame ? "" : $"  !! emuΔ={emuDelta} (expected {_driver.CurrentFrame})";
                 Log($"checksum frame {frame}: local {hash:X8}{drift}");
             }
             // The host aggregates all peers' checksums itself; joiners just report theirs to the host.
@@ -693,13 +741,29 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void RebuildDriver()
         {
-            _driver = new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
-                _localPort, _sessionDelay, redundancy: 8);
+            _driver = CreateDriver();
             _startEmuFrame = APIs.Emulation.FrameCount();
             lock (_hashLock) { _frameHashes.Clear(); }
             _driver.Start();
             _lastResync = DateTime.UtcNow;
             _paceClock.Restart();
+        }
+
+        /// <summary>
+        /// Build the frame driver for the negotiated <see cref="_mode"/>: rollback plugs the
+        /// <see cref="RollbackStrategy"/> (with its savestate ring depth) in behind the same seam
+        /// lockstep uses, and widens the driver's network window to the ring depth so late corrections
+        /// reach the pipeline. Used for both session start and resync rebuilds so they never diverge.
+        /// </summary>
+        private FrameDriver CreateDriver()
+        {
+            if (_mode == SyncMode.Rollback)
+                return new FrameDriver(_adapter!, _transport!,
+                    p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth),
+                    _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth);
+
+            return new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
+                _localPort, _sessionDelay, redundancy: 8);
         }
 
         private void SendToAllPeers(ControlMessageType type, byte[] body)
@@ -819,14 +883,45 @@ namespace BizHawkNetplay.Tool
 
         // ------------------------------------------------------------------ helpers
 
-        private PeerIdentity BuildIdentity(EmuHawkAdapter a)
+        private PeerIdentity BuildIdentity(EmuHawkAdapter a, bool wantRollback)
         {
             var layouts = new string[a.PortCount];
             for (int p = 0; p < layouts.Length; p++)
                 layouts[p] = a.GetControllerLayout(p).Digest;
-            // Depth 0 for M1: only LockstepStrategy exists yet, so rollback is never negotiated.
+            // Advertise the core's real rollback depth only when this peer wants rollback; otherwise 0
+            // so the negotiator (which needs both peers to opt in) settles on lockstep for free.
+            int depth = wantRollback ? MeasureRollbackDepth(a) : 0;
             return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
-                a.SyncSettingsDigest, layouts, a.VerifyDeterministicMode(), maxRollbackDepth: 0);
+                a.SyncSettingsDigest, layouts, a.VerifyDeterministicMode(), maxRollbackDepth: depth);
+        }
+
+        /// <summary>
+        /// Run the capability probe once (cached) to learn how deep a rollback this core can repair
+        /// inside one frame budget. Saves and restores the core state so the pre-session position is
+        /// untouched. Requires the emulator to already be paused (we advance frames invisibly here).
+        /// </summary>
+        private int MeasureRollbackDepth(EmuHawkAdapter a)
+        {
+            if (_probeDepth >= 0) return _probeDepth;
+            string? restore = null;
+            try
+            {
+                restore = APIs.MemorySaveState.SaveCoreStateToMemory();
+                double budget = FrameMs();
+                var result = new CapabilityProbe(a, new StopwatchClock(), samples: 60).Run(budget, budget * 0.25);
+                _probeDepth = result.MaxRollbackDepth;
+                Log($"rollback probe — {result}");
+            }
+            catch (Exception ex) { _probeDepth = 0; Log("rollback probe failed, will use lockstep: " + ex.Message); }
+            finally
+            {
+                if (restore != null)
+                {
+                    try { APIs.MemorySaveState.LoadCoreStateFromMemory(restore); APIs.MemorySaveState.DeleteState(restore); }
+                    catch (Exception ex) { Log("(warning) could not restore pre-probe state: " + ex.Message); }
+                }
+            }
+            return _probeDepth;
         }
 
         /// <summary>

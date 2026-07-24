@@ -57,6 +57,14 @@ namespace BizHawkNetplay.Core.Emu
         /// <summary>Restore a previously captured in-memory state.</summary>
         void LoadStateFromMemory(StateHandle handle);
 
+        /// <summary>
+        /// Free an in-memory state the rollback ring no longer needs. On BizHawk each
+        /// <see cref="SaveStateToMemory"/> allocates a GUID-keyed blob (~hundreds of KiB) that
+        /// persists until deleted; the rollback strategy saves one per frame, so releasing evicted
+        /// ring entries is mandatory to avoid unbounded growth. Idempotent / safe on unknown handles.
+        /// </summary>
+        void ReleaseState(StateHandle handle);
+
         /// <summary>Serialize full state for the initial session sync transfer.</summary>
         byte[] ExportState();
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Input;
 
@@ -37,16 +38,18 @@ namespace BizHawkNetplay.Core.Probe
             // the equivalent full binary state once — not on the timed hot path).
             int stateSize = _emu.ExportState().Length;
 
-            double medianSave = MeasureMedian(() =>
-            {
-                var h = _emu.SaveStateToMemory();
-                GC.KeepAlive(h);
-            });
+            // Retain the timed save handles so we can free them afterwards — otherwise every probe
+            // leaks ~samples whole-core states into the emulator's in-memory store (~hundreds of MiB).
+            var scratch = new List<StateHandle>(_samples);
+            double medianSave = MeasureMedian(() => scratch.Add(_emu.SaveStateToMemory()));
 
             double medianLoad = MeasureMedian(() => _emu.LoadStateFromMemory(reference));
 
             double medianFrame = MeasureMedian(() =>
                 _emu.RunFramesInvisible(1, _ => neutral));
+
+            foreach (var h in scratch) _emu.ReleaseState(h);
+            _emu.ReleaseState(reference);
 
             int depth = SolveMaxDepth(
                 frameBudgetMs, headroomMs, medianFrame, medianLoad, medianSave);

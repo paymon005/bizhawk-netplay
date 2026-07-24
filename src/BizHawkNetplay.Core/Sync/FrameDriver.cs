@@ -34,6 +34,9 @@ namespace BizHawkNetplay.Core.Sync
         private readonly int _delay;
         private readonly int _redundancy;
         private readonly int _historyKeep;
+        private readonly int _rollbackWindow;
+        private readonly int _maxLead;
+        private FrameDecision _pendingDecision;
 
         // Rolling window of the local port's most recent serialized inputs, for redundant sends.
         private readonly LinkedList<KeyValuePair<int, byte[]>> _sendWindow = new LinkedList<KeyValuePair<int, byte[]>>();
@@ -50,19 +53,28 @@ namespace BizHawkNetplay.Core.Sync
         /// frame the behind peer needs. Below that, sustained loss can slide the window past a needed
         /// frame and stall until retransmission (an M2 feature) recovers it.
         /// </param>
+        /// <param name="rollbackWindow">
+        /// How many frames the sim may run ahead of a remote port's confirmed input before a stale
+        /// correction can no longer arrive. 0 (the default) is pure lockstep: remote frames earlier
+        /// than the current frame are never needed, so they're dropped. Rollback passes its ring
+        /// depth here so late corrections for already-simulated frames reach the pipeline and the
+        /// far-future/history bounds stretch to cover the prediction horizon.
+        /// </param>
         public FrameDriver(
             IEmuAdapter adapter,
             ITransport transport,
             Func<InputPipeline, ISyncStrategy> strategyFactory,
             int localPort,
             int delay,
-            int redundancy = 8)
+            int redundancy = 8,
+            int rollbackWindow = 0)
         {
             _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
             if (strategyFactory == null) throw new ArgumentNullException(nameof(strategyFactory));
             if (delay < 1) throw new ArgumentOutOfRangeException(nameof(delay), "Input delay must be >= 1");
             if (redundancy < 1) throw new ArgumentOutOfRangeException(nameof(redundancy));
+            if (rollbackWindow < 0) throw new ArgumentOutOfRangeException(nameof(rollbackWindow));
 
             int ports = adapter.PortCount;
             if (localPort < 0 || localPort >= ports) throw new ArgumentOutOfRangeException(nameof(localPort));
@@ -70,6 +82,10 @@ namespace BizHawkNetplay.Core.Sync
             _localPort = localPort;
             _delay = delay;
             _redundancy = redundancy;
+            _rollbackWindow = rollbackWindow;
+            // Reject frames impossibly far in the future: at most the peer leads by the delay window
+            // plus (in rollback) however far it may have predicted ahead of us.
+            _maxLead = 2 * delay + redundancy + 4 + rollbackWindow;
 
             _pipeline = new InputPipeline(ports);
             for (int p = 0; p < ports; p++) _pipeline.SetLocal(p, p == localPort);
@@ -84,8 +100,9 @@ namespace BizHawkNetplay.Core.Sync
             _codec = new InputPacketCodec(payloadSizes);
             _strategy = strategyFactory(_pipeline);
 
-            // Keep enough history to cover the delay pipeline and the redundancy window.
-            _historyKeep = _delay + _redundancy + 2;
+            // Keep enough history to cover the delay pipeline, the redundancy window, and (for
+            // rollback) the whole ring depth, so real inputs for any resimulated frame survive pruning.
+            _historyKeep = _delay + _redundancy + 2 + _rollbackWindow;
         }
 
         public int CurrentFrame { get; private set; }
@@ -152,12 +169,16 @@ namespace BizHawkNetplay.Core.Sync
             SendWindow();
         }
 
-        /// <summary>True when every port's input for the current frame is confirmed (ready to advance).</summary>
+        /// <summary>
+        /// Ask the strategy to decide the current frame. True when it can advance (lockstep: all
+        /// ports confirmed; rollback: essentially always, using prediction). The decision — including
+        /// any predicted inputs — is cached for <see cref="CurrentInputs"/>.
+        /// </summary>
         public bool CurrentFrameReady()
         {
-            var decision = _strategy.BeginFrame(CurrentFrame);
-            IsStalled = decision.Stall;
-            return !decision.Stall;
+            _pendingDecision = _strategy.BeginFrame(CurrentFrame);
+            IsStalled = _pendingDecision.Stall;
+            return !_pendingDecision.Stall;
         }
 
         /// <summary>
@@ -175,8 +196,13 @@ namespace BizHawkNetplay.Core.Sync
             SendWindow();
         }
 
-        /// <summary>Merged inputs to apply for the current frame (only valid once <see cref="CurrentFrameReady"/> is true).</summary>
-        public InputSet CurrentInputs() => _pipeline.Merge(CurrentFrame);
+        /// <summary>
+        /// Inputs to apply for the current frame (valid once <see cref="CurrentFrameReady"/> returned
+        /// true). Returns the strategy's decided set — which for rollback includes predicted inputs for
+        /// unconfirmed ports; for lockstep this is exactly <c>Merge(CurrentFrame)</c>. Falls back to a
+        /// merge if no decision was cached (defensive).
+        /// </summary>
+        public InputSet CurrentInputs() => _pendingDecision.Inputs ?? _pipeline.Merge(CurrentFrame);
 
         /// <summary>Advance the frame counter after the core has stepped the current frame.</summary>
         public void CompleteFrame()
@@ -197,12 +223,19 @@ namespace BizHawkNetplay.Core.Sync
                 foreach (var inFrame in frames)
                 {
                     if (inFrame.Port == _localPort) continue;      // never let the wire override our own port
-                    if (inFrame.Frame < CurrentFrame) continue;    // already consumed; ignore stale redundancy
-                    // Reject frames impossibly far in the future. In lockstep the peer leads by at most
-                    // the delay window, so anything beyond it is bogus or — the case that matters — a
-                    // pre-resync datagram (high frame number) arriving after we rebuilt at frame 0. Left
-                    // unchecked it would sit in the pipeline and reapply thousands of frames later.
-                    if (inFrame.Frame > CurrentFrame + 2 * _delay + _redundancy + 4) continue;
+                    // Genuine redundancy: we already hold this exact (port, frame). This is also the
+                    // ONLY way an earlier-than-current frame reaches lockstep — it can't have advanced
+                    // past a frame it lacked — so with _rollbackWindow==0 this matches the old
+                    // "< CurrentFrame" drop exactly. In rollback, a late correction for an
+                    // already-simulated frame is NOT yet in the pipeline, so it falls through below.
+                    if (_pipeline.TryGet(inFrame.Port, inFrame.Frame, out _)) continue;
+                    // Too old to act on: before the rollback ring / pruned history can reach. For
+                    // lockstep (window 0) that is anything strictly before the current frame.
+                    if (inFrame.Frame < CurrentFrame - _rollbackWindow) continue;
+                    // Impossibly far in the future — bogus, or a pre-resync datagram (high frame number)
+                    // arriving after we rebuilt at frame 0. Left unchecked it would sit in the pipeline
+                    // and reapply thousands of frames later.
+                    if (inFrame.Frame > CurrentFrame + _maxLead) continue;
                     var input = _serializers[inFrame.Port].Deserialize(inFrame.Payload);
                     _pipeline.Add(inFrame.Port, inFrame.Frame, input);
                     _strategy.OnRemoteInput(inFrame);

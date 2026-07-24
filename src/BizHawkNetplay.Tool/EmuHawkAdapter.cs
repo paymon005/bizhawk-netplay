@@ -467,6 +467,15 @@ namespace BizHawkNetplay.Tool
         public void LoadStateFromMemory(StateHandle handle) =>
             _apis.MemorySaveState.LoadCoreStateFromMemory((string)handle.Token);
 
+        public void ReleaseState(StateHandle handle)
+        {
+            // The rollback ring evicts a state every frame; free the underlying GUID blob so it
+            // doesn't accumulate. Tolerate an already-deleted/unknown id (DeleteState of a stale
+            // GUID is a no-op or throws depending on build — swallow either way).
+            try { _apis.MemorySaveState.DeleteState((string)handle.Token); }
+            catch { /* already gone / unknown token — nothing to free */ }
+        }
+
         public byte[] ExportState()
         {
             using var ms = new MemoryStream();

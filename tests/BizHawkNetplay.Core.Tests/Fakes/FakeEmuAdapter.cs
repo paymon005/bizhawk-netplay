@@ -28,8 +28,18 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         // Instrumentation for assertions.
         public int SaveCount { get; private set; }
         public int LoadCount { get; private set; }
+        public int ReleaseCount { get; private set; }
         public int InvisibleFrameCount { get; private set; }
         public List<InputSet> AppliedInputs { get; } = new List<InputSet>();
+
+        /// <summary>Live in-memory states not yet released — models BizHawk's GUID-keyed store so
+        /// tests can prove the rollback ring stays bounded (no per-frame leak).</summary>
+        public HashSet<StateHandle> LiveStates { get; } = new HashSet<StateHandle>();
+
+        /// <summary>The inputs last applied to advance each frame, keyed by frame. A rollback re-runs
+        /// frames through <see cref="Step"/>, overwriting the earlier prediction — so once every input
+        /// is confirmed this holds the corrected (real) input per frame, the rollback correctness oracle.</summary>
+        public Dictionary<int, InputSet> LastInputByFrame { get; } = new Dictionary<int, InputSet>();
 
         public string RomHash => "fakerom";
         public string CoreName => "FakeCore";
@@ -63,7 +73,9 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         {
             SaveCount++;
             var copy = (byte[])_memory.Clone();
-            return new StateHandle(_frame, copy);
+            var handle = new StateHandle(_frame, copy);
+            LiveStates.Add(handle);
+            return handle;
         }
 
         public void LoadStateFromMemory(StateHandle handle)
@@ -71,6 +83,11 @@ namespace BizHawkNetplay.Core.Tests.Fakes
             LoadCount++;
             _memory = (byte[])((byte[])handle.Token).Clone();
             _frame = handle.Frame;
+        }
+
+        public void ReleaseState(StateHandle handle)
+        {
+            if (LiveStates.Remove(handle)) ReleaseCount++;
         }
 
         public byte[] ExportState()
@@ -103,6 +120,8 @@ namespace BizHawkNetplay.Core.Tests.Fakes
 
         private void Step(InputSet inputs)
         {
+            // Record the inputs used to advance this frame (resim overwrites any earlier prediction).
+            LastInputByFrame[_frame] = inputs;
             // Fold inputs into memory so state genuinely evolves and hashes diverge.
             int acc = _frame;
             foreach (var port in inputs.Ports)
