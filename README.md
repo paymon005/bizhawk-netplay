@@ -99,6 +99,3 @@ The M0 probe lives inside the netplay tool as the **Capability Probe** button (E
 exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It
 times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving
 and restoring your position so it doesn't disturb play.
-
-# Next Steps
-- Fix audio stopping after an alt-tab. After returning to the window after alt-tabbing the audio stops working, but then continues working after i disconnect and reconnect the session.

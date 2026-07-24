@@ -198,11 +198,18 @@ namespace BizHawkNetplay.Tool
         public void PumpAudio()
         {
             if (!_audioReady) return;
+            var dev = _outputDevice;
+            var snd = _sound;
+            if (dev == null || snd == null || _soundBuffer == null) return;
+
+            // EmuHawk disposes and recreates its audio device across a window minimize/restore
+            // (Sound.StopSound/StartSound). While it's stopped, skip — do NOT give up permanently, or
+            // audio would stay dead until a reconnect. When EmuHawk restarts the device we resume.
+            if (!snd.IsStarted) return;
+
             _audioPumps++;
             try
             {
-                var dev = _outputDevice;
-                if (dev == null || _soundBuffer == null) return;
                 dev.ApplyVolumeSettings(1.0); // full volume; the user's master volume is baked into the samples' source
                 int needed = dev.CalculateSamplesNeeded(); // sample-pairs the device can accept right now
                 if (needed <= 0) return;
@@ -211,7 +218,7 @@ namespace BizHawkNetplay.Tool
                 _soundBuffer.Read(_pumpScratch, shorts); // dequeue from our ring, silence-pad underruns
                 dev.WriteSamples(_pumpScratch, 0, needed);
             }
-            catch { _audioReady = false; }
+            catch { /* transient hiccup while the voice is being recreated — skip this tick, stay armed */ }
         }
 
         /// <summary>True once <see cref="EnableAudio"/> has wired up the sound output for the session.</summary>
