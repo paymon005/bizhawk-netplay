@@ -37,30 +37,30 @@ namespace BizHawkNetplay.Tool
         [RequiredService] public IEmulator? _emulator { get; set; }
         [OptionalService] public IStatable? _statable { get; set; }
 
-        // --- UI ---
-        private readonly RadioButton _hostRadio;
-        private readonly RadioButton _joinRadio;
-        private readonly TextBox _ipBox;
-        private readonly NumericUpDown _portBox;
-        private readonly NumericUpDown _delayBox;
-        private readonly Button _goButton;
-        private readonly Button _disconnectButton;
-        private readonly Button _probeButton;
-        private readonly Button _testInputButton;
-        private readonly CheckBox _verboseCheck;
-        private readonly CheckBox _freezeInputCheck;
-        private readonly CheckBox _forceDesyncCheck;
-        private readonly CheckBox _rollbackCheck;
-        private readonly CheckBox _simUnresponsiveCheck;
-        private readonly NumericUpDown _simLatencyBox;
-        private readonly Label _status;
+        // --- UI (assigned once, from the per-tab build methods the constructor calls) ---
+        private RadioButton _hostRadio = null!;
+        private RadioButton _joinRadio = null!;
+        private TextBox _ipBox = null!;
+        private NumericUpDown _portBox = null!;
+        private NumericUpDown _delayBox = null!;
+        private Button _goButton = null!;
+        private Button _disconnectButton = null!;
+        private Button _probeButton = null!;
+        private Button _testInputButton = null!;
+        private CheckBox _verboseCheck = null!;
+        private CheckBox _freezeInputCheck = null!;
+        private CheckBox _forceDesyncCheck = null!;
+        private CheckBox _rollbackCheck = null!;
+        private CheckBox _simUnresponsiveCheck = null!;
+        private NumericUpDown _simLatencyBox = null!;
+        private Label _status = null!;
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
 
         private bool Verbose => _verboseCheck.Checked;
 
         private int _startEmuFrame; // emulator FrameCount at session start, for drift detection
-        private readonly TextBox _log;
+        private TextBox _log = null!;
 
         /// <summary>One control link to a peer. Host: one per joiner. Joiner: one (the host).</summary>
         private sealed class PeerLink
@@ -158,40 +158,78 @@ namespace BizHawkNetplay.Tool
         public NetplayToolForm()
         {
             SuspendLayout();
-            ClientSize = new Size(560, 420);
-            MinimumSize = new Size(460, 320);
+            ClientSize = new Size(560, 440);
+            MinimumSize = new Size(480, 360);
+
+            var tabs = new TabControl { Dock = DockStyle.Fill };
+            tabs.TabPages.Add(BuildConnectionTab());
+            tabs.TabPages.Add(BuildDiagnosticsTab());
+            tabs.TabPages.Add(BuildLogTab());
+
+            // Status line stays visible under every tab.
+            _status = new Label
+            {
+                Text = "Idle.", Dock = DockStyle.Bottom, Height = 22, ForeColor = Color.DimGray,
+                TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(6, 0, 0, 0),
+                BorderStyle = BorderStyle.Fixed3D,
+            };
+
+            Controls.Add(tabs);   // fills the area left above the status bar
+            Controls.Add(_status);
+            ResumeLayout(false);
+
+            _frameTimer = new System.Windows.Forms.Timer();
+            _frameTimer.Tick += (_, __) => FrameTick();
+
+            UpdateEnabled();
+        }
+
+        /// <summary>The Connection tab: role, host address/port, delay, rollback, and the start/stop buttons.</summary>
+        private TabPage BuildConnectionTab()
+        {
+            var page = new TabPage("Connection") { Padding = new Padding(8) };
 
             _hostRadio = new RadioButton { Text = "Host", Checked = true, AutoSize = true, Location = new Point(12, 12) };
             _joinRadio = new RadioButton { Text = "Join", AutoSize = true, Location = new Point(80, 12) };
             _hostRadio.CheckedChanged += (_, __) => UpdateEnabled();
 
-            var ipLabel = new Label { Text = "Host IP:", AutoSize = true, Location = new Point(12, 44) };
-            _ipBox = new TextBox { Text = "127.0.0.1", Location = new Point(80, 41), Width = 160 };
-            var portLabel = new Label { Text = "Port:", AutoSize = true, Location = new Point(260, 44) };
-            _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 41), Width = 70 };
-            var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 76) };
-            _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 73), Width = 50 };
-            _rollbackCheck = new CheckBox
-            {
-                Text = "Prefer rollback (if core qualifies)", AutoSize = true, Location = new Point(155, 75),
-            };
+            var ipLabel = new Label { Text = "Host IP:", AutoSize = true, Location = new Point(12, 46) };
+            _ipBox = new TextBox { Text = "127.0.0.1", Location = new Point(80, 43), Width = 160 };
+            var portLabel = new Label { Text = "Port:", AutoSize = true, Location = new Point(260, 46) };
+            _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 43), Width = 70 };
 
-            _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 108), Width = 130 };
+            var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 82) };
+            _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 79), Width = 50 };
+            _rollbackCheck = new CheckBox { Text = "Prefer rollback (if core qualifies)", AutoSize = true, Location = new Point(155, 81) };
+
+            _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 120), Width = 150 };
             _goButton.Click += (_, __) => OnGo();
-            _disconnectButton = new Button { Text = "Disconnect", Location = new Point(150, 108), Width = 110, Enabled = false };
+            _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 120), Width = 120, Enabled = false };
             _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
 
-            _probeButton = new Button { Text = "Capability Probe", Location = new Point(268, 108), Width = 130 };
-            _probeButton.Click += (_, __) => RunProbe();
+            page.Controls.AddRange(new Control[]
+            {
+                _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
+                delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton,
+            });
+            return page;
+        }
 
-            _testInputButton = new Button { Text = "Test Input", Location = new Point(12, 140), Width = 130 };
+        /// <summary>The Diagnostics tab: the capability probe, input test, and the fault-injection toggles.</summary>
+        private TabPage BuildDiagnosticsTab()
+        {
+            var page = new TabPage("Diagnostics") { Padding = new Padding(8) };
+
+            _probeButton = new Button { Text = "Capability Probe", Location = new Point(12, 12), Width = 130 };
+            _probeButton.Click += (_, __) => RunProbe();
+            _testInputButton = new Button { Text = "Test Input", Location = new Point(152, 12), Width = 130 };
             _testInputButton.Click += (_, __) => RunInputTest();
 
-            _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(410, 100) };
-            _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(410, 122) };
+            _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(12, 54) };
+            _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(12, 78) };
             _freezeInputCheck.CheckedChanged += (_, __) =>
                 EmuHawkAdapter.ForceNeutralInput = _freezeInputCheck.Checked;
-            _forceDesyncCheck = new CheckBox { Text = "Force desync (diag)", AutoSize = true, Location = new Point(410, 144) };
+            _forceDesyncCheck = new CheckBox { Text = "Force desync (diag)", AutoSize = true, Location = new Point(12, 102) };
             _forceDesyncCheck.CheckedChanged += (_, __) =>
             {
                 if (!_forceDesyncCheck.Checked) return;
@@ -201,9 +239,9 @@ namespace BizHawkNetplay.Tool
                                    : "arm this during a session to test resync");
             };
 
-            var simLatencyLabel = new Label { Text = "Sim latency ms (diag):", AutoSize = true, Location = new Point(410, 168) };
-            _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(410, 186), Width = 60 };
-            _simUnresponsiveCheck = new CheckBox { Text = "Simulate unresponsive (diag)", AutoSize = true, Location = new Point(410, 214) };
+            var simLatencyLabel = new Label { Text = "Sim latency ms:", AutoSize = true, Location = new Point(12, 132) };
+            _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(110, 130), Width = 60 };
+            _simUnresponsiveCheck = new CheckBox { Text = "Simulate unresponsive (diag)", AutoSize = true, Location = new Point(12, 160) };
             _simUnresponsiveCheck.CheckedChanged += (_, __) =>
             {
                 _simUnresponsive = _simUnresponsiveCheck.Checked;
@@ -213,29 +251,25 @@ namespace BizHawkNetplay.Tool
                         : "resumed responding to pings");
             };
 
-            _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(150, 145), ForeColor = Color.DimGray };
+            page.Controls.AddRange(new Control[]
+            {
+                _probeButton, _testInputButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
+                simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
+            });
+            return page;
+        }
 
+        /// <summary>The Log tab: the scrolling monospace session log, filling the page.</summary>
+        private TabPage BuildLogTab()
+        {
+            var page = new TabPage("Log");
             _log = new TextBox
             {
                 Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false,
-                Location = new Point(12, 170), Size = new Size(536, 238),
-                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
-                Font = new Font(FontFamily.GenericMonospace, 9f),
+                Dock = DockStyle.Fill, Font = new Font(FontFamily.GenericMonospace, 9f),
             };
-
-            Controls.AddRange(new Control[]
-            {
-                _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton, _probeButton, _testInputButton,
-                _verboseCheck, _freezeInputCheck, _forceDesyncCheck, simLatencyLabel, _simLatencyBox,
-                _simUnresponsiveCheck, _status, _log,
-            });
-            ResumeLayout(false);
-
-            _frameTimer = new System.Windows.Forms.Timer();
-            _frameTimer.Tick += (_, __) => FrameTick();
-
-            UpdateEnabled();
+            page.Controls.Add(_log);
+            return page;
         }
 
         public override void Restart()
@@ -363,16 +397,11 @@ namespace BizHawkNetplay.Tool
                 // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
                 // (it reaches the host at the address it connected to, so the host is left off the list).
                 foreach (var link in links)
-                {
-                    var others = new List<IPEndPoint>();
-                    foreach (var o in links) if (!ReferenceEquals(o, link)) others.Add(o.UdpEndpoint);
-                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state, others);
-                }
+                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state,
+                        EndpointsExcept(links, link));
 
                 // The host sends its own input directly to every joiner.
-                var eps = new List<IPEndPoint>();
-                foreach (var link in links) eps.Add(link.UdpEndpoint);
-                _mesh!.SetPeers(eps);
+                _mesh!.SetPeers(EndpointsExcept(links, null));
 
                 BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay, mode));
             }
@@ -935,13 +964,20 @@ namespace BizHawkNetplay.Tool
             _reconnectThread.Start();
         }
 
+        /// <summary>UDP endpoints of the given links, optionally excluding one — a peer set for the mesh.</summary>
+        private static List<IPEndPoint> EndpointsExcept(IReadOnlyList<PeerLink> links, PeerLink? except)
+        {
+            var eps = new List<IPEndPoint>(links.Count);
+            foreach (var l in links)
+                if (!ReferenceEquals(l, except)) eps.Add(l.UdpEndpoint);
+            return eps;
+        }
+
         /// <summary>Host: point our mesh at every currently-connected joiner's UDP endpoint.</summary>
         private void UpdateMeshPeers()
         {
             if (_mesh == null) return;
-            var eps = new List<IPEndPoint>();
-            foreach (var l in _peers) eps.Add(l.UdpEndpoint);
-            try { _mesh.SetPeers(eps); } catch { }
+            try { _mesh.SetPeers(EndpointsExcept(_peers, null)); } catch { }
         }
 
         /// <summary>Joiner: point our mesh at the host (peer 0) plus every other joiner we've been told about.</summary>
@@ -1012,11 +1048,10 @@ namespace BizHawkNetplay.Tool
             {
                 var state = _adapter!.ExportState();
 
-                // The rejoiner's mesh peers = every current survivor (it reaches the host directly).
-                var rejoinerOthers = new List<IPEndPoint>();
-                foreach (var l in _peers) rejoinerOthers.Add(l.UdpEndpoint);
-                // The rejoiner adopts this state + mesh via Welcome and rebuilds fresh on its own side.
-                Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state, rejoinerOthers);
+                // The rejoiner's mesh peers = every current survivor (it reaches the host directly). It
+                // adopts this state + mesh via Welcome and rebuilds fresh on its own side.
+                Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
+                    EndpointsExcept(_peers, null));
 
                 var link = new PeerLink
                 {
@@ -1034,9 +1069,7 @@ namespace BizHawkNetplay.Tool
                 foreach (var l in _peers)
                 {
                     if (ReferenceEquals(l, link)) continue;
-                    var others = new List<IPEndPoint>();
-                    foreach (var o in _peers) if (!ReferenceEquals(o, l)) others.Add(o.UdpEndpoint);
-                    try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(others)); } catch { }
+                    try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(EndpointsExcept(_peers, l))); } catch { }
                     try { l.Control.Send(ControlMessageType.Resync, state); } catch { }
                 }
 
