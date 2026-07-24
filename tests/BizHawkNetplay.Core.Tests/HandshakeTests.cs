@@ -91,6 +91,50 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void MultiPlayerHandshake_AssignsPortsAndAuthoritativeDelay()
+        {
+            var (hostCh1, clientCh1, d1) = TcpPair();
+            var (hostCh2, clientCh2, d2) = TcpPair();
+            try
+            {
+                var hostState = new byte[2000];
+                new Random(99).NextBytes(hostState);
+
+                // Both joiners run their client handshakes concurrently while the host greets each.
+                var c1 = Task.Run(() => Handshake.RunClientMulti(clientCh1, Id(), new SessionPreferences(2, false), 51001));
+                var c2 = Task.Run(() => Handshake.RunClientMulti(clientCh2, Id(), new SessionPreferences(5, false), 51002));
+
+                var hostPrefs = new SessionPreferences(3, false);
+                var g1 = Handshake.HostGreet(hostCh1, Id(), hostPrefs, 47800);
+                var g2 = Handshake.HostGreet(hostCh2, Id(), hostPrefs, 47800);
+
+                // Authoritative delay is the max over everyone: max(3, 2, 5) = 5.
+                int delay = Math.Max(hostPrefs.InputDelay, Math.Max(g1.Prefs.InputDelay, g2.Prefs.InputDelay));
+                const int players = 3;
+                Handshake.HostSendWelcome(hostCh1, 1, players, delay, SyncMode.Lockstep, hostState);
+                Handshake.HostSendWelcome(hostCh2, 2, players, delay, SyncMode.Lockstep, hostState);
+
+                var p1 = c1.GetAwaiter().GetResult();
+                var p2 = c2.GetAwaiter().GetResult();
+
+                Assert.Equal(51001, g1.UdpPort);
+                Assert.Equal(51002, g2.UdpPort);
+
+                Assert.Equal(1, p1.LocalPort);
+                Assert.Equal(2, p2.LocalPort);
+                Assert.Equal(3, p1.PlayerCount);
+                Assert.Equal(3, p2.PlayerCount);
+                Assert.Equal(5, p1.InputDelay);
+                Assert.Equal(5, p2.InputDelay);
+                Assert.Equal(hostState, p1.InitialState);
+                Assert.Equal(hostState, p2.InitialState);
+                Assert.Equal(47800, p1.RemoteUdpPort);
+                Assert.Equal(47800, p2.RemoteUdpPort);
+            }
+            finally { d1(); d2(); }
+        }
+
+        [Fact]
         public void RollbackDowngrades_WhenClientShallow()
         {
             var (hostCh, clientCh, dispose) = TcpPair();

@@ -13,7 +13,7 @@ namespace BizHawkNetplay.Core.Session
     public sealed class SessionParams
     {
         public SessionParams(SyncMode mode, int inputDelay, int localPort, int remotePort,
-            int remoteUdpPort, byte[]? initialState)
+            int remoteUdpPort, byte[]? initialState, int playerCount = 2)
         {
             Mode = mode;
             InputDelay = inputDelay;
@@ -21,12 +21,16 @@ namespace BizHawkNetplay.Core.Session
             RemotePort = remotePort;
             RemoteUdpPort = remoteUdpPort;
             InitialState = initialState;
+            PlayerCount = playerCount;
         }
 
         public SyncMode Mode { get; }
         public int InputDelay { get; }
         public int LocalPort { get; }
         public int RemotePort { get; }
+
+        /// <summary>Total number of players (= controller ports sourced by peers) in this session.</summary>
+        public int PlayerCount { get; }
 
         /// <summary>The peer's UDP port for the input channel (combine with the peer IP from the control socket).</summary>
         public int RemoteUdpPort { get; }
@@ -104,6 +108,100 @@ namespace BizHawkNetplay.Core.Session
             // Client owns port 1.
             return new SessionParams(result.Mode, result.InputDelay, localPort: 1, remotePort: 0,
                 remoteUdpPort: hostUdpPort, initialState);
+        }
+
+        // ---- N-player (host-relay) handshake ---------------------------------------------
+        // The 3–4 player flow splits the host side into per-joiner steps the caller orchestrates:
+        // greet every joiner first (so all identities are validated and the authoritative input
+        // delay = max over everyone is known), then send each a Welcome carrying its assigned port,
+        // the player count and the final delay, followed by the shared initial state and Start.
+
+        /// <summary>Info a host records about one joiner after the HELLO exchange.</summary>
+        public sealed class JoinerGreeting
+        {
+            public JoinerGreeting(PeerIdentity id, SessionPreferences prefs, int udpPort)
+            {
+                Id = id; Prefs = prefs; UdpPort = udpPort;
+            }
+            public PeerIdentity Id { get; }
+            public SessionPreferences Prefs { get; }
+            public int UdpPort { get; }
+        }
+
+        /// <summary>
+        /// Host, per joiner: send our HELLO, receive theirs, and validate the pairing (ROM/core/etc.).
+        /// Throws <see cref="HandshakeException"/> on mismatch. Does NOT send state/Start yet — the
+        /// caller greets every joiner first, then calls <see cref="HostSendWelcome"/> on each.
+        /// </summary>
+        public static JoinerGreeting HostGreet(
+            ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs, int hostUdpPort)
+        {
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, hostUdpPort));
+
+            var (type, body) = channel.Receive();
+            if (type != ControlMessageType.Hello)
+                throw new HandshakeException($"expected HELLO from joiner, got {type}");
+            var (joinerId, joinerPrefs, joinerUdpPort) = HandshakeCodec.Decode(body);
+
+            var result = SessionNegotiator.Negotiate(hostId, joinerId, hostPrefs, joinerPrefs);
+            if (!result.Accepted)
+            {
+                channel.Send(ControlMessageType.Error, Encoding.UTF8.GetBytes(result.RejectReason ?? "rejected"));
+                throw new HandshakeException(result.RejectReason ?? "rejected");
+            }
+            return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort);
+        }
+
+        /// <summary>Host, per joiner: send the assignment (port, player count, final delay) + state + Start.</summary>
+        public static void HostSendWelcome(
+            ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state)
+        {
+            channel.Send(ControlMessageType.Welcome, HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode));
+            channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
+            channel.Send(ControlMessageType.Start, Array.Empty<byte>());
+        }
+
+        /// <summary>
+        /// Client (N-player): send HELLO, validate the host's HELLO, then take the authoritative
+        /// assignment from WELCOME (port/players/delay), receive the initial state, and wait for Start.
+        /// </summary>
+        public static SessionParams RunClientMulti(
+            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort)
+        {
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort));
+
+            var (type, body) = channel.Receive();
+            if (type == ControlMessageType.Error)
+                throw new HandshakeException(Encoding.UTF8.GetString(body));
+            if (type != ControlMessageType.Hello)
+                throw new HandshakeException($"expected HELLO from host, got {type}");
+            var (hostId, hostPrefs, hostUdpPort) = HandshakeCodec.Decode(body);
+
+            var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
+            if (!result.Accepted)
+                throw new HandshakeException(result.RejectReason ?? "rejected");
+
+            int assignedPort = 1, playerCount = 2, delay = result.InputDelay;
+            SyncMode mode = result.Mode;
+            byte[]? initialState = null;
+            while (true)
+            {
+                var (t, b) = channel.Receive();
+                if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
+                if (t == ControlMessageType.Welcome)
+                {
+                    (assignedPort, playerCount, delay, mode) = HandshakeCodec.DecodeWelcome(b);
+                    continue;
+                }
+                if (t == ControlMessageType.State) { initialState = b; continue; }
+                if (t == ControlMessageType.Start) break;
+                throw new HandshakeException($"unexpected control frame during start: {t}");
+            }
+            if (initialState == null)
+                throw new HandshakeException("host never sent the initial state");
+
+            return new SessionParams(mode, delay, localPort: assignedPort, remotePort: 0,
+                remoteUdpPort: hostUdpPort, initialState, playerCount);
         }
     }
 }

@@ -30,15 +30,31 @@ namespace BizHawkNetplay.Core.Session
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
+        /// <summary>Encode the host's WELCOME: a joiner's assigned port, the player count, the
+        /// authoritative input delay, and the sync mode.</summary>
+        public static byte[] EncodeWelcome(int assignedPort, int playerCount, int inputDelay, SyncMode mode)
+        {
+            var sb = new StringBuilder();
+            sb.Append("port=").Append(assignedPort).Append('\n');
+            sb.Append("players=").Append(playerCount).Append('\n');
+            sb.Append("delay=").Append(inputDelay).Append('\n');
+            sb.Append("mode=").Append(mode == SyncMode.Rollback ? "rollback" : "lockstep").Append('\n');
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        public static (int assignedPort, int playerCount, int inputDelay, SyncMode mode) DecodeWelcome(byte[] body)
+        {
+            var map = ParseLines(body);
+            int port = Math.Max(0, GetInt(map, "port", 1));
+            int players = Math.Max(2, GetInt(map, "players", 2));
+            int delay = Math.Max(1, GetInt(map, "delay", 1));
+            var mode = Get(map, "mode") == "rollback" ? SyncMode.Rollback : SyncMode.Lockstep;
+            return (port, players, delay, mode);
+        }
+
         public static (PeerIdentity id, SessionPreferences prefs, int udpPort) Decode(byte[] body)
         {
-            var map = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var line in Encoding.UTF8.GetString(body).Split('\n'))
-            {
-                int eq = line.IndexOf('=');
-                if (eq <= 0) continue;
-                map[line.Substring(0, eq)] = line.Substring(eq + 1);
-            }
+            var map = ParseLines(body);
 
             var layouts = map.TryGetValue("layouts", out var l) && l.Length > 0
                 ? l.Split(',')
@@ -58,6 +74,18 @@ namespace BizHawkNetplay.Core.Session
             var prefs = new SessionPreferences(Math.Max(1, GetInt(map, "delay", 1)), Get(map, "rollback") == "1");
             int udpPort = GetInt(map, "udpport", 0);
             return (id, prefs, udpPort);
+        }
+
+        private static Dictionary<string, string> ParseLines(byte[] body)
+        {
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var line in Encoding.UTF8.GetString(body).Split('\n'))
+            {
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+                map[line.Substring(0, eq)] = line.Substring(eq + 1);
+            }
+            return map;
         }
 
         private static string Get(Dictionary<string, string> m, string k) => m.TryGetValue(k, out var v) ? v : "";
