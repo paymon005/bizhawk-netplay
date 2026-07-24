@@ -309,9 +309,11 @@ namespace BizHawkNetplay.Tool
 
                 _soundChannels = _sound.ChannelCount;
                 _asyncScratch = new short[Math.Max(_soundChannels, SamplesPerFrame() * _soundChannels)];
-                _soundBuffer = new NetplaySoundBuffer(_sound.SampleRate, _soundChannels, capacityMs: 200);
-                // Prime a small standing cushion of silence so pump jitter doesn't underrun the ring.
-                int prime = _sound.SampleRate * _soundChannels * 50 / 1000;
+                _soundBuffer = new NetplaySoundBuffer(_sound.SampleRate, _soundChannels, capacityMs: 400);
+                // Prime a standing cushion of silence so pump jitter / brief network hitches don't
+                // underrun the ring (which would inject audible silence). ~80ms trades a little latency
+                // for clean playback.
+                int prime = _sound.SampleRate * _soundChannels * 80 / 1000;
                 _soundBuffer.Enqueue(new short[prime], prime);
 
                 // Detach EmuHawk's input pin so its run-loop UpdateSound(atten=0, while we hold it paused)
@@ -325,7 +327,7 @@ namespace BizHawkNetplay.Tool
                 {
                     var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
                     if (config != null)
-                        cfg = $" out={config.SoundOutputMethod} vol={config.SoundVolume} throttle={config.SoundThrottle} enabled={config.SoundEnabled}";
+                        cfg = $" out={config.SoundOutputMethod} vol={config.SoundVolume} throttle={config.SoundThrottle} enabled={config.SoundEnabled} bufMs={config.SoundBufferSizeMs}";
                 }
                 catch { }
                 AudioDiagnostic = $"core={_coreSound.GetType().Name} mode={(_coreSyncSound ? "Sync" : "Async")} " +

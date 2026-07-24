@@ -84,6 +84,13 @@ namespace BizHawkNetplay.Tool
         private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
         private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
 
+        // Raise the OS timer resolution to 1ms for the session so the WinForms frame timer fires
+        // regularly (it's otherwise bound to the ~15ms system tick and jitters), which keeps audio
+        // pumps steady and frame pacing smooth. Balanced by timeEndPeriod on session end.
+        [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint uMilliseconds);
+        [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint uMilliseconds);
+        private bool _timerResRaised;
+
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
         public NetplayToolForm()
@@ -274,6 +281,7 @@ namespace BizHawkNetplay.Tool
                 // so irregular WinForms-timer firing doesn't run the game slow.
                 _frameMs = FrameMs();
                 _paceClock.Restart();
+                try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
                 _frameTimer.Interval = 2;
                 _frameTimer.Start();
 
@@ -446,6 +454,7 @@ namespace BizHawkNetplay.Tool
             if (!_sessionActive && _listener == null && _tcp == null) { SetBusy(false); return; }
             _sessionActive = false;
             _frameTimer.Stop();
+            try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
 
             try { _control?.Send(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
             TeardownNetwork();
