@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Net;
 using System.Text;
 
 namespace BizHawkNetplay.Core.Session
@@ -13,7 +15,8 @@ namespace BizHawkNetplay.Core.Session
     public sealed class SessionParams
     {
         public SessionParams(SyncMode mode, int inputDelay, int localPort, int remotePort,
-            int remoteUdpPort, byte[]? initialState, int playerCount = 2)
+            int remoteUdpPort, byte[]? initialState, int playerCount = 2,
+            IReadOnlyList<IPEndPoint>? meshPeers = null)
         {
             Mode = mode;
             InputDelay = inputDelay;
@@ -22,6 +25,7 @@ namespace BizHawkNetplay.Core.Session
             RemoteUdpPort = remoteUdpPort;
             InitialState = initialState;
             PlayerCount = playerCount;
+            MeshPeers = meshPeers ?? Array.Empty<IPEndPoint>();
         }
 
         public SyncMode Mode { get; }
@@ -37,6 +41,10 @@ namespace BizHawkNetplay.Core.Session
 
         /// <summary>Whole-core state to import before starting; null for the host (it keeps its own).</summary>
         public byte[]? InitialState { get; }
+
+        /// <summary>The OTHER peers' UDP endpoints for the direct input mesh (excludes self and the host,
+        /// which the joiner reaches at the address it connected to). Empty for a 2-player session.</summary>
+        public IReadOnlyList<IPEndPoint> MeshPeers { get; }
     }
 
     /// <summary>
@@ -152,11 +160,16 @@ namespace BizHawkNetplay.Core.Session
             return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort);
         }
 
-        /// <summary>Host, per joiner: send the assignment (port, player count, final delay) + state + Start.</summary>
+        /// <summary>
+        /// Host, per joiner: send the assignment (port, player count, final delay, mode), the direct-mesh
+        /// peer endpoints (every OTHER joiner's UDP ip:port; empty for 2P), the initial state, and Start.
+        /// </summary>
         public static void HostSendWelcome(
-            ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state)
+            ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
+            IEnumerable<IPEndPoint>? meshPeers = null)
         {
             channel.Send(ControlMessageType.Welcome, HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode));
+            channel.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(meshPeers ?? Array.Empty<IPEndPoint>()));
             channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
             channel.Send(ControlMessageType.Start, Array.Empty<byte>());
         }
@@ -184,6 +197,7 @@ namespace BizHawkNetplay.Core.Session
             int assignedPort = 1, playerCount = 2, delay = result.InputDelay;
             SyncMode mode = result.Mode;
             byte[]? initialState = null;
+            IReadOnlyList<IPEndPoint> meshPeers = Array.Empty<IPEndPoint>();
             while (true)
             {
                 var (t, b) = channel.Receive();
@@ -193,6 +207,7 @@ namespace BizHawkNetplay.Core.Session
                     (assignedPort, playerCount, delay, mode) = HandshakeCodec.DecodeWelcome(b);
                     continue;
                 }
+                if (t == ControlMessageType.PeerList) { meshPeers = HandshakeCodec.DecodeEndpoints(b); continue; }
                 if (t == ControlMessageType.State) { initialState = b; continue; }
                 if (t == ControlMessageType.Start) break;
                 throw new HandshakeException($"unexpected control frame during start: {t}");
@@ -201,7 +216,7 @@ namespace BizHawkNetplay.Core.Session
                 throw new HandshakeException("host never sent the initial state");
 
             return new SessionParams(mode, delay, localPort: assignedPort, remotePort: 0,
-                remoteUdpPort: hostUdpPort, initialState, playerCount);
+                remoteUdpPort: hostUdpPort, initialState, playerCount, meshPeers);
         }
     }
 }

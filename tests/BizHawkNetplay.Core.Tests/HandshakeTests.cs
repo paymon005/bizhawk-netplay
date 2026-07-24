@@ -111,14 +111,21 @@ namespace BizHawkNetplay.Core.Tests
                 // Authoritative delay is the max over everyone: max(3, 2, 5) = 5.
                 int delay = Math.Max(hostPrefs.InputDelay, Math.Max(g1.Prefs.InputDelay, g2.Prefs.InputDelay));
                 const int players = 3;
-                Handshake.HostSendWelcome(hostCh1, 1, players, delay, SyncMode.Lockstep, hostState);
-                Handshake.HostSendWelcome(hostCh2, 2, players, delay, SyncMode.Lockstep, hostState);
+                // Each joiner is told the OTHER joiner's UDP endpoint for the direct mesh.
+                var j1Ep = new IPEndPoint(IPAddress.Loopback, g1.UdpPort);
+                var j2Ep = new IPEndPoint(IPAddress.Loopback, g2.UdpPort);
+                Handshake.HostSendWelcome(hostCh1, 1, players, delay, SyncMode.Lockstep, hostState, new[] { j2Ep });
+                Handshake.HostSendWelcome(hostCh2, 2, players, delay, SyncMode.Lockstep, hostState, new[] { j1Ep });
 
                 var p1 = c1.GetAwaiter().GetResult();
                 var p2 = c2.GetAwaiter().GetResult();
 
                 Assert.Equal(51001, g1.UdpPort);
                 Assert.Equal(51002, g2.UdpPort);
+
+                // Mesh endpoints reached each joiner: P1 learns P2's, P2 learns P1's.
+                Assert.Equal(new[] { j2Ep }, p1.MeshPeers);
+                Assert.Equal(new[] { j1Ep }, p2.MeshPeers);
 
                 Assert.Equal(1, p1.LocalPort);
                 Assert.Equal(2, p2.LocalPort);

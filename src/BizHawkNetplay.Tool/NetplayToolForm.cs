@@ -79,8 +79,8 @@ namespace BizHawkNetplay.Tool
         // --- Session state (all touched on the UI thread except where noted) ---
         private EmuHawkAdapter? _adapter;
         private ITransport? _transport;        // the FrameDriver's input channel (see below)
-        private UdpTransport? _udp;            // joiner: point-to-point to the host
-        private RelayUdpTransport? _relay;     // host: UDP hub that relays inputs among all peers
+        private MeshUdpTransport? _mesh;       // direct peer-to-peer UDP: host and joiners both send to all peers
+        private List<IPEndPoint> _meshOthers = new List<IPEndPoint>(); // joiner: the non-host peers in our mesh
         private TcpListener? _listener;
         private FrameDriver? _driver;
         private readonly List<PeerLink> _peers = new List<PeerLink>();
@@ -287,18 +287,18 @@ namespace BizHawkNetplay.Tool
                 SetBusy(true);
                 if (_hostRadio.Checked)
                 {
-                    _relay = RelayUdpTransport.Bind(port); _transport = WrapSimLatency(_relay);
+                    _mesh = MeshUdpTransport.Bind(port); _transport = WrapSimLatency(_mesh);
                     var state = _adapter.ExportState();
                     Log($"exported {state.Length / 1024}KiB initial state; hosting {players} players");
-                    StartThread(() => HostThread(port, id, prefs, state, _relay.LocalPort, players));
+                    StartThread(() => HostThread(port, id, prefs, state, _mesh.LocalPort, players));
                 }
                 else
                 {
                     if (!IPAddress.TryParse(_ipBox.Text.Trim(), out var _))
                     { Log("Enter a valid host IP."); SetBusy(false); return; }
-                    _udp = UdpTransport.Bind(0); _transport = WrapSimLatency(_udp);
+                    _mesh = MeshUdpTransport.Bind(0); _transport = WrapSimLatency(_mesh);
                     string ip = _ipBox.Text.Trim();
-                    StartThread(() => JoinThread(ip, port, id, prefs, _udp.LocalPort));
+                    StartThread(() => JoinThread(ip, port, id, prefs, _mesh.LocalPort));
                 }
             }
             catch (Exception ex)
@@ -360,12 +360,19 @@ namespace BizHawkNetplay.Tool
                     mode = allRollback ? SyncMode.Rollback : SyncMode.Lockstep;
                 }
 
+                // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
+                // (it reaches the host at the address it connected to, so the host is left off the list).
                 foreach (var link in links)
-                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state);
+                {
+                    var others = new List<IPEndPoint>();
+                    foreach (var o in links) if (!ReferenceEquals(o, link)) others.Add(o.UdpEndpoint);
+                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state, others);
+                }
 
+                // The host sends its own input directly to every joiner.
                 var eps = new List<IPEndPoint>();
                 foreach (var link in links) eps.Add(link.UdpEndpoint);
-                _relay!.SetPeers(eps);
+                _mesh!.SetPeers(eps);
 
                 BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay, mode));
             }
@@ -422,7 +429,9 @@ namespace BizHawkNetplay.Tool
                 }
                 _peers.Clear(); _peers.Add(hostLink);
                 _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
-                _udp!.SetRemote(hostLink.UdpEndpoint);
+                // Direct mesh: send to the host (at the address we connected to) plus every other joiner.
+                _meshOthers = new List<IPEndPoint>(sp.MeshPeers);
+                ApplyJoinerMesh();
                 // Both peers should print the SAME number here; if not, the start is misaligned.
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 Log($"joined as P{sp.LocalPort + 1} of {sp.PlayerCount}");
@@ -720,6 +729,20 @@ namespace BizHawkNetplay.Tool
                             BeginInvokeUi(MaybeHintDelay);
                         }
                     }
+                    else if (type == ControlMessageType.PeerList)
+                    {
+                        // Host reshuffled the mesh (e.g. someone rejoined) — update who we send to.
+                        if (!_isHost)
+                        {
+                            var eps = HandshakeCodec.DecodeEndpoints(body);
+                            BeginInvokeUi(() =>
+                            {
+                                _meshOthers = eps;
+                                ApplyJoinerMesh();
+                                if (Verbose) Log($"mesh updated: {eps.Count} other peer(s)");
+                            });
+                        }
+                    }
                     else if (type == ControlMessageType.Resync)
                     {
                         var state = body; // authoritative whole-core state from the host
@@ -901,7 +924,7 @@ namespace BizHawkNetplay.Tool
 
             _peers.Remove(link);
             try { link.Tcp?.Close(); } catch { }
-            UpdateRelayPeers(); // stop relaying input to the dead endpoint
+            UpdateMeshPeers(); // stop sending input to the dead endpoint
 
             Log($"{link.Label} dropped ({why}) — holding the session; waiting up to " +
                 $"{ReconnectTimeoutSeconds:F0}s for a rejoin on TCP {_hostTcpPort}…");
@@ -912,13 +935,22 @@ namespace BizHawkNetplay.Tool
             _reconnectThread.Start();
         }
 
-        /// <summary>Point the relay hub at the currently-connected peers' UDP endpoints.</summary>
-        private void UpdateRelayPeers()
+        /// <summary>Host: point our mesh at every currently-connected joiner's UDP endpoint.</summary>
+        private void UpdateMeshPeers()
         {
-            if (_relay == null) return;
+            if (_mesh == null) return;
             var eps = new List<IPEndPoint>();
             foreach (var l in _peers) eps.Add(l.UdpEndpoint);
-            try { _relay.SetPeers(eps); } catch { }
+            try { _mesh.SetPeers(eps); } catch { }
+        }
+
+        /// <summary>Joiner: point our mesh at the host (peer 0) plus every other joiner we've been told about.</summary>
+        private void ApplyJoinerMesh()
+        {
+            if (_mesh == null || _peers.Count == 0) return;
+            var eps = new List<IPEndPoint> { _peers[0].UdpEndpoint }; // the host
+            eps.AddRange(_meshOthers);
+            try { _mesh.SetPeers(eps); } catch { }
         }
 
         /// <summary>
@@ -980,8 +1012,11 @@ namespace BizHawkNetplay.Tool
             {
                 var state = _adapter!.ExportState();
 
-                // The rejoiner adopts this state via Welcome and rebuilds fresh on its own side.
-                Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state);
+                // The rejoiner's mesh peers = every current survivor (it reaches the host directly).
+                var rejoinerOthers = new List<IPEndPoint>();
+                foreach (var l in _peers) rejoinerOthers.Add(l.UdpEndpoint);
+                // The rejoiner adopts this state + mesh via Welcome and rebuilds fresh on its own side.
+                Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state, rejoinerOthers);
 
                 var link = new PeerLink
                 {
@@ -990,13 +1025,20 @@ namespace BizHawkNetplay.Tool
                 };
                 link.LastRecvTicks = DateTime.UtcNow.Ticks; // seed liveness for the rejoined link
                 _peers.Add(link);
-                UpdateRelayPeers();
+                UpdateMeshPeers(); // our own mesh now includes the rejoiner
                 link.Reader = new Thread(() => PeerReaderLoop(link)) { IsBackground = true, Name = "BizHawkNetplay-control" };
                 link.Reader.Start();
 
-                // Bring the survivors (if any) to the same state, then rebuild ourselves.
+                // Bring each survivor up to date: refresh its mesh with the rejoiner's endpoint, then
+                // resync it to the same state. (For a 2P session there are no survivors.)
                 foreach (var l in _peers)
-                    if (!ReferenceEquals(l, link)) { try { l.Control.Send(ControlMessageType.Resync, state); } catch { } }
+                {
+                    if (ReferenceEquals(l, link)) continue;
+                    var others = new List<IPEndPoint>();
+                    foreach (var o in _peers) if (!ReferenceEquals(o, l)) others.Add(o.UdpEndpoint);
+                    try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(others)); } catch { }
+                    try { l.Control.Send(ControlMessageType.Resync, state); } catch { }
+                }
 
                 _awaitingReconnect = false;
                 _reconnectPort = -1;
@@ -1056,7 +1098,7 @@ namespace BizHawkNetplay.Tool
             foreach (var link in peers) { try { link.Tcp?.Close(); } catch { } }
 
             try { (_transport as IDisposable)?.Dispose(); } catch { }
-            _transport = null; _udp = null; _relay = null;
+            _transport = null; _mesh = null;
             _driver = null;
 
             foreach (var link in peers)

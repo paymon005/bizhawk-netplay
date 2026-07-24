@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Net;
 using System.Text;
 
 namespace BizHawkNetplay.Core.Session
@@ -40,6 +41,33 @@ namespace BizHawkNetplay.Core.Session
             sb.Append("delay=").Append(inputDelay).Append('\n');
             sb.Append("mode=").Append(mode == SyncMode.Rollback ? "rollback" : "lockstep").Append('\n');
             return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        /// <summary>Encode a set of peer UDP endpoints (one "ip:port" per line) for the PeerList body.</summary>
+        public static byte[] EncodeEndpoints(IEnumerable<IPEndPoint> endpoints)
+        {
+            var sb = new StringBuilder();
+            foreach (var ep in endpoints)
+                sb.Append(ep.Address).Append(':').Append(ep.Port).Append('\n');
+            return Encoding.UTF8.GetBytes(sb.ToString());
+        }
+
+        /// <summary>Decode a PeerList body into endpoints, skipping any malformed line (untrusted input).</summary>
+        public static List<IPEndPoint> DecodeEndpoints(byte[] body)
+        {
+            var list = new List<IPEndPoint>();
+            foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0) continue;
+                int colon = line.LastIndexOf(':'); // IPv4 "a.b.c.d:port"
+                if (colon <= 0) continue;
+                if (IPAddress.TryParse(line.Substring(0, colon), out var ip) &&
+                    int.TryParse(line.Substring(colon + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var port) &&
+                    port > 0 && port <= 65535)
+                    list.Add(new IPEndPoint(ip, port));
+            }
+            return list;
         }
 
         public static (int assignedPort, int playerCount, int inputDelay, SyncMode mode) DecodeWelcome(byte[] body)
