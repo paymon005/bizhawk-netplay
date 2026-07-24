@@ -49,6 +49,7 @@ namespace BizHawkNetplay.Tool
         private readonly Button _testInputButton;
         private readonly CheckBox _verboseCheck;
         private readonly CheckBox _freezeInputCheck;
+        private readonly CheckBox _forceDesyncCheck;
         private readonly Label _status;
 
         private bool Verbose => _verboseCheck.Checked;
@@ -67,6 +68,13 @@ namespace BizHawkNetplay.Tool
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
         private bool _isHost;      // this instance hosted the session (authoritative for desync capture)
+        private int _localPort;    // our controller port, for rebuilding the driver on resync
+        private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
+        private volatile bool _awaitingResync; // joiner paused, waiting for the host's authoritative state
+        private DateTime _lastResync = DateTime.MinValue; // debounces near-simultaneous resync triggers
+        private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
+        private const int MaxResyncs = 6;
+        private const double ResyncGraceSeconds = 2.0;
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private int _stallLog;     // throttles verbose stall messages
 
@@ -133,6 +141,15 @@ namespace BizHawkNetplay.Tool
             _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(410, 122) };
             _freezeInputCheck.CheckedChanged += (_, __) =>
                 EmuHawkAdapter.ForceNeutralInput = _freezeInputCheck.Checked;
+            _forceDesyncCheck = new CheckBox { Text = "Force desync (diag)", AutoSize = true, Location = new Point(410, 144) };
+            _forceDesyncCheck.CheckedChanged += (_, __) =>
+            {
+                if (!_forceDesyncCheck.Checked) return;
+                _forceDesyncOnce = true;
+                _forceDesyncCheck.Checked = false;
+                Log(_sessionActive ? "will inject a fake desync at the next checksum (tests resync)"
+                                   : "arm this during a session to test resync");
+            };
 
             _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(150, 145), ForeColor = Color.DimGray };
 
@@ -148,7 +165,7 @@ namespace BizHawkNetplay.Tool
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
                 delayLabel, _delayBox, _goButton, _disconnectButton, _probeButton, _testInputButton,
-                _verboseCheck, _freezeInputCheck, _status, _log,
+                _verboseCheck, _freezeInputCheck, _forceDesyncCheck, _status, _log,
             });
             ResumeLayout(false);
 
@@ -291,6 +308,10 @@ namespace BizHawkNetplay.Tool
                 // so irregular WinForms-timer firing doesn't run the game slow.
                 _frameMs = FrameMs();
                 _sessionDelay = sp.InputDelay;
+                _localPort = sp.LocalPort;
+                _resyncCount = 0;
+                _awaitingResync = false;
+                _lastResync = DateTime.MinValue;
                 lock (_pingLock) { _pingMs = -1; _pingCount = 0; }
                 _delayHintShown = false;
                 _pingClock.Restart();
@@ -334,6 +355,14 @@ namespace BizHawkNetplay.Tool
                         ? $"EmuHawk advanced {diff} extra frame(s) — did you unpause?"
                         : $"the core's frame count jumped back {-diff} — a rewind/load-state hotkey fired?";
                     EndSession(why + " The tool must own the frame clock; avoid EmuHawk hotkeys during a session.");
+                    return;
+                }
+
+                // A desync was detected and we're the joiner: don't advance our (suspect) state — wait
+                // for the host's authoritative resync to arrive over the control channel.
+                if (_awaitingResync)
+                {
+                    Status("desync — waiting for host to resync…", Color.DarkOrange);
                     return;
                 }
 
@@ -382,6 +411,14 @@ namespace BizHawkNetplay.Tool
             int frame = _driver!.CurrentFrame;
             if (frame % ChecksumInterval != 0) return;
             uint hash = _adapter!.HashMainMemory();
+            if (_forceDesyncOnce)
+            {
+                // Diagnostic: corrupt the reported hash (not the actual state) so both peers see a
+                // mismatch and exercise the resync path. The state is fine, so recovery re-matches.
+                hash ^= 0xDEADBEEFu;
+                _forceDesyncOnce = false;
+                Log($"injected a fake desync at frame {frame} (diagnostic)");
+            }
             lock (_hashLock) { _localHashes[frame] = hash; }
             try { _control!.Send(ControlMessageType.Checksum, EncodeChecksum(frame, hash)); }
             catch { /* control channel gone; the reader loop will end the session */ }
@@ -460,6 +497,16 @@ namespace BizHawkNetplay.Tool
                             BeginInvokeUi(MaybeHintDelay);
                         }
                     }
+                    else if (type == ControlMessageType.ResyncRequest)
+                    {
+                        // The joiner saw a desync; the host (authoritative) drives the recovery.
+                        BeginInvokeUi(() => { if (_isHost) PerformResyncAsHost(); });
+                    }
+                    else if (type == ControlMessageType.Resync)
+                    {
+                        var state = body; // whole-core authoritative state from the host
+                        BeginInvokeUi(() => ApplyResyncAsJoiner(state));
+                    }
                     else if (type == ControlMessageType.Bye)
                     {
                         BeginInvokeUi(() => EndSession("peer left the session"));
@@ -483,27 +530,101 @@ namespace BizHawkNetplay.Tool
             }
             if (local != remote)
                 BeginInvokeUi(() => OnDesync(frame, local, remote));
-            else if (Verbose)
-                BeginInvokeUi(() => Log($"checksum frame {frame}: MATCH ({local:X8})"));
+            else
+            {
+                if (Verbose) BeginInvokeUi(() => Log($"checksum frame {frame}: MATCH ({local:X8})"));
+                // A clean match after a resync confirms recovery worked; clear the attempt counter.
+                if (_resyncCount != 0)
+                    BeginInvokeUi(() => { if (_resyncCount != 0) { _resyncCount = 0; Log("back in sync — recovery confirmed"); } });
+            }
         }
 
         /// <summary>
-        /// A checksum mismatch means the two sims have diverged. On the host (the authoritative
-        /// side) capture the current core state to quick-slot 10 so the desync can be reloaded and
-        /// inspected afterwards, then tear the session down.
+        /// A checksum mismatch means the two sims have diverged. Rather than end the session, recover:
+        /// the host re-broadcasts an authoritative state and both peers rebuild their frame driver from
+        /// a clean baseline (see PerformResyncAsHost / ApplyResyncAsJoiner). The host also snapshots the
+        /// diverged state to quick-slot 10 for inspection. A short grace window after each resync
+        /// debounces the near-simultaneous triggers both peers raise for the same desync.
         /// </summary>
         private void OnDesync(int frame, uint local, uint remote)
         {
+            if (_awaitingResync) return; // already waiting for the host's state
+            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // just resynced; give it time
+            Log($"DESYNC at frame {frame} (local {local:X8} != remote {remote:X8})");
             if (_isHost)
             {
-                try
-                {
-                    APIs.SaveState.SaveSlot(10, suppressOSD: false);
-                    Log($"desync — saved host state to slot 10 (near frame {frame})");
-                }
-                catch (Exception ex) { Log("(warning) couldn't save desync state to slot 10: " + ex.Message); }
+                PerformResyncAsHost();
             }
-            EndSession($"DESYNC detected at frame {frame} (local {local:X8} != remote {remote:X8})");
+            else
+            {
+                _awaitingResync = true; // stop advancing our suspect state until the host resyncs us
+                try { _control!.Send(ControlMessageType.ResyncRequest, Array.Empty<byte>()); } catch { }
+                Log("requesting an authoritative state from the host…");
+            }
+        }
+
+        /// <summary>Host: snapshot the diverged state to slot 10, then broadcast an authoritative state
+        /// and rebuild from a clean baseline. Bounded by <see cref="MaxResyncs"/> so a persistent
+        /// (non-transient) desync eventually gives up instead of looping forever.</summary>
+        private void PerformResyncAsHost()
+        {
+            if (!_sessionActive || !_isHost) return;
+            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // debounce double-trigger
+            try
+            {
+                APIs.SaveState.SaveSlot(10, suppressOSD: false);
+                Log("saved diverged host state to slot 10 for inspection");
+            }
+            catch (Exception ex) { Log("(warning) couldn't save slot 10: " + ex.Message); }
+
+            if (++_resyncCount > MaxResyncs)
+            {
+                EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
+                return;
+            }
+            try
+            {
+                var state = _adapter!.ExportState();
+                _control!.Send(ControlMessageType.Resync, state);
+                RebuildDriver();
+                Log($"resync #{_resyncCount}: sent {state.Length / 1024}KiB host state; resuming from a clean baseline");
+            }
+            catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
+        }
+
+        /// <summary>Joiner: adopt the host's authoritative state and rebuild from a clean baseline.</summary>
+        private void ApplyResyncAsJoiner(byte[] state)
+        {
+            if (!_sessionActive) return;
+            if (++_resyncCount > MaxResyncs)
+            {
+                EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
+                return;
+            }
+            try
+            {
+                _adapter!.ImportState(state);
+                RebuildDriver();
+                _awaitingResync = false;
+                Log($"resync #{_resyncCount}: imported {state.Length / 1024}KiB host state; resuming");
+            }
+            catch (Exception ex) { EndSession("resync apply failed: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// Rebuild the frame driver from the current core state as a fresh frame-0 baseline: new
+        /// pipeline, cleared checksums, reset pacing and drift baseline. In-flight pre-resync UDP
+        /// datagrams carry high frame numbers and are dropped by the FrameDriver's far-future guard.
+        /// </summary>
+        private void RebuildDriver()
+        {
+            _driver = new FrameDriver(_adapter!, _udp!, p => new LockstepStrategy(p),
+                _localPort, _sessionDelay, redundancy: 8);
+            _startEmuFrame = APIs.Emulation.FrameCount();
+            lock (_hashLock) { _localHashes.Clear(); _remoteHashes.Clear(); }
+            _driver.Start();
+            _lastResync = DateTime.UtcNow;
+            _paceClock.Restart();
         }
 
         private void FailSession(string reason)

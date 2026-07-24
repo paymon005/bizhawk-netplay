@@ -198,6 +198,11 @@ namespace BizHawkNetplay.Core.Sync
                 {
                     if (inFrame.Port == _localPort) continue;      // never let the wire override our own port
                     if (inFrame.Frame < CurrentFrame) continue;    // already consumed; ignore stale redundancy
+                    // Reject frames impossibly far in the future. In lockstep the peer leads by at most
+                    // the delay window, so anything beyond it is bogus or — the case that matters — a
+                    // pre-resync datagram (high frame number) arriving after we rebuilt at frame 0. Left
+                    // unchecked it would sit in the pipeline and reapply thousands of frames later.
+                    if (inFrame.Frame > CurrentFrame + 2 * _delay + _redundancy + 4) continue;
                     var input = _serializers[inFrame.Port].Deserialize(inFrame.Payload);
                     _pipeline.Add(inFrame.Port, inFrame.Frame, input);
                     _strategy.OnRemoteInput(inFrame);

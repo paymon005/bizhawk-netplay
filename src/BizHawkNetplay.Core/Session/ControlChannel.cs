@@ -14,6 +14,8 @@ namespace BizHawkNetplay.Core.Session
         Bye = 7,       // graceful close
         Ping = 8,      // RTT probe: body = [t0Ms:double] (sender's monotonic send time)
         Pong = 9,      // RTT echo: body = [t0Ms:double] (the ping's t0, echoed back unchanged)
+        Resync = 10,   // host -> client: authoritative whole-core state to recover from a desync
+        ResyncRequest = 11, // client -> host: "I saw a desync, please resync us"
     }
 
     /// <summary>
