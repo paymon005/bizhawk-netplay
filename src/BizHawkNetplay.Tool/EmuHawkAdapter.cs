@@ -31,8 +31,10 @@ namespace BizHawkNetplay.Tool
         // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame / PumpAudio).
         private BizHawk.Client.EmuHawk.Sound? _sound;
         private BizHawk.Client.EmuHawk.MainForm? _mainForm;
+        private ISoundOutput? _outputDevice;             // EmuHawk's host audio device, driven directly
         private ISoundProvider? _coreSound;
         private NetplaySoundBuffer? _soundBuffer;
+        private short[] _pumpScratch = Array.Empty<short>();
         private int _soundChannels = 2;
         private bool _audioReady;
         private bool _coreSyncSound = true;              // drain via GetSamplesSync (else GetSamplesAsync)
@@ -183,17 +185,32 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// Top up EmuHawk's audio device from our ring buffer. Call every frame-timer tick — whether
-        /// or not a frame advanced — so the device stays fed at the real playback rate, decoupled from
-        /// our (bursty, occasionally stalled) frame stepping. The async path in <c>Sound.UpdateSound</c>
-        /// just moves buffered samples to the device: no resampling, no blocking.
+        /// Top up the host audio device from our ring buffer. Call every frame-timer tick — whether or
+        /// not a frame advanced — so the device stays fed at the real playback rate, decoupled from our
+        /// (bursty, occasionally stalled) frame stepping.
+        ///
+        /// We write to the device DIRECTLY rather than via <c>Sound.UpdateSound</c>, because EmuHawk's
+        /// own run loop also calls <c>Sound.UpdateSound</c> every iteration; while we hold it paused
+        /// that call runs with atten=0, which discards our buffered samples and floods the device with
+        /// silence far faster than we can pump. Nulling EmuHawk's input pin (see EnableAudio) makes its
+        /// call early-return, leaving the device ours to feed here.
         /// </summary>
         public void PumpAudio()
         {
             if (!_audioReady) return;
             _audioPumps++;
-            // atten = 1 → full volume (EmuHawk applies the user's master volume at the device).
-            try { _sound!.UpdateSound(1.0f, isSecondaryThrottlingDisabled: false); }
+            try
+            {
+                var dev = _outputDevice;
+                if (dev == null || _soundBuffer == null) return;
+                dev.ApplyVolumeSettings(1.0); // full volume; the user's master volume is baked into the samples' source
+                int needed = dev.CalculateSamplesNeeded(); // sample-pairs the device can accept right now
+                if (needed <= 0) return;
+                int shorts = needed * _soundChannels;
+                if (_pumpScratch.Length < shorts) _pumpScratch = new short[shorts];
+                _soundBuffer.Read(_pumpScratch, shorts); // dequeue from our ring, silence-pad underruns
+                dev.WriteSamples(_pumpScratch, 0, needed);
+            }
             catch { _audioReady = false; }
         }
 
@@ -239,13 +256,14 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// Wire up audio for a driven session. Because we keep EmuHawk paused and step the core
-        /// ourselves, EmuHawk's main loop never pumps its sound output. We grab its Sound device (the
-        /// private <c>MainForm.Sound</c>) and re-point its input pin at a ring buffer we own
-        /// (<see cref="NetplaySoundBuffer"/>, in async mode → the jitter-tolerant buffered path), then
-        /// feed that ring from the core each frame in <see cref="AdvanceFrame"/> and drain it to the
-        /// device each tick in <see cref="PumpAudio"/>. <see cref="DisableAudio"/> restores EmuHawk's
-        /// own wiring when the session ends.
+        /// Wire up audio for a driven session. We keep EmuHawk paused and step the core ourselves, but
+        /// EmuHawk's run loop keeps calling <c>Sound.UpdateSound</c> every iteration — with atten=0
+        /// while paused, which discards buffered samples and writes silence to the device. So we (1)
+        /// grab EmuHawk's Sound and its host audio device (both via reflection), (2) NULL EmuHawk's
+        /// input pin so its paused <c>UpdateSound</c> early-returns and never touches the device, and
+        /// (3) feed the device directly from a ring we own (<see cref="NetplaySoundBuffer"/>): filled
+        /// from the core each frame in <see cref="AdvanceFrame"/>, drained to the device each tick in
+        /// <see cref="PumpAudio"/>. <see cref="DisableAudio"/> restores EmuHawk's wiring on session end.
         /// </summary>
         public void EnableAudio(BizHawk.Client.EmuHawk.MainForm? mainForm)
         {
@@ -264,6 +282,12 @@ namespace BizHawkNetplay.Tool
                     .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 _sound = prop?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;
                 if (_sound == null) { AudioDiagnostic = "couldn't reach MainForm.Sound"; return; }
+
+                // The host audio device (XAudio2/OpenAL). Sound._outputDevice is private; we drive it directly.
+                var devField = typeof(BizHawk.Client.EmuHawk.Sound)
+                    .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic);
+                _outputDevice = devField?.GetValue(_sound) as ISoundOutput;
+                if (_outputDevice == null) { AudioDiagnostic = "couldn't reach Sound._outputDevice"; return; }
 
                 _coreSound = _emulator.ServiceProvider.GetService<ISoundProvider>();
                 if (_coreSound == null) { AudioDiagnostic = "core exposes no ISoundProvider"; return; }
@@ -290,7 +314,10 @@ namespace BizHawkNetplay.Tool
                 int prime = _sound.SampleRate * _soundChannels * 50 / 1000;
                 _soundBuffer.Enqueue(new short[prime], prime);
 
-                _sound.SetInputPin(_soundBuffer); // route the device to pull from our async ring
+                // Detach EmuHawk's input pin so its run-loop UpdateSound(atten=0, while we hold it paused)
+                // early-returns instead of discarding our audio and writing silence to the device. From
+                // here PumpAudio owns the device.
+                _sound.SetInputPin(null);
                 _audioReady = true;
 
                 string cfg = "";

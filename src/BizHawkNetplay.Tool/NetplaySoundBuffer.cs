@@ -63,16 +63,24 @@ namespace BizHawkNetplay.Tool
         public void GetSamplesAsync(short[] samples)
         {
             if (samples == null) return;
+            Read(samples, samples.Length);
+        }
+
+        /// <summary>Dequeue <paramref name="count"/> shorts into <paramref name="dest"/>, padding with
+        /// silence on underrun. Used to drive the host audio device directly.</summary>
+        public void Read(short[] dest, int count)
+        {
+            if (dest == null) return;
             lock (_lock)
             {
-                int give = Math.Min(samples.Length, _count);
+                int give = Math.Min(Math.Min(count, dest.Length), _count);
                 for (int i = 0; i < give; i++)
                 {
-                    samples[i] = _ring[_read];
+                    dest[i] = _ring[_read];
                     _read = (_read + 1) % _capacity;
                 }
                 _count -= give;
-                for (int i = give; i < samples.Length; i++) samples[i] = 0;
+                for (int i = give; i < count && i < dest.Length; i++) dest[i] = 0;
             }
         }
 
