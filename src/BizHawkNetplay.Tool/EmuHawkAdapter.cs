@@ -35,6 +35,11 @@ namespace BizHawkNetplay.Tool
         private NetplaySoundBuffer? _soundBuffer;
         private int _soundChannels = 2;
         private bool _audioReady;
+        private bool _coreSyncSound = true;              // drain via GetSamplesSync (else GetSamplesAsync)
+        private short[] _asyncScratch = Array.Empty<short>();
+        // Diagnostics so a single test round shows where the audio pipeline breaks.
+        private long _audioFrames, _audioPairs, _audioPumps;
+        private string _audioSyncErr = "";
 
         public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
         {
@@ -150,14 +155,26 @@ namespace BizHawkNetplay.Tool
             // pulls from that ring at the steady real-time rate (PumpAudio → UpdateSound), so the ring
             // absorbs the mismatch between this bursty manual stepping and smooth playback. Producing
             // here and consuming there is what keeps audio clean despite the coarse WinForms timer.
+            // Drain in whichever mode the core actually reports — a sync-only drain of an async core
+            // gets nothing (silence).
             if (_audioReady)
             {
                 try
                 {
-                    _coreSound!.GetSamplesSync(out var samples, out var nSampPairs);
-                    _soundBuffer!.Enqueue(samples, nSampPairs * _soundChannels);
+                    if (_coreSyncSound)
+                    {
+                        _coreSound!.GetSamplesSync(out var samples, out var nSampPairs);
+                        _soundBuffer!.Enqueue(samples, nSampPairs * _soundChannels);
+                        _audioFrames++; _audioPairs += nSampPairs;
+                    }
+                    else
+                    {
+                        _coreSound!.GetSamplesAsync(_asyncScratch);
+                        _soundBuffer!.Enqueue(_asyncScratch, _asyncScratch.Length);
+                        _audioFrames++; _audioPairs += _asyncScratch.Length / Math.Max(1, _soundChannels);
+                    }
                 }
-                catch { /* a sample-pull hiccup must never break emulation */ }
+                catch (Exception ex) { _audioSyncErr = ex.Message; } // never break emulation over audio
             }
         }
 
@@ -170,6 +187,7 @@ namespace BizHawkNetplay.Tool
         public void PumpAudio()
         {
             if (!_audioReady) return;
+            _audioPumps++;
             // atten = 1 → full volume (EmuHawk applies the user's master volume at the device).
             try { _sound!.UpdateSound(1.0f, isSecondaryThrottlingDisabled: false); }
             catch { _audioReady = false; }
@@ -180,6 +198,30 @@ namespace BizHawkNetplay.Tool
 
         /// <summary>Human-readable note on why audio was/wasn't wired up (for the UI log).</summary>
         public string AudioDiagnostic { get; private set; } = "";
+
+        /// <summary>Pipeline counters for diagnosing silence: samples produced vs pumped vs buffered.</summary>
+        public string AudioStats()
+        {
+            int ring = _soundBuffer?.Count ?? -1;
+            int cap = _soundBuffer?.Capacity ?? 0;
+            string err = string.IsNullOrEmpty(_audioSyncErr) ? "" : $" drainErr='{_audioSyncErr}'";
+            return $"audio stats: coreMode={(_coreSyncSound ? "Sync" : "Async")} frames={_audioFrames} " +
+                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts{err}";
+        }
+
+        private int SamplesPerFrame()
+        {
+            double fps = 60.0;
+            try
+            {
+                var vp = _emulator.ServiceProvider.GetService<IVideoProvider>();
+                if (vp != null && vp.VsyncNumerator > 0 && vp.VsyncDenominator > 0)
+                    fps = (double)vp.VsyncNumerator / vp.VsyncDenominator;
+            }
+            catch { /* fall back to 60 */ }
+            int rate = _sound?.SampleRate ?? 44100;
+            return Math.Max(1, (int)Math.Round(rate / fps));
+        }
 
         /// <summary>
         /// Wire up audio for a driven session. Because we keep EmuHawk paused and step the core
@@ -194,6 +236,8 @@ namespace BizHawkNetplay.Tool
         {
             _audioReady = false;
             AudioDiagnostic = "";
+            _audioFrames = _audioPairs = _audioPumps = 0;
+            _audioSyncErr = "";
             try
             {
                 if (mainForm == null) { AudioDiagnostic = "no MainForm reference"; return; }
@@ -208,12 +252,15 @@ namespace BizHawkNetplay.Tool
                 _coreSound = _emulator.ServiceProvider.GetService<ISoundProvider>();
                 if (_coreSound == null) { AudioDiagnostic = "core exposes no ISoundProvider"; return; }
 
-                // We pull the core's samples synchronously right after each FrameAdvance.
+                // Prefer draining the core synchronously (one frame's samples per FrameAdvance). If the
+                // core won't switch to sync, drain it in async mode instead — either way we feed our
+                // ring. Forcing sync on an async-only core and then GetSamplesSync'ing it yields silence,
+                // which is the bug this replaces.
                 if (_coreSound.SyncMode != SyncSoundMode.Sync)
                 {
-                    try { _coreSound.SetSyncMode(SyncSoundMode.Sync); }
-                    catch { AudioDiagnostic = "core sound is async-only (unsupported for driven audio)"; return; }
+                    try { _coreSound.SetSyncMode(SyncSoundMode.Sync); } catch { /* async core */ }
                 }
+                _coreSyncSound = _coreSound.SyncMode == SyncSoundMode.Sync;
 
                 // Make sure the device is running before we touch its input pin (so a bail leaves
                 // EmuHawk's wiring untouched). StartSound no-ops if the user disabled sound.
@@ -221,6 +268,7 @@ namespace BizHawkNetplay.Tool
                 if (!_sound.IsStarted) { AudioDiagnostic = "EmuHawk sound output is off (enable Config → Sound)"; return; }
 
                 _soundChannels = _sound.ChannelCount;
+                _asyncScratch = new short[Math.Max(_soundChannels, SamplesPerFrame() * _soundChannels)];
                 _soundBuffer = new NetplaySoundBuffer(_sound.SampleRate, _soundChannels, capacityMs: 200);
                 // Prime a small standing cushion of silence so pump jitter doesn't underrun the ring.
                 int prime = _sound.SampleRate * _soundChannels * 50 / 1000;
@@ -228,6 +276,8 @@ namespace BizHawkNetplay.Tool
 
                 _sound.SetInputPin(_soundBuffer); // route the device to pull from our async ring
                 _audioReady = true;
+                AudioDiagnostic = $"core={_coreSound.GetType().Name} mode={(_coreSyncSound ? "Sync" : "Async")} " +
+                                  $"rate={_sound.SampleRate} ch={_soundChannels} started={_sound.IsStarted}";
             }
             catch (Exception ex) { _sound = null; AudioDiagnostic = "audio init failed: " + ex.Message; }
         }

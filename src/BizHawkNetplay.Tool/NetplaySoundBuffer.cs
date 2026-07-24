@@ -36,6 +36,12 @@ namespace BizHawkNetplay.Tool
         public SyncSoundMode SyncMode => SyncSoundMode.Async;
         public void SetSyncMode(SyncSoundMode mode) { /* async only; nothing to switch */ }
 
+        /// <summary>Current fill level in shorts (diagnostic).</summary>
+        public int Count { get { lock (_lock) { return _count; } } }
+
+        /// <summary>Ring capacity in shorts (diagnostic).</summary>
+        public int Capacity => _capacity;
+
         /// <summary>Push <paramref name="shortCount"/> interleaved shorts from <paramref name="src"/>
         /// into the ring, dropping the oldest samples on overflow so latency stays bounded.</summary>
         public void Enqueue(short[] src, int shortCount)

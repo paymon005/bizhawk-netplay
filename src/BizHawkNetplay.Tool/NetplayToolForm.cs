@@ -67,6 +67,7 @@ namespace BizHawkNetplay.Tool
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
         private bool _isHost;      // this instance hosted the session (authoritative for desync capture)
+        private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private int _stallLog;     // throttles verbose stall messages
 
         private readonly object _hashLock = new object();
@@ -261,8 +262,10 @@ namespace BizHawkNetplay.Tool
 
                 // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
                 // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
+                _audioStatsLogged = false;
                 _adapter!.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
-                Log(_adapter.AudioReady ? "audio enabled" : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
+                Log(_adapter.AudioReady ? "audio enabled — " + _adapter.AudioDiagnostic
+                                        : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
 
                 _controlReader = new Thread(ControlReaderLoop) { IsBackground = true, Name = "BizHawkNetplay-control" };
                 _controlReader.Start();
@@ -332,6 +335,18 @@ namespace BizHawkNetplay.Tool
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
                 }
+
+                // One-shot audio pipeline snapshot ~2s in, so a single test shows where sound breaks.
+                if (!_audioStatsLogged && _driver.CurrentFrame >= 120)
+                {
+                    _audioStatsLogged = true;
+                    Log(_adapter!.AudioStats());
+                }
+                else if (Verbose && _driver.CurrentFrame % 300 == 0 && _driver.CurrentFrame > 0)
+                {
+                    Log(_adapter!.AudioStats());
+                }
+
                 Status($"in session — frame {_driver.CurrentFrame}", Color.Green);
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
