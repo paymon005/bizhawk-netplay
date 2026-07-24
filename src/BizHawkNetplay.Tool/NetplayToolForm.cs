@@ -103,6 +103,20 @@ namespace BizHawkNetplay.Tool
         private int _sessionDelay;    // the input delay this session negotiated
         private bool _delayHintShown; // one-time "raise your delay" hint per session
 
+        // Reconnect: when a joiner unexpectedly drops, the host freezes the session and waits for it to
+        // rejoin (into the same port, with the current state) instead of ending. Host-side only — a
+        // joiner that loses the host ends and the user rejoins manually. One outstanding drop at a time.
+        private volatile bool _awaitingReconnect;
+        private int _reconnectPort = -1;           // controller port waiting to be refilled
+        private Thread? _reconnectThread;
+        private DateTime _reconnectStarted;
+        private const double ReconnectTimeoutSeconds = 60.0;
+        // Host session context stashed so a rejoiner can be re-greeted with the same identity/params.
+        private PeerIdentity? _hostIdentity;
+        private SessionPreferences? _hostPrefs;
+        private int _hostTcpPort;
+        private int _hostUdpPort;
+
         // Sync mode + rollback config for the live session.
         private SyncMode _mode = SyncMode.Lockstep;   // negotiated; drives which strategy the driver builds
         private int _probeDepth = -1;                 // cached capability-probe depth (frames); -1 = not measured
@@ -269,6 +283,8 @@ namespace BizHawkNetplay.Tool
 
         private void HostThread(int port, PeerIdentity id, SessionPreferences prefs, byte[] state, int udpLocalPort, int players)
         {
+            // Remember what a rejoiner needs to be greeted with if a peer later drops.
+            _hostIdentity = id; _hostPrefs = prefs; _hostTcpPort = port; _hostUdpPort = udpLocalPort;
             try
             {
                 _listener = new TcpListener(IPAddress.Any, port);
@@ -445,6 +461,10 @@ namespace BizHawkNetplay.Tool
                 // Keep the audio device fed every tick, independent of how many frames we step this
                 // tick (or none, during a stall) — the ring buffer decouples playback from stepping.
                 _adapter?.PumpAudio();
+
+                // Frozen while a dropped peer is being waited on — don't advance until the rejoin
+                // resyncs everyone. Audio is already pumped (it drains to silence, which is correct).
+                if (_awaitingReconnect) return;
 
                 // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
                 // its own loop would advance the core on top of ours and desync — snap it back.
@@ -639,7 +659,7 @@ namespace BizHawkNetplay.Tool
             }
             catch (Exception ex)
             {
-                if (_sessionActive) BeginInvokeUi(() => EndSession($"control link to {link.Label} lost: " + ex.Message));
+                if (_sessionActive) BeginInvokeUi(() => OnPeerLinkLost(link, ex.Message));
             }
         }
 
@@ -774,6 +794,140 @@ namespace BizHawkNetplay.Tool
             }
         }
 
+        // ------------------------------------------------------------------ reconnect
+
+        /// <summary>
+        /// A peer's control link dropped unexpectedly (not a clean Bye). The host holds the session
+        /// open and waits for it to rejoin into the same port; a joiner that lost the host just ends
+        /// (the host is the hub — the user rejoins with the Join button). One drop at a time.
+        /// </summary>
+        private void OnPeerLinkLost(PeerLink link, string why)
+        {
+            if (!_sessionActive) return;
+
+            if (!_isHost)
+            {
+                EndSession($"lost connection to {link.Label}: {why} — click Join to reconnect");
+                return;
+            }
+            if (_awaitingReconnect)
+            {
+                EndSession($"a second peer ({link.Label}) dropped during a reconnect: {why}");
+                return;
+            }
+
+            _awaitingReconnect = true;
+            _reconnectPort = link.RemotePort;
+            _reconnectStarted = DateTime.UtcNow;
+
+            _peers.Remove(link);
+            try { link.Tcp?.Close(); } catch { }
+            UpdateRelayPeers(); // stop relaying input to the dead endpoint
+
+            Log($"{link.Label} dropped ({why}) — holding the session; waiting up to " +
+                $"{ReconnectTimeoutSeconds:F0}s for a rejoin on TCP {_hostTcpPort}…");
+            Status($"P{_reconnectPort + 1} dropped — waiting to rejoin…", Color.DarkOrange);
+
+            _reconnectThread = new Thread(() => ReconnectAcceptLoop(_reconnectPort))
+            { IsBackground = true, Name = "BizHawkNetplay-reconnect" };
+            _reconnectThread.Start();
+        }
+
+        /// <summary>Point the relay hub at the currently-connected peers' UDP endpoints.</summary>
+        private void UpdateRelayPeers()
+        {
+            if (_relay == null) return;
+            var eps = new List<IPEndPoint>();
+            foreach (var l in _peers) eps.Add(l.UdpEndpoint);
+            try { _relay.SetPeers(eps); } catch { }
+        }
+
+        /// <summary>
+        /// Host reconnect listener (background thread): reopen the TCP port and wait for the dropped
+        /// player to reconnect. Re-greet — which re-validates ROM/core/layout still match — then hand
+        /// off to the UI thread to welcome them back. Gives up (ends the session) after the timeout.
+        /// </summary>
+        private void ReconnectAcceptLoop(int freedPort)
+        {
+            TcpListener? listener = null;
+            try
+            {
+                listener = new TcpListener(IPAddress.Any, _hostTcpPort);
+                listener.Start();
+                while (_sessionActive && _awaitingReconnect)
+                {
+                    if ((DateTime.UtcNow - _reconnectStarted).TotalSeconds > ReconnectTimeoutSeconds)
+                    {
+                        BeginInvokeUi(() => { if (_awaitingReconnect) EndSession("no rejoin within the timeout"); });
+                        return;
+                    }
+                    if (!listener.Pending()) { Thread.Sleep(100); continue; }
+
+                    var tcp = listener.AcceptTcpClient();
+                    try { tcp.NoDelay = true; } catch { }
+                    var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
+                    var channel = new ControlChannel(tcp.GetStream());
+                    try
+                    {
+                        var greet = Handshake.HostGreet(channel, _hostIdentity!, _hostPrefs!, _hostUdpPort);
+                        var udpEp = new IPEndPoint(remoteIp, greet.UdpPort);
+                        BeginInvokeUi(() => CompleteReconnect(tcp, channel, remoteIp, udpEp, freedPort));
+                        return; // one rejoin fills the slot
+                    }
+                    catch (Exception ex)
+                    {
+                        // Rejected (e.g. wrong ROM/core) — refuse this one and keep waiting for a valid rejoin.
+                        UiLog($"rejected a rejoin attempt: {ex.Message}");
+                        try { tcp.Close(); } catch { }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                BeginInvokeUi(() => { if (_awaitingReconnect) EndSession("reconnect listener failed: " + ex.Message); });
+            }
+            finally { try { listener?.Stop(); } catch { } }
+        }
+
+        /// <summary>
+        /// UI thread: finish a reconnect. Export the current authoritative state once, welcome the
+        /// rejoiner back into its old port with it, resync every surviving peer to the same state, and
+        /// rebuild our own driver — so everyone lands on a common frame-0 baseline and resumes together.
+        /// </summary>
+        private void CompleteReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp, IPEndPoint udpEp, int freedPort)
+        {
+            if (!_sessionActive || !_awaitingReconnect) { try { tcp.Close(); } catch { } return; }
+            try
+            {
+                var state = _adapter!.ExportState();
+
+                // The rejoiner adopts this state via Welcome and rebuilds fresh on its own side.
+                Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state);
+
+                var link = new PeerLink
+                {
+                    Tcp = tcp, Control = channel, RemotePort = freedPort,
+                    UdpEndpoint = udpEp, Label = $"P{freedPort + 1} ({remoteIp})",
+                };
+                _peers.Add(link);
+                UpdateRelayPeers();
+                link.Reader = new Thread(() => PeerReaderLoop(link)) { IsBackground = true, Name = "BizHawkNetplay-control" };
+                link.Reader.Start();
+
+                // Bring the survivors (if any) to the same state, then rebuild ourselves.
+                foreach (var l in _peers)
+                    if (!ReferenceEquals(l, link)) { try { l.Control.Send(ControlMessageType.Resync, state); } catch { } }
+
+                _awaitingReconnect = false;
+                _reconnectPort = -1;
+                _resyncCount = 0; // a rejoin is a fresh, healthy start — not a desync loop
+                RebuildDriver();
+                Log($"{link.Label} reconnected — resynced {_peers.Count} peer(s); resuming");
+                Status($"reconnected P{freedPort + 1} — resuming", Color.Green);
+            }
+            catch (Exception ex) { EndSession("reconnect failed: " + ex.Message); }
+        }
+
         private void FailSession(string reason)
         {
             Log("connection failed: " + reason);
@@ -807,6 +961,12 @@ namespace BizHawkNetplay.Tool
 
         private void TeardownNetwork()
         {
+            // Stop any in-flight reconnect wait first; its loop exits once these flags clear.
+            _awaitingReconnect = false;
+            var reconnect = _reconnectThread;
+            _reconnectThread = null;
+            _reconnectPort = -1;
+
             try { _listener?.Stop(); } catch { }
             _listener = null;
 
@@ -825,6 +985,11 @@ namespace BizHawkNetplay.Tool
                 {
                     try { reader.Join(300); } catch { }
                 }
+            }
+
+            if (reconnect != null && reconnect.IsAlive && reconnect != Thread.CurrentThread)
+            {
+                try { reconnect.Join(400); } catch { } // it polls the flags every 100ms, so this returns quickly
             }
         }
 
