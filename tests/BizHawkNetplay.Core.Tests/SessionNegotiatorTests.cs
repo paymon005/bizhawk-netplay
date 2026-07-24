@@ -13,8 +13,8 @@ namespace BizHawkNetplay.Core.Tests
             => new PeerIdentity(protocol, rom, core, coreVer, sync,
                 new[] { layout, "L1" }, deterministic, depth);
 
-        private static SessionPreferences Pref(int delay = 2, bool rollback = false)
-            => new SessionPreferences(delay, rollback);
+        private static SessionPreferences Pref(int delay = 2, bool rollback = false, string password = "")
+            => new SessionPreferences(delay, rollback, SessionPreferences.HashPassword(password));
 
         [Fact]
         public void MatchingPeers_AcceptLockstep()
@@ -55,6 +55,21 @@ namespace BizHawkNetplay.Core.Tests
             var r = SessionNegotiator.Negotiate(local, remote, Pref(), Pref());
             Assert.False(r.Accepted);
             Assert.False(string.IsNullOrEmpty(r.RejectReason));
+        }
+
+        [Fact]
+        public void SessionPassword_MustMatch()
+        {
+            // Same password on both sides -> accepted.
+            Assert.True(SessionNegotiator.Negotiate(Id(), Id(), Pref(password: "hunter2"), Pref(password: "hunter2")).Accepted);
+            // No password on either side -> accepted.
+            Assert.True(SessionNegotiator.Negotiate(Id(), Id(), Pref(), Pref()).Accepted);
+            // Different passwords -> rejected.
+            Assert.False(SessionNegotiator.Negotiate(Id(), Id(), Pref(password: "hunter2"), Pref(password: "letmein")).Accepted);
+            // One side set a password, the other didn't -> rejected.
+            Assert.False(SessionNegotiator.Negotiate(Id(), Id(), Pref(password: "hunter2"), Pref()).Accepted);
+            // The password isn't sent in the clear — only its hash crosses the wire.
+            Assert.DoesNotContain("hunter2", SessionPreferences.HashPassword("hunter2"));
         }
 
         [Fact]

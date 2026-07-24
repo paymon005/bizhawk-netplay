@@ -27,6 +27,7 @@ namespace BizHawkNetplay.Core.Session
             sb.Append("depth=").Append(id.MaxRollbackDepth).Append('\n');
             sb.Append("delay=").Append(prefs.InputDelay).Append('\n');
             sb.Append("rollback=").Append(prefs.WantRollback ? '1' : '0').Append('\n');
+            sb.Append("pwhash=").Append(prefs.PasswordHash).Append('\n');
             sb.Append("udpport=").Append(udpPort).Append('\n');
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
@@ -99,7 +100,7 @@ namespace BizHawkNetplay.Core.Session
                 GetInt(map, "depth", 0));
 
             // Clamp delay to a sane floor so a malformed peer can't request delay < 1.
-            var prefs = new SessionPreferences(Math.Max(1, GetInt(map, "delay", 1)), Get(map, "rollback") == "1");
+            var prefs = new SessionPreferences(Math.Max(1, GetInt(map, "delay", 1)), Get(map, "rollback") == "1", Get(map, "pwhash"));
             int udpPort = GetInt(map, "udpport", 0);
             return (id, prefs, udpPort);
         }

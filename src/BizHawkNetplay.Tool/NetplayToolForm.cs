@@ -53,10 +53,13 @@ namespace BizHawkNetplay.Tool
         private CheckBox _forceDesyncCheck = null!;
         private CheckBox _rollbackCheck = null!;
         private CheckBox _simUnresponsiveCheck = null!;
+        private CheckBox _upnpCheck = null!;
+        private TextBox _passwordBox = null!;
         private NumericUpDown _simLatencyBox = null!;
         private Label _status = null!;
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
+        private bool _upnpEnabled;  // host: whether to attempt the UPnP auto-forward (captured from the checkbox)
         private UpnpMapping? _upnpMapping; // host: the router forward we added, removed on session end
 
         private bool Verbose => _verboseCheck.Checked;
@@ -200,27 +203,34 @@ namespace BizHawkNetplay.Tool
             var portLabel = new Label { Text = "Port:", AutoSize = true, Location = new Point(260, 46) };
             _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 43), Width = 70 };
 
-            var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 82) };
-            _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 79), Width = 50 };
-            _rollbackCheck = new CheckBox { Text = "Prefer rollback (if core qualifies)", AutoSize = true, Location = new Point(155, 81) };
+            var passwordLabel = new Label { Text = "Password:", AutoSize = true, Location = new Point(12, 78) };
+            _passwordBox = new TextBox { Location = new Point(80, 75), Width = 160, UseSystemPasswordChar = true };
+            var passwordHint = new Label { Text = "(optional; must match on both ends)", AutoSize = true, Location = new Point(248, 78), ForeColor = Color.DimGray };
 
-            _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 120), Width = 150 };
+            var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 110) };
+            _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 107), Width = 50 };
+            _rollbackCheck = new CheckBox { Text = "Prefer rollback (if core qualifies)", AutoSize = true, Location = new Point(155, 109) };
+
+            _upnpCheck = new CheckBox { Text = "Auto-forward host port (UPnP)", AutoSize = true, Checked = true, Location = new Point(12, 140) };
+
+            _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 172), Width = 150 };
             _goButton.Click += (_, __) => OnGo();
-            _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 120), Width = 120, Enabled = false };
+            _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 172), Width = 120, Enabled = false };
             _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
 
-            _pubAddrButton = new Button { Text = "My public address", Location = new Point(12, 158), Width = 150 };
+            _pubAddrButton = new Button { Text = "My public address", Location = new Point(12, 210), Width = 150 };
             _pubAddrButton.Click += (_, __) => ShowPublicAddress();
             var natHint = new Label
             {
-                Text = "For internet play: host forwards its port (UPnP is tried automatically).",
-                AutoSize = true, Location = new Point(12, 190), ForeColor = Color.DimGray,
+                Text = "Internet play: the host forwards its port (UPnP, above) or you forward it manually.",
+                AutoSize = true, Location = new Point(12, 244), ForeColor = Color.DimGray,
             };
 
             page.Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton, _pubAddrButton, natHint,
+                passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox, _rollbackCheck,
+                _upnpCheck, _goButton, _disconnectButton, _pubAddrButton, natHint,
             });
             return page;
         }
@@ -321,10 +331,12 @@ namespace BizHawkNetplay.Tool
                 // Rollback is offered for any player count (host-relay), gated on the capability probe
                 // and every peer opting in — the negotiator has the final say.
                 bool wantRollback = _rollbackCheck.Checked;
-                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback);
+                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
+                    SessionPreferences.HashPassword(_passwordBox.Text));
                 var id = BuildIdentity(_adapter, wantRollback);
                 int port = (int)_portBox.Value;
                 _simLatencyMs = (int)_simLatencyBox.Value; // diagnostic artificial UDP delay for this session
+                _upnpEnabled = _upnpCheck.Checked;         // capture on the UI thread for the host accept thread
                 if (_simLatencyMs > 0)
                     Log($"simulating {_simLatencyMs}ms one-way UDP latency (~{2 * _simLatencyMs}ms RTT) — diagnostic");
 
@@ -958,10 +970,17 @@ namespace BizHawkNetplay.Tool
             try
             {
                 string lan = UpnpPortMapper.PrimaryLanIp();
-                _upnpMapping = UpnpPortMapper.TryAddPortMapping(port, lan, "BizHawk Netplay", TimeSpan.FromSeconds(2.5));
-                UiLog(_upnpMapping != null
-                    ? $"UPnP: forwarded port {port} (TCP+UDP) to {lan} on your router"
-                    : $"UPnP: no router accepted a forward — for internet play, forward port {port} (TCP+UDP) to {lan} manually");
+                if (_upnpEnabled)
+                {
+                    _upnpMapping = UpnpPortMapper.TryAddPortMapping(port, lan, "BizHawk Netplay", TimeSpan.FromSeconds(2.5));
+                    UiLog(_upnpMapping != null
+                        ? $"UPnP: forwarded port {port} (TCP+UDP) to {lan} on your router"
+                        : $"UPnP: no router accepted a forward — for internet play, forward port {port} (TCP+UDP) to {lan} manually");
+                }
+                else
+                {
+                    UiLog($"UPnP auto-forward is off — for internet play, forward port {port} (TCP+UDP) to {lan} manually");
+                }
 
                 var pub = StunClient.DiscoverPublicAddress(TimeSpan.FromSeconds(2.0));
                 UiLog(pub != null
