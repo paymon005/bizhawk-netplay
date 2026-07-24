@@ -12,6 +12,8 @@ namespace BizHawkNetplay.Core.Session
         Start = 5,     // synchronized-start marker
         Error = 6,     // rejection with a reason string
         Bye = 7,       // graceful close
+        Ping = 8,      // RTT probe: body = [t0Ms:double] (sender's monotonic send time)
+        Pong = 9,      // RTT echo: body = [t0Ms:double] (the ping's t0, echoed back unchanged)
     }
 
     /// <summary>

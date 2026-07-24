@@ -74,6 +74,14 @@ namespace BizHawkNetplay.Tool
         private readonly Dictionary<int, uint> _localHashes = new Dictionary<int, uint>();
         private readonly Dictionary<int, uint> _remoteHashes = new Dictionary<int, uint>();
 
+        // Live round-trip time over the control channel, for connection-quality feedback.
+        private readonly System.Diagnostics.Stopwatch _pingClock = new System.Diagnostics.Stopwatch();
+        private readonly object _pingLock = new object();
+        private double _pingMs = -1; // EMA of round-trip time; <0 until the first sample
+        private int _pingCount;
+        private int _sessionDelay;    // the input delay this session negotiated
+        private bool _delayHintShown; // one-time "raise your delay" hint per session
+
         // Saved EmuHawk config we override for the session's duration (keep running while unfocused).
         private Config? _config;
         private bool _prevRunInBackground;
@@ -214,6 +222,7 @@ namespace BizHawkNetplay.Tool
                 _listener.Start();
                 UiLog($"hosting on TCP+UDP {port} — waiting for a player to join…");
                 var tcp = _listener.AcceptTcpClient();
+                try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                 try { _listener.Stop(); } catch { }
                 _listener = null;
 
@@ -233,6 +242,7 @@ namespace BizHawkNetplay.Tool
                 UiLog($"connecting to {ip}:{port}…");
                 var tcp = new TcpClient();
                 tcp.Connect(ip, port);
+                try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                 var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                 var channel = new ControlChannel(tcp.GetStream());
                 var sp = Handshake.RunClient(channel, id, prefs, udpLocalPort);
@@ -280,6 +290,10 @@ namespace BizHawkNetplay.Tool
                 // Real-time pacing: tick often and advance however many frames wall-clock demands,
                 // so irregular WinForms-timer firing doesn't run the game slow.
                 _frameMs = FrameMs();
+                _sessionDelay = sp.InputDelay;
+                lock (_pingLock) { _pingMs = -1; _pingCount = 0; }
+                _delayHintShown = false;
+                _pingClock.Restart();
                 _paceClock.Restart();
                 try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
                 _frameTimer.Interval = 2;
@@ -342,6 +356,7 @@ namespace BizHawkNetplay.Tool
                     _adapter!.AdvanceFrame(_driver.CurrentInputs());
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
+                    MaybeSendPing();
                 }
 
                 // One-shot audio pipeline snapshot ~2s in, so a single test shows where sound breaks.
@@ -355,7 +370,9 @@ namespace BizHawkNetplay.Tool
                     Log(_adapter!.AudioStats());
                 }
 
-                Status($"in session — frame {_driver.CurrentFrame}", Color.Green);
+                double ping; lock (_pingLock) { ping = _pingMs; }
+                string pingStr = ping < 0 ? "" : $" — ping {ping:F0}ms";
+                Status($"in session — frame {_driver.CurrentFrame}{pingStr}", Color.Green);
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
         }
@@ -379,6 +396,38 @@ namespace BizHawkNetplay.Tool
             CompareChecksum(frame);
         }
 
+        /// <summary>
+        /// Twice a second, send a ping stamped with our monotonic clock. The peer echoes it back
+        /// unchanged; when it returns we know the round-trip time (see the Pong handler). Cheap RTT
+        /// telemetry so the user can judge connection quality and pick an input delay that won't stall.
+        /// </summary>
+        private void MaybeSendPing()
+        {
+            if (_driver!.CurrentFrame % 30 != 0) return;
+            try { _control!.Send(ControlMessageType.Ping, BitConverter.GetBytes(_pingClock.Elapsed.TotalMilliseconds)); }
+            catch { /* control channel gone; the reader loop will end the session */ }
+        }
+
+        /// <summary>
+        /// Once we have a stable ping, if the negotiated input delay is lower than the round-trip
+        /// really needs, say so once — too-low delay is the usual cause of constant stalling on a real
+        /// network. Lockstep needs delay·frameMs to cover the one-way latency (≈ RTT/2).
+        /// </summary>
+        private void MaybeHintDelay()
+        {
+            if (_delayHintShown) return;
+            double ping; int count;
+            lock (_pingLock) { ping = _pingMs; count = _pingCount; }
+            if (count < 6 || ping < 0) return;
+            _delayHintShown = true;
+            int suggested = (int)Math.Ceiling((ping / 2.0) / _frameMs) + 1;
+            if (suggested > _sessionDelay)
+                Log($"connection ping ~{ping:F0}ms: input delay {suggested} is recommended for smooth play " +
+                    $"(this session is {_sessionDelay}). If it stalls, reconnect with a higher 'Input delay'.");
+            else
+                Log($"connection ping ~{ping:F0}ms: input delay {_sessionDelay} is comfortable for this link.");
+        }
+
         private void ControlReaderLoop()
         {
             try
@@ -391,6 +440,25 @@ namespace BizHawkNetplay.Tool
                         DecodeChecksum(body, out int frame, out uint hash);
                         lock (_hashLock) { _remoteHashes[frame] = hash; }
                         CompareChecksum(frame);
+                    }
+                    else if (type == ControlMessageType.Ping && body.Length == 8)
+                    {
+                        // Echo the sender's t0 back verbatim so it can compute its own round-trip.
+                        try { _control!.Send(ControlMessageType.Pong, body); } catch { }
+                    }
+                    else if (type == ControlMessageType.Pong && body.Length == 8)
+                    {
+                        double t0 = BitConverter.ToDouble(body, 0);
+                        double rtt = _pingClock.Elapsed.TotalMilliseconds - t0;
+                        if (rtt >= 0)
+                        {
+                            lock (_pingLock)
+                            {
+                                _pingMs = _pingMs < 0 ? rtt : 0.8 * _pingMs + 0.2 * rtt;
+                                _pingCount++;
+                            }
+                            BeginInvokeUi(MaybeHintDelay);
+                        }
                     }
                     else if (type == ControlMessageType.Bye)
                     {
