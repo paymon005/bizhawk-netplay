@@ -51,7 +51,10 @@ namespace BizHawkNetplay.Tool
         private readonly CheckBox _freezeInputCheck;
         private readonly CheckBox _forceDesyncCheck;
         private readonly CheckBox _rollbackCheck;
+        private readonly NumericUpDown _simLatencyBox;
         private readonly Label _status;
+
+        private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
 
         private bool Verbose => _verboseCheck.Checked;
 
@@ -188,6 +191,9 @@ namespace BizHawkNetplay.Tool
                                    : "arm this during a session to test resync");
             };
 
+            var simLatencyLabel = new Label { Text = "Sim latency ms (diag):", AutoSize = true, Location = new Point(410, 168) };
+            _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(410, 186), Width = 60 };
+
             _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(150, 145), ForeColor = Color.DimGray };
 
             _log = new TextBox
@@ -202,7 +208,7 @@ namespace BizHawkNetplay.Tool
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
                 delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton, _probeButton, _testInputButton,
-                _verboseCheck, _freezeInputCheck, _forceDesyncCheck, _status, _log,
+                _verboseCheck, _freezeInputCheck, _forceDesyncCheck, simLatencyLabel, _simLatencyBox, _status, _log,
             });
             ResumeLayout(false);
 
@@ -256,11 +262,14 @@ namespace BizHawkNetplay.Tool
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback);
                 var id = BuildIdentity(_adapter, wantRollback);
                 int port = (int)_portBox.Value;
+                _simLatencyMs = (int)_simLatencyBox.Value; // diagnostic artificial UDP delay for this session
+                if (_simLatencyMs > 0)
+                    Log($"simulating {_simLatencyMs}ms one-way UDP latency (~{2 * _simLatencyMs}ms RTT) — diagnostic");
 
                 SetBusy(true);
                 if (_hostRadio.Checked)
                 {
-                    _relay = RelayUdpTransport.Bind(port); _transport = _relay;
+                    _relay = RelayUdpTransport.Bind(port); _transport = WrapSimLatency(_relay);
                     var state = _adapter.ExportState();
                     Log($"exported {state.Length / 1024}KiB initial state; hosting {players} players");
                     StartThread(() => HostThread(port, id, prefs, state, _relay.LocalPort, players));
@@ -269,7 +278,7 @@ namespace BizHawkNetplay.Tool
                 {
                     if (!IPAddress.TryParse(_ipBox.Text.Trim(), out var _))
                     { Log("Enter a valid host IP."); SetBusy(false); return; }
-                    _udp = UdpTransport.Bind(0); _transport = _udp;
+                    _udp = UdpTransport.Bind(0); _transport = WrapSimLatency(_udp);
                     string ip = _ipBox.Text.Trim();
                     StartThread(() => JoinThread(ip, port, id, prefs, _udp.LocalPort));
                 }
@@ -522,9 +531,16 @@ namespace BizHawkNetplay.Tool
 
                 double ping = -1;
                 lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
+
+                // Feed the sync strategy a clock/quality report so rollback's time-sync can size its
+                // prediction horizon. The sim latency (if any) isn't on the TCP ping path, so fold it
+                // into the reported RTT to keep the horizon consistent with the delayed UDP inputs.
+                double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
+                _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, 0));
+
                 string pingStr = ping < 0 ? "" : $" — ping {ping:F0}ms{(_peers.Count > 1 ? " (worst)" : "")}";
                 string rbStr = _driver.Strategy is RollbackStrategy rbs
-                    ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen})"
+                    ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
                     : "";
                 Status($"in session — frame {_driver.CurrentFrame}{pingStr}{rbStr}", Color.Green);
             }
@@ -779,12 +795,16 @@ namespace BizHawkNetplay.Tool
         {
             if (_mode == SyncMode.Rollback)
                 return new FrameDriver(_adapter!, _transport!,
-                    p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth),
+                    p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth, FrameMs()),
                     _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth);
 
             return new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
                 _localPort, _sessionDelay, redundancy: 8);
         }
+
+        /// <summary>Wrap the input transport in the artificial-latency simulator if the diagnostic is set.</summary>
+        private ITransport WrapSimLatency(ITransport inner)
+            => _simLatencyMs > 0 ? new LatencySimTransport(inner, _simLatencyMs) : inner;
 
         private void SendToAllPeers(ControlMessageType type, byte[] body)
         {

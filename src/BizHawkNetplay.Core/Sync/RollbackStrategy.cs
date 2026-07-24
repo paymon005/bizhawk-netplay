@@ -29,13 +29,18 @@ namespace BizHawkNetplay.Core.Sync
         // How many extra frames of state to retain beyond the rollback cap, so a correction landing
         // exactly at the prediction horizon still finds its base state in the ring.
         private const int PruneMargin = 2;
+        // Time-sync soft cap = (one-way latency in frames) + SoftMargin, floored at MinSoftCap.
+        private const int SoftMargin = 2;
+        private const int MinSoftCap = 3;
 
         private readonly InputPipeline _pipeline;
         private readonly IEmuAdapter _adapter;
         private readonly int _portCount;
         private readonly int _localPort;
         private readonly int _maxRollback;
+        private readonly double _frameMs;   // console frame period; 0 disables time-sync
         private readonly PortInput[] _neutral;
+        private int _softCap;               // horizon at which time-sync trims (<= _maxRollback)
 
         // state[N] = whole-core state captured entering frame N (i.e. the result of frames 0..N-1).
         private readonly Dictionary<int, StateHandle> _states = new Dictionary<int, StateHandle>();
@@ -48,7 +53,12 @@ namespace BizHawkNetplay.Core.Sync
         private int _lastRunFrame = -1;         // highest frame actually simulated so far
         private int _lastChecksumFrame = -1;    // highest interval-boundary already checksummed (dedupe)
 
-        public RollbackStrategy(InputPipeline pipeline, IEmuAdapter adapter, int localPort, int maxRollback)
+        /// <param name="frameMs">
+        /// Console frame period, used to turn a measured round-trip time (via <see cref="OnPacingReport"/>)
+        /// into a target prediction horizon for time-sync. 0 (the default) disables time-sync entirely —
+        /// the strategy then only ever stalls at the hard ring cap.
+        /// </param>
+        public RollbackStrategy(InputPipeline pipeline, IEmuAdapter adapter, int localPort, int maxRollback, double frameMs = 0)
         {
             _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
             _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
@@ -57,6 +67,8 @@ namespace BizHawkNetplay.Core.Sync
             if (maxRollback < 1) throw new ArgumentOutOfRangeException(nameof(maxRollback));
             _localPort = localPort;
             _maxRollback = maxRollback;
+            _frameMs = frameMs;
+            _softCap = maxRollback; // no trimming until a pacing report narrows it
 
             _neutral = new PortInput[_portCount];
             for (int p = 0; p < _portCount; p++)
@@ -75,6 +87,8 @@ namespace BizHawkNetplay.Core.Sync
         public int MaxRollbackDepthSeen { get; private set; }
         public long FramesResimulated { get; private set; }
         public int PredictionStalls { get; private set; }
+        public int TimeSyncStalls { get; private set; }
+        public int SoftCap => _softCap;
 
         public FrameDecision BeginFrame(int frame)
         {
@@ -82,12 +96,25 @@ namespace BizHawkNetplay.Core.Sync
             //    re-run forward to `frame` with the fixed inputs before we decide anything new.
             ExecutePendingRollback(frame);
 
-            // 2) Prediction cap. Never run so far past the slowest remote port that a late correction
-            //    could target a frame already evicted from the ring — that would be an unrecoverable
-            //    desync. Stalling here is rollback's only backpressure (and it is rare on a sane link).
-            if (RemoteHorizon(frame) > _maxRollback)
+            int horizon = RemoteHorizon(frame);
+
+            // 2a) Hard cap. Never run so far past the slowest remote port that a late correction could
+            //     target a frame already evicted from the ring — that would be an unrecoverable desync.
+            if (horizon > _maxRollback)
             {
                 PredictionStalls++;
+                IsStalled = true;
+                return FrameDecision.StallDecision;
+            }
+
+            // 2b) Time-sync soft cap. Once a clock-skewed peer runs further ahead of the remote than the
+            //     latency actually warrants, hold it for a tick so the other catches up — keeping
+            //     rollbacks shallow instead of letting depth grow toward the hard cap. Disabled (soft cap
+            //     == hard cap) until a pacing report narrows it, so it never trims the latency we mean to
+            //     hide. This is rollback's only routine backpressure and is rare on a sane link.
+            if (horizon > _softCap)
+            {
+                TimeSyncStalls++;
                 IsStalled = true;
                 return FrameDecision.StallDecision;
             }
@@ -173,8 +200,17 @@ namespace BizHawkNetplay.Core.Sync
 
         public void OnPacingReport(PacingInfo info)
         {
-            // Rollback hides latency directly; no pacing valve needed here (frame-advantage-based
-            // time-sync is a possible refinement, but not required for correctness).
+            // Turn the measured round-trip into a target prediction horizon: about the one-way latency
+            // (RTT/2) in frames, plus a small margin so ordinary jitter doesn't trip it. We allow the
+            // horizon to grow to this much (hiding the real latency) but trim anything beyond it as
+            // clock skew. Floored so a near-zero-latency link still tolerates a couple of frames, and
+            // never above the hard ring cap. No-op when time-sync is disabled (frameMs <= 0).
+            if (_frameMs <= 0) return;
+            int latencyFrames = (int)Math.Ceiling((info.RoundTripMs / 2.0) / _frameMs);
+            int cap = latencyFrames + SoftMargin;
+            if (cap < MinSoftCap) cap = MinSoftCap;
+            if (cap > _maxRollback) cap = _maxRollback;
+            _softCap = cap;
         }
 
         // --- internals ----------------------------------------------------------------

@@ -108,11 +108,11 @@ namespace BizHawkNetplay.Core.Tests
             }
         }
 
-        private static Instance BuildRollback(ITransport t, int localPort)
+        private static Instance BuildRollback(ITransport t, int localPort, double frameMs = 0)
         {
             var emu = new FakeEmuAdapter(portCount: 2) { LocalInputScript = Scripts[localPort] };
             var driver = new FrameDriver(emu, t,
-                p => new RollbackStrategy(p, emu, localPort, MaxRollback),
+                p => new RollbackStrategy(p, emu, localPort, MaxRollback, frameMs),
                 localPort: localPort, delay: Delay, redundancy: Redundancy, rollbackWindow: MaxRollback);
             var inst = new Instance { Emu = emu, Driver = driver, Rollback = (RollbackStrategy)driver.Strategy };
             driver.Start();
@@ -310,6 +310,48 @@ namespace BizHawkNetplay.Core.Tests
                     Assert.True(kv.Value == other, $"checksum disagreement at boundary {kv.Key}");
                 }
             Assert.True(shared >= 10, $"expected many aligned confirmed checksums, got {shared}");
+        }
+
+        [Fact]
+        public void TimeSync_BoundsRollbackDepthUnderClockSkew()
+        {
+            // Instance A's clock runs faster than B's (stepped twice per B step). Without time-sync A
+            // predicts ever-further ahead of B's real inputs and rolls back toward the hard ring cap.
+            // With time-sync it holds itself back once its lead exceeds ~the latency, so peak rollback
+            // depth stays shallow (near the soft cap) — the whole point of the valve.
+            const int k = 3;
+            const double frameMs = 16.0;
+            double rtt = 2 * k * frameMs; // k frames each way -> soft cap ~= k + margin(2) = 5
+
+            (int maxDepth, int tsyncStalls) RunSkewed(bool timeSync)
+            {
+                var clock = new Clock();
+                var (ta, tb) = LatencyLink.Pair(clock, latency: k);
+                var a = BuildRollback(ta, 0, timeSync ? frameMs : 0);
+                var b = BuildRollback(tb, 1, timeSync ? frameMs : 0);
+                if (timeSync)
+                {
+                    a.Rollback.OnPacingReport(new PacingInfo(rtt, 0, 0));
+                    b.Rollback.OnPacingReport(new PacingInfo(rtt, 0, 0));
+                }
+                for (int i = 0; i < 400; i++)
+                {
+                    clock.Tick = i;
+                    a.Step();
+                    a.Step(); // A's clock runs twice as fast as B's
+                    b.Step();
+                }
+                return (a.Rollback.MaxRollbackDepthSeen, a.Rollback.TimeSyncStalls);
+            }
+
+            var withSync = RunSkewed(true);
+            var without = RunSkewed(false);
+
+            Assert.True(withSync.tsyncStalls > 0, "time-sync valve should have engaged under skew");
+            Assert.True(without.maxDepth > withSync.maxDepth,
+                $"time-sync should reduce peak rollback depth (with={withSync.maxDepth}, without={without.maxDepth})");
+            Assert.True(withSync.maxDepth <= k + 3,
+                $"time-sync should bound depth near the soft cap, got {withSync.maxDepth}");
         }
 
         [Fact]
