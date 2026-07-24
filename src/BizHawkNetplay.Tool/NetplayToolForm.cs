@@ -47,6 +47,7 @@ namespace BizHawkNetplay.Tool
         private Button _disconnectButton = null!;
         private Button _probeButton = null!;
         private Button _testInputButton = null!;
+        private Button _pubAddrButton = null!;
         private CheckBox _verboseCheck = null!;
         private CheckBox _freezeInputCheck = null!;
         private CheckBox _forceDesyncCheck = null!;
@@ -56,6 +57,7 @@ namespace BizHawkNetplay.Tool
         private Label _status = null!;
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
+        private UpnpMapping? _upnpMapping; // host: the router forward we added, removed on session end
 
         private bool Verbose => _verboseCheck.Checked;
 
@@ -207,10 +209,18 @@ namespace BizHawkNetplay.Tool
             _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 120), Width = 120, Enabled = false };
             _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
 
+            _pubAddrButton = new Button { Text = "My public address", Location = new Point(12, 158), Width = 150 };
+            _pubAddrButton.Click += (_, __) => ShowPublicAddress();
+            var natHint = new Label
+            {
+                Text = "For internet play: host forwards its port (UPnP is tried automatically).",
+                AutoSize = true, Location = new Point(12, 190), ForeColor = Color.DimGray,
+            };
+
             page.Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton,
+                delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton, _pubAddrButton, natHint,
             });
             return page;
         }
@@ -352,6 +362,9 @@ namespace BizHawkNetplay.Tool
                 _listener.Start();
                 int need = players - 1;
                 UiLog($"hosting on TCP+UDP {port} — waiting for {need} player(s) to join…");
+
+                // Best-effort NAT reachability (UPnP forward + public-address report). Non-fatal.
+                TryPublishHostAddress(port);
 
                 var links = new List<PeerLink>();
                 var greetings = new List<Handshake.JoinerGreeting>();
@@ -917,6 +930,47 @@ namespace BizHawkNetplay.Tool
         private ITransport WrapSimLatency(ITransport inner)
             => _simLatencyMs > 0 ? new LatencySimTransport(inner, _simLatencyMs) : inner;
 
+        // ------------------------------------------------------------------ NAT / reachability
+
+        /// <summary>Look up and log our public (reflexive) address via STUN, plus our LAN IP. Off-thread
+        /// (STUN does a UDP round-trip to a public server).</summary>
+        private void ShowPublicAddress()
+        {
+            Log("looking up your public address…");
+            new Thread(() =>
+            {
+                var pub = StunClient.DiscoverPublicAddress(TimeSpan.FromSeconds(2.5));
+                string lan = UpnpPortMapper.PrimaryLanIp();
+                UiLog(pub != null
+                    ? $"public IP {pub.Address} (this UDP flow maps to :{pub.Port}); LAN IP {lan}"
+                    : $"couldn't reach a STUN server (offline or UDP blocked); LAN IP {lan}");
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-stun" }.Start();
+        }
+
+        /// <summary>
+        /// Host, off the accept thread: best-effort UPnP-forward our port and report the address internet
+        /// joiners should use. Non-fatal — LAN/localhost play needs none of it. The mapping is removed on
+        /// session end.
+        /// </summary>
+        private void TryPublishHostAddress(int port)
+        {
+            try
+            {
+                string lan = UpnpPortMapper.PrimaryLanIp();
+                _upnpMapping = UpnpPortMapper.TryAddPortMapping(port, lan, "BizHawk Netplay", TimeSpan.FromSeconds(2.5));
+                UiLog(_upnpMapping != null
+                    ? $"UPnP: forwarded port {port} (TCP+UDP) to {lan} on your router"
+                    : $"UPnP: no router accepted a forward — for internet play, forward port {port} (TCP+UDP) to {lan} manually");
+
+                var pub = StunClient.DiscoverPublicAddress(TimeSpan.FromSeconds(2.0));
+                UiLog(pub != null
+                    ? $"internet joiners connect to {pub.Address}:{port}  (LAN: {lan}:{port})"
+                    : $"couldn't determine your public IP (offline or STUN blocked); LAN joiners use {lan}:{port}");
+            }
+            catch (Exception ex) { UiLog("(note) NAT setup skipped: " + ex.Message); }
+        }
+
         private void SendToAllPeers(ControlMessageType type, byte[] body)
         {
             foreach (var link in _peers)
@@ -1117,6 +1171,13 @@ namespace BizHawkNetplay.Tool
 
         private void TeardownNetwork()
         {
+            // Remove any UPnP forward we added, off-thread (it's a router round-trip).
+            var upnp = _upnpMapping;
+            _upnpMapping = null;
+            if (upnp != null)
+                new Thread(() => { try { upnp.Remove(TimeSpan.FromSeconds(2)); } catch { } })
+                { IsBackground = true, Name = "BizHawkNetplay-upnp" }.Start();
+
             // Stop any in-flight reconnect wait first; its loop exits once these flags clear.
             _awaitingReconnect = false;
             var reconnect = _reconnectThread;
