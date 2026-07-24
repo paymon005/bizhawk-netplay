@@ -163,7 +163,7 @@ namespace BizHawkNetplay.Tool
             _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 73), Width = 50 };
             _rollbackCheck = new CheckBox
             {
-                Text = "Prefer rollback (2P, if core qualifies)", AutoSize = true, Location = new Point(155, 75),
+                Text = "Prefer rollback (if core qualifies)", AutoSize = true, Location = new Point(155, 75),
             };
 
             _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 108), Width = 130 };
@@ -254,11 +254,9 @@ namespace BizHawkNetplay.Tool
                 // frames invisibly and restores, so it must be paused first.)
                 APIs.EmuClient.Pause();
 
-                // Rollback is a 2-player upgrade only; for 3–4 players we always run lockstep. It's also
-                // gated on the capability probe + the peer opting in (the negotiator has the final say).
-                bool wantRollback = _rollbackCheck.Checked && players == 2;
-                if (_rollbackCheck.Checked && players != 2)
-                    Log($"rollback is 2-player only; this core exposes {players} ports — using lockstep.");
+                // Rollback is offered for any player count (host-relay), gated on the capability probe
+                // and every peer opting in — the negotiator has the final say.
+                bool wantRollback = _rollbackCheck.Checked;
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback);
                 var id = BuildIdentity(_adapter, wantRollback);
                 int port = (int)_portBox.Value;
@@ -329,12 +327,18 @@ namespace BizHawkNetplay.Tool
                 int finalDelay = prefs.InputDelay;
                 foreach (var g in greetings) finalDelay = Math.Max(finalDelay, g.Prefs.InputDelay);
 
-                // The host is authoritative on sync mode too. Rollback only for a single joiner (2P):
-                // ask the negotiator, which grants it only if both peers opted in and both cleared the
-                // probe depth threshold. Anything else (or 3–4 players) stays lockstep.
+                // The host is authoritative on sync mode too. Grant rollback only if the host opted in
+                // AND every joiner pairwise negotiates to rollback (each opted in and cleared the probe
+                // depth threshold); if any peer can't or won't, everyone runs lockstep.
                 SyncMode mode = SyncMode.Lockstep;
-                if (players == 2 && greetings.Count == 1)
-                    mode = SessionNegotiator.Negotiate(id, greetings[0].Id, prefs, greetings[0].Prefs).Mode;
+                if (prefs.WantRollback && greetings.Count >= 1)
+                {
+                    bool allRollback = true;
+                    foreach (var g in greetings)
+                        if (SessionNegotiator.Negotiate(id, g.Id, prefs, g.Prefs).Mode != SyncMode.Rollback)
+                        { allRollback = false; break; }
+                    mode = allRollback ? SyncMode.Rollback : SyncMode.Lockstep;
+                }
 
                 foreach (var link in links)
                     Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state);
@@ -417,6 +421,9 @@ namespace BizHawkNetplay.Tool
                 // Each peer bounds its own ring independently; correctness never needs them equal.
                 int d = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
                 _rollbackDepth = Math.Max(ProbeResult.RollbackDepthThreshold, Math.Min(d, RollbackDepthCap));
+                if (_playerCount > 2)
+                    Log($"rollback with {_playerCount} players is experimental — inputs relay through the " +
+                        "host (two hops), so rollbacks may run deeper. Uncheck 'Prefer rollback' if it feels choppy.");
             }
             _driver = CreateDriver();
 
