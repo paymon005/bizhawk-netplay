@@ -51,6 +51,7 @@ namespace BizHawkNetplay.Tool
         private readonly CheckBox _freezeInputCheck;
         private readonly CheckBox _forceDesyncCheck;
         private readonly CheckBox _rollbackCheck;
+        private readonly CheckBox _simUnresponsiveCheck;
         private readonly NumericUpDown _simLatencyBox;
         private readonly Label _status;
 
@@ -71,6 +72,7 @@ namespace BizHawkNetplay.Tool
             public Thread? Reader;
             public double PingMs = -1;        // guarded by _pingLock
             public int PingCount;             // guarded by _pingLock
+            public long LastRecvTicks;        // UtcNow.Ticks of the last message from this peer (Interlocked)
             public string Label = "";
         }
 
@@ -119,6 +121,14 @@ namespace BizHawkNetplay.Tool
         private SessionPreferences? _hostPrefs;
         private int _hostTcpPort;
         private int _hostUdpPort;
+
+        // Liveness: pings go out on a wall-clock cadence (independent of frame stepping, so a
+        // stalled-but-alive peer keeps answering), and a watchdog drops a link that has gone silent —
+        // catching a frozen peer or a silent cable-pull that never breaks the TCP connection.
+        private double _lastPingMs = -1;                // _pingClock time of the last ping we sent
+        private const double PingIntervalMs = 400;      // ~2.5 pings/sec
+        private const double PingTimeoutSeconds = 3.0;  // no message for this long => presumed dropped
+        private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
 
         // Sync mode + rollback config for the live session.
         private SyncMode _mode = SyncMode.Lockstep;   // negotiated; drives which strategy the driver builds
@@ -193,6 +203,15 @@ namespace BizHawkNetplay.Tool
 
             var simLatencyLabel = new Label { Text = "Sim latency ms (diag):", AutoSize = true, Location = new Point(410, 168) };
             _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(410, 186), Width = 60 };
+            _simUnresponsiveCheck = new CheckBox { Text = "Simulate unresponsive (diag)", AutoSize = true, Location = new Point(410, 214) };
+            _simUnresponsiveCheck.CheckedChanged += (_, __) =>
+            {
+                _simUnresponsive = _simUnresponsiveCheck.Checked;
+                if (_sessionActive)
+                    Log(_simUnresponsive
+                        ? "simulating an unresponsive peer — we've stopped answering pings; the other side should drop us in ~3s"
+                        : "resumed responding to pings");
+            };
 
             _status = new Label { Text = "Idle.", AutoSize = true, Location = new Point(150, 145), ForeColor = Color.DimGray };
 
@@ -208,7 +227,8 @@ namespace BizHawkNetplay.Tool
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
                 delayLabel, _delayBox, _rollbackCheck, _goButton, _disconnectButton, _probeButton, _testInputButton,
-                _verboseCheck, _freezeInputCheck, _forceDesyncCheck, simLatencyLabel, _simLatencyBox, _status, _log,
+                _verboseCheck, _freezeInputCheck, _forceDesyncCheck, simLatencyLabel, _simLatencyBox,
+                _simUnresponsiveCheck, _status, _log,
             });
             ResumeLayout(false);
 
@@ -448,9 +468,11 @@ namespace BizHawkNetplay.Tool
             foreach (var link in _peers)
             {
                 var l = link;
+                l.LastRecvTicks = DateTime.UtcNow.Ticks; // seed liveness so the watchdog has a baseline
                 l.Reader = new Thread(() => PeerReaderLoop(l)) { IsBackground = true, Name = "BizHawkNetplay-control" };
                 l.Reader.Start();
             }
+            _lastPingMs = -1; // send the first ping immediately
 
             // Real-time pacing: tick often and advance however many frames wall-clock demands,
             // so irregular WinForms-timer firing doesn't run the game slow.
@@ -522,8 +544,12 @@ namespace BizHawkNetplay.Tool
                     _adapter!.AdvanceFrame(_driver.CurrentInputs());
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
-                    MaybeSendPing();
                 }
+
+                // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
+                // and a dead link is still detected while we're waiting on it).
+                MaybeSendPing();
+                CheckLinkTimeouts();
 
                 // One-shot audio pipeline snapshot ~2s in, so a single test shows where sound breaks.
                 if (!_audioStatsLogged && _driver.CurrentFrame >= 120)
@@ -596,18 +622,42 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// Twice a second, ping each peer with our monotonic clock; the peer echoes it back unchanged
-        /// and the returning Pong gives that link's round-trip time. Cheap per-link RTT telemetry so
-        /// the user can judge connection quality and pick an input delay that won't stall.
+        /// On a wall-clock cadence (not tied to frame stepping, so a stalled peer keeps them flowing),
+        /// ping each peer with our monotonic clock; the peer echoes it back and the returning Pong gives
+        /// that link's round-trip time. Doubles as the liveness signal the drop watchdog watches for.
         /// </summary>
         private void MaybeSendPing()
         {
-            if (_driver!.CurrentFrame % 30 != 0) return;
-            var body = BitConverter.GetBytes(_pingClock.Elapsed.TotalMilliseconds);
+            if (_simUnresponsive) return; // diagnostic: pretend we're frozen
+            double nowMs = _pingClock.Elapsed.TotalMilliseconds;
+            if (_lastPingMs >= 0 && nowMs - _lastPingMs < PingIntervalMs) return;
+            _lastPingMs = nowMs;
+            var body = BitConverter.GetBytes(nowMs);
             foreach (var link in _peers)
             {
                 try { link.Control.Send(ControlMessageType.Ping, body); } catch { }
             }
+        }
+
+        /// <summary>
+        /// Watchdog: a link that hasn't sent us anything for <see cref="PingTimeoutSeconds"/> is presumed
+        /// dropped (frozen peer or a silent cable-pull that never broke TCP) and routed into the same
+        /// drop handling as a broken connection. Pings/pongs are serviced on the reader thread regardless
+        /// of stepping, so a merely stalled — but alive — peer keeps answering and is never flagged here.
+        /// </summary>
+        private void CheckLinkTimeouts()
+        {
+            if (_awaitingReconnect) return; // already holding for a reconnect
+            long now = DateTime.UtcNow.Ticks;
+            long limit = TimeSpan.FromSeconds(PingTimeoutSeconds).Ticks;
+            PeerLink? dead = null;
+            foreach (var link in _peers)
+            {
+                long last = Interlocked.Read(ref link.LastRecvTicks);
+                if (last != 0 && now - last > limit) { dead = link; break; }
+            }
+            if (dead != null)
+                OnPeerLinkLost(dead, $"no response for {PingTimeoutSeconds:F0}s (ping timeout)");
         }
 
         /// <summary>
@@ -645,6 +695,7 @@ namespace BizHawkNetplay.Tool
                 while (_sessionActive)
                 {
                     var (type, body) = link.Control.Receive();
+                    Interlocked.Exchange(ref link.LastRecvTicks, DateTime.UtcNow.Ticks); // liveness heartbeat
                     if (type == ControlMessageType.Checksum && body.Length == 8)
                     {
                         // Only the host aggregates; a joiner never receives checksums.
@@ -652,7 +703,8 @@ namespace BizHawkNetplay.Tool
                     }
                     else if (type == ControlMessageType.Ping && body.Length == 8)
                     {
-                        try { link.Control.Send(ControlMessageType.Pong, body); } catch { }
+                        if (!_simUnresponsive) // diagnostic: a "frozen" peer stops answering pings
+                            try { link.Control.Send(ControlMessageType.Pong, body); } catch { }
                     }
                     else if (type == ControlMessageType.Pong && body.Length == 8)
                     {
@@ -936,6 +988,7 @@ namespace BizHawkNetplay.Tool
                     Tcp = tcp, Control = channel, RemotePort = freedPort,
                     UdpEndpoint = udpEp, Label = $"P{freedPort + 1} ({remoteIp})",
                 };
+                link.LastRecvTicks = DateTime.UtcNow.Ticks; // seed liveness for the rejoined link
                 _peers.Add(link);
                 UpdateRelayPeers();
                 link.Reader = new Thread(() => PeerReaderLoop(link)) { IsBackground = true, Name = "BizHawkNetplay-control" };
@@ -971,6 +1024,7 @@ namespace BizHawkNetplay.Tool
             if (!_sessionActive && _listener == null && _peers.Count == 0) { SetBusy(false); return; }
             _sessionActive = false;
             _frameTimer.Stop();
+            _simUnresponsive = false; _simUnresponsiveCheck.Checked = false; // clear the diagnostic
             try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
 
             try { SendToAllPeers(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
