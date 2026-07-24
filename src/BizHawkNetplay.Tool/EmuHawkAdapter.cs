@@ -39,6 +39,7 @@ namespace BizHawkNetplay.Tool
         private short[] _asyncScratch = Array.Empty<short>();
         // Diagnostics so a single test round shows where the audio pipeline breaks.
         private long _audioFrames, _audioPairs, _audioPumps;
+        private int _audioPeak;               // max abs sample seen (0 => core handed us silence)
         private string _audioSyncErr = "";
 
         public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
@@ -164,12 +165,15 @@ namespace BizHawkNetplay.Tool
                     if (_coreSyncSound)
                     {
                         _coreSound!.GetSamplesSync(out var samples, out var nSampPairs);
-                        _soundBuffer!.Enqueue(samples, nSampPairs * _soundChannels);
+                        int shorts = nSampPairs * _soundChannels;
+                        UpdatePeak(samples, shorts);
+                        _soundBuffer!.Enqueue(samples, shorts);
                         _audioFrames++; _audioPairs += nSampPairs;
                     }
                     else
                     {
                         _coreSound!.GetSamplesAsync(_asyncScratch);
+                        UpdatePeak(_asyncScratch, _asyncScratch.Length);
                         _soundBuffer!.Enqueue(_asyncScratch, _asyncScratch.Length);
                         _audioFrames++; _audioPairs += _asyncScratch.Length / Math.Max(1, _soundChannels);
                     }
@@ -206,7 +210,18 @@ namespace BizHawkNetplay.Tool
             int cap = _soundBuffer?.Capacity ?? 0;
             string err = string.IsNullOrEmpty(_audioSyncErr) ? "" : $" drainErr='{_audioSyncErr}'";
             return $"audio stats: coreMode={(_coreSyncSound ? "Sync" : "Async")} frames={_audioFrames} " +
-                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts{err}";
+                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts peak={_audioPeak}{err}";
+        }
+
+        private void UpdatePeak(short[] buf, int shorts)
+        {
+            if (buf == null) return;
+            int n = Math.Min(shorts, buf.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int a = buf[i]; if (a < 0) a = -a;
+                if (a > _audioPeak) _audioPeak = a;
+            }
         }
 
         private int SamplesPerFrame()
@@ -237,6 +252,7 @@ namespace BizHawkNetplay.Tool
             _audioReady = false;
             AudioDiagnostic = "";
             _audioFrames = _audioPairs = _audioPumps = 0;
+            _audioPeak = 0;
             _audioSyncErr = "";
             try
             {
@@ -276,8 +292,17 @@ namespace BizHawkNetplay.Tool
 
                 _sound.SetInputPin(_soundBuffer); // route the device to pull from our async ring
                 _audioReady = true;
+
+                string cfg = "";
+                try
+                {
+                    var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                    if (config != null)
+                        cfg = $" out={config.SoundOutputMethod} vol={config.SoundVolume} throttle={config.SoundThrottle} enabled={config.SoundEnabled}";
+                }
+                catch { }
                 AudioDiagnostic = $"core={_coreSound.GetType().Name} mode={(_coreSyncSound ? "Sync" : "Async")} " +
-                                  $"rate={_sound.SampleRate} ch={_soundChannels} started={_sound.IsStarted}";
+                                  $"rate={_sound.SampleRate} ch={_soundChannels} started={_sound.IsStarted}{cfg}";
             }
             catch (Exception ex) { _sound = null; AudioDiagnostic = "audio init failed: " + ex.Message; }
         }
