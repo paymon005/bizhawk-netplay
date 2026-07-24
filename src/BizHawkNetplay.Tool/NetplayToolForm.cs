@@ -57,20 +57,33 @@ namespace BizHawkNetplay.Tool
         private int _startEmuFrame; // emulator FrameCount at session start, for drift detection
         private readonly TextBox _log;
 
+        /// <summary>One control link to a peer. Host: one per joiner. Joiner: one (the host).</summary>
+        private sealed class PeerLink
+        {
+            public TcpClient Tcp = null!;
+            public ControlChannel Control = null!;
+            public int RemotePort;            // the controller port this peer owns (host peer = 0)
+            public IPEndPoint UdpEndpoint = null!;
+            public Thread? Reader;
+            public double PingMs = -1;        // guarded by _pingLock
+            public int PingCount;             // guarded by _pingLock
+            public string Label = "";
+        }
+
         // --- Session state (all touched on the UI thread except where noted) ---
         private EmuHawkAdapter? _adapter;
-        private UdpTransport? _udp;
+        private ITransport? _transport;        // the FrameDriver's input channel (see below)
+        private UdpTransport? _udp;            // joiner: point-to-point to the host
+        private RelayUdpTransport? _relay;     // host: UDP hub that relays inputs among all peers
         private TcpListener? _listener;
-        private TcpClient? _tcp;
-        private ControlChannel? _control;
         private FrameDriver? _driver;
-        private Thread? _controlReader;
+        private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
-        private bool _isHost;      // this instance hosted the session (authoritative for desync capture)
+        private bool _isHost;      // host is authoritative for desync detection + resync
+        private int _playerCount = 2;
         private int _localPort;    // our controller port, for rebuilding the driver on resync
         private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
-        private volatile bool _awaitingResync; // joiner paused, waiting for the host's authoritative state
         private DateTime _lastResync = DateTime.MinValue; // debounces near-simultaneous resync triggers
         private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
         private const int MaxResyncs = 6;
@@ -78,15 +91,14 @@ namespace BizHawkNetplay.Tool
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private int _stallLog;     // throttles verbose stall messages
 
+        // Desync detection: the host aggregates every peer's checksum for a frame (its own + each
+        // joiner's); once it has them all it verifies they agree. Joiners just report to the host.
         private readonly object _hashLock = new object();
-        private readonly Dictionary<int, uint> _localHashes = new Dictionary<int, uint>();
-        private readonly Dictionary<int, uint> _remoteHashes = new Dictionary<int, uint>();
+        private readonly Dictionary<int, List<uint>> _frameHashes = new Dictionary<int, List<uint>>();
 
-        // Live round-trip time over the control channel, for connection-quality feedback.
+        // Live round-trip time per control link, for connection-quality feedback.
         private readonly System.Diagnostics.Stopwatch _pingClock = new System.Diagnostics.Stopwatch();
         private readonly object _pingLock = new object();
-        private double _pingMs = -1; // EMA of round-trip time; <0 until the first sample
-        private int _pingCount;
         private int _sessionDelay;    // the input delay this session negotiated
         private bool _delayHintShown; // one-time "raise your delay" hint per session
 
@@ -198,28 +210,34 @@ namespace BizHawkNetplay.Tool
                     Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
                 _isHost = _hostRadio.Checked;
+                int players = _adapter.PortCount; // one network player per controller port the core exposes
+                if (_hostRadio.Checked && players < 2)
+                {
+                    Log($"this core exposes only {players} controller port — configure at least 2 controllers to host netplay.");
+                    SetBusy(false); return;
+                }
                 var id = BuildIdentity(_adapter);
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback: false); // rollback is M3
                 int port = (int)_portBox.Value;
 
                 // Freeze the emulator NOW. Otherwise the host keeps free-running between exporting
-                // its state and the joiner arriving, so the two sims start on different frames and
-                // desync immediately. Paused here == the frame both peers resume from.
+                // its state and the joiners arriving, so the sims start on different frames and
+                // desync immediately. Paused here == the frame all peers resume from.
                 APIs.EmuClient.Pause();
 
                 SetBusy(true);
                 if (_hostRadio.Checked)
                 {
-                    _udp = UdpTransport.Bind(port);
+                    _relay = RelayUdpTransport.Bind(port); _transport = _relay;
                     var state = _adapter.ExportState();
-                    Log($"exported {state.Length / 1024}KiB initial state (frozen until a player joins)");
-                    StartThread(() => HostThread(port, id, prefs, state, _udp.LocalPort));
+                    Log($"exported {state.Length / 1024}KiB initial state; hosting {players} players");
+                    StartThread(() => HostThread(port, id, prefs, state, _relay.LocalPort, players));
                 }
                 else
                 {
                     if (!IPAddress.TryParse(_ipBox.Text.Trim(), out var _))
                     { Log("Enter a valid host IP."); SetBusy(false); return; }
-                    _udp = UdpTransport.Bind(0);
+                    _udp = UdpTransport.Bind(0); _transport = _udp;
                     string ip = _ipBox.Text.Trim();
                     StartThread(() => JoinThread(ip, port, id, prefs, _udp.LocalPort));
                 }
@@ -231,23 +249,51 @@ namespace BizHawkNetplay.Tool
             }
         }
 
-        private void HostThread(int port, PeerIdentity id, SessionPreferences prefs, byte[] state, int udpLocalPort)
+        private void HostThread(int port, PeerIdentity id, SessionPreferences prefs, byte[] state, int udpLocalPort, int players)
         {
             try
             {
                 _listener = new TcpListener(IPAddress.Any, port);
                 _listener.Start();
-                UiLog($"hosting on TCP+UDP {port} — waiting for a player to join…");
-                var tcp = _listener.AcceptTcpClient();
-                try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
+                int need = players - 1;
+                UiLog($"hosting on TCP+UDP {port} — waiting for {need} player(s) to join…");
+
+                var links = new List<PeerLink>();
+                var greetings = new List<Handshake.JoinerGreeting>();
+                for (int i = 0; i < need; i++)
+                {
+                    var tcp = _listener.AcceptTcpClient();
+                    try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
+                    var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
+                    var channel = new ControlChannel(tcp.GetStream());
+                    var greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+                    int assignedPort = i + 1;
+                    links.Add(new PeerLink
+                    {
+                        Tcp = tcp,
+                        Control = channel,
+                        RemotePort = assignedPort,
+                        UdpEndpoint = new IPEndPoint(remoteIp, greet.UdpPort),
+                        Label = $"P{assignedPort + 1} ({remoteIp})",
+                    });
+                    greetings.Add(greet);
+                    UiLog($"P{assignedPort + 1} joined ({i + 1}/{need})");
+                }
                 try { _listener.Stop(); } catch { }
                 _listener = null;
 
-                var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
-                var channel = new ControlChannel(tcp.GetStream());
-                var sp = Handshake.RunHost(channel, id, prefs, state, udpLocalPort);
-                _tcp = tcp; _control = channel;
-                BeginInvokeUi(() => BeginSession(sp, remoteIp));
+                // The host decides the authoritative delay (max anyone asked) once everyone's in.
+                int finalDelay = prefs.InputDelay;
+                foreach (var g in greetings) finalDelay = Math.Max(finalDelay, g.Prefs.InputDelay);
+
+                foreach (var link in links)
+                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, SyncMode.Lockstep, state);
+
+                var eps = new List<IPEndPoint>();
+                foreach (var link in links) eps.Add(link.UdpEndpoint);
+                _relay!.SetPeers(eps);
+
+                BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay));
             }
             catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
         }
@@ -262,16 +308,36 @@ namespace BizHawkNetplay.Tool
                 try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                 var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                 var channel = new ControlChannel(tcp.GetStream());
-                var sp = Handshake.RunClient(channel, id, prefs, udpLocalPort);
-                _tcp = tcp; _control = channel;
-                BeginInvokeUi(() => BeginSession(sp, remoteIp));
+                var sp = Handshake.RunClientMulti(channel, id, prefs, udpLocalPort);
+                var link = new PeerLink
+                {
+                    Tcp = tcp,
+                    Control = channel,
+                    RemotePort = 0, // the host
+                    UdpEndpoint = new IPEndPoint(remoteIp, sp.RemoteUdpPort),
+                    Label = $"host ({remoteIp})",
+                };
+                BeginInvokeUi(() => BeginSessionJoiner(sp, link));
             }
             catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
         }
 
         // ------------------------------------------------------------------ session
 
-        private void BeginSession(SessionParams sp, IPAddress remoteIp)
+        private void BeginSessionHost(List<PeerLink> links, int players, int delay)
+        {
+            try
+            {
+                _peers.Clear(); _peers.AddRange(links);
+                _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
+                Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
+                Log($"all {players} players connected — you are P1 (host)");
+                BeginSessionCommon(SyncMode.Lockstep, $"{links.Count} peer(s)");
+            }
+            catch (Exception ex) { FailSession(ex.Message); }
+        }
+
+        private void BeginSessionJoiner(SessionParams sp, PeerLink hostLink)
         {
             try
             {
@@ -280,52 +346,63 @@ namespace BizHawkNetplay.Tool
                     _adapter!.ImportState(sp.InitialState);
                     Log($"imported {sp.InitialState.Length / 1024}KiB host state");
                 }
+                _peers.Clear(); _peers.Add(hostLink);
+                _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
+                _udp!.SetRemote(hostLink.UdpEndpoint);
                 // Both peers should print the SAME number here; if not, the start is misaligned.
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
-
-                _udp!.SetRemote(new IPEndPoint(remoteIp, sp.RemoteUdpPort));
-                _driver = new FrameDriver(_adapter!, _udp, p => new LockstepStrategy(p),
-                    sp.LocalPort, sp.InputDelay, redundancy: 8);
-
-                ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
-                try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
-                APIs.EmuClient.Pause(); // we own the clock now
-                _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
-                _driver.Start();
-                _sessionActive = true;
-
-                // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
-                // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
-                _audioStatsLogged = false;
-                _adapter!.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
-                Log(_adapter.AudioReady ? "audio enabled — " + _adapter.AudioDiagnostic
-                                        : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
-
-                _controlReader = new Thread(ControlReaderLoop) { IsBackground = true, Name = "BizHawkNetplay-control" };
-                _controlReader.Start();
-
-                // Real-time pacing: tick often and advance however many frames wall-clock demands,
-                // so irregular WinForms-timer firing doesn't run the game slow.
-                _frameMs = FrameMs();
-                _sessionDelay = sp.InputDelay;
-                _localPort = sp.LocalPort;
-                _resyncCount = 0;
-                _awaitingResync = false;
-                _lastResync = DateTime.MinValue;
-                lock (_pingLock) { _pingMs = -1; _pingCount = 0; }
-                _delayHintShown = false;
-                _pingClock.Restart();
-                _paceClock.Restart();
-                try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
-                _frameTimer.Interval = 2;
-                _frameTimer.Start();
-
-                Status($"in session — {(sp.Mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
-                       $"you are P{sp.LocalPort + 1}, delay {sp.InputDelay}", Color.Green);
-                Log($"session started vs {remoteIp}:{sp.RemoteUdpPort}");
-                _disconnectButton.Enabled = true;
+                Log($"joined as P{sp.LocalPort + 1} of {sp.PlayerCount}");
+                BeginSessionCommon(sp.Mode, hostLink.Label);
             }
             catch (Exception ex) { FailSession(ex.Message); }
+        }
+
+        /// <summary>The role-independent session bring-up: driver, audio, per-link readers, pacing.</summary>
+        private void BeginSessionCommon(SyncMode mode, string remoteLabel)
+        {
+            _driver = new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
+                _localPort, _sessionDelay, redundancy: 8);
+
+            ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
+            try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
+            APIs.EmuClient.Pause(); // we own the clock now
+            _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
+            _resyncCount = 0;
+            _lastResync = DateTime.MinValue;
+            lock (_hashLock) { _frameHashes.Clear(); }
+            _driver.Start();
+            _sessionActive = true;
+
+            // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
+            // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
+            _audioStatsLogged = false;
+            _adapter!.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
+            Log(_adapter.AudioReady ? "audio enabled — " + _adapter.AudioDiagnostic
+                                    : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
+
+            // One reader thread per control link.
+            foreach (var link in _peers)
+            {
+                var l = link;
+                l.Reader = new Thread(() => PeerReaderLoop(l)) { IsBackground = true, Name = "BizHawkNetplay-control" };
+                l.Reader.Start();
+            }
+
+            // Real-time pacing: tick often and advance however many frames wall-clock demands,
+            // so irregular WinForms-timer firing doesn't run the game slow.
+            _frameMs = FrameMs();
+            _delayHintShown = false;
+            lock (_pingLock) { foreach (var link in _peers) { link.PingMs = -1; link.PingCount = 0; } }
+            _pingClock.Restart();
+            _paceClock.Restart();
+            try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
+            _frameTimer.Interval = 2;
+            _frameTimer.Start();
+
+            Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
+                   $"you are P{_localPort + 1}/{_playerCount}, delay {_sessionDelay}", Color.Green);
+            Log($"session started vs {remoteLabel}");
+            _disconnectButton.Enabled = true;
         }
 
         private void FrameTick()
@@ -355,14 +432,6 @@ namespace BizHawkNetplay.Tool
                         ? $"EmuHawk advanced {diff} extra frame(s) — did you unpause?"
                         : $"the core's frame count jumped back {-diff} — a rewind/load-state hotkey fired?";
                     EndSession(why + " The tool must own the frame clock; avoid EmuHawk hotkeys during a session.");
-                    return;
-                }
-
-                // A desync was detected and we're the joiner: don't advance our (suspect) state — wait
-                // for the host's authoritative resync to arrive over the control channel.
-                if (_awaitingResync)
-                {
-                    Status("desync — waiting for host to resync…", Color.DarkOrange);
                     return;
                 }
 
@@ -399,8 +468,9 @@ namespace BizHawkNetplay.Tool
                     Log(_adapter!.AudioStats());
                 }
 
-                double ping; lock (_pingLock) { ping = _pingMs; }
-                string pingStr = ping < 0 ? "" : $" — ping {ping:F0}ms";
+                double ping = -1;
+                lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
+                string pingStr = ping < 0 ? "" : $" — ping {ping:F0}ms{(_peers.Count > 1 ? " (worst)" : "")}";
                 Status($"in session — frame {_driver.CurrentFrame}{pingStr}", Color.Green);
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
@@ -413,75 +483,85 @@ namespace BizHawkNetplay.Tool
             uint hash = _adapter!.HashMainMemory();
             if (_forceDesyncOnce)
             {
-                // Diagnostic: corrupt the reported hash (not the actual state) so both peers see a
-                // mismatch and exercise the resync path. The state is fine, so recovery re-matches.
+                // Diagnostic: corrupt the reported hash (not the actual state) so the peers disagree
+                // and exercise the resync path. The state is fine, so recovery re-matches immediately.
                 hash ^= 0xDEADBEEFu;
                 _forceDesyncOnce = false;
                 Log($"injected a fake desync at frame {frame} (diagnostic)");
             }
-            lock (_hashLock) { _localHashes[frame] = hash; }
-            try { _control!.Send(ControlMessageType.Checksum, EncodeChecksum(frame, hash)); }
-            catch { /* control channel gone; the reader loop will end the session */ }
             if (Verbose)
             {
                 int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
-                // emuΔ should always equal frame; if not, DoFrameAdvance stepped the core an unequal
-                // number of times on this side — the smoking gun for a frame-advance drift desync.
                 string drift = emuDelta == frame ? "" : $"  !! emuΔ={emuDelta} (expected {frame})";
                 Log($"checksum frame {frame}: local {hash:X8}{drift}");
             }
-            CompareChecksum(frame);
+            // The host aggregates all peers' checksums itself; joiners just report theirs to the host.
+            if (_isHost) RecordChecksum(frame, hash);
+            else if (_peers.Count > 0)
+            {
+                try { _peers[0].Control.Send(ControlMessageType.Checksum, EncodeChecksum(frame, hash)); }
+                catch { /* control link gone; the reader loop will end the session */ }
+            }
         }
 
         /// <summary>
-        /// Twice a second, send a ping stamped with our monotonic clock. The peer echoes it back
-        /// unchanged; when it returns we know the round-trip time (see the Pong handler). Cheap RTT
-        /// telemetry so the user can judge connection quality and pick an input delay that won't stall.
+        /// Twice a second, ping each peer with our monotonic clock; the peer echoes it back unchanged
+        /// and the returning Pong gives that link's round-trip time. Cheap per-link RTT telemetry so
+        /// the user can judge connection quality and pick an input delay that won't stall.
         /// </summary>
         private void MaybeSendPing()
         {
             if (_driver!.CurrentFrame % 30 != 0) return;
-            try { _control!.Send(ControlMessageType.Ping, BitConverter.GetBytes(_pingClock.Elapsed.TotalMilliseconds)); }
-            catch { /* control channel gone; the reader loop will end the session */ }
+            var body = BitConverter.GetBytes(_pingClock.Elapsed.TotalMilliseconds);
+            foreach (var link in _peers)
+            {
+                try { link.Control.Send(ControlMessageType.Ping, body); } catch { }
+            }
         }
 
         /// <summary>
-        /// Once we have a stable ping, if the negotiated input delay is lower than the round-trip
+        /// Once ping is stable, if the negotiated input delay is lower than the worst link's round-trip
         /// really needs, say so once — too-low delay is the usual cause of constant stalling on a real
         /// network. Lockstep needs delay·frameMs to cover the one-way latency (≈ RTT/2).
         /// </summary>
         private void MaybeHintDelay()
         {
-            if (_delayHintShown) return;
-            double ping; int count;
-            lock (_pingLock) { ping = _pingMs; count = _pingCount; }
-            if (count < 6 || ping < 0) return;
+            if (_delayHintShown || _peers.Count == 0) return;
+            double worst = -1; int minCount = int.MaxValue;
+            lock (_pingLock)
+            {
+                foreach (var link in _peers)
+                {
+                    if (link.PingMs > worst) worst = link.PingMs;
+                    if (link.PingCount < minCount) minCount = link.PingCount;
+                }
+            }
+            if (minCount < 6 || worst < 0) return;
             _delayHintShown = true;
-            int suggested = (int)Math.Ceiling((ping / 2.0) / _frameMs) + 1;
+            int suggested = (int)Math.Ceiling((worst / 2.0) / _frameMs) + 1;
             if (suggested > _sessionDelay)
-                Log($"connection ping ~{ping:F0}ms: input delay {suggested} is recommended for smooth play " +
+                Log($"worst link ping ~{worst:F0}ms: input delay {suggested} is recommended for smooth play " +
                     $"(this session is {_sessionDelay}). If it stalls, reconnect with a higher 'Input delay'.");
             else
-                Log($"connection ping ~{ping:F0}ms: input delay {_sessionDelay} is comfortable for this link.");
+                Log($"worst link ping ~{worst:F0}ms: input delay {_sessionDelay} is comfortable for this link.");
         }
 
-        private void ControlReaderLoop()
+        /// <summary>Reader loop for one control link. Dispatch depends on our role.</summary>
+        private void PeerReaderLoop(PeerLink link)
         {
             try
             {
                 while (_sessionActive)
                 {
-                    var (type, body) = _control!.Receive();
+                    var (type, body) = link.Control.Receive();
                     if (type == ControlMessageType.Checksum && body.Length == 8)
                     {
-                        DecodeChecksum(body, out int frame, out uint hash);
-                        lock (_hashLock) { _remoteHashes[frame] = hash; }
-                        CompareChecksum(frame);
+                        // Only the host aggregates; a joiner never receives checksums.
+                        if (_isHost) { DecodeChecksum(body, out int frame, out uint hash); RecordChecksum(frame, hash); }
                     }
                     else if (type == ControlMessageType.Ping && body.Length == 8)
                     {
-                        // Echo the sender's t0 back verbatim so it can compute its own round-trip.
-                        try { _control!.Send(ControlMessageType.Pong, body); } catch { }
+                        try { link.Control.Send(ControlMessageType.Pong, body); } catch { }
                     }
                     else if (type == ControlMessageType.Pong && body.Length == 8)
                     {
@@ -491,85 +571,81 @@ namespace BizHawkNetplay.Tool
                         {
                             lock (_pingLock)
                             {
-                                _pingMs = _pingMs < 0 ? rtt : 0.8 * _pingMs + 0.2 * rtt;
-                                _pingCount++;
+                                link.PingMs = link.PingMs < 0 ? rtt : 0.8 * link.PingMs + 0.2 * rtt;
+                                link.PingCount++;
                             }
                             BeginInvokeUi(MaybeHintDelay);
                         }
                     }
-                    else if (type == ControlMessageType.ResyncRequest)
-                    {
-                        // The joiner saw a desync; the host (authoritative) drives the recovery.
-                        BeginInvokeUi(() => { if (_isHost) PerformResyncAsHost(); });
-                    }
                     else if (type == ControlMessageType.Resync)
                     {
-                        var state = body; // whole-core authoritative state from the host
-                        BeginInvokeUi(() => ApplyResyncAsJoiner(state));
+                        var state = body; // authoritative whole-core state from the host
+                        if (!_isHost) BeginInvokeUi(() => ApplyResyncAsJoiner(state));
                     }
                     else if (type == ControlMessageType.Bye)
                     {
-                        BeginInvokeUi(() => EndSession("peer left the session"));
+                        BeginInvokeUi(() => EndSession($"{link.Label} left the session"));
                         return;
                     }
                 }
             }
             catch (Exception ex)
             {
-                if (_sessionActive) BeginInvokeUi(() => EndSession("control channel lost: " + ex.Message));
-            }
-        }
-
-        private void CompareChecksum(int frame)
-        {
-            uint local, remote;
-            lock (_hashLock)
-            {
-                if (!_localHashes.TryGetValue(frame, out local)) return;
-                if (!_remoteHashes.TryGetValue(frame, out remote)) return;
-            }
-            if (local != remote)
-                BeginInvokeUi(() => OnDesync(frame, local, remote));
-            else
-            {
-                if (Verbose) BeginInvokeUi(() => Log($"checksum frame {frame}: MATCH ({local:X8})"));
-                // A clean match after a resync confirms recovery worked; clear the attempt counter.
-                if (_resyncCount != 0)
-                    BeginInvokeUi(() => { if (_resyncCount != 0) { _resyncCount = 0; Log("back in sync — recovery confirmed"); } });
+                if (_sessionActive) BeginInvokeUi(() => EndSession($"control link to {link.Label} lost: " + ex.Message));
             }
         }
 
         /// <summary>
-        /// A checksum mismatch means the two sims have diverged. Rather than end the session, recover:
-        /// the host re-broadcasts an authoritative state and both peers rebuild their frame driver from
-        /// a clean baseline (see PerformResyncAsHost / ApplyResyncAsJoiner). The host also snapshots the
-        /// diverged state to quick-slot 10 for inspection. A short grace window after each resync
-        /// debounces the near-simultaneous triggers both peers raise for the same desync.
+        /// Host desync detection: gather each peer's checksum for a frame (our own + every joiner's).
+        /// Once all <see cref="_playerCount"/> are in, they must agree; if not, resync everyone. Called
+        /// from the UI thread (our own hash) and from reader threads (joiners'), hence the lock.
         /// </summary>
-        private void OnDesync(int frame, uint local, uint remote)
+        private void RecordChecksum(int frame, uint hash)
         {
-            if (_awaitingResync) return; // already waiting for the host's state
-            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // just resynced; give it time
-            Log($"DESYNC at frame {frame} (local {local:X8} != remote {remote:X8})");
-            if (_isHost)
+            bool complete = false, mismatch = false;
+            lock (_hashLock)
             {
-                PerformResyncAsHost();
+                if (!_frameHashes.TryGetValue(frame, out var list)) { list = new List<uint>(); _frameHashes[frame] = list; }
+                list.Add(hash);
+                if (list.Count >= _playerCount)
+                {
+                    complete = true;
+                    for (int i = 1; i < list.Count; i++) if (list[i] != list[0]) { mismatch = true; break; }
+                    _frameHashes.Remove(frame);
+                }
+                // Drop very old partial entries (a peer that never reported a frame) to bound memory.
+                if (_frameHashes.Count > 32)
+                {
+                    var stale = new List<int>();
+                    foreach (var k in _frameHashes.Keys) if (k < frame - 600) stale.Add(k);
+                    foreach (var k in stale) _frameHashes.Remove(k);
+                }
             }
-            else
-            {
-                _awaitingResync = true; // stop advancing our suspect state until the host resyncs us
-                try { _control!.Send(ControlMessageType.ResyncRequest, Array.Empty<byte>()); } catch { }
-                Log("requesting an authoritative state from the host…");
-            }
+            if (!complete) return;
+            if (mismatch) BeginInvokeUi(() => OnHostDesync(frame));
+            else if (_resyncCount != 0)
+                BeginInvokeUi(() => { if (_resyncCount != 0) { _resyncCount = 0; Log("back in sync — recovery confirmed"); } });
+            else if (Verbose)
+                BeginInvokeUi(() => Log($"checksum frame {frame}: all {_playerCount} agree"));
         }
 
-        /// <summary>Host: snapshot the diverged state to slot 10, then broadcast an authoritative state
-        /// and rebuild from a clean baseline. Bounded by <see cref="MaxResyncs"/> so a persistent
-        /// (non-transient) desync eventually gives up instead of looping forever.</summary>
+        private void OnHostDesync(int frame)
+        {
+            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // just resynced; give it time
+            Log($"DESYNC at frame {frame} — peers disagree");
+            PerformResyncAsHost();
+        }
+
+        /// <summary>
+        /// Host recovery: snapshot the diverged state to slot 10, broadcast an authoritative state to
+        /// every peer, and rebuild from a clean baseline. Joiners adopt it in <see cref="ApplyResyncAsJoiner"/>.
+        /// Bounded by <see cref="MaxResyncs"/> so a persistent (non-transient) desync gives up instead
+        /// of looping; a short grace window debounces repeat triggers for the same desync.
+        /// </summary>
         private void PerformResyncAsHost()
         {
             if (!_sessionActive || !_isHost) return;
-            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // debounce double-trigger
+            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // debounce
             try
             {
                 APIs.SaveState.SaveSlot(10, suppressOSD: false);
@@ -585,9 +661,9 @@ namespace BizHawkNetplay.Tool
             try
             {
                 var state = _adapter!.ExportState();
-                _control!.Send(ControlMessageType.Resync, state);
+                SendToAllPeers(ControlMessageType.Resync, state);
                 RebuildDriver();
-                Log($"resync #{_resyncCount}: sent {state.Length / 1024}KiB host state; resuming from a clean baseline");
+                Log($"resync #{_resyncCount}: sent {state.Length / 1024}KiB host state to {_peers.Count} peer(s); resuming");
             }
             catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
         }
@@ -605,7 +681,6 @@ namespace BizHawkNetplay.Tool
             {
                 _adapter!.ImportState(state);
                 RebuildDriver();
-                _awaitingResync = false;
                 Log($"resync #{_resyncCount}: imported {state.Length / 1024}KiB host state; resuming");
             }
             catch (Exception ex) { EndSession("resync apply failed: " + ex.Message); }
@@ -618,13 +693,21 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void RebuildDriver()
         {
-            _driver = new FrameDriver(_adapter!, _udp!, p => new LockstepStrategy(p),
+            _driver = new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
                 _localPort, _sessionDelay, redundancy: 8);
             _startEmuFrame = APIs.Emulation.FrameCount();
-            lock (_hashLock) { _localHashes.Clear(); _remoteHashes.Clear(); }
+            lock (_hashLock) { _frameHashes.Clear(); }
             _driver.Start();
             _lastResync = DateTime.UtcNow;
             _paceClock.Restart();
+        }
+
+        private void SendToAllPeers(ControlMessageType type, byte[] body)
+        {
+            foreach (var link in _peers)
+            {
+                try { link.Control.Send(type, body); } catch { }
+            }
         }
 
         private void FailSession(string reason)
@@ -640,18 +723,18 @@ namespace BizHawkNetplay.Tool
 
         private void EndSession(string reason)
         {
-            if (!_sessionActive && _listener == null && _tcp == null) { SetBusy(false); return; }
+            if (!_sessionActive && _listener == null && _peers.Count == 0) { SetBusy(false); return; }
             _sessionActive = false;
             _frameTimer.Stop();
             try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
 
-            try { _control?.Send(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
+            try { SendToAllPeers(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
             TeardownNetwork();
 
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
             try { APIs.EmuClient.Unpause(); } catch { }
-            lock (_hashLock) { _localHashes.Clear(); _remoteHashes.Clear(); }
+            lock (_hashLock) { _frameHashes.Clear(); }
 
             Log("session ended: " + reason);
             Status("Idle.", Color.DimGray);
@@ -662,17 +745,22 @@ namespace BizHawkNetplay.Tool
         {
             try { _listener?.Stop(); } catch { }
             _listener = null;
-            try { _tcp?.Close(); } catch { }
-            _tcp = null;
-            _control = null;
-            try { _udp?.Dispose(); } catch { }
-            _udp = null;
+
+            var peers = new List<PeerLink>(_peers);
+            _peers.Clear();
+            foreach (var link in peers) { try { link.Tcp?.Close(); } catch { } }
+
+            try { (_transport as IDisposable)?.Dispose(); } catch { }
+            _transport = null; _udp = null; _relay = null;
             _driver = null;
-            var reader = _controlReader;
-            _controlReader = null;
-            if (reader != null && reader.IsAlive && reader != Thread.CurrentThread)
+
+            foreach (var link in peers)
             {
-                try { reader.Join(300); } catch { }
+                var reader = link.Reader;
+                if (reader != null && reader.IsAlive && reader != Thread.CurrentThread)
+                {
+                    try { reader.Join(300); } catch { }
+                }
             }
         }
 
