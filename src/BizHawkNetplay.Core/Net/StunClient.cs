@@ -17,13 +17,25 @@ namespace BizHawkNetplay.Core.Net
         private const ushort BindingRequest = 0x0001;
         private const ushort BindingSuccess = 0x0101;
 
-        // Public STUN servers (Binding Request over UDP), tried in order until one answers.
-        private static readonly (string host, int port)[] Servers =
+        /// <summary>Public STUN servers (Binding Request over UDP), tried in order until one answers.</summary>
+        public static readonly (string host, int port)[] Servers =
         {
             ("stun.l.google.com", 19302),
             ("stun1.l.google.com", 19302),
             ("stun.cloudflare.com", 3478),
         };
+
+        /// <summary>Resolve a STUN server host to its first IPv4 endpoint, or null.</summary>
+        public static IPEndPoint? ResolveV4(string host, int port)
+        {
+            try
+            {
+                foreach (var a in Dns.GetHostAddresses(host))
+                    if (a.AddressFamily == AddressFamily.InterNetwork) return new IPEndPoint(a, port);
+            }
+            catch { }
+            return null;
+        }
 
         /// <summary>Build a Binding Request and hand back its 12-byte transaction id for matching.</summary>
         public static byte[] BuildRequest(out byte[] transactionId)

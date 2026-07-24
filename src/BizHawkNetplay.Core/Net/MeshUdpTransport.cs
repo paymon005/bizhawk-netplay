@@ -33,6 +33,12 @@ namespace BizHawkNetplay.Core.Net
         private volatile bool _running = true;
         private volatile IPEndPoint[] _peers = Array.Empty<IPEndPoint>();
 
+        // Reflexive-address discovery: while a request is pending, the receive loop watches for the
+        // STUN response on this same socket (so the reflexive port is the one the mesh actually uses).
+        private volatile byte[]? _pendingStunTxn;
+        private volatile IPEndPoint? _reflexive;
+        private readonly ManualResetEventSlim _stunEvent = new ManualResetEventSlim(false);
+
         private MeshUdpTransport(int localPort)
         {
             _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
@@ -63,6 +69,33 @@ namespace BizHawkNetplay.Core.Net
 
         public bool TryReceive(out byte[] datagram) => _inbound.TryDequeue(out datagram!);
 
+        /// <summary>
+        /// Discover this socket's public (reflexive) address via STUN, without disturbing the running
+        /// receive loop — the response is caught there. Because it's the mesh's own socket, the port
+        /// reported is the one peers must send to. Returns null if offline or every server times out.
+        /// </summary>
+        public IPEndPoint? DiscoverReflexive(TimeSpan timeout)
+        {
+            int perServer = Math.Max(400, (int)(timeout.TotalMilliseconds / StunClient.Servers.Length));
+            foreach (var (host, port) in StunClient.Servers)
+            {
+                var server = StunClient.ResolveV4(host, port);
+                if (server == null) continue;
+
+                var req = StunClient.BuildRequest(out var txn);
+                _reflexive = null;
+                _stunEvent.Reset();
+                _pendingStunTxn = txn;
+                try { _socket.SendTo(req, server); }
+                catch { _pendingStunTxn = null; continue; }
+
+                bool got = _stunEvent.Wait(perServer);
+                _pendingStunTxn = null;
+                if (got && _reflexive != null) return _reflexive;
+            }
+            return null;
+        }
+
         private void ReceiveLoop()
         {
             var buffer = new byte[2048];
@@ -73,6 +106,17 @@ namespace BizHawkNetplay.Core.Net
                 try { n = _socket.ReceiveFrom(buffer, ref from); }
                 catch (SocketException) { if (!_running) break; continue; }
                 catch (ObjectDisposedException) { break; }
+
+                // While a reflexive discovery is in flight, a STUN response arrives here (it isn't
+                // MAGIC-framed, so it would otherwise be dropped below). Only parsed while pending.
+                var stunTxn = _pendingStunTxn;
+                if (stunTxn != null && n >= 20)
+                {
+                    var pkt = new byte[n];
+                    Buffer.BlockCopy(buffer, 0, pkt, 0, n);
+                    var refl = StunClient.ParseResponse(pkt, stunTxn);
+                    if (refl != null) { _reflexive = refl; _stunEvent.Set(); continue; }
+                }
 
                 if (n < HeaderSize) continue;
                 if (buffer[0] != Magic[0] || buffer[1] != Magic[1] ||
@@ -111,6 +155,7 @@ namespace BizHawkNetplay.Core.Net
             _running = false;
             try { _socket.Dispose(); } catch { /* ignore */ }
             try { if (_rxThread.IsAlive) _rxThread.Join(500); } catch { /* ignore */ }
+            try { _stunEvent.Dispose(); } catch { /* ignore */ }
         }
     }
 }

@@ -17,6 +17,7 @@ namespace BizHawkNetplay.Core.Session
         Resync = 10,   // host -> client: authoritative whole-core state to recover from a desync
         ResyncRequest = 11, // client -> host: "I saw a desync, please resync us"
         PeerList = 12, // host -> client: the other peers' UDP endpoints for the direct input mesh
+        Candidate = 13, // client -> host: my reflexive (STUN) UDP endpoint, for NAT-traversal candidates
     }
 
     /// <summary>

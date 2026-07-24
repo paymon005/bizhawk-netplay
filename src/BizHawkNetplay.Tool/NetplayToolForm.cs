@@ -51,11 +51,13 @@ namespace BizHawkNetplay.Tool
         private CheckBox _verboseCheck = null!;
         private CheckBox _freezeInputCheck = null!;
         private CheckBox _forceDesyncCheck = null!;
-        private CheckBox _rollbackCheck = null!;
+        private ComboBox _netcodeCombo = null!;
+        private Label _netcodeLabel = null!;
         private CheckBox _simUnresponsiveCheck = null!;
         private CheckBox _upnpCheck = null!;
         private TextBox _passwordBox = null!;
         private NumericUpDown _simLatencyBox = null!;
+        private ListView _playersList = null!;
         private Label _status = null!;
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
@@ -73,7 +75,8 @@ namespace BizHawkNetplay.Tool
             public TcpClient Tcp = null!;
             public ControlChannel Control = null!;
             public int RemotePort;            // the controller port this peer owns (host peer = 0)
-            public IPEndPoint UdpEndpoint = null!;
+            public IPEndPoint UdpEndpoint = null!;      // LAN/observed endpoint (from TCP source + reported port)
+            public IPEndPoint? ReflexiveEndpoint;       // public (STUN) endpoint, for NAT traversal; null until reported
             public Thread? Reader;
             public double PingMs = -1;        // guarded by _pingLock
             public int PingCount;             // guarded by _pingLock
@@ -136,6 +139,8 @@ namespace BizHawkNetplay.Tool
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
 
         // Sync mode + rollback config for the live session.
+        private enum NetcodeChoice { Automatic = 0, Rollback = 1, Lockstep = 2 }
+        private NetcodeChoice _netcodeChoice; // captured from the dropdown at start (host decides the mode)
         private SyncMode _mode = SyncMode.Lockstep;   // negotiated; drives which strategy the driver builds
         private int _probeDepth = -1;                 // cached capability-probe depth (frames); -1 = not measured
         private int _rollbackDepth;                   // this session's savestate-ring depth when in rollback
@@ -168,6 +173,7 @@ namespace BizHawkNetplay.Tool
 
             var tabs = new TabControl { Dock = DockStyle.Fill };
             tabs.TabPages.Add(BuildConnectionTab());
+            tabs.TabPages.Add(BuildPlayersTab());
             tabs.TabPages.Add(BuildDiagnosticsTab());
             tabs.TabPages.Add(BuildLogTab());
 
@@ -209,7 +215,11 @@ namespace BizHawkNetplay.Tool
 
             var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 110) };
             _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 107), Width = 50 };
-            _rollbackCheck = new CheckBox { Text = "Prefer rollback (if core qualifies)", AutoSize = true, Location = new Point(155, 109) };
+
+            var netcodeSelLabel = new Label { Text = "Netcode:", AutoSize = true, Location = new Point(155, 110) };
+            _netcodeCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(215, 107), Width = 110 };
+            _netcodeCombo.Items.AddRange(new object[] { "Automatic", "Rollback", "Lockstep" });
+            _netcodeCombo.SelectedIndex = 0; // Automatic: rollback if the core qualifies, else lockstep
 
             _upnpCheck = new CheckBox { Text = "Auto-forward host port (UPnP)", AutoSize = true, Checked = true, Location = new Point(12, 140) };
 
@@ -223,14 +233,22 @@ namespace BizHawkNetplay.Tool
             var natHint = new Label
             {
                 Text = "Internet play: the host forwards its port (UPnP, above) or you forward it manually.",
-                AutoSize = true, Location = new Point(12, 244), ForeColor = Color.DimGray,
+                AutoSize = true, Location = new Point(12, 242), ForeColor = Color.DimGray,
+            };
+
+            _netcodeLabel = new Label
+            {
+                Text = "Netcode in use: —", Location = new Point(12, 270), Width = 300, Height = 24,
+                BorderStyle = BorderStyle.FixedSingle, TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(6, 0, 0, 0), ForeColor = Color.DimGray,
             };
 
             page.Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
-                passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox, _rollbackCheck,
-                _upnpCheck, _goButton, _disconnectButton, _pubAddrButton, natHint,
+                passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
+                netcodeSelLabel, _netcodeCombo, _upnpCheck, _goButton, _disconnectButton,
+                _pubAddrButton, natHint, _netcodeLabel,
             });
             return page;
         }
@@ -277,6 +295,49 @@ namespace BizHawkNetplay.Tool
                 simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
             });
             return page;
+        }
+
+        /// <summary>The Players tab: a live list of everyone in the session with their address and ping.</summary>
+        private TabPage BuildPlayersTab()
+        {
+            var page = new TabPage("Players");
+            _playersList = new ListView
+            {
+                Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true,
+                HeaderStyle = ColumnHeaderStyle.Nonclickable,
+            };
+            _playersList.Columns.Add("Player", 90);
+            _playersList.Columns.Add("Address", 250);
+            _playersList.Columns.Add("Ping", 80);
+            page.Controls.Add(_playersList);
+            return page;
+        }
+
+        /// <summary>Rebuild the players list from the current peers (self first). Cheap for 2–4 players.</summary>
+        private void RefreshPlayersList()
+        {
+            if (_playersList.IsDisposed) return;
+            _playersList.BeginUpdate();
+            _playersList.Items.Clear();
+            if (_sessionActive)
+            {
+                var me = new ListViewItem($"P{_localPort + 1} (you)");
+                me.SubItems.Add(_isHost ? "this machine (host)" : "this machine");
+                me.SubItems.Add("—");
+                _playersList.Items.Add(me);
+
+                lock (_pingLock)
+                {
+                    foreach (var link in _peers)
+                    {
+                        var item = new ListViewItem($"P{link.RemotePort + 1}");
+                        item.SubItems.Add(link.UdpEndpoint?.ToString() ?? link.Label);
+                        item.SubItems.Add(link.PingMs < 0 ? "…" : $"{link.PingMs:F0} ms");
+                        _playersList.Items.Add(item);
+                    }
+                }
+            }
+            _playersList.EndUpdate();
         }
 
         /// <summary>The Log tab: the scrolling monospace session log, filling the page.</summary>
@@ -328,9 +389,11 @@ namespace BizHawkNetplay.Tool
                 // frames invisibly and restores, so it must be paused first.)
                 APIs.EmuClient.Pause();
 
-                // Rollback is offered for any player count (host-relay), gated on the capability probe
-                // and every peer opting in — the negotiator has the final say.
-                bool wantRollback = _rollbackCheck.Checked;
+                // Netcode: Automatic prefers rollback but drops to lockstep if the probe fails; Rollback
+                // forces it; Lockstep forces lockstep. We "want" rollback unless Lockstep is chosen, and
+                // probe accordingly. The host's choice is authoritative for the session's mode.
+                _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
+                bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
                     SessionPreferences.HashPassword(_passwordBox.Text));
                 var id = BuildIdentity(_adapter, wantRollback);
@@ -406,13 +469,22 @@ namespace BizHawkNetplay.Tool
                 int finalDelay = prefs.InputDelay;
                 foreach (var g in greetings) finalDelay = Math.Max(finalDelay, g.Prefs.InputDelay);
 
-                // The host is authoritative on sync mode too. Grant rollback only if the host opted in
-                // AND every joiner pairwise negotiates to rollback (each opted in and cleared the probe
-                // depth threshold); if any peer can't or won't, everyone runs lockstep.
-                SyncMode mode = SyncMode.Lockstep;
-                if (prefs.WantRollback && greetings.Count >= 1)
+                // The host is authoritative on sync mode. Lockstep/Rollback force it; Automatic grants
+                // rollback only if every joiner pairwise negotiates to rollback (opted in + cleared the
+                // probe depth threshold), else lockstep.
+                SyncMode mode;
+                if (_netcodeChoice == NetcodeChoice.Lockstep)
                 {
-                    bool allRollback = true;
+                    mode = SyncMode.Lockstep;
+                }
+                else if (_netcodeChoice == NetcodeChoice.Rollback)
+                {
+                    mode = SyncMode.Rollback; // forced — bypasses the probe gate
+                    UiLog("netcode forced to rollback — bypassing the capability probe (may stutter if a core can't keep up)");
+                }
+                else // Automatic
+                {
+                    bool allRollback = greetings.Count >= 1;
                     foreach (var g in greetings)
                         if (SessionNegotiator.Negotiate(id, g.Id, prefs, g.Prefs).Mode != SyncMode.Rollback)
                         { allRollback = false; break; }
@@ -423,10 +495,10 @@ namespace BizHawkNetplay.Tool
                 // (it reaches the host at the address it connected to, so the host is left off the list).
                 foreach (var link in links)
                     Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state,
-                        EndpointsExcept(links, link));
+                        CandidatesExcept(links, link));
 
                 // The host sends its own input directly to every joiner.
-                _mesh!.SetPeers(EndpointsExcept(links, null));
+                _mesh!.SetPeers(CandidatesExcept(links, null));
 
                 BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay, mode));
             }
@@ -550,8 +622,52 @@ namespace BizHawkNetplay.Tool
 
             Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
                    $"you are P{_localPort + 1}/{_playerCount}, delay {_sessionDelay}", Color.Green);
+            _netcodeLabel.Text = "Netcode in use: " + (mode == SyncMode.Rollback ? "Rollback" : "Lockstep");
+            _netcodeLabel.ForeColor = mode == SyncMode.Rollback ? Color.DarkGreen : Color.DarkSlateBlue;
+            RefreshPlayersList();
             Log($"session started vs {remoteLabel}");
             _disconnectButton.Enabled = true;
+
+            // NAT traversal: a joiner discovers its public (reflexive) mesh endpoint and reports it to the
+            // host, which shares it so peers can reach us across NAT. Additive to the LAN candidates, so
+            // LAN/localhost play is unaffected whether or not this succeeds. The host is reached at the
+            // address joiners connected to, so it doesn't report one.
+            if (!_isHost) StartReflexiveDiscovery();
+        }
+
+        /// <summary>Joiner: off-thread, STUN-discover our mesh socket's public endpoint and send it to the host.</summary>
+        private void StartReflexiveDiscovery()
+        {
+            var mesh = _mesh;
+            if (mesh == null) return;
+            new Thread(() =>
+            {
+                var reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(2.5));
+                if (reflexive == null)
+                {
+                    UiLog("(note) couldn't determine our public UDP endpoint (STUN blocked) — internet peers may be unreachable");
+                    return;
+                }
+                UiLog($"our public UDP endpoint is {reflexive} — sharing it for NAT traversal");
+                BeginInvokeUi(() =>
+                {
+                    if (_sessionActive && _peers.Count > 0)
+                        try { _peers[0].Control.Send(ControlMessageType.Candidate, HandshakeCodec.EncodeEndpoints(new[] { reflexive })); }
+                        catch { /* link gone */ }
+                });
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-stun-mesh" }.Start();
+        }
+
+        /// <summary>Host: record a joiner's reflexive endpoint and re-share the candidate lists.</summary>
+        private void OnJoinerCandidate(PeerLink link, IPEndPoint reflexive)
+        {
+            if (!_sessionActive || !_isHost || _awaitingReconnect) return;
+            if (!_peers.Contains(link)) return;                                  // dropped meanwhile
+            if (reflexive.Equals(link.ReflexiveEndpoint)) return;               // unchanged
+            link.ReflexiveEndpoint = reflexive;
+            if (Verbose) Log($"{link.Label} public endpoint {reflexive}");
+            RedistributeMesh();
         }
 
         private void FrameTick()
@@ -639,6 +755,8 @@ namespace BizHawkNetplay.Tool
                     ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
                     : "";
                 Status($"in session — frame {_driver.CurrentFrame}{pingStr}{rbStr}", Color.Green);
+
+                if (_driver.CurrentFrame % 30 == 0) RefreshPlayersList(); // ~2x/sec: keep the players/ping list live
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
         }
@@ -795,6 +913,17 @@ namespace BizHawkNetplay.Tool
                                 ApplyJoinerMesh();
                                 if (Verbose) Log($"mesh updated: {eps.Count} other peer(s)");
                             });
+                        }
+                    }
+                    else if (type == ControlMessageType.Candidate)
+                    {
+                        // A joiner reported its public (reflexive) endpoint; record it and re-share the
+                        // candidate lists so everyone can reach it across NAT.
+                        if (_isHost)
+                        {
+                            var eps = HandshakeCodec.DecodeEndpoints(body);
+                            if (eps.Count > 0)
+                                BeginInvokeUi(() => OnJoinerCandidate(link, eps[0]));
                         }
                     }
                     else if (type == ControlMessageType.Resync)
@@ -1037,20 +1166,38 @@ namespace BizHawkNetplay.Tool
             _reconnectThread.Start();
         }
 
-        /// <summary>UDP endpoints of the given links, optionally excluding one — a peer set for the mesh.</summary>
-        private static List<IPEndPoint> EndpointsExcept(IReadOnlyList<PeerLink> links, PeerLink? except)
+        /// <summary>All candidate UDP endpoints of the given links (LAN plus reflexive/public where
+        /// known), optionally excluding one — the peer set the mesh sends to and accepts from. The mesh
+        /// tolerates dead candidates, so including both lets the same session work on LAN and over NAT.</summary>
+        private static List<IPEndPoint> CandidatesExcept(IReadOnlyList<PeerLink> links, PeerLink? except)
         {
-            var eps = new List<IPEndPoint>(links.Count);
+            var eps = new List<IPEndPoint>();
             foreach (var l in links)
-                if (!ReferenceEquals(l, except)) eps.Add(l.UdpEndpoint);
+            {
+                if (ReferenceEquals(l, except)) continue;
+                eps.Add(l.UdpEndpoint);
+                if (l.ReflexiveEndpoint != null) eps.Add(l.ReflexiveEndpoint);
+            }
             return eps;
         }
 
-        /// <summary>Host: point our mesh at every currently-connected joiner's UDP endpoint.</summary>
+        /// <summary>Host: point our mesh at every currently-connected joiner's candidate endpoints.</summary>
         private void UpdateMeshPeers()
         {
             if (_mesh == null) return;
-            try { _mesh.SetPeers(EndpointsExcept(_peers, null)); } catch { }
+            try { _mesh.SetPeers(CandidatesExcept(_peers, null)); } catch { }
+        }
+
+        /// <summary>Host: re-point our own mesh and re-send each joiner its candidate peer list (used
+        /// whenever the candidate set changes — a reflexive candidate arrives, or someone rejoins).</summary>
+        private void RedistributeMesh()
+        {
+            UpdateMeshPeers();
+            foreach (var l in _peers)
+            {
+                try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(CandidatesExcept(_peers, l))); }
+                catch { /* link gone; its reader will handle it */ }
+            }
         }
 
         /// <summary>Joiner: point our mesh at the host (peer 0) plus every other joiner we've been told about.</summary>
@@ -1124,7 +1271,7 @@ namespace BizHawkNetplay.Tool
                 // The rejoiner's mesh peers = every current survivor (it reaches the host directly). It
                 // adopts this state + mesh via Welcome and rebuilds fresh on its own side.
                 Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
-                    EndpointsExcept(_peers, null));
+                    CandidatesExcept(_peers, null));
 
                 var link = new PeerLink
                 {
@@ -1142,7 +1289,7 @@ namespace BizHawkNetplay.Tool
                 foreach (var l in _peers)
                 {
                     if (ReferenceEquals(l, link)) continue;
-                    try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(EndpointsExcept(_peers, l))); } catch { }
+                    try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(CandidatesExcept(_peers, l))); } catch { }
                     try { l.Control.Send(ControlMessageType.Resync, state); } catch { }
                 }
 
@@ -1182,6 +1329,10 @@ namespace BizHawkNetplay.Tool
             ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
             try { APIs.EmuClient.Unpause(); } catch { }
             lock (_hashLock) { _frameHashes.Clear(); }
+
+            _netcodeLabel.Text = "Netcode in use: —";
+            _netcodeLabel.ForeColor = Color.DimGray;
+            RefreshPlayersList(); // session inactive now → clears the list
 
             Log("session ended: " + reason);
             Status("Idle.", Color.DimGray);
@@ -1399,6 +1550,7 @@ namespace BizHawkNetplay.Tool
             _hostRadio.Enabled = _joinRadio.Enabled = !busy;
             _ipBox.Enabled = !busy && _joinRadio.Checked;
             _portBox.Enabled = _delayBox.Enabled = !busy;
+            _netcodeCombo.Enabled = _passwordBox.Enabled = _upnpCheck.Enabled = !busy;
             _probeButton.Enabled = !busy;
             _disconnectButton.Enabled = busy;
             // _testInputButton stays enabled (useful to check bindings before and during a session)
