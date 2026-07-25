@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using BizHawkNetplay.Core.Net;
+using BizHawkNetplay.Core.Session;
+using Xunit;
+
+namespace BizHawkNetplay.Core.Tests
+{
+    /// <summary>
+    /// Exercises the reliable-over-UDP stream directly and, crucially, end-to-end: the real
+    /// <see cref="Handshake"/> runs over a pair of these streams across a lossy, reordering link,
+    /// proving the punch path reuses the TCP control channel unmodified.
+    /// </summary>
+    public class ReliableUdpStreamTests
+    {
+        /// <summary>
+        /// An async datagram link between two reliable streams with injectable loss and reordering.
+        /// Each direction has a worker thread that pulls a random queued datagram (reorder) and either
+        /// drops it or delivers it to the far stream's OnDatagram.
+        /// </summary>
+        private sealed class LossyLink : IDisposable
+        {
+            private readonly Random _rng;
+            private readonly double _drop;
+            private readonly object _l = new object();
+            private readonly List<byte[]> _aToB = new List<byte[]>();
+            private readonly List<byte[]> _bToA = new List<byte[]>();
+            private ReliableUdpStream _a = null!, _b = null!;
+            private volatile bool _run = true;
+            private Thread _t1 = null!, _t2 = null!;
+
+            public LossyLink(int seed, double drop) { _rng = new Random(seed); _drop = drop; }
+
+            public (ReliableUdpStream a, ReliableUdpStream b) Connect()
+            {
+                _a = new ReliableUdpStream(seg => Enqueue(_aToB, seg));
+                _b = new ReliableUdpStream(seg => Enqueue(_bToA, seg));
+                _t1 = new Thread(() => Pump(_aToB, () => _b)) { IsBackground = true };
+                _t2 = new Thread(() => Pump(_bToA, () => _a)) { IsBackground = true };
+                _t1.Start(); _t2.Start();
+                return (_a, _b);
+            }
+
+            private void Enqueue(List<byte[]> q, byte[] seg)
+            {
+                lock (_l) q.Add((byte[])seg.Clone());
+            }
+
+            private void Pump(List<byte[]> q, Func<ReliableUdpStream> target)
+            {
+                while (_run)
+                {
+                    byte[]? seg = null;
+                    lock (_l)
+                    {
+                        if (q.Count > 0)
+                        {
+                            int idx = _rng.Next(q.Count); // pull out of order
+                            seg = q[idx];
+                            q.RemoveAt(idx);
+                        }
+                    }
+                    if (seg == null) { Thread.Sleep(1); continue; }
+                    if (_rng.NextDouble() < _drop) continue; // dropped
+                    target().OnDatagram(seg);
+                }
+            }
+
+            public void Dispose() { _run = false; try { _a?.Dispose(); _b?.Dispose(); } catch { } }
+        }
+
+        [Fact]
+        public void ReorderBuffer_DeliversInOrder_NoThreads()
+        {
+            // Feed DATA segments to a receiver in shuffled order; it must reassemble exactly.
+            var captured = new List<byte[]>();
+            var sender = new ReliableUdpStream(seg => captured.Add(seg));
+            var blob = new byte[20_000];
+            new Random(7).NextBytes(blob);
+            sender.Write(blob, 0, blob.Length);
+
+            var receiver = new ReliableUdpStream(_ => { }); // ignore its ACKs
+            var shuffled = new List<byte[]>(captured);
+            var rng = new Random(42);
+            for (int i = shuffled.Count - 1; i > 0; i--) { int j = rng.Next(i + 1); (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]); }
+            foreach (var seg in shuffled) receiver.OnDatagram(seg);
+
+            var got = ReadExactly(receiver, blob.Length);
+            Assert.Equal(blob, got);
+        }
+
+        [Fact]
+        public void LargeTransfer_OverLossyReorderingLink_ArrivesIntact()
+        {
+            using var link = new LossyLink(seed: 123, drop: 0.20);
+            var (a, b) = link.Connect();
+
+            var blob = new byte[256_000];
+            new Random(2024).NextBytes(blob);
+
+            var writer = Task.Run(() => { a.Write(blob, 0, blob.Length); });
+            var got = ReadExactly(b, blob.Length);
+            writer.Wait(TimeSpan.FromSeconds(60));
+
+            Assert.Equal(blob, got);
+        }
+
+        [Fact]
+        public void Bidirectional_Simultaneous()
+        {
+            using var link = new LossyLink(seed: 9, drop: 0.10);
+            var (a, b) = link.Connect();
+
+            var msgA = new byte[40_000]; new Random(1).NextBytes(msgA);
+            var msgB = new byte[40_000]; new Random(2).NextBytes(msgB);
+
+            var wa = Task.Run(() => a.Write(msgA, 0, msgA.Length));
+            var wb = Task.Run(() => b.Write(msgB, 0, msgB.Length));
+            var gotB = Task.Run(() => ReadExactly(b, msgA.Length));
+            var gotA = Task.Run(() => ReadExactly(a, msgB.Length));
+
+            Assert.True(Task.WaitAll(new[] { wa, wb, gotA, gotB }, TimeSpan.FromSeconds(60)));
+            Assert.Equal(msgA, gotB.Result);
+            Assert.Equal(msgB, gotA.Result);
+        }
+
+        [Fact]
+        public void RealHandshake_RunsOverThePunchStreams()
+        {
+            using var link = new LossyLink(seed: 555, drop: 0.15);
+            var (hostStream, clientStream) = link.Connect();
+            var hostCh = new ControlChannel(hostStream);
+            var clientCh = new ControlChannel(clientStream);
+
+            var hostState = new byte[120_000];
+            new Random(1234).NextBytes(hostState);
+
+            PeerIdentity Id() => new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, 20);
+
+            var hostTask = Task.Run(() =>
+                Handshake.RunHost(hostCh, Id(), new SessionPreferences(3, wantRollback: true), hostState, 47800));
+            var clientParams = Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, wantRollback: true), 51000);
+            var hostParams = hostTask.GetAwaiter().GetResult();
+
+            Assert.Equal(SyncMode.Rollback, clientParams.Mode);
+            Assert.Equal(3, clientParams.InputDelay);
+            Assert.Equal(hostState, clientParams.InitialState); // ~1 MiB-class transfer survived 15% loss
+            Assert.Equal(51000, hostParams.RemoteUdpPort);
+            Assert.Equal(47800, clientParams.RemoteUdpPort);
+        }
+
+        private static byte[] ReadExactly(ReliableUdpStream s, int count)
+        {
+            var buf = new byte[count];
+            int read = 0;
+            while (read < count)
+            {
+                int n = s.Read(buf, read, count - read);
+                if (n <= 0) throw new Exception($"EOF after {read}/{count}");
+                read += n;
+            }
+            return buf;
+        }
+    }
+}

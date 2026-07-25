@@ -3,6 +3,9 @@
 [Oo]bj/
 [Dd]ebug/
 [Rr]elease/
+
+# Release-artifact staging (binaries are published to GitHub Releases, not committed)
+/dist/
 *.user
 *.suo
 *.userosscache

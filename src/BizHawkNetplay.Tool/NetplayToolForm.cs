@@ -40,7 +40,7 @@ namespace BizHawkNetplay.Tool
         // --- UI (assigned once, from the per-tab build methods the constructor calls) ---
         private RadioButton _hostRadio = null!;
         private RadioButton _joinRadio = null!;
-        private TextBox _ipBox = null!;
+        private ComboBox _ipBox = null!;
         private NumericUpDown _portBox = null!;
         private NumericUpDown _delayBox = null!;
         private Button _goButton = null!;
@@ -59,6 +59,17 @@ namespace BizHawkNetplay.Tool
         private NumericUpDown _simLatencyBox = null!;
         private ListView _playersList = null!;
         private Label _status = null!;
+        private Button _punchButton = null!;
+        private GroupBox _punchGroup = null!;
+        private TextBox _myCodeBox = null!;
+        private Button _copyCodeButton = null!;
+        private TextBox _peerCodeBox = null!;
+        private Button _connectButton = null!;
+        private Label _punchStatus = null!;
+
+        private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
+        private bool _loadingSettings;                  // suppress change-handler saves while applying loaded prefs
+        private string? _pendingJoinIp;                 // regular-join IP awaiting a successful connect, then recorded
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
         private bool _upnpEnabled;  // host: whether to attempt the UPnP auto-forward (captured from the checkbox)
@@ -89,6 +100,15 @@ namespace BizHawkNetplay.Tool
         private ITransport? _transport;        // the FrameDriver's input channel (see below)
         private MeshUdpTransport? _mesh;       // direct peer-to-peer UDP: host and joiners both send to all peers
         private List<IPEndPoint> _meshOthers = new List<IPEndPoint>(); // joiner: the non-host peers in our mesh
+
+        // UDP-punch path (2-player, no port-forwarding): one socket does STUN + hole-punch, then carries
+        // both the reliable control channel and the input hot path. Set up in two steps (generate our
+        // connect code, then punch to the pasted peer code) before the normal session bring-up runs.
+        private PunchedPeerLink? _punchLink;
+        private volatile bool _punchMode;      // this session connected via UDP punch (no TCP listener / mesh)
+        private PeerIdentity? _punchId;         // prepared handshake identity, captured when punch setup began
+        private SessionPreferences? _punchPrefs;
+        private byte[]? _punchState;            // host only: the initial state to transfer once punched
         private TcpListener? _listener;
         private FrameDriver? _driver;
         private readonly List<PeerLink> _peers = new List<PeerLink>();
@@ -168,8 +188,8 @@ namespace BizHawkNetplay.Tool
         public NetplayToolForm()
         {
             SuspendLayout();
-            ClientSize = new Size(560, 440);
-            MinimumSize = new Size(480, 360);
+            ClientSize = new Size(580, 540);
+            MinimumSize = new Size(520, 480);
 
             var tabs = new TabControl { Dock = DockStyle.Fill };
             tabs.TabPages.Add(BuildConnectionTab());
@@ -192,8 +212,67 @@ namespace BizHawkNetplay.Tool
             _frameTimer = new System.Windows.Forms.Timer();
             _frameTimer.Tick += (_, __) => FrameTick();
 
+            LoadAndApplySettings();
             UpdateEnabled();
         }
+
+        // ------------------------------------------------------------------ persisted settings
+
+        /// <summary>Load remembered prefs and apply them to the controls, then hook change-to-save.</summary>
+        private void LoadAndApplySettings()
+        {
+            _settings = NetplaySettings.Load();
+            _loadingSettings = true;
+            try
+            {
+                _upnpCheck.Checked = _settings.Upnp;
+                _portBox.Value = Clamp(_settings.Port, (int)_portBox.Minimum, (int)_portBox.Maximum);
+                _delayBox.Value = Clamp(_settings.Delay, (int)_delayBox.Minimum, (int)_delayBox.Maximum);
+                if (_settings.Netcode >= 0 && _settings.Netcode < _netcodeCombo.Items.Count)
+                    _netcodeCombo.SelectedIndex = _settings.Netcode;
+                RefreshIpDropdown();
+                if (_settings.RecentIps.Count > 0) _ipBox.Text = _settings.RecentIps[0]; // last host, ready to re-join
+            }
+            finally { _loadingSettings = false; }
+
+            // Persist whenever a remembered control changes, so state survives even without starting a session.
+            _upnpCheck.CheckedChanged += (_, __) => SaveSettingsFromUi();
+            _portBox.ValueChanged += (_, __) => SaveSettingsFromUi();
+            _delayBox.ValueChanged += (_, __) => SaveSettingsFromUi();
+            _netcodeCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
+        }
+
+        private void SaveSettingsFromUi()
+        {
+            if (_loadingSettings || _settings == null) return;
+            _settings.Upnp = _upnpCheck.Checked;
+            _settings.Port = (int)_portBox.Value;
+            _settings.Delay = (int)_delayBox.Value;
+            _settings.Netcode = _netcodeCombo.SelectedIndex;
+            _settings.Save();
+        }
+
+        /// <summary>Record a successfully-joined host IP into the recent list and refresh the dropdown.</summary>
+        private void RecordJoinIp(string ip)
+        {
+            if (_settings == null) return;
+            _settings.RecordIp(ip);
+            SaveSettingsFromUi(); // also persists the current control values alongside the new IP
+            RefreshIpDropdown();
+        }
+
+        /// <summary>Repopulate the IP dropdown from the recent list, preserving the typed text.</summary>
+        private void RefreshIpDropdown()
+        {
+            string current = _ipBox.Text;
+            _ipBox.BeginUpdate();
+            _ipBox.Items.Clear();
+            foreach (var ip in _settings.RecentIps) _ipBox.Items.Add(ip);
+            _ipBox.EndUpdate();
+            _ipBox.Text = current;
+        }
+
+        private static int Clamp(int v, int lo, int hi) => v < lo ? lo : v > hi ? hi : v;
 
         /// <summary>The Connection tab: role, host address/port, delay, rollback, and the start/stop buttons.</summary>
         private TabPage BuildConnectionTab()
@@ -205,7 +284,11 @@ namespace BizHawkNetplay.Tool
             _hostRadio.CheckedChanged += (_, __) => UpdateEnabled();
 
             var ipLabel = new Label { Text = "Host IP:", AutoSize = true, Location = new Point(12, 46) };
-            _ipBox = new TextBox { Text = "127.0.0.1", Location = new Point(80, 43), Width = 160 };
+            _ipBox = new ComboBox
+            {
+                Text = "127.0.0.1", Location = new Point(80, 43), Width = 160,
+                DropDownStyle = ComboBoxStyle.DropDown, // editable, with a dropdown of recently-used IPs
+            };
             var portLabel = new Label { Text = "Port:", AutoSize = true, Location = new Point(260, 46) };
             _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 43), Width = 70 };
 
@@ -225,20 +308,14 @@ namespace BizHawkNetplay.Tool
 
             _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 172), Width = 150 };
             _goButton.Click += (_, __) => OnGo();
-            _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 172), Width = 120, Enabled = false };
+            _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 172), Width = 110, Enabled = false };
             _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
-
-            _pubAddrButton = new Button { Text = "My public address", Location = new Point(12, 210), Width = 150 };
+            _pubAddrButton = new Button { Text = "My public address", Location = new Point(292, 172), Width = 150 };
             _pubAddrButton.Click += (_, __) => ShowPublicAddress();
-            var natHint = new Label
-            {
-                Text = "Internet play: the host forwards its port (UPnP, above) or you forward it manually.",
-                AutoSize = true, Location = new Point(12, 242), ForeColor = Color.DimGray,
-            };
 
             _netcodeLabel = new Label
             {
-                Text = "Netcode in use: —", Location = new Point(12, 270), Width = 300, Height = 24,
+                Text = "Netcode in use: —", Location = new Point(12, 208), Width = 300, Height = 24,
                 BorderStyle = BorderStyle.FixedSingle, TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(6, 0, 0, 0), ForeColor = Color.DimGray,
             };
@@ -248,9 +325,60 @@ namespace BizHawkNetplay.Tool
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
                 passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
                 netcodeSelLabel, _netcodeCombo, _upnpCheck, _goButton, _disconnectButton,
-                _pubAddrButton, natHint, _netcodeLabel,
+                _pubAddrButton, _netcodeLabel, BuildPunchGroup(),
             });
             return page;
+        }
+
+        /// <summary>
+        /// The "UDP Punch" group: the no-port-forwarding path (2-player). Distinct buttons for a regular
+        /// connection (above) versus punch, exactly as requested — punch isn't a silent fallback, it's an
+        /// explicit choice that surfaces a connect code you swap with your friend out of band.
+        /// </summary>
+        private GroupBox BuildPunchGroup()
+        {
+            _punchGroup = new GroupBox
+            {
+                Text = "UDP Punch — connect with no port-forwarding (2 players)",
+                Location = new Point(12, 244), Size = new Size(544, 176),
+            };
+
+            var step1 = new Label
+            {
+                Text = "1. Click UDP Punch. Your code appears below — send it to your friend:",
+                AutoSize = true, Location = new Point(12, 24),
+            };
+            _myCodeBox = new TextBox
+            {
+                ReadOnly = true, Location = new Point(12, 46), Width = 240,
+                Font = new Font(FontFamily.GenericMonospace, 11f), Text = "",
+            };
+            _copyCodeButton = new Button { Text = "Copy", Location = new Point(260, 45), Width = 60, Enabled = false };
+            _copyCodeButton.Click += (_, __) => CopyMyCode();
+            _punchButton = new Button { Text = "UDP Punch", Location = new Point(340, 44), Width = 120 };
+
+            var step2 = new Label
+            {
+                Text = "2. Paste your friend's code and Connect:",
+                AutoSize = true, Location = new Point(12, 84),
+            };
+            _peerCodeBox = new TextBox { Location = new Point(12, 106), Width = 240, Enabled = false };
+            _connectButton = new Button { Text = "Connect", Location = new Point(260, 105), Width = 80, Enabled = false };
+            _connectButton.Click += (_, __) => OnPunchConnect();
+
+            _punchStatus = new Label
+            {
+                Text = "", AutoSize = true, Location = new Point(12, 142), ForeColor = Color.DimGray,
+            };
+
+            _punchButton.Click += (_, __) => OnPunchStart();
+
+            _punchGroup.Controls.AddRange(new Control[]
+            {
+                step1, _myCodeBox, _copyCodeButton, _punchButton,
+                step2, _peerCodeBox, _connectButton, _punchStatus,
+            });
+            return _punchGroup;
         }
 
         /// <summary>The Diagnostics tab: the capability probe, input test, and the fault-injection toggles.</summary>
@@ -417,6 +545,7 @@ namespace BizHawkNetplay.Tool
                     { Log("Enter a valid host IP."); SetBusy(false); return; }
                     _mesh = MeshUdpTransport.Bind(0); _transport = WrapSimLatency(_mesh);
                     string ip = _ipBox.Text.Trim();
+                    _pendingJoinIp = ip; // recorded into the recent-IPs list once the connect succeeds
                     StartThread(() => JoinThread(ip, port, id, prefs, _mesh.LocalPort));
                 }
             }
@@ -425,6 +554,192 @@ namespace BizHawkNetplay.Tool
                 Log("start failed: " + ex.Message);
                 SetBusy(false);
             }
+        }
+
+        // ------------------------------------------------------------------ UDP punch (no port-forwarding)
+
+        /// <summary>
+        /// Step 1 of the punch path: prepare the session exactly as <see cref="OnGo"/> does, bind the
+        /// punch socket, and STUN-discover our connect code off-thread. The chosen role (Host/Join) still
+        /// decides who owns the initial state and is P1 — the punch is symmetric at the transport level.
+        /// </summary>
+        private void OnPunchStart()
+        {
+            if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
+            if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
+            if (_punchMode || _sessionActive) { Log("Already connecting — Disconnect first."); return; }
+
+            try
+            {
+                _adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
+                if (!_adapter.VerifyDeterministicMode())
+                    Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
+                if (!_adapter.HasBindings)
+                    Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
+
+                _isHost = _hostRadio.Checked;
+                int players = _adapter.PortCount;
+                if (players < 2)
+                {
+                    Log($"this core exposes only {players} controller port — need at least 2 for netplay.");
+                    return;
+                }
+                // Punch is 2-player only: swapping connect codes by hand doesn't scale to a full mesh.
+
+                APIs.EmuClient.Pause(); // freeze now so the resume frame is fixed before the peer arrives
+
+                _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
+                bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
+                _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
+                    SessionPreferences.HashPassword(_passwordBox.Text));
+                _punchId = BuildIdentity(_adapter, wantRollback);
+                _simLatencyMs = (int)_simLatencyBox.Value;
+                _punchState = _isHost ? _adapter.ExportState() : null;
+
+                _punchMode = true;
+                _punchLink = PunchedPeerLink.Bind(0);
+                _transport = WrapSimLatency(_punchLink);
+                SetBusy(true);
+                _punchButton.Enabled = false;
+                _punchStatus.Text = "finding your public address…";
+                _punchStatus.ForeColor = Color.DimGray;
+
+                var link = _punchLink;
+                int localPort = link.LocalPort;
+                new Thread(() =>
+                {
+                    var reflexive = link.DiscoverReflexive(TimeSpan.FromSeconds(3));
+                    string lan = UpnpPortMapper.PrimaryLanIp();
+                    IPEndPoint? lanEp = null;
+                    try { lanEp = new IPEndPoint(IPAddress.Parse(lan), localPort); } catch { }
+                    var loopEp = new IPEndPoint(IPAddress.Loopback, localPort);
+                    BeginInvokeUi(() =>
+                    {
+                        if (!_punchMode) return; // cancelled while discovering
+                        string primary = reflexive != null ? ConnectCode.Encode(reflexive)
+                                       : lanEp != null ? ConnectCode.Encode(lanEp)
+                                       : ConnectCode.Encode(loopEp);
+                        _myCodeBox.Text = primary;
+                        _copyCodeButton.Enabled = true;
+                        _peerCodeBox.Enabled = true;
+                        _connectButton.Enabled = true;
+                        _punchStatus.Text = reflexive != null
+                            ? "share your code, paste your friend's, then Connect."
+                            : "STUN unavailable — using a local code (internet peers may be unreachable).";
+                        Log(reflexive != null
+                            ? $"UDP punch — your public code: {primary}   (endpoint {reflexive})"
+                            : "UDP punch — couldn't reach a STUN server; internet peers may be unreachable");
+                        if (lanEp != null) Log($"UDP punch — same-LAN code: {ConnectCode.Encode(lanEp)}   ({lanEp})");
+                        Log($"UDP punch — same-machine test code: {ConnectCode.Encode(loopEp)}   ({loopEp})");
+                        Log("(both ends must use matching code types: public over the internet, LAN on one router, same-machine for local testing)");
+                    });
+                })
+                { IsBackground = true, Name = "BizHawkNetplay-punch-stun" }.Start();
+            }
+            catch (Exception ex)
+            {
+                Log("punch setup failed: " + ex.Message);
+                EndSession("punch setup failed");
+            }
+        }
+
+        private void CopyMyCode()
+        {
+            try { if (!string.IsNullOrEmpty(_myCodeBox.Text)) Clipboard.SetText(_myCodeBox.Text); }
+            catch { /* clipboard busy */ }
+        }
+
+        /// <summary>
+        /// Step 2 of the punch path: punch toward the pasted peer code, then run the normal handshake over
+        /// the reliable control stream and hand off to the shared session bring-up. All off the UI thread.
+        /// </summary>
+        private void OnPunchConnect()
+        {
+            var link = _punchLink;
+            if (!_punchMode || link == null) { Log("Click UDP Punch first."); return; }
+            var peer = ConnectCode.TryDecode(_peerCodeBox.Text);
+            if (peer == null)
+            {
+                _punchStatus.Text = "that code doesn't look right — check it and retry.";
+                _punchStatus.ForeColor = Color.Firebrick;
+                return;
+            }
+
+            _connectButton.Enabled = false;
+            _peerCodeBox.Enabled = false;
+            _punchStatus.Text = $"punching toward {peer}…";
+            _punchStatus.ForeColor = Color.DimGray;
+
+            bool isHost = _isHost;
+            var id = _punchId!; var prefs = _punchPrefs!; var state = _punchState;
+            new Thread(() =>
+            {
+                bool ok = link.Punch(peer, TimeSpan.FromSeconds(15));
+                if (!ok)
+                {
+                    BeginInvokeUi(() =>
+                    {
+                        if (!_punchMode) return;
+                        _punchStatus.Text = "punch failed — no path opened (the other side may be on symmetric NAT).";
+                        _punchStatus.ForeColor = Color.Firebrick;
+                        _connectButton.Enabled = true; _peerCodeBox.Enabled = true;
+                    });
+                    return;
+                }
+                UiLog($"UDP punch opened a path to {link.PeerEndpoint}");
+                try
+                {
+                    var ch = new ControlChannel(link.Control);
+                    var sp = isHost
+                        ? Handshake.RunHost(ch, id, prefs, state ?? Array.Empty<byte>(), link.LocalPort)
+                        : Handshake.RunClient(ch, id, prefs, link.LocalPort);
+                    BeginInvokeUi(() => BeginPunchSession(sp, ch, link.PeerEndpoint!, isHost));
+                }
+                catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-punch-handshake" }.Start();
+        }
+
+        /// <summary>Hand a punched, handshaken link to the shared session bring-up (same as the TCP path).</summary>
+        private void BeginPunchSession(SessionParams sp, ControlChannel ch, IPEndPoint peerEp, bool isHost)
+        {
+            try
+            {
+                _punchGroup.Enabled = false; // freeze the punch controls for the session's duration
+                if (isHost)
+                {
+                    var link = new PeerLink
+                    {
+                        Tcp = null!, Control = ch, RemotePort = 1,
+                        UdpEndpoint = peerEp, Label = $"P2 ({peerEp.Address})",
+                    };
+                    BeginSessionHost(new List<PeerLink> { link }, players: 2, delay: sp.InputDelay, mode: sp.Mode);
+                }
+                else
+                {
+                    var link = new PeerLink
+                    {
+                        Tcp = null!, Control = ch, RemotePort = 0,
+                        UdpEndpoint = peerEp, Label = $"host ({peerEp.Address})",
+                    };
+                    BeginSessionJoiner(sp, link); // imports state, sets fields, mesh setup no-ops (punch is 2P)
+                }
+            }
+            catch (Exception ex) { FailSession(ex.Message); }
+        }
+
+        private void ResetPunchUi()
+        {
+            if (_punchGroup.IsDisposed) return;
+            _punchGroup.Enabled = true;
+            _punchButton.Enabled = true;
+            _myCodeBox.Text = "";
+            _peerCodeBox.Text = "";
+            _copyCodeButton.Enabled = false;
+            _peerCodeBox.Enabled = false;
+            _connectButton.Enabled = false;
+            _punchStatus.Text = "";
+            _punchStatus.ForeColor = Color.DimGray;
         }
 
         private void HostThread(int port, PeerIdentity id, SessionPreferences prefs, byte[] state, int udpLocalPort, int players)
@@ -561,6 +876,7 @@ namespace BizHawkNetplay.Tool
                 // Both peers should print the SAME number here; if not, the start is misaligned.
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 Log($"joined as P{sp.LocalPort + 1} of {sp.PlayerCount}");
+                if (_pendingJoinIp != null) { RecordJoinIp(_pendingJoinIp); _pendingJoinIp = null; } // connect succeeded
                 BeginSessionCommon(sp.Mode, hostLink.Label);
             }
             catch (Exception ex) { FailSession(ex.Message); }
@@ -632,7 +948,7 @@ namespace BizHawkNetplay.Tool
             // host, which shares it so peers can reach us across NAT. Additive to the LAN candidates, so
             // LAN/localhost play is unaffected whether or not this succeeds. The host is reached at the
             // address joiners connected to, so it doesn't report one.
-            if (!_isHost) StartReflexiveDiscovery();
+            if (!_isHost && !_punchMode) StartReflexiveDiscovery();
         }
 
         /// <summary>Joiner: off-thread, STUN-discover our mesh socket's public endpoint and send it to the host.</summary>
@@ -1077,14 +1393,33 @@ namespace BizHawkNetplay.Tool
         /// (STUN does a UDP round-trip to a public server).</summary>
         private void ShowPublicAddress()
         {
+            // Feedback lands on the status bar (visible under every tab) as well as the Log — otherwise,
+            // from the Connection tab, the button looks like it does nothing. Report the address friends
+            // actually dial (public IP + the port you'd forward), not the throwaway STUN probe's port.
+            int port = (int)_portBox.Value;
+            _pubAddrButton.Enabled = false;
+            _pubAddrButton.Text = "Looking up…";
+            Status("looking up your public address…", Color.DimGray);
             Log("looking up your public address…");
             new Thread(() =>
             {
                 var pub = StunClient.DiscoverPublicAddress(TimeSpan.FromSeconds(2.5));
                 string lan = UpnpPortMapper.PrimaryLanIp();
-                UiLog(pub != null
-                    ? $"public IP {pub.Address} (this UDP flow maps to :{pub.Port}); LAN IP {lan}"
-                    : $"couldn't reach a STUN server (offline or UDP blocked); LAN IP {lan}");
+                BeginInvokeUi(() =>
+                {
+                    if (!_pubAddrButton.IsDisposed) { _pubAddrButton.Enabled = true; _pubAddrButton.Text = "My public address"; }
+                    if (pub != null)
+                    {
+                        Status($"Public IP {pub.Address} — friends connect to {pub.Address}:{port} (forward port {port})", Color.DarkGreen);
+                        Log($"public IP {pub.Address}; for internet play, forward port {port} (TCP+UDP) and give friends {pub.Address}:{port}   (LAN: {lan}:{port})");
+                        try { Clipboard.SetText($"{pub.Address}:{port}"); Log("(copied to clipboard)"); } catch { }
+                    }
+                    else
+                    {
+                        Status("Couldn't reach a STUN server (offline or UDP blocked).", Color.Firebrick);
+                        Log($"couldn't reach a STUN server (offline or UDP blocked); LAN IP {lan}:{port}");
+                    }
+                });
             })
             { IsBackground = true, Name = "BizHawkNetplay-stun" }.Start();
         }
@@ -1137,6 +1472,13 @@ namespace BizHawkNetplay.Tool
         private void OnPeerLinkLost(PeerLink link, string why)
         {
             if (!_sessionActive) return;
+
+            // Punch sessions have no TCP listener to re-accept on, so a lost link just ends for both roles.
+            if (_punchMode)
+            {
+                EndSession($"lost connection to {link.Label}: {why}");
+                return;
+            }
 
             if (!_isHost)
             {
@@ -1305,18 +1647,20 @@ namespace BizHawkNetplay.Tool
 
         private void FailSession(string reason)
         {
+            _pendingJoinIp = null; // a failed connect shouldn't land in the recent-IPs list
             Log("connection failed: " + reason);
             TeardownNetwork();
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false);
             try { APIs.EmuClient.Unpause(); } catch { } // undo the freeze from OnGo
+            ResetPunchUi();
             SetBusy(false);
             Status("Idle.", Color.DimGray);
         }
 
         private void EndSession(string reason)
         {
-            if (!_sessionActive && _listener == null && _peers.Count == 0) { SetBusy(false); return; }
+            if (!_sessionActive && _listener == null && _peers.Count == 0 && !_punchMode) { SetBusy(false); return; }
             _sessionActive = false;
             _frameTimer.Stop();
             _simUnresponsive = false; _simUnresponsiveCheck.Checked = false; // clear the diagnostic
@@ -1333,6 +1677,7 @@ namespace BizHawkNetplay.Tool
             _netcodeLabel.Text = "Netcode in use: —";
             _netcodeLabel.ForeColor = Color.DimGray;
             RefreshPlayersList(); // session inactive now → clears the list
+            ResetPunchUi();
 
             Log("session ended: " + reason);
             Status("Idle.", Color.DimGray);
@@ -1362,7 +1707,9 @@ namespace BizHawkNetplay.Tool
             foreach (var link in peers) { try { link.Tcp?.Close(); } catch { } }
 
             try { (_transport as IDisposable)?.Dispose(); } catch { }
-            _transport = null; _mesh = null;
+            try { _punchLink?.Dispose(); } catch { } // in case _transport is a sim-latency wrapper over it
+            _transport = null; _mesh = null; _punchLink = null;
+            _punchMode = false; _punchState = null;
             _driver = null;
 
             foreach (var link in peers)
@@ -1552,6 +1899,7 @@ namespace BizHawkNetplay.Tool
             _portBox.Enabled = _delayBox.Enabled = !busy;
             _netcodeCombo.Enabled = _passwordBox.Enabled = _upnpCheck.Enabled = !busy;
             _probeButton.Enabled = !busy;
+            _punchButton.Enabled = !busy;
             _disconnectButton.Enabled = busy;
             // _testInputButton stays enabled (useful to check bindings before and during a session)
         }
