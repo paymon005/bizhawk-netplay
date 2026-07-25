@@ -262,6 +262,42 @@ namespace BizHawkNetplay.Tool
             UpdateEnabled();
         }
 
+        /// <summary>
+        /// After the host restores our last window position, make sure we actually landed on a visible
+        /// monitor. BizHawk persists tool positions, so a spot saved on a monitor that's since been
+        /// disconnected or rearranged leaves the window stranded offscreen. If little of it is on any
+        /// screen, re-center on the primary display; an already-visible position is left untouched.
+        /// </summary>
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            // The host restores our saved position AFTER OnShown returns (right after Show()), so a fix
+            // applied here is immediately overwritten. Defer to the end of the message queue via
+            // BeginInvoke — by then the final position is in place and we can pull it back if stranded.
+            try { BeginInvoke((Action)MoveOnScreenIfStranded); } catch { MoveOnScreenIfStranded(); }
+        }
+
+        /// <summary>If little of the window ended up on any connected monitor — a position saved on a
+        /// display that's since been removed or rearranged — re-center it on EmuHawk's screen so it's
+        /// visible. A window that's already substantially on-screen is left where the user put it.</summary>
+        private void MoveOnScreenIfStranded()
+        {
+            try
+            {
+                foreach (var s in Screen.AllScreens)
+                {
+                    var vis = Rectangle.Intersect(s.WorkingArea, Bounds);
+                    if (vis.Width >= 120 && vis.Height >= 60) return; // enough of us is on a real screen
+                }
+                var host = Owner ?? (MainForm as Control);
+                var wa = (host != null ? Screen.FromControl(host) : Screen.PrimaryScreen).WorkingArea;
+                int w = Math.Min(Width, wa.Width), h = Math.Min(Height, wa.Height);
+                StartPosition = FormStartPosition.Manual;
+                Location = new Point(wa.Left + (wa.Width - w) / 2, wa.Top + (wa.Height - h) / 2);
+            }
+            catch { /* positioning is best-effort — never let it break opening the tool */ }
+        }
+
         // ------------------------------------------------------------------ persisted settings
 
         /// <summary>Load remembered prefs and apply them to the controls, then hook change-to-save.</summary>
@@ -601,6 +637,8 @@ namespace BizHawkNetplay.Tool
             if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
             if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
 
+            WarnSessionHazards(); // non-blocking heads-up about movies/TAStudio/Lua
+
             try
             {
                 _adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
@@ -689,6 +727,8 @@ namespace BizHawkNetplay.Tool
             if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
             if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
             if (_punchMode || _sessionActive) { Log("Already connecting — Disconnect first."); return; }
+
+            WarnSessionHazards(); // non-blocking heads-up about movies/TAStudio/Lua
 
             try
             {
@@ -1821,6 +1861,76 @@ namespace BizHawkNetplay.Tool
             if (_netcodeChoice != NetcodeChoice.Lockstep)
                 Log("N64 uses lockstep for stability — deep rollback can freeze presentation on this core.");
             _netcodeChoice = NetcodeChoice.Lockstep;
+        }
+
+        // Reflection flags for reaching EmuHawk internals (Tools/LuaConsole members aren't all public).
+        private const System.Reflection.BindingFlags AnyInstance =
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+
+        /// <summary>
+        /// Log a heads-up (NEVER block) if something that also owns input or the frame clock is active —
+        /// a loaded movie (playback/record, incl. TAStudio) or a running Lua script. These can desync
+        /// netplay, but we only warn and let the user proceed. Everything here is best-effort and swallows
+        /// its own errors: it must never disrupt starting a session (and resolves EmuHawk types by name,
+        /// so this file carries no compile-time dependency on them).
+        /// </summary>
+        private void WarnSessionHazards()
+        {
+            try
+            {
+                if (APIs.Movie.IsLoaded())
+                {
+                    string mode = ""; try { mode = APIs.Movie.Mode() ?? ""; } catch { }
+                    bool rec = string.Equals(mode, "RECORD", StringComparison.OrdinalIgnoreCase);
+                    Log($"WARNING: a movie is {(rec ? "recording" : "loaded")} (or TAStudio is open) — it injects " +
+                        "input and drives frame advance, which will likely desync netplay. Stop it if the session won't sync.");
+                }
+            }
+            catch { /* movie API unavailable — ignore */ }
+
+            try
+            {
+                int lua = RunningLuaScripts();
+                if (lua > 0)
+                    Log($"WARNING: {lua} Lua script(s) running — Lua can set input, load states, or call " +
+                        "emu.frameadvance and may desync netplay. Stop them (Lua Console → Stop All Scripts) if you see desyncs.");
+            }
+            catch { /* best-effort — ignore */ }
+        }
+
+        /// <summary>Count Lua scripts in the RUNNING state, only if the Lua Console is already open (never
+        /// instantiates it). EmuHawk types are resolved by name; any failure returns 0 (a warning-only
+        /// heads-up must never disrupt a session).</summary>
+        private int RunningLuaScripts()
+        {
+            try
+            {
+                object? mf = MainForm;
+                if (mf == null) return 0;
+                var asm = mf.GetType().Assembly;
+                var luaConsoleType = asm.GetType("BizHawk.Client.EmuHawk.LuaConsole");
+                if (luaConsoleType == null) return 0;
+                var tools = mf.GetType().GetField("Tools", AnyInstance)?.GetValue(mf)
+                         ?? mf.GetType().GetProperty("Tools", AnyInstance)?.GetValue(mf);
+                if (tools == null) return 0;
+                var isLoaded = tools.GetType().GetMethod("IsLoaded", new[] { typeof(Type) });
+                if (!(isLoaded?.Invoke(tools, new object[] { luaConsoleType }) as bool? ?? false)) return 0; // closed
+                var console = tools.GetType().GetProperty("LuaConsole", AnyInstance)?.GetValue(tools);
+                var luaImp = console?.GetType().GetField("LuaImp", AnyInstance)?.GetValue(console)
+                          ?? console?.GetType().GetProperty("LuaImp", AnyInstance)?.GetValue(console);
+                var scriptList = luaImp?.GetType().GetProperty("ScriptList", AnyInstance)?.GetValue(luaImp)
+                    as System.Collections.IEnumerable;
+                if (scriptList == null) return 0;
+                int running = 0;
+                foreach (var file in scriptList)
+                {
+                    var state = file?.GetType().GetProperty("State", AnyInstance)?.GetValue(file);
+                    if (state != null && string.Equals(state.ToString(), "Running", StringComparison.OrdinalIgnoreCase))
+                        running++;
+                }
+                return running;
+            }
+            catch { return 0; }
         }
 
         /// <summary>Wrap the input transport in the artificial-latency simulator if the diagnostic is set.</summary>
