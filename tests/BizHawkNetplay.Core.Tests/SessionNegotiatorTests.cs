@@ -58,6 +58,27 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void LayoutMismatch_NamesTheOffendingPort()
+        {
+            // First port matches, the SECOND differs — the reason must point at P2 specifically.
+            var local = new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, 20);
+            var remote = new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "DIFF" }, true, 20);
+            var r = SessionNegotiator.Negotiate(local, remote, Pref(), Pref());
+            Assert.False(r.Accepted);
+            Assert.Contains("P2", r.RejectReason);
+        }
+
+        [Fact]
+        public void ControllerCountMismatch_IsReportedWithCounts()
+        {
+            var local = new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, 20);
+            var remote = new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0" }, true, 20);
+            var r = SessionNegotiator.Negotiate(local, remote, Pref(), Pref());
+            Assert.False(r.Accepted);
+            Assert.Contains("count differs", r.RejectReason);
+        }
+
+        [Fact]
         public void SessionPassword_MustMatch()
         {
             // Same password on both sides -> accepted.

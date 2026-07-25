@@ -42,6 +42,12 @@
       <HintPath>$(BizHawkHome)\EmuHawk.exe</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- Ships with BizHawk (loaded already); used to serialize the core's sync-settings object for a
+         real cross-peer digest. Bind-only, never copied. -->
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(BizHawkHome)\dll\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <!-- After build, drop the tool DLL into the install's ExternalTools folder so EmuHawk

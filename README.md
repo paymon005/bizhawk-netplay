@@ -165,8 +165,6 @@ and restoring your position so it doesn't disturb play.
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
-- **Guard movies / TAStudio / Lua:** detect and refuse them at session start instead of only documenting it.
-- **Compare real sync settings:** hash the core's actual sync-settings blob at handshake so mismatched per-core settings (e.g. different N64 plugins) are caught up front instead of surfacing as a desync.
 - **Authenticate the session password:** today both peers just exchange a SHA-256 hash and compare, so a peer on the wire can echo the hash back without knowing the password. A nonce challenge-response with a slow KDF would make the password a real gate rather than a casual one.
 
 ## Known limitations
@@ -174,7 +172,7 @@ and restoring your position so it doesn't disturb play.
 Things that are by-design gaps or not-yet-built, worth knowing before relying on it:
 
 - **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined to non-RAM state can slip past the checksum until it perturbs RAM.
-- **The sync-settings check is coarse** — the handshake compares core + assembly version + system ID, not the core's full sync-settings blob, so two peers with the same core but different per-core sync settings (e.g. different N64 video plugins) can pass the handshake and then desync. Match settings on both machines manually.
+- **Sync-settings check is best-effort** — the handshake compares the core's real sync-settings blob (read via `ISettable.GetSyncSettings()`), so mismatched per-core settings (e.g. different N64 video plugins) are refused up front rather than desyncing. If a core's settings can't be read it falls back to a coarse core+version+system digest, which wouldn't catch such a mismatch.
 - **NAT traversal is cone-only** — UDP Punch and the mesh connectivity checks open cone-NAT paths;
   **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the rendezvous for the joiner↔joiner mesh.
 - **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine

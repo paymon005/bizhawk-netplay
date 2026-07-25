@@ -96,18 +96,41 @@ namespace BizHawkNetplay.Tool
         /// <summary>BizHawk system identifier (for conservative per-system netplay defaults).</summary>
         public string SystemId => _emulator.SystemId;
 
-        // NOTE (M1): replace with a hash of the core's real sync-settings blob obtained via the
-        // settable-service interface. For M0 identity is core+version+system, enough to catch
-        // gross mismatches at handshake.
+        // Identity = core + version + system + the core's REAL sync-settings blob. The blob is what
+        // makes two peers on the same core but different per-core settings (e.g. an N64 video plugin, a
+        // region, a CPU-core choice) fail the handshake up front instead of silently desyncing later.
+        // Both peers run the identical core build (the handshake already requires matching CoreVersion),
+        // so the same settings serialize to the same JSON and hash equal — while any real difference
+        // diverges. Best-effort: if the settings can't be read, the blob is empty and this degrades to
+        // the old coarse core+version+system digest (no false mismatch).
         public string SyncSettingsDigest
         {
             get
             {
                 using var sha = SHA256.Create();
                 var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(
-                    CoreName + "|" + CoreVersion + "|" + _emulator.SystemId));
+                    CoreName + "|" + CoreVersion + "|" + _emulator.SystemId + "|" + SyncSettingsBlob()));
                 return BitConverter.ToString(bytes, 0, 8).Replace("-", string.Empty);
             }
+        }
+
+        /// <summary>
+        /// The core's live sync settings serialized to JSON, or "" if the core exposes none / it can't be
+        /// read. Read straight from the core via <c>ISettable&lt;,&gt;.GetSyncSettings()</c> (the authoritative,
+        /// both-peers-symmetric source) rather than the config dict, so a value the user just changed and a
+        /// value loaded from disk can't serialize differently for the same logical settings.
+        /// </summary>
+        private string SyncSettingsBlob()
+        {
+            try
+            {
+                var settable = _emulator.GetType().GetInterfaces().FirstOrDefault(i =>
+                    i.IsGenericType && i.GetGenericTypeDefinition().FullName == "BizHawk.Emulation.Common.ISettable`2");
+                var syncSettings = settable?.GetMethod("GetSyncSettings")?.Invoke(_emulator, null);
+                if (syncSettings == null) return "";
+                return Newtonsoft.Json.JsonConvert.SerializeObject(syncSettings);
+            }
+            catch { return ""; } // never let a settings read break the handshake — fall back to the coarse digest
         }
 
         public bool VerifyDeterministicMode() => _emulator.DeterministicEmulation;

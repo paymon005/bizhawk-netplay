@@ -28,7 +28,7 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        private const int Protocol = 2; // v2 adds READY/GO and asynchronous resync framing
+        private const int Protocol = 3; // v3 folds the core's real sync-settings blob into the identity digest
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

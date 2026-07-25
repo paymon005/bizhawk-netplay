@@ -94,8 +94,18 @@ namespace BizHawkNetplay.Core.Session
             if (!string.Equals(local.SyncSettingsDigest, remote.SyncSettingsDigest, StringComparison.Ordinal))
                 return NegotiationResult.Reject("core sync-settings mismatch — align sync settings on both ends");
 
-            if (!SequenceEqual(local.PortLayoutDigests, remote.PortLayoutDigests))
-                return NegotiationResult.Reject("controller layout mismatch");
+            // Point at the exact difference rather than a bare "controller layout mismatch" — the usual
+            // cause is a per-port controller-type difference (3- vs 6-button pad, analog vs digital, a
+            // multitap/peripheral) that's fixable in seconds once you know which port to look at.
+            if (local.PortLayoutDigests.Count != remote.PortLayoutDigests.Count)
+                return NegotiationResult.Reject(
+                    $"controller count differs — you expose {local.PortLayoutDigests.Count} port(s), the peer exposes " +
+                    $"{remote.PortLayoutDigests.Count}. Match the number of controllers / the multitap setting on both machines.");
+            for (int i = 0; i < local.PortLayoutDigests.Count; i++)
+                if (!string.Equals(local.PortLayoutDigests[i], remote.PortLayoutDigests[i], StringComparison.Ordinal))
+                    return NegotiationResult.Reject(
+                        $"controller layout differs on port P{i + 1} — check that P{i + 1}'s controller type matches on " +
+                        "both machines (e.g. 3- vs 6-button pad, analog vs digital, or an attached peripheral).");
 
             if (!local.Deterministic)
                 return NegotiationResult.Reject("this core is not running deterministically here");
@@ -119,12 +129,5 @@ namespace BizHawkNetplay.Core.Session
             return NegotiationResult.Accept(mode, inputDelay);
         }
 
-        private static bool SequenceEqual(IReadOnlyList<string> a, IReadOnlyList<string> b)
-        {
-            if (a.Count != b.Count) return false;
-            for (int i = 0; i < a.Count; i++)
-                if (!string.Equals(a[i], b[i], StringComparison.Ordinal)) return false;
-            return true;
-        }
     }
 }
