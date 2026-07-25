@@ -1,6 +1,6 @@
 # Builds the netplay tool in Release and stages the two shippable DLLs in dist/
 # (BizHawkNetplay.Tool.dll + BizHawkNetplay.Core.dll) for upload to a GitHub Release.
-# dist/ is gitignored — binaries live on Releases, not in the repo tree.
+# dist/ is gitignored: binaries live on Releases, not in the repo tree.
 #
 #   .\build-dist.ps1                       # just build + stage into dist/
 #   .\build-dist.ps1 -Tag v0.4.0           # also create/upload a GitHub Release (needs gh CLI)
@@ -10,7 +10,7 @@
 param(
     [string]$BizHawkHome = "",
     [string]$Tag = "",
-    [string]$Notes = "Prebuilt BizHawk Netplay external tool. See dist install steps in the README."
+    [string]$Notes = "Prebuilt BizHawk Netplay external tool. See the README for install steps."
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,7 +35,7 @@ Write-Host "dist/ staged." -ForegroundColor Cyan
 
 if ($Tag -ne "") {
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        throw "gh CLI not found — install it, or upload dist\*.dll to a Release manually."
+        throw "gh CLI not found. Install it, or upload dist\*.dll to a Release manually."
     }
     $assets = $dlls | ForEach-Object { Join-Path $dist $_ }
     Write-Host "Creating GitHub Release $Tag..." -ForegroundColor Cyan
