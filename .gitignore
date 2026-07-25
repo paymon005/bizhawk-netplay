@@ -6,6 +6,8 @@
 
 # Release-artifact staging (binaries are published to GitHub Releases, not committed)
 /dist/
+# Local release tooling — useful on this machine, nothing anyone downloading the repo needs
+/build-dist.ps1
 *.user
 *.suo
 *.userosscache

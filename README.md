@@ -91,12 +91,17 @@ dotnet build src/BizHawkNetplay.Tool -p:BizHawkHome="X:\path\to\BizHawk"
 A successful Tool build copies `BizHawkNetplay.Tool.dll` + `BizHawkNetplay.Core.dll` into
 `<BizHawkHome>\ExternalTools\`. Disable with `-p:DeployToExternalTools=false`.
 
-**Cutting a release:** [`build-dist.ps1`](build-dist.ps1) builds Release and stages the two DLLs in
-`dist/` (gitignored). Pass a tag to publish them as a GitHub Release via the `gh` CLI:
+**Cutting a release:** build Release, then attach the two DLLs to a GitHub Release — that's all a
+release is. Binaries are never committed; they live on the Releases page.
 
 ```powershell
-.\build-dist.ps1 -Tag v0.4.0    # build, stage dist\, and create the Release with both DLLs attached
+dotnet build src/BizHawkNetplay.Tool -c Release -p:DeployToExternalTools=false
+gh release create v0.8.0 <release-output>\BizHawkNetplay.Tool.dll <release-output>\BizHawkNetplay.Core.dll `
+    --title v0.8.0 --target main --notes-file notes.md
 ```
+
+Use `--notes-file`, not `--notes`: PowerShell re-parses quotes when building a native command line,
+so notes containing a `"` or a newline get split and `gh` rejects the fragments as bad asset paths.
 
 ## Running netplay
 
