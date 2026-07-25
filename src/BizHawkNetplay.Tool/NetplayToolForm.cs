@@ -182,6 +182,12 @@ namespace BizHawkNetplay.Tool
         private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
         private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
 
+        // Actual sustained emulation speed, sampled ~2x/sec, so the status bar can flag a CPU-bound
+        // instance (the real cause of "lag" on a heavy core) rather than it looking like a netcode fault.
+        private readonly System.Diagnostics.Stopwatch _fpsClock = new System.Diagnostics.Stopwatch();
+        private int _fpsCount;
+        private double _actualFps = -1;
+
         // Raise the OS timer resolution to 1ms for the session so the WinForms frame timer fires
         // regularly (it's otherwise bound to the ~15ms system tick and jitters), which keeps audio
         // pumps steady and frame pacing smooth. Balanced by timeEndPeriod on session end.
@@ -1013,6 +1019,7 @@ namespace BizHawkNetplay.Tool
             lock (_pingLock) { foreach (var link in _peers) { link.PingMs = -1; link.PingCount = 0; } }
             _pingClock.Restart();
             _paceClock.Restart();
+            _fpsClock.Restart(); _fpsCount = 0; _actualFps = -1;
             try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
             _frameTimer.Interval = 2;
             _frameTimer.Start();
@@ -1123,6 +1130,12 @@ namespace BizHawkNetplay.Tool
                     _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderThis);
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
+                    _fpsCount++;
+                    // A heavy catch-up burst can block this thread for many frames; feed the audio device
+                    // between them so it doesn't underrun/crackle while we're busy stepping (the ring
+                    // decouples playback from our bursty stepping — this keeps it topped up). Cheap and
+                    // self-limiting: PumpAudio only writes what the device currently needs.
+                    if ((_driver.CurrentFrame & 1) == 0) _adapter.PumpAudio();
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
@@ -1165,7 +1178,22 @@ namespace BizHawkNetplay.Tool
                 string rbStr = _driver.Strategy is RollbackStrategy rbs
                     ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
                     : "";
-                Status($"in session — frame {_driver.CurrentFrame}{pingStr}{rbStr}", Color.Green);
+
+                // Measure the emulation speed we're actually sustaining vs the core's real rate. A reading
+                // well under 100% means this machine can't run the core fast enough (CPU-bound) — the true
+                // cause of "lag" on a heavy core, and NOT a netcode problem. Surface it so it's unmistakable.
+                if (_fpsClock.ElapsedMilliseconds >= 500)
+                {
+                    _actualFps = _fpsCount * 1000.0 / _fpsClock.ElapsedMilliseconds;
+                    _fpsCount = 0;
+                    _fpsClock.Restart();
+                }
+                double targetFps = _frameMs > 0 ? 1000.0 / _frameMs : 60.0;
+                bool cpuBound = _actualFps >= 0 && _actualFps < targetFps * 0.95;
+                string speedStr = _actualFps < 0 ? ""
+                    : $" — {_actualFps:F0}/{targetFps:F0} fps ({_actualFps / targetFps * 100:F0}%{(cpuBound ? ", CPU-bound" : "")})";
+                Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}",
+                    cpuBound ? Color.DarkOrange : Color.Green);
 
                 if (_driver.CurrentFrame % 30 == 0) RefreshPlayersList(); // ~2x/sec: keep the players/ping list live
             }

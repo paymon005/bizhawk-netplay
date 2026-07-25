@@ -29,10 +29,10 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | Milestone | State |
 |---|---|
 | **M0 — Probe harness** | ✅ Done. Runs the §5 probe + three API experiments. Validated on Genesis/GPGX (see below) |
-| Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, **lockstep + rollback** strategies — unit-tested |
-| **M1 — 2-player lockstep** | ✅ Verified on hardware (two EmuHawk instances, Genesis/GPGX): real-time pacing, working audio, desync detection (host saves quick-slot 10 on mismatch), configurable delay + packet redundancy |
+| Core sync logic | Input serialization (digital **+ analog axes**), layout negotiation, input pipeline / confirmed-frontier, **lockstep + rollback** strategies — unit-tested |
+| **M1 — 2-player lockstep** | ✅ Verified on hardware (two EmuHawk instances, Genesis/GPGX + N64): real-time pacing, working audio, desync detection (host saves quick-slot 10 on mismatch), configurable delay + packet redundancy |
 | **M2 — hardening** | ✅ Live ping/RTT + delay hints, **desync auto-recovery** (mismatch → resync from an authoritative state instead of ending), alt-tab audio resilience |
-| **3–4 players** | ✅ Code-complete — direct peer-to-peer input mesh with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status); player count = the core's controller-port count. *Untested on hardware.* |
+| **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input mesh with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). 2P verified on hardware; 3–4P *untested on hardware.* |
 | **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). *Untested on hardware.* |
 | **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. *Untested on real internet NAT (no second machine).* |
 
@@ -105,14 +105,22 @@ Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), 
   gets a short **connect code**. Swap codes out of band (Discord/text), paste your friend's, and
   *Connect*. Both punch outbound and the whole session runs over that one UDP socket.
 
-Two settings worth knowing on the Connection tab:
+Settings worth knowing on the Connection tab:
 
+- **Players** (host decides) — how many of the core's controller ports to fill, from 2 up to the
+  core's port count. So you can play 2-player on a core that exposes 4 ports (e.g. N64); the unused
+  ports read neutral.
 - **My controls** — which of *your* controller-port bindings the tool reads (default *Use P1 pad*),
   independent of the port you're assigned in-game. So a player assigned P2/P3/P4 just uses their
   normal P1 pad with no rebinding.
 - **Netcode** (host decides) — **Automatic** (rollback if both cores clear the capability probe, else
   lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows in
   a box on the tab.
+
+**Analog** sticks are networked (not just digital buttons), so N64/analog-pad games play with full
+stick control. During a session the status bar shows the emulation speed you're actually sustaining
+(e.g. `55/60 fps (92%)`) and flags **CPU-bound** in orange when your machine can't run the core fast
+enough — the true cause of "lag" on a heavy core, distinct from any netcode issue.
 
 On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason
 otherwise), transfers the host's savestate so both sims start identical, then runs. It trades
@@ -122,9 +130,27 @@ authoritative state (saving the diverged state to quick-slot 10 for inspection) 
 **Frame-driving model:** the tool pauses EmuHawk and steps the core exactly one confirmed frame per
 timer tick with only the merged network inputs — it *owns the clock* rather than fighting EmuHawk's
 own loop (which pausing would silence). This is what makes lockstep stalls safe, and it keeps input
-capture entirely out of the emulation path so both peers stay deterministic.
+capture entirely out of the emulation path so both peers stay deterministic. Under load it renders
+only the last frame of a catch-up burst (Dolphin-style frame-skip) to keep heavy cores responsive.
 
-See [Known limitations](#known-limitations) for the honest gaps (analog, NAT scope, etc.).
+### Heavy cores (N64 and friends)
+
+N64 works (connects, plays, stays in sync, analog moves), but BizHawk's N64 core is **interpreter-only
+(no dynamic recompiler)**, so it's CPU-heavy — worst when two instances share one machine. To get it
+to full speed:
+
+- **Core:** Mupen64Plus (not Ares64 — Ares is accurate but slower).
+- **Video plugin:** **Rice** (or Glide64mk2), *not* the default GLideN64, and never Angrylion (software
+  renderer). The plugin is the biggest adjustable cost.
+- **RSP:** Hle (the default). Keep GLideN64, if used, at native (1x) resolution with enhancements off.
+- Both machines must use **identical** N64 settings (they're sync settings — a mismatch desyncs).
+- N64 reports non-deterministic, so tick the **experimental override** on the Diagnostics tab on *both*
+  ends. In practice it stays in sync; desync detection guards you.
+
+Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster
+settings or a second machine, not netcode).
+
+See [Known limitations](#known-limitations) for the honest gaps (NAT scope, checksum scope, etc.).
 
 ## Capability probe
 
@@ -134,25 +160,24 @@ times save/load/frame-advance on the loaded core and prints the per-core rollbac
 and restoring your position so it doesn't disturb play.
 
 # To Do
-- **Performance:** the picture can dip under heavy on-screen action (both players see it). This looks
-  like emulator + UI-thread render cost rather than the network (rollback re-sim already runs with
-  rendering off); a real fix likely means moving emulation off the UI thread. Profile before attempting.
+- **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and
+  audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are
+  thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 - **Guard movies / TAStudio / Lua:** detect and refuse them at session start instead of only documenting it.
-- **Analog axes:** network the analog sticks (currently held neutral), for N64 / analog-pad games.
+- **Compare real sync settings:** hash the core's actual sync-settings blob at handshake so mismatched
+  per-core settings (e.g. different N64 plugins) are caught up front instead of surfacing as a desync.
 
 ## Known limitations
 
 Things that are by-design gaps or not-yet-built, worth knowing before relying on it:
 
-- **Analog axes aren't networked** — inputs are transmitted as digital buttons with analog axes held
-  neutral, so analog-stick control isn't supported yet. (A core like N64 can still be tried via the
-  experimental non-deterministic override on the Diagnostics tab, but its stick stays centered.)
 - **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined
   to non-RAM state can slip past the checksum until it perturbs RAM.
 - **The sync-settings check is coarse** — the handshake compares core + assembly version + system ID,
   not the core's full sync-settings blob, so two peers with the same core but different per-core sync
-  settings can pass the handshake and then diverge. Match your core settings manually.
+  settings (e.g. different N64 video plugins) can pass the handshake and then desync. Match settings on
+  both machines manually.
 - **NAT traversal is cone-only** — UDP Punch and the mesh connectivity checks open cone-NAT paths;
   **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't
   built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the
