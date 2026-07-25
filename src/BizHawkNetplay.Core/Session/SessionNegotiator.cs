@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Security.Cryptography;
-using System.Text;
 using BizHawkNetplay.Core.Probe;
 
 namespace BizHawkNetplay.Core.Session
@@ -9,12 +7,12 @@ namespace BizHawkNetplay.Core.Session
     /// <summary>How a peer wants to play, independent of what the other peer can do.</summary>
     public sealed class SessionPreferences
     {
-        public SessionPreferences(int inputDelay, bool wantRollback, string passwordHash = "")
+        public SessionPreferences(int inputDelay, bool wantRollback, string password = "")
         {
             if (inputDelay < 1) throw new ArgumentOutOfRangeException(nameof(inputDelay), "Delay must be >= 1");
             InputDelay = inputDelay;
             WantRollback = wantRollback;
-            PasswordHash = passwordHash ?? "";
+            Password = password ?? "";
         }
 
         /// <summary>Requested input delay D (frames). The session uses the larger of the two peers' asks.</summary>
@@ -23,19 +21,9 @@ namespace BizHawkNetplay.Core.Session
         /// <summary>Whether this peer opted into rollback (only honored if both peers qualify).</summary>
         public bool WantRollback { get; }
 
-        /// <summary>Hash of the session password (empty = no password). Peers must match to be paired.</summary>
-        public string PasswordHash { get; }
-
-        /// <summary>Hash a session password to a hex digest; empty/null password → empty (no password).</summary>
-        public static string HashPassword(string? password)
-        {
-            if (string.IsNullOrEmpty(password)) return "";
-            using var sha = SHA256.Create();
-            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(password));
-            var sb = new StringBuilder(bytes.Length * 2);
-            foreach (var b in bytes) sb.Append(b.ToString("x2"));
-            return sb.ToString();
-        }
+        /// <summary>The session password in the clear (empty = no password). NEVER transmitted: it's used
+        /// locally to compute the handshake's nonce challenge-response proof (see <see cref="SessionAuth"/>).</summary>
+        public string Password { get; }
     }
 
     /// <summary>The agreed session parameters, or a rejection with a human-readable reason.</summary>
@@ -112,9 +100,9 @@ namespace BizHawkNetplay.Core.Session
             if (!remote.Deterministic)
                 return NegotiationResult.Reject("the remote core is not running deterministically");
 
-            // Session password: both sides must present the same hash (empty on both = no password).
-            if (!string.Equals(localPrefs.PasswordHash, remotePrefs.PasswordHash, StringComparison.Ordinal))
-                return NegotiationResult.Reject("session password mismatch");
+            // (The session password is verified separately, via the nonce challenge-response in
+            // Handshake/SessionAuth — it can't be a stateless equality check here without sending a
+            // replayable hash over the wire.)
 
             // Input delay: honor the larger ask so both peers are comfortable (§8).
             int inputDelay = Math.Max(localPrefs.InputDelay, remotePrefs.InputDelay);

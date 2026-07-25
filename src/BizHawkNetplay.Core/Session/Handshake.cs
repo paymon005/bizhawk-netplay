@@ -61,12 +61,13 @@ namespace BizHawkNetplay.Core.Session
             ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs,
             byte[] hostState, int localUdpPort)
         {
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, localUdpPort));
+            var hostNonce = SessionAuth.NewNonce();
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, localUdpPort, hostNonce));
 
             var (type, body) = channel.Receive();
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from joiner, got {type}");
-            var (clientId, clientPrefs, clientUdpPort) = HandshakeCodec.Decode(body);
+            var (clientId, clientPrefs, clientUdpPort, joinNonce) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(hostId, clientId, hostPrefs, clientPrefs);
             if (!result.Accepted)
@@ -74,6 +75,9 @@ namespace BizHawkNetplay.Core.Session
                 channel.Send(ControlMessageType.Error, Encoding.UTF8.GetBytes(result.RejectReason ?? "rejected"));
                 throw new HandshakeException(result.RejectReason ?? "rejected");
             }
+
+            // Verify the session password (nonce challenge-response) before transferring any state.
+            VerifyPassword(channel, hostPrefs.Password, hostNonce, joinNonce, isHost: true);
 
             // Host owns port 0; transfer the reference state, then release the synchronized start.
             channel.Send(ControlMessageType.State, hostState ?? Array.Empty<byte>());
@@ -87,7 +91,8 @@ namespace BizHawkNetplay.Core.Session
         public static SessionParams RunClient(
             ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort)
         {
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort));
+            var joinNonce = SessionAuth.NewNonce();
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
 
             // First frame back is the host's HELLO (or an early ERROR).
             var (type, body) = channel.Receive();
@@ -95,11 +100,14 @@ namespace BizHawkNetplay.Core.Session
                 throw new HandshakeException(Encoding.UTF8.GetString(body));
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from host, got {type}");
-            var (hostId, hostPrefs, hostUdpPort) = HandshakeCodec.Decode(body);
+            var (hostId, hostPrefs, hostUdpPort, hostNonce) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
             if (!result.Accepted)
                 throw new HandshakeException(result.RejectReason ?? "rejected");
+
+            // Prove we know the session password (and verify the host does too) before taking any state.
+            VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
 
             byte[]? initialState = null;
             while (true)
@@ -116,6 +124,47 @@ namespace BizHawkNetplay.Core.Session
             // Client owns port 1.
             return new SessionParams(result.Mode, result.InputDelay, localPort: 1, remotePort: 0,
                 remoteUdpPort: hostUdpPort, initialState);
+        }
+
+        /// <summary>
+        /// The session-password step: a mutual, nonce-bound challenge-response (see <see cref="SessionAuth"/>)
+        /// run right after the HELLO exchange. The host verifies the joiner's proof BEFORE revealing its own,
+        /// so a wrong-password joiner learns nothing to work with; then it proves itself so the joiner can
+        /// trust the host too. An empty password on both ends produces matching proofs — the open-session
+        /// case. Throws <see cref="HandshakeException"/> on a mismatch (message is user-facing).
+        /// </summary>
+        public static void VerifyPassword(
+            ControlChannel channel, string? password, byte[]? hostNonce, byte[]? joinNonce, bool isHost)
+        {
+            if (hostNonce == null || joinNonce == null)
+                throw new HandshakeException("handshake is missing an auth nonce — the peer may be on an incompatible build");
+
+            string myRole = isHost ? SessionAuth.RoleHost : SessionAuth.RoleJoin;
+            string peerRole = isHost ? SessionAuth.RoleJoin : SessionAuth.RoleHost;
+            string myProof = SessionAuth.Proof(password, myRole, hostNonce, joinNonce);
+            string peerExpected = SessionAuth.Proof(password, peerRole, hostNonce, joinNonce);
+
+            if (isHost)
+            {
+                var (t, b) = channel.Receive();
+                if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
+                if (t != ControlMessageType.Auth) throw new HandshakeException($"expected AUTH from joiner, got {t}");
+                if (!SessionAuth.FixedTimeEquals(Encoding.UTF8.GetString(b), peerExpected))
+                {
+                    channel.Send(ControlMessageType.Error, Encoding.UTF8.GetBytes("wrong session password"));
+                    throw new HandshakeException("session password mismatch");
+                }
+                channel.Send(ControlMessageType.Auth, Encoding.UTF8.GetBytes(myProof));
+            }
+            else
+            {
+                channel.Send(ControlMessageType.Auth, Encoding.UTF8.GetBytes(myProof));
+                var (t, b) = channel.Receive();
+                if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
+                if (t != ControlMessageType.Auth) throw new HandshakeException($"expected AUTH from host, got {t}");
+                if (!SessionAuth.FixedTimeEquals(Encoding.UTF8.GetString(b), peerExpected))
+                    throw new HandshakeException("session password mismatch (could not verify the host)");
+            }
         }
 
         // ---- N-player (host-relay) handshake ---------------------------------------------
@@ -144,12 +193,13 @@ namespace BizHawkNetplay.Core.Session
         public static JoinerGreeting HostGreet(
             ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs, int hostUdpPort)
         {
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, hostUdpPort));
+            var hostNonce = SessionAuth.NewNonce();
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, hostUdpPort, hostNonce));
 
             var (type, body) = channel.Receive();
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from joiner, got {type}");
-            var (joinerId, joinerPrefs, joinerUdpPort) = HandshakeCodec.Decode(body);
+            var (joinerId, joinerPrefs, joinerUdpPort, joinNonce) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(hostId, joinerId, hostPrefs, joinerPrefs);
             if (!result.Accepted)
@@ -157,6 +207,11 @@ namespace BizHawkNetplay.Core.Session
                 channel.Send(ControlMessageType.Error, Encoding.UTF8.GetBytes(result.RejectReason ?? "rejected"));
                 throw new HandshakeException(result.RejectReason ?? "rejected");
             }
+
+            // Verify the session password during the greet, so a wrong-password joiner is refused before
+            // the host commits it a port / includes it in the delay + mode decisions.
+            VerifyPassword(channel, hostPrefs.Password, hostNonce, joinNonce, isHost: true);
+
             return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort);
         }
 
@@ -197,18 +252,22 @@ namespace BizHawkNetplay.Core.Session
         public static SessionParams RunClientMulti(
             ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort)
         {
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort));
+            var joinNonce = SessionAuth.NewNonce();
+            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
 
             var (type, body) = channel.Receive();
             if (type == ControlMessageType.Error)
                 throw new HandshakeException(Encoding.UTF8.GetString(body));
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from host, got {type}");
-            var (hostId, hostPrefs, hostUdpPort) = HandshakeCodec.Decode(body);
+            var (hostId, hostPrefs, hostUdpPort, hostNonce) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
             if (!result.Accepted)
                 throw new HandshakeException(result.RejectReason ?? "rejected");
+
+            // Prove we know the session password (and verify the host does too) before the Welcome flow.
+            VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
 
             int assignedPort = 1, playerCount = 2, delay = result.InputDelay;
             SyncMode mode = result.Mode;

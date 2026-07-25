@@ -38,6 +38,7 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input mesh with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). 2P verified on hardware; 3–4P *untested on hardware.* |
 | **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). *Untested on hardware.* |
 | **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. *Untested on real internet NAT (no second machine).* |
+| **Session passwords** (v0.8.0) | ✅ Nonce challenge-response with a slow KDF — the password never crosses the wire and a captured proof can't be replayed. A refused joiner loses only its own connection; the host keeps hosting. **Protocol v4 — everyone must update.** |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
@@ -103,7 +104,10 @@ Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), 
 **Tools → External Tools → BizHawk Netplay**.
 
 - **Host:** pick *Host*, choose a port (default 47800), *Start Hosting*.
-- **Join:** pick *Join*, enter the host's IP + port, *Join*. (Recent hosts are remembered in the IP dropdown.)
+- **Join:** pick *Join*, enter the host's address, *Join*. The box takes either a bare IP (`1.2.3.4`,
+  using the *Port* box) or the `ip:port` form the host reads out (`1.2.3.4:47800`), in which case the
+  typed port wins and the *Port* box updates to match. Recent hosts are remembered in the dropdown,
+  with their ports.
 - **UDP Punch** (2 players, no port-forwarding): each side picks its role, clicks *UDP Punch*, and
   gets a short **connect code**. Swap codes out of band (Discord/text), paste your friend's, and
   *Connect*. Both punch outbound and the whole session runs over that one UDP socket.
@@ -116,9 +120,17 @@ Settings worth knowing on the Connection tab:
 - **My controls** — which of *your* controller-port bindings the tool reads (default *Use P1 pad*),
   independent of the port you're assigned in-game. So a player assigned P2/P3/P4 just uses their
   normal P1 pad with no rebinding.
+- **Password** (optional) — must match on both ends. Leave it empty for an open session. It's never
+  sent over the wire; both ends prove they know it via a nonce challenge-response (see *Known
+  limitations*). Getting it wrong costs the joiner their connection attempt, not the host's lobby —
+  the host logs the refusal and keeps waiting.
 - **Netcode** (host decides) — **Automatic** (rollback if both cores clear the capability probe, else
   lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows in
   a box on the tab.
+- **Connection status** — a running log of connection events right above the netcode box: hosting,
+  connecting, joined, refused (with the reason), dropped, reconnected, ended. Red is a refusal or
+  failure, green is connected. Everything else — per-frame diagnostics, audio, probe output — stays on
+  the *Log* tab.
 
 **Analog** sticks are networked (not just digital buttons), so N64/analog-pad games play with full
 stick control. During a session the status bar shows the emulation speed you're actually sustaining
@@ -165,7 +177,6 @@ and restoring your position so it doesn't disturb play.
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
-- **Authenticate the session password:** today both peers just exchange a SHA-256 hash and compare, so a peer on the wire can echo the hash back without knowing the password. A nonce challenge-response with a slow KDF would make the password a real gate rather than a casual one.
 
 ## Known limitations
 
@@ -177,6 +188,6 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
   **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the rendezvous for the joiner↔joiner mesh.
 - **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
   for playing with people you trust; not a hostile-network guarantee.
-- **The session password is a casual gate, not authentication** — peers exchange a SHA-256 hash and compare it, so it keeps out someone who doesn't know the password but not someone on the wire who can echo the hash. Treat it as "don't join by accident", not as protection against a determined attacker.
+- **The session password** is verified by a nonce challenge-response (`SessionAuth`): the password is never sent (not even hashed), a captured proof can't be replayed to another session, and role-tagging blocks a reflection attack. An empty password means an open session. A refused joiner (wrong password, wrong ROM/core, a HELLO that never arrives) only loses its own connection — the host logs it and keeps listening, so a typo doesn't cost you the lobby. Still not a fortress — it's a shared secret over a plaintext control channel with no forward secrecy — but it's a real gate, not an echo-able hash.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
 - **Untested on real hardware** for 3–4 players and any over-the-internet NAT path (developed on a single machine). Everything below the socket layer is unit-tested; the last mile needs two boxes.

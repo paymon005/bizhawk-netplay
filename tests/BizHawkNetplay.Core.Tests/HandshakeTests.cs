@@ -91,6 +91,79 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void MatchingPassword_CompletesHandshake()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var hostState = new byte[1024];
+                new Random(7).NextBytes(hostState);
+                var hostTask = Task.Run(() =>
+                    Handshake.RunHost(hostCh, Id(), new SessionPreferences(2, false, "hunter2"), hostState, 47800));
+                var clientParams = Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, false, "hunter2"), 51000);
+                hostTask.GetAwaiter().GetResult();
+                Assert.Equal(hostState, clientParams.InitialState); // password matched -> state transferred
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void WrongPassword_RejectsBothSides_AndSendsNoState()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var hostTask = Task.Run(() =>
+                    Handshake.RunHost(hostCh, Id(), new SessionPreferences(2, false, "hunter2"), new byte[10], 47800));
+                var clientEx = Assert.Throws<HandshakeException>(() =>
+                    Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, false, "letmein"), 51000));
+                var hostEx = Assert.Throws<HandshakeException>(() => hostTask.GetAwaiter().GetResult());
+                Assert.Contains("password", clientEx.Message);
+                Assert.Contains("password", hostEx.Message);
+            }
+            finally { dispose(); }
+        }
+
+        /// <summary>
+        /// A refused joiner must cost only that joiner's connection: the host greets a wrong-password
+        /// attempt, it fails, and the very next connection with the right password still completes.
+        /// The tool's accept loop relies on this to keep hosting through a typo'd password instead of
+        /// making the host tear down and re-host.
+        /// </summary>
+        [Fact]
+        public void WrongPasswordGreet_DoesNotPoisonTheNextJoiner()
+        {
+            var (badHostCh, badClientCh, d1) = TcpPair();
+            var (hostCh, clientCh, d2) = TcpPair();
+            try
+            {
+                var hostPrefs = new SessionPreferences(2, false, "hunter2");
+                var hostState = new byte[1000];
+                new Random(7).NextBytes(hostState);
+
+                // First attempt: wrong password. Both ends refuse, and the host survives it.
+                var badClient = Task.Run(() =>
+                    Handshake.RunClientMulti(badClientCh, Id(), new SessionPreferences(2, false, "letmein"), 51001));
+                var hostEx = Assert.Throws<HandshakeException>(() => Handshake.HostGreet(badHostCh, Id(), hostPrefs, 47800));
+                Assert.Contains("password", hostEx.Message);
+                Assert.Throws<HandshakeException>(() => badClient.GetAwaiter().GetResult());
+                d1(); // the host drops just this connection
+
+                // Second attempt on a fresh connection with the right password: fully accepted.
+                var goodClient = Task.Run(() =>
+                    Handshake.RunClientMulti(clientCh, Id(), new SessionPreferences(2, false, "hunter2"), 51002));
+                var greet = Handshake.HostGreet(hostCh, Id(), hostPrefs, 47800);
+                Handshake.HostSendWelcome(hostCh, 1, 2, 2, SyncMode.Lockstep, hostState);
+
+                var p = goodClient.GetAwaiter().GetResult();
+                Assert.Equal(51002, greet.UdpPort);
+                Assert.Equal(1, p.LocalPort);
+                Assert.Equal(hostState, p.InitialState);
+            }
+            finally { d1(); d2(); }
+        }
+
+        [Fact]
         public void MultiPlayerHandshake_AssignsPortsAndAuthoritativeDelay()
         {
             var (hostCh1, clientCh1, d1) = TcpPair();

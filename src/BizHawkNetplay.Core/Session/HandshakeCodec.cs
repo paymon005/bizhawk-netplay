@@ -22,7 +22,7 @@ namespace BizHawkNetplay.Core.Session
 
         private static int ClampDelay(int d) => d < 1 ? 1 : d > MaxInputDelay ? MaxInputDelay : d;
 
-        public static byte[] Encode(PeerIdentity id, SessionPreferences prefs, int udpPort)
+        public static byte[] Encode(PeerIdentity id, SessionPreferences prefs, int udpPort, byte[] nonce)
         {
             var sb = new StringBuilder();
             sb.Append("proto=").Append(id.ProtocolVersion).Append('\n');
@@ -35,7 +35,9 @@ namespace BizHawkNetplay.Core.Session
             sb.Append("depth=").Append(id.MaxRollbackDepth).Append('\n');
             sb.Append("delay=").Append(prefs.InputDelay).Append('\n');
             sb.Append("rollback=").Append(prefs.WantRollback ? '1' : '0').Append('\n');
-            sb.Append("pwhash=").Append(prefs.PasswordHash).Append('\n');
+            // The password never crosses the wire — only this fresh nonce, which seeds the challenge-
+            // response proof exchanged afterward (see SessionAuth). Empty nonce is tolerated (open session).
+            sb.Append("nonce=").Append(nonce == null ? "" : SessionAuth.ToHex(nonce)).Append('\n');
             sb.Append("udpport=").Append(udpPort).Append('\n');
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
@@ -89,7 +91,7 @@ namespace BizHawkNetplay.Core.Session
             return (port, players, delay, mode);
         }
 
-        public static (PeerIdentity id, SessionPreferences prefs, int udpPort) Decode(byte[] body)
+        public static (PeerIdentity id, SessionPreferences prefs, int udpPort, byte[]? nonce) Decode(byte[] body)
         {
             var map = ParseLines(body);
 
@@ -107,11 +109,13 @@ namespace BizHawkNetplay.Core.Session
                 Get(map, "det") == "1",
                 GetInt(map, "depth", 0));
 
-            // Clamp delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge
-            // value that would hang the host seeding that many neutral frames on the UI thread.
-            var prefs = new SessionPreferences(ClampDelay(GetInt(map, "delay", 1)), Get(map, "rollback") == "1", Get(map, "pwhash"));
+            // The remote's password is never on the wire — prefs carries only delay/rollback here. Clamp
+            // delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge value
+            // that would hang the host seeding that many neutral frames on the UI thread.
+            var prefs = new SessionPreferences(ClampDelay(GetInt(map, "delay", 1)), Get(map, "rollback") == "1");
             int udpPort = GetInt(map, "udpport", 0);
-            return (id, prefs, udpPort);
+            byte[]? nonce = SessionAuth.FromHex(Get(map, "nonce")); // null if missing/malformed
+            return (id, prefs, udpPort, nonce);
         }
 
         private static Dictionary<string, string> ParseLines(byte[] body)

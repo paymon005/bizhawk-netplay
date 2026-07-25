@@ -21,6 +21,7 @@ namespace BizHawkNetplay.Core.Session
         Ready = 14,    // multi-peer start barrier request/ack after state import data is received
         Go = 15,       // host releases every ready joiner at once
         ResyncBegin = 16, // host -> client: a large Resync frame follows; suspend ping timeout while receiving it
+        Auth = 17,     // session-password challenge-response proof (see SessionAuth)
     }
 
     /// <summary>

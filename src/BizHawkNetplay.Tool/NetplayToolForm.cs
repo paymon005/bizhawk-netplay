@@ -28,7 +28,7 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        private const int Protocol = 3; // v3 folds the core's real sync-settings blob into the identity digest
+        private const int Protocol = 4; // v4 replaces the password hash with a nonce challenge-response (SessionAuth)
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
@@ -57,6 +57,7 @@ namespace BizHawkNetplay.Tool
         private ComboBox _inputSourceCombo = null!;
         private CheckBox _allowNonDetCheck = null!;
         private Label _netcodeLabel = null!;
+        private RichTextBox _connLog = null!;
         private CheckBox _simUnresponsiveCheck = null!;
         private CheckBox _upnpCheck = null!;
         private TextBox _passwordBox = null!;
@@ -70,7 +71,7 @@ namespace BizHawkNetplay.Tool
         private TextBox _peerCodeBox = null!;
         private Button _connectButton = null!;
         private Label _punchStatus = null!;
-
+        private readonly ToolTip _tips = new ToolTip(); // owns a native window — disposed with the form
         private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
         private bool _loadingSettings;                  // suppress change-handler saves while applying loaded prefs
         private string? _pendingJoinIp;                 // regular-join IP awaiting a successful connect, then recorded
@@ -135,6 +136,8 @@ namespace BizHawkNetplay.Tool
         private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
         private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
+        private const int ConnLogMaxLines = 200; // connection-log history cap, trimmed back to ConnLogKeepLines
+        private const int ConnLogKeepLines = 120;
         private FrameDriver? _driver;
         private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
@@ -234,8 +237,8 @@ namespace BizHawkNetplay.Tool
         public NetplayToolForm()
         {
             SuspendLayout();
-            ClientSize = new Size(580, 540);
-            MinimumSize = new Size(520, 480);
+            ClientSize = new Size(580, 600);
+            MinimumSize = new Size(520, 600); // the Connection tab's content ends at y=526 — don't clip the punch group
 
             var tabs = new TabControl { Dock = DockStyle.Fill };
             tabs.TabPages.Add(BuildConnectionTab());
@@ -268,9 +271,18 @@ namespace BizHawkNetplay.Tool
         /// disconnected or rearranged leaves the window stranded offscreen. If little of it is on any
         /// screen, re-center on the primary display; an already-visible position is left untouched.
         /// </summary>
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            try { _tips.Dispose(); } catch { }
+            base.OnFormClosed(e);
+        }
+
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
+            // Seed the connection log here rather than in the constructor: RichTextBox coloring forces
+            // handle creation, which we'd rather not trigger while the form is still being built.
+            if (_connLog.TextLength == 0) ConnLog("Ready — pick Host or Join, then Start.", Color.DimGray);
             // The host restores our saved position AFTER OnShown returns (right after Show()), so a fix
             // applied here is immediately overwritten. Defer to the end of the message queue via
             // BeginInvoke — by then the final position is in place and we can pull it back if stranded.
@@ -378,6 +390,9 @@ namespace BizHawkNetplay.Tool
                 Text = "127.0.0.1", Location = new Point(80, 43), Width = 160,
                 DropDownStyle = ComboBoxStyle.DropDown, // editable, with a dropdown of recently-used IPs
             };
+            _tips.SetToolTip(_ipBox,
+                "The host's address: 1.2.3.4 or 1.2.3.4:47800.\r\n" +
+                "A port typed here overrides the Port box.");
             var portLabel = new Label { Text = "Port:", AutoSize = true, Location = new Point(260, 46) };
             _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 43), Width = 70 };
             var playersLabel = new Label { Text = "Players:", AutoSize = true, Location = new Point(388, 46) };
@@ -409,9 +424,21 @@ namespace BizHawkNetplay.Tool
             _pubAddrButton = new Button { Text = "My public address", Location = new Point(292, 172), Width = 150 };
             _pubAddrButton.Click += (_, __) => ShowPublicAddress();
 
+            // Connection log: the did-I-get-in answer, on the tab you're already looking at. The Log tab
+            // carries the full diagnostic firehose, which is the wrong place to learn that your password
+            // was wrong — only connection-lifecycle events land here, color-coded (red = refused/failed,
+            // green = connected). See ConnLog.
+            var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 200) };
+            _connLog = new RichTextBox
+            {
+                Location = new Point(12, 218), Size = new Size(544, 92),
+                ReadOnly = true, BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
+                ScrollBars = RichTextBoxScrollBars.Vertical, TabStop = false, DetectUrls = false,
+            };
+
             _netcodeLabel = new Label
             {
-                Text = "Netcode in use: —", Location = new Point(12, 208), Width = 300, Height = 24,
+                Text = "Netcode in use: —", Location = new Point(12, 318), Width = 300, Height = 24,
                 BorderStyle = BorderStyle.FixedSingle, TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(6, 0, 0, 0), ForeColor = Color.DimGray,
             };
@@ -421,7 +448,8 @@ namespace BizHawkNetplay.Tool
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox, playersLabel, _playersBox,
                 passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
                 netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
-                _goButton, _disconnectButton, _pubAddrButton, _netcodeLabel, BuildPunchGroup(),
+                _goButton, _disconnectButton, _pubAddrButton,
+                connLogLabel, _connLog, _netcodeLabel, BuildPunchGroup(),
             });
             return page;
         }
@@ -436,7 +464,7 @@ namespace BizHawkNetplay.Tool
             _punchGroup = new GroupBox
             {
                 Text = "UDP Punch — connect with no port-forwarding (2 players)",
-                Location = new Point(12, 244), Size = new Size(544, 176),
+                Location = new Point(12, 350), Size = new Size(544, 176),
             };
 
             var step1 = new Label
@@ -663,10 +691,30 @@ namespace BizHawkNetplay.Tool
                     Log($"this core has only {portCount} controller ports — hosting {players} players.");
 
                 // Validate the join address BEFORE pausing — otherwise a typo'd IP leaves the emulator
-                // frozen on the early return with no session to un-freeze it.
-                if (!_hostRadio.Checked && !IPAddress.TryParse(_ipBox.Text.Trim(), out _))
+                // frozen on the early return with no session to un-freeze it. The box takes either a
+                // bare IP or "ip:port" (what a host usually reads out), and a port typed there wins
+                // over the Port box — which we update so the UI still shows the port we're dialing.
+                IPAddress? joinIp = null;
+                if (!_hostRadio.Checked)
                 {
-                    Log("Enter a valid host IP."); SetBusy(false); return;
+                    if (!HostAddress.TryParse(_ipBox.Text, (int)_portBox.Value, out joinIp, out int joinPort))
+                    {
+                        ConnLog("Enter a valid host address — an IP (1.2.3.4) or IP:port (1.2.3.4:47800).",
+                            Color.Firebrick);
+                        SetBusy(false); return;
+                    }
+                    // Everything below the socket layer is IPv4 (the host binds IPAddress.Any, connect
+                    // codes pack 4 bytes) — say so plainly instead of failing later in a socket error.
+                    if (joinIp!.AddressFamily != AddressFamily.InterNetwork)
+                    {
+                        ConnLog("IPv6 host addresses aren't supported — use the host's IPv4 address.", Color.Firebrick);
+                        SetBusy(false); return;
+                    }
+                    if (joinPort != (int)_portBox.Value)
+                    {
+                        Log($"using port {joinPort} from the host address (was {(int)_portBox.Value})");
+                        _portBox.Value = joinPort; // read back below as the port we dial
+                    }
                 }
 
                 // Freeze the emulator NOW. Otherwise it keeps free-running between probing/exporting
@@ -681,8 +729,7 @@ namespace BizHawkNetplay.Tool
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
                 ApplyHeavyCoreNetcodeDefault();
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
-                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
-                    SessionPreferences.HashPassword(_passwordBox.Text));
+                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
                 var id = BuildIdentity(_adapter, wantRollback);
                 int port = (int)_portBox.Value;
                 _simLatencyMs = (int)_simLatencyBox.Value; // diagnostic artificial UDP delay for this session
@@ -701,8 +748,10 @@ namespace BizHawkNetplay.Tool
                 else
                 {
                     _mesh = MeshUdpTransport.Bind(0); _transport = WrapSimLatency(_mesh);
-                    string ip = _ipBox.Text.Trim(); // already validated above, before the pause
-                    _pendingJoinIp = ip; // recorded into the recent-IPs list once the connect succeeds
+                    string ip = joinIp!.ToString(); // parsed above, before the pause
+                    // Remember the address WITH its port: the dropdown's whole job is to let you rejoin
+                    // the same host, which a bare IP can't do once the port isn't the default any more.
+                    _pendingJoinIp = HostAddress.Format(joinIp, port); // recorded once the connect succeeds
                     StartThread(() => JoinThread(ip, port, id, prefs, _mesh.LocalPort));
                 }
             }
@@ -753,8 +802,7 @@ namespace BizHawkNetplay.Tool
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
                 ApplyHeavyCoreNetcodeDefault();
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
-                _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
-                    SessionPreferences.HashPassword(_passwordBox.Text));
+                _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
                 _punchId = BuildIdentity(_adapter, wantRollback);
                 _simLatencyMs = (int)_simLatencyBox.Value;
                 _punchState = _isHost ? _adapter.ExportState() : null;
@@ -845,11 +893,13 @@ namespace BizHawkNetplay.Tool
                         if (!_punchMode) return;
                         _punchStatus.Text = "punch failed — no path opened (the other side may be on symmetric NAT).";
                         _punchStatus.ForeColor = Color.Firebrick;
+                        ConnLog($"UDP punch to {peer} failed — no path opened (the other side may be on " +
+                                "symmetric NAT, or hasn't clicked Connect yet).", Color.Firebrick);
                         _connectButton.Enabled = true; _peerCodeBox.Enabled = true;
                     });
                     return;
                 }
-                UiLog($"UDP punch opened a path to {link.PeerEndpoint}");
+                UiConnLog($"UDP punch opened a path to {link.PeerEndpoint}", Color.DarkSlateBlue);
                 try
                 {
                     // Punch is symmetric at the transport level — unlike the TCP path (listener vs dialer)
@@ -930,25 +980,50 @@ namespace BizHawkNetplay.Tool
                 _listener = new TcpListener(IPAddress.Any, port);
                 _listener.Start();
                 int need = players - 1;
-                UiLog($"hosting on TCP+UDP {port} — waiting for {need} player(s) to join…");
+                UiConnLog($"hosting on TCP+UDP {port} — waiting for {need} player(s) to join…", Color.DarkSlateBlue);
 
                 // Best-effort NAT reachability (UPnP forward + public-address report). Non-fatal.
                 TryPublishHostAddress(port);
 
                 var links = new List<PeerLink>();
                 var greetings = new List<Handshake.JoinerGreeting>();
-                for (int i = 0; i < need; i++)
+                while (links.Count < need)
                 {
-                    var tcp = _listener.AcceptTcpClient();
+                    var listener = _listener;
+                    if (listener == null) return; // Disconnect tore the host down while we waited
+
+                    TcpClient tcp;
+                    try { tcp = listener.AcceptTcpClient(); }
+                    catch when (_listener == null) { return; } // teardown stopped the listener, not a failure
+
                     try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                     try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // bound a silent joiner's HELLO
                     _greetingTcp = tcp; // so Disconnect/teardown can abort a joiner stuck mid-handshake
                     var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                     var channel = new ControlChannel(tcp.GetStream());
-                    var greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+
+                    Handshake.JoinerGreeting greet;
+                    try
+                    {
+                        greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+                    }
+                    catch (Exception ex)
+                    {
+                        // One joiner failing the greet — wrong session password, wrong ROM/core, a HELLO
+                        // that never arrived — is that joiner's problem, not the session's. Refusing them
+                        // used to take the whole host down with it, so a typo'd password meant re-hosting;
+                        // drop just this connection and keep the door open (same policy as a rejoin).
+                        _greetingTcp = null;
+                        try { tcp.Close(); } catch { }
+                        if (_listener == null) return; // teardown aborted the greet mid-handshake
+                        UiConnLog($"refused a join from {remoteIp}: {ex.Message} — still hosting, " +
+                                  $"waiting for {need - links.Count} player(s)", Color.Firebrick);
+                        continue;
+                    }
+
                     _greetingTcp = null;
                     try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
-                    int assignedPort = i + 1;
+                    int assignedPort = links.Count + 1;
                     links.Add(new PeerLink
                     {
                         Tcp = tcp,
@@ -958,7 +1033,7 @@ namespace BizHawkNetplay.Tool
                         Label = $"P{assignedPort + 1} ({remoteIp})",
                     });
                     greetings.Add(greet);
-                    UiLog($"P{assignedPort + 1} joined ({i + 1}/{need})");
+                    UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);
                 }
                 try { _listener.Stop(); } catch { }
                 _listener = null;
@@ -1017,7 +1092,7 @@ namespace BizHawkNetplay.Tool
         {
             try
             {
-                UiLog($"connecting to {ip}:{port}…");
+                UiConnLog($"connecting to {ip}:{port}…", Color.DarkSlateBlue);
                 var tcp = new TcpClient();
                 _joiningTcp = tcp;          // so Disconnect can close a connect that's still blocking
                 tcp.Connect(ip, port);
@@ -1048,7 +1123,7 @@ namespace BizHawkNetplay.Tool
                 _peers.Clear(); _peers.AddRange(links);
                 _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
-                Log($"all {players} players connected — you are P1 (host)");
+                ConnLog($"all {players} players connected — you are P1 (host)", Color.DarkGreen);
                 BeginSessionCommon(mode, $"{links.Count} peer(s)");
             }
             catch (Exception ex) { FailSession(ex.Message); }
@@ -1070,7 +1145,7 @@ namespace BizHawkNetplay.Tool
                 ApplyJoinerMesh();
                 // Both peers should print the SAME number here; if not, the start is misaligned.
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
-                Log($"joined as P{sp.LocalPort + 1} of {sp.PlayerCount}");
+                ConnLog($"connected — joined as P{sp.LocalPort + 1} of {sp.PlayerCount}", Color.DarkGreen);
                 if (_pendingJoinIp != null) { RecordJoinIp(_pendingJoinIp); _pendingJoinIp = null; } // connect succeeded
                 BeginSessionCommon(sp.Mode, hostLink.Label);
             }
@@ -1144,7 +1219,8 @@ namespace BizHawkNetplay.Tool
             _netcodeLabel.Text = "Netcode in use: " + (mode == SyncMode.Rollback ? "Rollback" : "Lockstep");
             _netcodeLabel.ForeColor = mode == SyncMode.Rollback ? Color.DarkGreen : Color.DarkSlateBlue;
             RefreshPlayersList();
-            Log($"session started vs {remoteLabel}");
+            ConnLog($"session started vs {remoteLabel} — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
+                    $"delay {_sessionDelay}", Color.DarkGreen);
             _disconnectButton.Enabled = true;
 
             // NAT traversal: a joiner discovers its public (reflexive) mesh endpoint and reports it to the
@@ -2042,8 +2118,8 @@ namespace BizHawkNetplay.Tool
             try { link.Tcp?.Close(); } catch { }
             UpdateMeshPeers(); // stop sending input to the dead endpoint
 
-            Log($"{link.Label} dropped ({why}) — holding the session; waiting up to " +
-                $"{ReconnectTimeoutSeconds:F0}s for a rejoin on TCP {_hostTcpPort}…");
+            ConnLog($"{link.Label} dropped ({why}) — holding the session; waiting up to " +
+                $"{ReconnectTimeoutSeconds:F0}s for a rejoin on TCP {_hostTcpPort}…", Color.DarkOrange);
             Status($"P{_reconnectPort + 1} dropped — waiting to rejoin…", Color.DarkOrange);
 
             _reconnectThread = new Thread(() => ReconnectAcceptLoop(_reconnectPort))
@@ -2131,7 +2207,7 @@ namespace BizHawkNetplay.Tool
                     catch (Exception ex)
                     {
                         // Rejected (e.g. wrong ROM/core) — refuse this one and keep waiting for a valid rejoin.
-                        UiLog($"rejected a rejoin attempt: {ex.Message}");
+                        UiConnLog($"rejected a rejoin attempt: {ex.Message}", Color.Firebrick);
                         try { tcp.Close(); } catch { }
                     }
                 }
@@ -2248,7 +2324,8 @@ namespace BizHawkNetplay.Tool
                         _resyncCount = 0;
                         _paceClock.Restart();
                         _nextFrameDueMs = 0;
-                        Log($"{link.Label} reconnected — {stateLength / 1024}KiB baseline synchronized; resuming");
+                        ConnLog($"{link.Label} reconnected — {stateLength / 1024}KiB baseline synchronized; resuming",
+                            Color.DarkGreen);
                         Status($"reconnected P{link.RemotePort + 1} — resuming", Color.Green);
                     });
                 }
@@ -2263,7 +2340,7 @@ namespace BizHawkNetplay.Tool
         private void FailSession(string reason)
         {
             _pendingJoinIp = null; // a failed connect shouldn't land in the recent-IPs list
-            Log("connection failed: " + reason);
+            ConnLog("connection failed: " + reason, Color.Firebrick);
             TeardownNetwork();
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false);
@@ -2307,7 +2384,7 @@ namespace BizHawkNetplay.Tool
             RefreshPlayersList(); // session inactive now → clears the list
             ResetPunchUi();
 
-            Log("session ended: " + reason);
+            ConnLog("session ended: " + reason, Color.DimGray);
             Status("Idle.", Color.DimGray);
             SetBusy(false);
         }
@@ -2583,6 +2660,37 @@ namespace BizHawkNetplay.Tool
         }
 
         private void UiLog(string message) => BeginInvokeUi(() => Log(message));
+
+        /// <summary>
+        /// Report a connection-lifecycle event — hosting/joining/refused/connected/dropped/ended. It goes
+        /// to the Connection tab's box, where someone who just failed to join can actually see it, and to
+        /// the full log. Colors carry the verdict: red refused/failed, green connected, orange interrupted.
+        /// Per-frame and diagnostic chatter stays on <see cref="Log"/> so this box stays readable.
+        /// </summary>
+        private void ConnLog(string message, Color color)
+        {
+            Log(message);
+            if (_connLog.IsDisposed) return;
+
+            // Bound the history — a long session can rack up drops, rejoins and resyncs, and an unbounded
+            // RichTextBox is a slow leak. Delete the oldest lines by selection so the kept tail retains
+            // its coloring (re-appending them as text would flatten it).
+            if (_connLog.Lines.Length > ConnLogMaxLines)
+            {
+                int cut = _connLog.GetFirstCharIndexFromLine(_connLog.Lines.Length - ConnLogKeepLines);
+                if (cut > 0) { _connLog.Select(0, cut); _connLog.SelectedText = string.Empty; }
+            }
+
+            _connLog.SelectionStart = _connLog.TextLength;
+            _connLog.SelectionLength = 0;
+            _connLog.SelectionColor = color;
+            _connLog.AppendText($"{DateTime.Now:HH:mm:ss}  {message}{Environment.NewLine}");
+            _connLog.SelectionColor = _connLog.ForeColor;
+            _connLog.ScrollToCaret(); // newest line stays visible in the small box
+        }
+
+        /// <summary>Thread-safe <see cref="ConnLog"/> for the accept/join/reconnect background threads.</summary>
+        private void UiConnLog(string message, Color color) => BeginInvokeUi(() => ConnLog(message, color));
 
         private void BeginInvokeUi(Action action)
         {
