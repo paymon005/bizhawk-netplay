@@ -164,6 +164,11 @@ namespace BizHawkNetplay.Core.Net
 
         private void OnAck(uint ack)
         {
+            // An ACK can only acknowledge data we've actually queued. A corrupt or hostile segment
+            // carrying an ack beyond _nextSeq would otherwise spin this loop up to ~4 billion times
+            // while holding _gate (a hang) and advance _sendBase past _nextSeq, permanently corrupting
+            // the sender. Anything at/below _sendBase is a stale duplicate the while-loop already ignores.
+            if (ack > _nextSeq) return;
             bool progressed = false;
             while (_sendBase < ack)
             {

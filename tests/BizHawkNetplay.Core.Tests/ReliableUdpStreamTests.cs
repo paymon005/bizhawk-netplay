@@ -151,6 +151,41 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(47800, clientParams.RemoteUdpPort);
         }
 
+        [Fact]
+        public void MalformedAck_BeyondSendWindow_DoesNotHangOrCorrupt()
+        {
+            // A corrupt/hostile SegAck acking far beyond what we've sent must be ignored: the old code
+            // looped _sendBase up to the ack (billions of iterations under the gate = hang) and drove
+            // _sendBase past _nextSeq, wedging the sender. The stream must shrug it off and keep working.
+            var captured = new List<byte[]>();
+            var sender = new ReliableUdpStream(seg => captured.Add(seg));
+
+            var poison = new byte[5];
+            poison[0] = 0x02; // SegAck
+            poison[1] = poison[2] = poison[3] = poison[4] = 0xFF; // ack = uint.MaxValue
+
+            var fed = Task.Run(() => sender.OnDatagram(poison));
+            Assert.True(fed.Wait(TimeSpan.FromSeconds(5)), "OnAck spun on an out-of-range ack (hang)");
+
+            // Still healthy: a normal write goes out and a legitimate cumulative ACK frees the window.
+            var blob = new byte[3000];
+            new Random(11).NextBytes(blob);
+            sender.Write(blob, 0, blob.Length);
+            Assert.True(captured.Count > 0, "sender stopped emitting DATA after the bad ack");
+
+            uint highestSeq = 0;
+            foreach (var seg in captured)
+                if (seg.Length >= 5 && seg[0] == 0x01) // SegData
+                    highestSeq = Math.Max(highestSeq, ((uint)seg[1] << 24) | ((uint)seg[2] << 16) | ((uint)seg[3] << 8) | seg[4]);
+
+            var ack = new byte[5];
+            ack[0] = 0x02;
+            uint next = highestSeq + 1;
+            ack[1] = (byte)(next >> 24); ack[2] = (byte)(next >> 16); ack[3] = (byte)(next >> 8); ack[4] = (byte)next;
+            var acked = Task.Run(() => sender.OnDatagram(ack));
+            Assert.True(acked.Wait(TimeSpan.FromSeconds(5)), "a valid follow-up ack hung after the poison ack");
+        }
+
         private static byte[] ReadExactly(ReliableUdpStream s, int count)
         {
             var buf = new byte[count];

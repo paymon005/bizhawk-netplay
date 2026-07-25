@@ -167,6 +167,9 @@ and restoring your position so it doesn't disturb play.
 - **Guard movies / TAStudio / Lua:** detect and refuse them at session start instead of only documenting it.
 - **Compare real sync settings:** hash the core's actual sync-settings blob at handshake so mismatched
   per-core settings (e.g. different N64 plugins) are caught up front instead of surfacing as a desync.
+- **Authenticate the session password:** today both peers just exchange a SHA-256 hash and compare, so
+  a peer on the wire can echo the hash back without knowing the password. A nonce challenge-response
+  with a slow KDF would make the password a real gate rather than a casual one.
 
 ## Known limitations
 
@@ -185,6 +188,9 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
 - **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically
   bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
   for playing with people you trust; not a hostile-network guarantee.
+- **The session password is a casual gate, not authentication** — peers exchange a SHA-256 hash and
+  compare it, so it keeps out someone who doesn't know the password but not someone on the wire who can
+  echo the hash. Treat it as "don't join by accident", not as protection against a determined attacker.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
 - **Untested on real hardware** for 3–4 players and any over-the-internet NAT path (developed on a
   single machine). Everything below the socket layer is unit-tested; the last mile needs two boxes.

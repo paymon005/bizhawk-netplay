@@ -115,6 +115,8 @@ namespace BizHawkNetplay.Tool
         private byte[]? _punchState;            // host only: the initial state to transfer once punched
         private TcpListener? _listener;
         private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
+        private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
+        private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
         private FrameDriver? _driver;
         private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
@@ -635,8 +637,10 @@ namespace BizHawkNetplay.Tool
             }
             catch (Exception ex)
             {
-                Log("start failed: " + ex.Message);
-                SetBusy(false);
+                // We may already have paused the emulator and bound a transport above; FailSession
+                // unpauses, tears down the transport, and clears busy — a bare SetBusy(false) would
+                // leave EmuHawk frozen (e.g. the UDP port was in use, or state export threw).
+                FailSession("start failed: " + ex.Message);
             }
         }
 
@@ -774,6 +778,22 @@ namespace BizHawkNetplay.Tool
                 UiLog($"UDP punch opened a path to {link.PeerEndpoint}");
                 try
                 {
+                    // Punch is symmetric at the transport level — unlike the TCP path (listener vs dialer)
+                    // both peers pick their role from a local radio button, so two Hosts (both P1, both own
+                    // the state) or two Joins (both wait forever for a state neither sends) are possible.
+                    // Trade one reliable byte each way up front, before any ControlChannel framing, and
+                    // refuse a same-role pair with a message that says exactly what to change.
+                    var reliable = link.Control;
+                    byte myRole = (byte)(isHost ? 1 : 0);
+                    reliable.WriteByte(myRole);
+                    reliable.Flush();
+                    int peerRole = reliable.ReadByte();
+                    if (peerRole < 0) throw new System.IO.IOException("peer closed during role exchange");
+                    if (peerRole == myRole)
+                        throw new HandshakeException(isHost
+                            ? "both players clicked Host — one of you must Join instead."
+                            : "both players clicked Join — one of you must Host instead.");
+
                     var ch = new ControlChannel(link.Control);
                     var sp = isHost
                         ? Handshake.RunHost(ch, id, prefs, state ?? Array.Empty<byte>(), link.LocalPort)
@@ -847,9 +867,13 @@ namespace BizHawkNetplay.Tool
                 {
                     var tcp = _listener.AcceptTcpClient();
                     try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
+                    try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // bound a silent joiner's HELLO
+                    _greetingTcp = tcp; // so Disconnect/teardown can abort a joiner stuck mid-handshake
                     var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                     var channel = new ControlChannel(tcp.GetStream());
                     var greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+                    _greetingTcp = null;
+                    try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
                     int assignedPort = i + 1;
                     links.Add(new PeerLink
                     {
@@ -1698,11 +1722,13 @@ namespace BizHawkNetplay.Tool
 
                     var tcp = listener.AcceptTcpClient();
                     try { tcp.NoDelay = true; } catch { }
+                    try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // a silent rejoiner can't wedge the wait
                     var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
                     var channel = new ControlChannel(tcp.GetStream());
                     try
                     {
                         var greet = Handshake.HostGreet(channel, _hostIdentity!, _hostPrefs!, _hostUdpPort);
+                        try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads
                         var udpEp = new IPEndPoint(remoteIp, greet.UdpPort);
                         BeginInvokeUi(() => CompleteReconnect(tcp, channel, remoteIp, udpEp, freedPort));
                         return; // one rejoin fills the slot
@@ -1827,6 +1853,8 @@ namespace BizHawkNetplay.Tool
             _listener = null;
             try { _joiningTcp?.Close(); } catch { } // unblock a join connect that's still dialing
             _joiningTcp = null;
+            try { _greetingTcp?.Close(); } catch { } // abort a joiner we're blocked greeting (Disconnect mid-handshake)
+            _greetingTcp = null;
 
             var peers = new List<PeerLink>(_peers);
             _peers.Clear();
