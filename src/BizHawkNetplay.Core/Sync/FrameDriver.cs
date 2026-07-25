@@ -67,7 +67,8 @@ namespace BizHawkNetplay.Core.Sync
             int localPort,
             int delay,
             int redundancy = 8,
-            int rollbackWindow = 0)
+            int rollbackWindow = 0,
+            int portCount = 0)
         {
             _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
@@ -76,7 +77,10 @@ namespace BizHawkNetplay.Core.Sync
             if (redundancy < 1) throw new ArgumentOutOfRangeException(nameof(redundancy));
             if (rollbackWindow < 0) throw new ArgumentOutOfRangeException(nameof(rollbackWindow));
 
-            int ports = adapter.PortCount;
+            // The session may use fewer players than the core has controller ports (e.g. 2-player on an
+            // N64's 4 ports). The driver then networks only the active ports; the core's remaining ports
+            // are left unset by the controller (read as neutral). 0 = use every port the core exposes.
+            int ports = portCount > 0 ? Math.Min(portCount, adapter.PortCount) : adapter.PortCount;
             if (localPort < 0 || localPort >= ports) throw new ArgumentOutOfRangeException(nameof(localPort));
 
             _localPort = localPort;

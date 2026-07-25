@@ -18,6 +18,7 @@ namespace BizHawkNetplay.Tool
 
         public bool Upnp = true;
         public int Port = 47800;
+        public int Players = 2;      // host: how many controller ports to fill
         public int Delay = 2;
         public int Netcode = 0;     // index into the netcode dropdown (Automatic/Rollback/Lockstep)
         public int InputSource = 0; // index into the "My controls" dropdown (P1..P4, or Assigned port)
@@ -45,6 +46,7 @@ namespace BizHawkNetplay.Tool
                     {
                         case "upnp": s.Upnp = val == "1" || string.Equals(val, "true", StringComparison.OrdinalIgnoreCase); break;
                         case "port": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var p)) s.Port = p; break;
+                        case "players": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var pl)) s.Players = pl; break;
                         case "delay": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d)) s.Delay = d; break;
                         case "netcode": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)) s.Netcode = n; break;
                         case "inputsrc": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ins)) s.InputSource = ins; break;
@@ -66,6 +68,7 @@ namespace BizHawkNetplay.Tool
                 {
                     "upnp=" + (Upnp ? "1" : "0"),
                     "port=" + Port.ToString(CultureInfo.InvariantCulture),
+                    "players=" + Players.ToString(CultureInfo.InvariantCulture),
                     "delay=" + Delay.ToString(CultureInfo.InvariantCulture),
                     "netcode=" + Netcode.ToString(CultureInfo.InvariantCulture),
                     "inputsrc=" + InputSource.ToString(CultureInfo.InvariantCulture),

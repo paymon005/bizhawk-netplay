@@ -42,6 +42,7 @@ namespace BizHawkNetplay.Tool
         private RadioButton _joinRadio = null!;
         private ComboBox _ipBox = null!;
         private NumericUpDown _portBox = null!;
+        private NumericUpDown _playersBox = null!;
         private NumericUpDown _delayBox = null!;
         private Button _goButton = null!;
         private Button _disconnectButton = null!;
@@ -232,6 +233,7 @@ namespace BizHawkNetplay.Tool
             {
                 _upnpCheck.Checked = _settings.Upnp;
                 _portBox.Value = Clamp(_settings.Port, (int)_portBox.Minimum, (int)_portBox.Maximum);
+                _playersBox.Value = Clamp(_settings.Players, (int)_playersBox.Minimum, (int)_playersBox.Maximum);
                 _delayBox.Value = Clamp(_settings.Delay, (int)_delayBox.Minimum, (int)_delayBox.Maximum);
                 if (_settings.Netcode >= 0 && _settings.Netcode < _netcodeCombo.Items.Count)
                     _netcodeCombo.SelectedIndex = _settings.Netcode;
@@ -245,6 +247,7 @@ namespace BizHawkNetplay.Tool
             // Persist whenever a remembered control changes, so state survives even without starting a session.
             _upnpCheck.CheckedChanged += (_, __) => SaveSettingsFromUi();
             _portBox.ValueChanged += (_, __) => SaveSettingsFromUi();
+            _playersBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _delayBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _netcodeCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
             _inputSourceCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
@@ -255,6 +258,7 @@ namespace BizHawkNetplay.Tool
             if (_loadingSettings || _settings == null) return;
             _settings.Upnp = _upnpCheck.Checked;
             _settings.Port = (int)_portBox.Value;
+            _settings.Players = (int)_playersBox.Value;
             _settings.Delay = (int)_delayBox.Value;
             _settings.Netcode = _netcodeCombo.SelectedIndex;
             _settings.InputSource = _inputSourceCombo.SelectedIndex;
@@ -300,6 +304,8 @@ namespace BizHawkNetplay.Tool
             };
             var portLabel = new Label { Text = "Port:", AutoSize = true, Location = new Point(260, 46) };
             _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 43), Width = 70 };
+            var playersLabel = new Label { Text = "Players:", AutoSize = true, Location = new Point(388, 46) };
+            _playersBox = new NumericUpDown { Minimum = 2, Maximum = 8, Value = 2, Location = new Point(444, 43), Width = 46 };
 
             var passwordLabel = new Label { Text = "Password:", AutoSize = true, Location = new Point(12, 78) };
             _passwordBox = new TextBox { Location = new Point(80, 75), Width = 160, UseSystemPasswordChar = true };
@@ -336,7 +342,7 @@ namespace BizHawkNetplay.Tool
 
             page.Controls.AddRange(new Control[]
             {
-                _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
+                _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox, playersLabel, _playersBox,
                 passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
                 netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
                 _goButton, _disconnectButton, _pubAddrButton, _netcodeLabel, BuildPunchGroup(),
@@ -565,12 +571,18 @@ namespace BizHawkNetplay.Tool
                     Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
                 _isHost = _hostRadio.Checked;
-                int players = _adapter.PortCount; // one network player per controller port the core exposes
-                if (_hostRadio.Checked && players < 2)
+                int portCount = _adapter.PortCount; // controller ports the core exposes (N64 = 4, Genesis = 2…)
+                if (_hostRadio.Checked && portCount < 2)
                 {
-                    Log($"this core exposes only {players} controller port — configure at least 2 controllers to host netplay.");
+                    Log($"this core exposes only {portCount} controller port — configure at least 2 controllers to host netplay.");
                     SetBusy(false); return;
                 }
+                // The host picks how many of those ports to actually fill (e.g. 2-player on an N64's 4);
+                // the rest read neutral. Joiners take the count from the host's Welcome, so only the host
+                // reads the box here. Clamp to what the core supports.
+                int players = _hostRadio.Checked ? Math.Min(Math.Max(2, (int)_playersBox.Value), portCount) : portCount;
+                if (_hostRadio.Checked && (int)_playersBox.Value > portCount)
+                    Log($"this core has only {portCount} controller ports — hosting {players} players.");
 
                 // Validate the join address BEFORE pausing — otherwise a typo'd IP leaves the emulator
                 // frozen on the early return with no session to un-freeze it.
@@ -1104,8 +1116,11 @@ namespace BizHawkNetplay.Tool
                         break; // retry next tick
                     }
                     // Step the core with ONLY our merged inputs — deterministic, bypasses EmuHawk's
-                    // input chain and hotkeys.
-                    _adapter!.AdvanceFrame(_driver.CurrentInputs());
+                    // input chain and hotkeys. Under load we may step several frames this tick to catch
+                    // up; only the last one's picture is shown, so skip the intermediate video renders
+                    // (Dolphin-style frame-skip) to recover from hitches faster on heavy cores.
+                    bool renderThis = _driver.CurrentFrame + 1 >= target || budget == 0;
+                    _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderThis);
                     _driver.CompleteFrame();
                     MaybeSendChecksum();
                 }
@@ -1458,10 +1473,10 @@ namespace BizHawkNetplay.Tool
             if (_mode == SyncMode.Rollback)
                 return new FrameDriver(_adapter!, _transport!,
                     p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth, FrameMs()),
-                    _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth);
+                    _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth, portCount: _playerCount);
 
             return new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
-                _localPort, _sessionDelay, redundancy: 8);
+                _localPort, _sessionDelay, redundancy: 8, portCount: _playerCount);
         }
 
         /// <summary>Wrap the input transport in the artificial-latency simulator if the diagnostic is set.</summary>
@@ -1991,6 +2006,7 @@ namespace BizHawkNetplay.Tool
         {
             bool host = _hostRadio.Checked;
             _ipBox.Enabled = !host;
+            _playersBox.Enabled = host; // only the host chooses the player count
             _goButton.Text = host ? "Start Hosting" : "Join";
         }
 
@@ -1999,6 +2015,7 @@ namespace BizHawkNetplay.Tool
             _goButton.Enabled = !busy;
             _hostRadio.Enabled = _joinRadio.Enabled = !busy;
             _ipBox.Enabled = !busy && _joinRadio.Checked;
+            _playersBox.Enabled = !busy && _hostRadio.Checked;
             _portBox.Enabled = _delayBox.Enabled = !busy;
             _netcodeCombo.Enabled = _passwordBox.Enabled = _upnpCheck.Enabled = !busy;
             _inputSourceCombo.Enabled = !busy;

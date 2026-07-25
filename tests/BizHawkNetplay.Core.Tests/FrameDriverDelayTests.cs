@@ -63,6 +63,31 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void FewerPlayersThanPorts_RunsInSync()
+        {
+            // A 4-controller core (e.g. N64) played 2-player: the driver networks only the 2 active
+            // ports; the core's other ports are simply never set (read neutral). Both peers must still
+            // advance and stay byte-identical.
+            const int Target = 60, Ports = 4, Players = 2;
+            var (pa, pb) = Pipe.Pair();
+            var ea = new FakeEmuAdapter(portCount: Ports) { LocalInputScript = f => Btn(f % 2 == 0) };
+            var eb = new FakeEmuAdapter(portCount: Ports) { LocalInputScript = f => Btn(f % 3 == 0) };
+            var da = new FrameDriver(ea, pa, p => new LockstepStrategy(p), localPort: 0, delay: 2, portCount: Players);
+            var db = new FrameDriver(eb, pb, p => new LockstepStrategy(p), localPort: 1, delay: 2, portCount: Players);
+            da.Start(); db.Start();
+
+            for (int iter = 0; iter < Target * 20 && (da.CurrentFrame < Target || db.CurrentFrame < Target); iter++)
+            {
+                if (da.OnPreFrame() == FrameStep.Ran) { ea.AdvanceAppliedFrame(); da.OnPostFrame(); }
+                if (db.OnPreFrame() == FrameStep.Ran) { eb.AdvanceAppliedFrame(); db.OnPostFrame(); }
+            }
+
+            Assert.True(da.CurrentFrame >= Target && db.CurrentFrame >= Target, "a 2-of-4-player session stalled");
+            Assert.Equal(Players, da.LastAppliedInputs!.Ports.Length); // only the active ports are networked
+            Assert.Equal(ea.HashMainMemory(), eb.HashMainMemory());    // and both stayed in sync
+        }
+
+        [Fact]
         public void DisposingDriver_ReleasesRollbackRing()
         {
             const int MaxRollback = 16;

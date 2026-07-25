@@ -27,6 +27,8 @@ namespace BizHawkNetplay.Tool
         private readonly IStatable _statable;
         private readonly CoreLayout[] _layouts;
         private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
+        private readonly AnalogBind?[][] _analogBinds; // [port][axisIndex] -> host analog binding (null if unbound)
+        private readonly bool[][] _axisReversed;      // [port][axisIndex] -> core axis IsReversed flag
 
         // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame / PumpAudio).
         private BizHawk.Client.EmuHawk.Sound? _sound;
@@ -51,6 +53,8 @@ namespace BizHawkNetplay.Tool
             _statable = statable ?? throw new ArgumentNullException(nameof(statable));
             _layouts = BuildLayouts(emulator.ControllerDefinition);
             _bindings = BuildBindings();
+            _analogBinds = BuildAnalogBinds();
+            _axisReversed = BuildAxisReversed();
         }
 
         /// <summary>True if we found the user's controller bindings (needed to capture input).</summary>
@@ -147,9 +151,21 @@ namespace BizHawkNetplay.Tool
             var buttons = new bool[layout.Buttons.Count];
             for (int i = 0; i < buttons.Length; i++)
                 buttons[i] = EvaluateBinding(binds[i], pressed);
+
             var axes = new int[layout.Axes.Count];
-            for (int j = 0; j < axes.Length; j++)
-                axes[j] = layout.Axes[j].Neutral; // analog capture is M2
+            if (axes.Length > 0)
+            {
+                // Read live host analog axes — paused-safe via the same host coalescer GetPressedButtons
+                // uses (values are in BizHawk's ±10000 convention) — and apply BizHawk's own analog-bind
+                // math so the captured value matches exactly what local play would feed the core. Same
+                // source-port remap as buttons, so a player assigned P2/P3/P4 uses their P1 stick.
+                int axSrc = (src >= 0 && src < _analogBinds.Length && _analogBinds[src].Length == axes.Length) ? src : port;
+                IReadOnlyDictionary<string, int> hostAxes;
+                try { hostAxes = _apis.Input.GetPressedAxes(); }
+                catch { hostAxes = null; }
+                for (int j = 0; j < axes.Length; j++)
+                    axes[j] = ResolveAxis(_analogBinds[axSrc][j], layout.Axes[j], _axisReversed[port][j], hostAxes, pressed);
+            }
             return new PortInput(buttons, axes);
         }
 
@@ -162,10 +178,13 @@ namespace BizHawkNetplay.Tool
         /// (bypasses EmuHawk's input chain and hotkeys). Identical inputs on both peers therefore
         /// produce identical state — the proven-deterministic stepping path.
         /// </summary>
-        public void AdvanceFrame(InputSet inputs)
+        public void AdvanceFrame(InputSet inputs, bool renderVideo = true)
         {
+            // renderVideo=false skips only the video render — used for the throwaway intermediate frames
+            // of a catch-up burst (their picture is never shown), which lets a heavy core recover from a
+            // hitch faster. Sound is always rendered so audio stays continuous, and emulation is identical.
             var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
-            _emulator.FrameAdvance(controller, render: true, renderSound: true);
+            _emulator.FrameAdvance(controller, render: renderVideo, renderSound: true);
 
             // Drain the samples the core just generated into our ring buffer. EmuHawk's audio device
             // pulls from that ring at the steady real-time rate (PumpAudio → UpdateSound), so the ring
@@ -469,6 +488,84 @@ namespace BizHawkNetplay.Tool
                     arr[i] = (map != null && map.TryGetValue(layout.Buttons[i], out var b)) ? b : "";
                 result[p] = arr;
             }
+            return result;
+        }
+
+        /// <summary>Per-axis host analog bindings (host axis + mult/deadzone/button binds), from the user's
+        /// EmuHawk analog config. Null entries are unbound axes (captured as neutral).</summary>
+        private AnalogBind?[][] BuildAnalogBinds()
+        {
+            Dictionary<string, AnalogBind> map = null;
+            try
+            {
+                var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                config?.AllTrollersAnalog.TryGetValue(_emulator.ControllerDefinition.Name, out map);
+            }
+            catch { /* leave unbound -> neutral axes */ }
+
+            var result = new AnalogBind?[_layouts.Length][];
+            for (int p = 0; p < _layouts.Length; p++)
+            {
+                var axes = _layouts[p].Axes;
+                var arr = new AnalogBind?[axes.Count];
+                for (int j = 0; j < arr.Length; j++)
+                    arr[j] = (map != null && map.TryGetValue(axes[j].Name, out var b)) ? b : (AnalogBind?)null;
+                result[p] = arr;
+            }
+            return result;
+        }
+
+        /// <summary>The core's IsReversed flag per axis (BizHawk applies it when mapping host -> core).</summary>
+        private bool[][] BuildAxisReversed()
+        {
+            var def = _emulator.ControllerDefinition;
+            var result = new bool[_layouts.Length][];
+            for (int p = 0; p < _layouts.Length; p++)
+            {
+                var axes = _layouts[p].Axes;
+                var arr = new bool[axes.Count];
+                for (int j = 0; j < arr.Length; j++) // names come from def.Axes, so the indexer is safe
+                    arr[j] = def.Axes[axes[j].Name].IsReversed;
+                result[p] = arr;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Turn a live host analog reading into a core axis value, mirroring BizHawk's own analog-bind
+        /// math (Controller.cs): host value ÷10000 → [-1,1], deadzone, ×Mult, scale to the axis half-range,
+        /// shift to Neutral, clamp. Kept identical so a captured value equals what local play would inject.
+        /// </summary>
+        private static int ResolveAxis(AnalogBind? bindN, CoreAxisSpec spec, bool reversed,
+            IReadOnlyDictionary<string, int> hostAxes, HashSet<string> pressedButtons)
+        {
+            if (bindN == null) return spec.Neutral;
+            var bind = bindN.Value;
+
+            float value = 0f;
+            if (!string.IsNullOrEmpty(bind.ButtonBindPositive) && EvaluateBinding(bind.ButtonBindPositive, pressedButtons)) value += 1f;
+            if (!string.IsNullOrEmpty(bind.ButtonBindNegative) && EvaluateBinding(bind.ButtonBindNegative, pressedButtons)) value -= 1f;
+            if (value == 0f)
+            {
+                int host = 0;
+                if (hostAxes != null && !string.IsNullOrEmpty(bind.Value)) hostAxes.TryGetValue(bind.Value, out host);
+                value = host / 10000f;
+            }
+
+            float dz = bind.Deadzone;
+            if (value < -dz) value += dz;
+            else if (value < dz) value = 0f;
+            else value -= dz;
+            value = dz < 1f ? value / (1f - dz) : 0f;
+
+            value *= bind.Mult;
+            if (reversed) value = -value;
+            value *= Math.Max(spec.Neutral - spec.Min, spec.Max - spec.Neutral);
+            value += spec.Neutral;
+
+            int result = (int)Math.Round(value);
+            if (result < spec.Min) result = spec.Min;
+            else if (result > spec.Max) result = spec.Max;
             return result;
         }
 
