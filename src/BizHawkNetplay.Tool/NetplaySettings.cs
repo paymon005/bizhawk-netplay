@@ -19,7 +19,8 @@ namespace BizHawkNetplay.Tool
         public bool Upnp = true;
         public int Port = 47800;
         public int Delay = 2;
-        public int Netcode = 0; // index into the netcode dropdown (Automatic/Rollback/Lockstep)
+        public int Netcode = 0;     // index into the netcode dropdown (Automatic/Rollback/Lockstep)
+        public int InputSource = 0; // index into the "My controls" dropdown (P1..P4, or Assigned port)
         public readonly List<string> RecentIps = new List<string>();
 
         private static string FilePath => Path.Combine(
@@ -46,6 +47,7 @@ namespace BizHawkNetplay.Tool
                         case "port": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var p)) s.Port = p; break;
                         case "delay": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d)) s.Delay = d; break;
                         case "netcode": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)) s.Netcode = n; break;
+                        case "inputsrc": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ins)) s.InputSource = ins; break;
                         case "ip": if (val.Length > 0 && s.RecentIps.Count < MaxRecentIps && !s.RecentIps.Contains(val)) s.RecentIps.Add(val); break;
                     }
                 }
@@ -66,6 +68,7 @@ namespace BizHawkNetplay.Tool
                     "port=" + Port.ToString(CultureInfo.InvariantCulture),
                     "delay=" + Delay.ToString(CultureInfo.InvariantCulture),
                     "netcode=" + Netcode.ToString(CultureInfo.InvariantCulture),
+                    "inputsrc=" + InputSource.ToString(CultureInfo.InvariantCulture),
                 };
                 foreach (var ip in RecentIps) lines.Add("ip=" + ip);
                 File.WriteAllLines(path, lines);

@@ -52,6 +52,8 @@ namespace BizHawkNetplay.Tool
         private CheckBox _freezeInputCheck = null!;
         private CheckBox _forceDesyncCheck = null!;
         private ComboBox _netcodeCombo = null!;
+        private ComboBox _inputSourceCombo = null!;
+        private CheckBox _allowNonDetCheck = null!;
         private Label _netcodeLabel = null!;
         private CheckBox _simUnresponsiveCheck = null!;
         private CheckBox _upnpCheck = null!;
@@ -233,6 +235,8 @@ namespace BizHawkNetplay.Tool
                 _delayBox.Value = Clamp(_settings.Delay, (int)_delayBox.Minimum, (int)_delayBox.Maximum);
                 if (_settings.Netcode >= 0 && _settings.Netcode < _netcodeCombo.Items.Count)
                     _netcodeCombo.SelectedIndex = _settings.Netcode;
+                if (_settings.InputSource >= 0 && _settings.InputSource < _inputSourceCombo.Items.Count)
+                    _inputSourceCombo.SelectedIndex = _settings.InputSource;
                 RefreshIpDropdown();
                 if (_settings.RecentIps.Count > 0) _ipBox.Text = _settings.RecentIps[0]; // last host, ready to re-join
             }
@@ -243,6 +247,7 @@ namespace BizHawkNetplay.Tool
             _portBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _delayBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _netcodeCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
+            _inputSourceCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
         }
 
         private void SaveSettingsFromUi()
@@ -252,6 +257,7 @@ namespace BizHawkNetplay.Tool
             _settings.Port = (int)_portBox.Value;
             _settings.Delay = (int)_delayBox.Value;
             _settings.Netcode = _netcodeCombo.SelectedIndex;
+            _settings.InputSource = _inputSourceCombo.SelectedIndex;
             _settings.Save();
         }
 
@@ -307,7 +313,12 @@ namespace BizHawkNetplay.Tool
             _netcodeCombo.Items.AddRange(new object[] { "Automatic", "Rollback", "Lockstep" });
             _netcodeCombo.SelectedIndex = 0; // Automatic: rollback if the core qualifies, else lockstep
 
-            _upnpCheck = new CheckBox { Text = "Auto-forward host port (UPnP)", AutoSize = true, Checked = true, Location = new Point(12, 140) };
+            var inputSrcLabel = new Label { Text = "My controls:", AutoSize = true, Location = new Point(12, 142) };
+            _inputSourceCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(90, 139), Width = 130 };
+            _inputSourceCombo.Items.AddRange(new object[] { "Use P1 pad", "Use P2 pad", "Use P3 pad", "Use P4 pad", "Assigned port" });
+            _inputSourceCombo.SelectedIndex = 0; // default: read your normal P1 controls, whatever port you're assigned
+
+            _upnpCheck = new CheckBox { Text = "Auto-forward host port (UPnP)", AutoSize = true, Checked = true, Location = new Point(240, 141) };
 
             _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 172), Width = 150 };
             _goButton.Click += (_, __) => OnGo();
@@ -327,8 +338,8 @@ namespace BizHawkNetplay.Tool
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox,
                 passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
-                netcodeSelLabel, _netcodeCombo, _upnpCheck, _goButton, _disconnectButton,
-                _pubAddrButton, _netcodeLabel, BuildPunchGroup(),
+                netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
+                _goButton, _disconnectButton, _pubAddrButton, _netcodeLabel, BuildPunchGroup(),
             });
             return page;
         }
@@ -420,10 +431,22 @@ namespace BizHawkNetplay.Tool
                         : "resumed responding to pings");
             };
 
+            _allowNonDetCheck = new CheckBox
+            {
+                Text = "Allow non-deterministic core (experimental — may desync)",
+                AutoSize = true, Location = new Point(12, 192),
+            };
+
+            var nonDetHint = new Label
+            {
+                Text = "For cores that report non-deterministic but often sync anyway (e.g. N64 with no movie).\nBoth players must enable it. Desync detection still guards you.",
+                AutoSize = true, Location = new Point(30, 214), ForeColor = Color.DimGray,
+            };
+
             page.Controls.AddRange(new Control[]
             {
                 _probeButton, _testInputButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
-                simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
+                simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _allowNonDetCheck, nonDetHint,
             });
             return page;
         }
@@ -535,6 +558,7 @@ namespace BizHawkNetplay.Tool
             try
             {
                 _adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
+                _adapter.InputSourcePort = InputSourceFromCombo(); // read your normal pad, whatever port you're assigned
                 if (!_adapter.VerifyDeterministicMode())
                     Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
                 if (!_adapter.HasBindings)
@@ -614,6 +638,7 @@ namespace BizHawkNetplay.Tool
             try
             {
                 _adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
+                _adapter.InputSourcePort = InputSourceFromCombo(); // read your normal pad, whatever port you're assigned
                 if (!_adapter.VerifyDeterministicMode())
                     Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
                 if (!_adapter.HasBindings)
@@ -1849,8 +1874,27 @@ namespace BizHawkNetplay.Tool
             // Advertise the core's real rollback depth only when this peer wants rollback; otherwise 0
             // so the negotiator (which needs both peers to opt in) settles on lockstep for free.
             int depth = wantRollback ? MeasureRollbackDepth(a) : 0;
+
+            // Determinism gate: normally the core's own report. The experimental override lets a peer
+            // assert a core that reports non-deterministic (often just "not requested", e.g. N64 with no
+            // movie) is fine to net-play. Both peers must opt in — the negotiator checks both flags — and
+            // desync detection still catches a genuine divergence.
+            bool deterministic = a.VerifyDeterministicMode();
+            if (!deterministic && _allowNonDetCheck.Checked)
+            {
+                deterministic = true;
+                Log("WARNING: overriding the non-deterministic core check (experimental) — both players must " +
+                    "enable this, and a truly non-deterministic core will desync and give up.");
+            }
             return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
-                a.SyncSettingsDigest, layouts, a.VerifyDeterministicMode(), maxRollbackDepth: depth);
+                a.SyncSettingsDigest, layouts, deterministic, maxRollbackDepth: depth);
+        }
+
+        /// <summary>Map the "My controls" dropdown to an input-source port: P1..P4 (0..3) or -1 (assigned port).</summary>
+        private int InputSourceFromCombo()
+        {
+            int idx = _inputSourceCombo.SelectedIndex;
+            return idx >= 0 && idx <= 3 ? idx : -1; // index 4 ("Assigned port") or none => -1
         }
 
         /// <summary>
@@ -1957,6 +2001,7 @@ namespace BizHawkNetplay.Tool
             _ipBox.Enabled = !busy && _joinRadio.Checked;
             _portBox.Enabled = _delayBox.Enabled = !busy;
             _netcodeCombo.Enabled = _passwordBox.Enabled = _upnpCheck.Enabled = !busy;
+            _inputSourceCombo.Enabled = !busy;
             _probeButton.Enabled = !busy;
             _punchButton.Enabled = !busy;
             _disconnectButton.Enabled = busy;

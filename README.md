@@ -32,9 +32,9 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | Core sync logic | Input serialization, layout negotiation, input pipeline / confirmed-frontier, **lockstep + rollback** strategies — unit-tested |
 | **M1 — 2-player lockstep** | ✅ Verified on hardware (two EmuHawk instances, Genesis/GPGX): real-time pacing, working audio, desync detection (host saves quick-slot 10 on mismatch), configurable delay + packet redundancy |
 | **M2 — hardening** | ✅ Live ping/RTT + delay hints, **desync auto-recovery** (mismatch → resync from an authoritative state instead of ending), alt-tab audio resilience |
-| **3–4 players** | ✅ Code-complete — direct peer-to-peer input mesh; player count = the core's controller-port count. *Untested on hardware.* |
+| **3–4 players** | ✅ Code-complete — direct peer-to-peer input mesh with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status); player count = the core's controller-port count. *Untested on hardware.* |
 | **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). *Untested on hardware.* |
-| **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries the whole session over a reliable-over-UDP control channel; 2-player, cone NAT. *Untested on real internet NAT (no second machine).* |
+| **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. *Untested on real internet NAT (no second machine).* |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
@@ -46,7 +46,7 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 
 - **UDP for the input hot path, TCP for the reliable control channel** (handshake, state transfer, checksums) — the proven split from RemotePlay. The one exception is the **UDP Punch** path: with no port-forwarding there's only one punched UDP socket, so a `ReliableUdpStream` re-implements the essential slice of TCP (sequencing, cumulative ACKs, retransmit, a flow window) and the *same* handshake/state/checksum code runs over it unchanged.
 - UDP datagrams carry a `MAGIC + version` envelope and are **pinned to the peer's exact ip:port** (foreign/off-path packets dropped).
-- Handshake **verifies rather than trusts**: ROM/core/version/sync-settings/layout must match and both cores must be deterministic, or the session is refused with a reason.
+- Handshake **verifies rather than trusts**: ROM/core/version/sync-settings/layout must match and both cores must be deterministic (or both opt into the experimental non-deterministic override), or the session is refused with a reason. Peer-supplied numbers (delay, player count) are clamped so a malformed/hostile peer can't hang the host.
 - Known gotcha inherited from RemotePlay: on a **"Public" Windows network profile, the firewall silently drops inbound UDP** while the TCP handshake still connects — i.e. "connected but permanently stalling." An inbound allow-rule for the port fixes it.
 
 ## Layout
@@ -56,15 +56,16 @@ src/
   BizHawkNetplay.Core/    netstandard2.0 — no BizHawk dependency, fully unit-testable
     Emu/    IEmuAdapter, StateHandle          (the seam BizHawk sits behind)
     Input/  ControllerLayout, InputSerializer (generic-over-any-core packing)
-    Sync/   ISyncStrategy, LockstepStrategy, InputPipeline, FrameDecision, FrameDriver
+    Sync/   ISyncStrategy, LockstepStrategy, RollbackStrategy, InputPipeline, FrameDriver
     Probe/  CapabilityProbe, ProbeResult      (§5 rollback-feasibility math)
-    Net/    ITransport, LoopbackTransport, UdpTransport, InputPacketCodec, PacingInfo
-    Session/ PeerIdentity, SessionNegotiator, ControlChannel, Handshake, ClockEstimator
+    Net/    ITransport, MeshUdpTransport (mesh + punch), PunchedPeerLink + ReliableUdpStream
+            (UDP-punch path), StunClient, UpnpPortMapper, ConnectCode, InputPacketCodec
+    Session/ PeerIdentity, SessionNegotiator, ControlChannel, Handshake, HandshakeCodec
   BizHawkNetplay.Tool/    net48 — the only project that references BizHawk
     NetplayToolForm.cs    [ExternalTool] entry point (host/join, session UI, folds in the probe)
     EmuHawkAdapter.cs     IEmuAdapter bridged onto ApiHawk + emulator services
     InputSetController.cs  InputSet -> IController for invisible frame advance
-    NetplaySettings.cs    persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
+    NetplaySettings.cs    persisted UI prefs (UPnP, port, delay, netcode, input source, recent IPs)
 tests/
   BizHawkNetplay.Core.Tests/  net5.0 xUnit — no EmuHawk required (run: dotnet test)
 ```
@@ -93,7 +94,7 @@ A successful Tool build copies `BizHawkNetplay.Tool.dll` + `BizHawkNetplay.Core.
 .\build-dist.ps1 -Tag v0.4.0    # build, stage dist\, and create the Release with both DLLs attached
 ```
 
-## Running netplay (M1)
+## Running netplay
 
 Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), then open
 **Tools → External Tools → BizHawk Netplay**.
@@ -104,25 +105,26 @@ Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), 
   gets a short **connect code**. Swap codes out of band (Discord/text), paste your friend's, and
   *Connect*. Both punch outbound and the whole session runs over that one UDP socket.
 
+Two settings worth knowing on the Connection tab:
+
+- **My controls** — which of *your* controller-port bindings the tool reads (default *Use P1 pad*),
+  independent of the port you're assigned in-game. So a player assigned P2/P3/P4 just uses their
+  normal P1 pad with no rebinding.
+- **Netcode** (host decides) — **Automatic** (rollback if both cores clear the capability probe, else
+  lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows in
+  a box on the tab.
+
 On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason
 otherwise), transfers the host's savestate so both sims start identical, then runs. It trades
-memory-hash checksums every 60 frames and halts with a frame number if a desync is ever detected.
+memory-hash checksums every 60 frames and, on a mismatch, resyncs everyone from the host's
+authoritative state (saving the diverged state to quick-slot 10 for inspection) rather than ending.
 
-**Frame-driving model:** the tool pauses EmuHawk and advances exactly one confirmed frame per
-timer tick via `DoFrameAdvance` — it *owns the clock* rather than fighting EmuHawk's own loop
-(which pausing would silence). This is what makes lockstep stalls safe.
+**Frame-driving model:** the tool pauses EmuHawk and steps the core exactly one confirmed frame per
+timer tick with only the merged network inputs — it *owns the clock* rather than fighting EmuHawk's
+own loop (which pausing would silence). This is what makes lockstep stalls safe, and it keeps input
+capture entirely out of the emulation path so both peers stay deterministic.
 
-**Current limitations (M1):**
-- Pacing uses a WinForms timer (~coarse), so speed may sit a hair under 100%. Smooth
-  `speedmode`/drift-corrected pacing is M2.
-- Direct IP / LAN / port-forward for any player count; for two players with no forwarding, **UDP
-  Punch** hole-punches a direct link from swapped connect codes (cone NAT; symmetric NAT still needs
-  a relay, not built). Host-as-rendezvous for automatic N-player punch is planned.
-- The host picks the netcode from a dropdown: **Automatic** (rollback if both cores clear the
-  capability probe, else lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced).
-  The active mode is shown in a box on the Connection tab.
-- Running a movie, TAStudio, or a Lua script alongside a session isn't blocked yet — any of them can
-  inject frames/state and desync everyone, so avoid them during a session.
+See [Known limitations](#known-limitations) for the honest gaps (analog, NAT scope, etc.).
 
 ## Capability probe
 
@@ -132,19 +134,20 @@ times save/load/frame-advance on the loaded core and prints the per-core rollbac
 and restoring your position so it doesn't disturb play.
 
 # To Do
-- anyway to help optimize which player uses what controller without them having to rebind their controls to only a certain port? how how is that currently being handled?
-- the screen lags a bit on the sega for both users while a lot of going on on the screen, anyway to optimize this?
-- n64 games don't seem to work 
-  -connecting to 127.0.0.1:47800…
-  -connection failed: this core is not running deterministically here
-- players need to have their controls bound prior to joining, does this help with reliability, or can we change this after joining?
+- **Performance:** the picture can dip under heavy on-screen action (both players see it). This looks
+  like emulator + UI-thread render cost rather than the network (rollback re-sim already runs with
+  rendering off); a real fix likely means moving emulation off the UI thread. Profile before attempting.
+- **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
+- **Guard movies / TAStudio / Lua:** detect and refuse them at session start instead of only documenting it.
+- **Analog axes:** network the analog sticks (currently held neutral), for N64 / analog-pad games.
 
 ## Known limitations
 
 Things that are by-design gaps or not-yet-built, worth knowing before relying on it:
 
 - **Analog axes aren't networked** — inputs are transmitted as digital buttons with analog axes held
-  neutral, so analog-stick games (N64, analog pads) aren't supported yet.
+  neutral, so analog-stick control isn't supported yet. (A core like N64 can still be tried via the
+  experimental non-deterministic override on the Diagnostics tab, but its stick stays centered.)
 - **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined
   to non-RAM state can slip past the checksum until it perturbs RAM.
 - **The sync-settings check is coarse** — the handshake compares core + assembly version + system ID,

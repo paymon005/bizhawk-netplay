@@ -118,6 +118,14 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         public static bool ForceNeutralInput = false;
 
+        /// <summary>
+        /// Which EmuHawk controller port's bindings to actually read the local pad from. -1 (default)
+        /// reads the assigned port's own bindings. Set it to e.g. 0 so a player assigned P2/P3/P4 still
+        /// uses their normal P1 controls with no rebinding — same-console ports share button order, so
+        /// the source bindings map onto the assigned port's layout by index.
+        /// </summary>
+        public int InputSourcePort { get; set; } = -1;
+
         public PortInput ReadLocalInput(int port)
         {
             var layout = _layouts[port];
@@ -130,7 +138,12 @@ namespace BizHawkNetplay.Tool
             // ever sees the merged inputs we feed in AdvanceFrame, so there is no physical leak, no
             // hotkey firing, and both peers stay deterministic.
             var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
+            // Optionally source the pad from a different port's bindings, but only if that port's layout
+            // has the same button set (guards mixed-layout cores); otherwise fall back to the assigned port.
             var binds = _bindings[port];
+            int src = InputSourcePort;
+            if (src >= 0 && src < _bindings.Length && _bindings[src].Length == layout.Buttons.Count)
+                binds = _bindings[src];
             var buttons = new bool[layout.Buttons.Count];
             for (int i = 0; i < buttons.Length; i++)
                 buttons[i] = EvaluateBinding(binds[i], pressed);
