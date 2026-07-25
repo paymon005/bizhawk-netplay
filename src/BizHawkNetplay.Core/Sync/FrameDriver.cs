@@ -21,7 +21,7 @@ namespace BizHawkNetplay.Core.Sync
     /// the same two calls around a fake core advance. Strategy-agnostic: swap lockstep for
     /// rollback by passing a different factory — nothing else here changes.
     /// </summary>
-    public sealed class FrameDriver
+    public sealed class FrameDriver : IDisposable
     {
         private readonly IEmuAdapter _adapter;
         private readonly ITransport _transport;
@@ -81,11 +81,16 @@ namespace BizHawkNetplay.Core.Sync
 
             _localPort = localPort;
             _delay = delay;
-            _redundancy = redundancy;
+            // The redundant send window must reach back far enough that the peer — which in lockstep can
+            // lead us by up to the delay in either direction — still receives every frame it needs, i.e.
+            // R >= 2·delay+1. If the caller asks for less (notably when delay exceeds the requested
+            // redundancy), the earliest frames, including frame 0, are evicted from the window before the
+            // first send and the peer stalls at frame 0 forever. Raise R to satisfy the bound.
+            _redundancy = Math.Max(redundancy, 2 * delay + 1);
             _rollbackWindow = rollbackWindow;
             // Reject frames impossibly far in the future: at most the peer leads by the delay window
             // plus (in rollback) however far it may have predicted ahead of us.
-            _maxLead = 2 * delay + redundancy + 4 + rollbackWindow;
+            _maxLead = 2 * delay + _redundancy + 4 + rollbackWindow;
 
             _pipeline = new InputPipeline(ports);
             for (int p = 0; p < ports; p++) _pipeline.SetLocal(p, p == localPort);
@@ -269,5 +274,9 @@ namespace BizHawkNetplay.Core.Sync
             var window = new List<KeyValuePair<int, byte[]>>(_sendWindow);
             _transport.Send(_codec.EncodeInput((byte)_localPort, window));
         }
+
+        /// <summary>Release the strategy's resources (e.g. rollback's savestate ring). Call when replacing
+        /// the driver on a resync or tearing the session down, so BizHawk state blobs don't accumulate.</summary>
+        public void Dispose() => (_strategy as IDisposable)?.Dispose();
     }
 }

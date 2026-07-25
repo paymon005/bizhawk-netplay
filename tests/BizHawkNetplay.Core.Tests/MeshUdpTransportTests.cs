@@ -79,6 +79,36 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(new IPEndPoint(IPAddress.Parse("10.0.0.9"), 52000), d2[1]);
         }
 
+        [Fact]
+        public void ActivePunch_ConfirmsDirectPaths_WithoutAnyInput()
+        {
+            // With no input ever sent, the punch loop alone must open + confirm a direct path both ways
+            // (this is the keepalive/rendezvous behaviour that holds NAT mappings during a lockstep stall).
+            var a = MeshUdpTransport.Bind(0);
+            var b = MeshUdpTransport.Bind(0);
+            var c = MeshUdpTransport.Bind(0);
+            try
+            {
+                var aeps = new[] { Loop(b.LocalPort), Loop(c.LocalPort) };
+                var beps = new[] { Loop(a.LocalPort), Loop(c.LocalPort) };
+                var ceps = new[] { Loop(a.LocalPort), Loop(b.LocalPort) };
+                a.SetPeers(aeps); b.SetPeers(beps); c.SetPeers(ceps);
+
+                var sw = Stopwatch.StartNew();
+                bool all = false;
+                while (sw.ElapsedMilliseconds < 3000 && !all)
+                {
+                    all = a.IsEndpointAlive(aeps[0]) && a.IsEndpointAlive(aeps[1])
+                       && b.IsEndpointAlive(beps[0]) && b.IsEndpointAlive(beps[1])
+                       && c.IsEndpointAlive(ceps[0]) && c.IsEndpointAlive(ceps[1]);
+                    if (!all) Thread.Sleep(20);
+                }
+                Assert.True(all, "active punch did not confirm all direct paths without input");
+                Assert.Equal(2, a.AliveEndpoints().Count);
+            }
+            finally { a.Dispose(); b.Dispose(); c.Dispose(); }
+        }
+
         private static PortInput Btn(bool pressed)
         {
             var arr = new bool[8];

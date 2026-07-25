@@ -24,7 +24,7 @@ namespace BizHawkNetplay.Core.Sync
     /// final tail, which rollback rewrites before it can be observed as a checkpoint. All methods run
     /// single-threaded on the UI thread, interleaved with the <see cref="FrameDriver"/>.
     /// </summary>
-    public sealed class RollbackStrategy : ISyncStrategy
+    public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     {
         // How many extra frames of state to retain beyond the rollback cap, so a correction landing
         // exactly at the prediction horizon still finds its base state in the ring.
@@ -287,6 +287,19 @@ namespace BizHawkNetplay.Core.Sync
             if (_states.TryGetValue(frame, out var old))
                 _adapter.ReleaseState(old);
             _states[frame] = _adapter.SaveStateToMemory();
+        }
+
+        /// <summary>
+        /// Release every savestate still held in the ring. The strategy has no other reference to hand
+        /// these back through, so without this a resync (which builds a fresh driver) or session end
+        /// would strand a ring's worth of BizHawk state blobs — ~<see cref="MaxRollback"/> of them each
+        /// time. Idempotent.
+        /// </summary>
+        public void Dispose()
+        {
+            foreach (var st in _states.Values) _adapter.ReleaseState(st);
+            _states.Clear();
+            _applied.Clear();
         }
 
         private void Prune(int frame)

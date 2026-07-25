@@ -61,9 +61,10 @@ src/
     Net/    ITransport, LoopbackTransport, UdpTransport, InputPacketCodec, PacingInfo
     Session/ PeerIdentity, SessionNegotiator, ControlChannel, Handshake, ClockEstimator
   BizHawkNetplay.Tool/    net48 — the only project that references BizHawk
-    ProbeToolForm.cs      [ExternalTool] entry point (the M0 harness)
+    NetplayToolForm.cs    [ExternalTool] entry point (host/join, session UI, folds in the probe)
     EmuHawkAdapter.cs     IEmuAdapter bridged onto ApiHawk + emulator services
     InputSetController.cs  InputSet -> IController for invisible frame advance
+    NetplaySettings.cs    persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
 tests/
   BizHawkNetplay.Core.Tests/  net5.0 xUnit — no EmuHawk required (run: dotnet test)
 ```
@@ -120,7 +121,8 @@ timer tick via `DoFrameAdvance` — it *owns the clock* rather than fighting Emu
 - The host picks the netcode from a dropdown: **Automatic** (rollback if both cores clear the
   capability probe, else lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced).
   The active mode is shown in a box on the Connection tab.
-- Refuses to run sensibly alongside movies/TAStudio/Lua is not yet enforced — avoid those during a session.
+- Running a movie, TAStudio, or a Lua script alongside a session isn't blocked yet — any of them can
+  inject frames/state and desync everyone, so avoid them during a session.
 
 ## Capability probe
 
@@ -136,42 +138,25 @@ and restoring your position so it doesn't disturb play.
   -connecting to 127.0.0.1:47800…
   -connection failed: this core is not running deterministically here
 - players need to have their controls bound prior to joining, does this help with reliability, or can we change this after joining?
-- incorporate host-as-rendezvous for UDP
 
-## GPT Code Review
+## Known limitations
 
-Code review — main at 9603e3c
+Things that are by-design gaps or not-yet-built, worth knowing before relying on it:
 
-High — input delays above eight permanently lose frame 0.
-The UI permits delay 1–20, but every driver uses redundancy 8. Start() creates all D neutral frames, trims the window to eight, and only then sends it. At delay 9, frame 0 is discarded before the first packet: lockstep stalls immediately and rollback eventually hits its prediction cap. The code’s own requirement of R >= 2D+1 is also unenforced.
-FrameDriver startup · window trimming · hardcoded redundancy
-Fix: dynamically use at least 2 * delay + 1, or add reliable recovery for evicted frames. Add tests at delays 4, 9, and 20.
-High — sync settings are not actually compared.
-SyncSettingsDigest is currently a hash of core name | assembly version | system ID. Different core sync settings therefore pass the handshake and can deterministically diverge, despite the README claiming they are verified.
-Placeholder digest
-Fix: canonically serialize the core’s real sync-settings object and hash that.
-High/security — the handshake is unbounded and has no timeout.
-Remote delay is only lower-clamped. A client can echo the host’s HELLO with delay=2147483647; the host accepts it and later loops billions of times seeding inputs on the UI thread. Alternatively, a client can connect and never send HELLO, blocking the host’s handshake indefinitely.
-Unbounded decode · blocking receive · remote delay accepted
-Fix: enforce protocol limits such as delay 1–20, valid UDP ports and player counts, plus handshake read/write timeouts and cancellation.
-High/integrity — relay endpoints are not bound to controller ports.
-The relay checks that a datagram came from a known endpoint, but never verifies that its embedded port matches that endpoint’s assigned player. In 3–4 player sessions, P2 can submit input as P3 or the host; the pipeline accepts the first value received for that frame.
-Endpoint-only peer list · blind relay
-Fix: store endpoint → assigned port, decode enough of the packet to validate it before enqueueing or relaying, and ideally authenticate datagrams with a per-session key.
-High — reconnect bypasses rollback qualification.
-HostGreet may negotiate lockstep because the returning peer did not opt into rollback or failed its probe. The result is discarded, and CompleteReconnect sends the old session’s rollback mode anyway.
-Greeting result discarded · existing mode forced
-Fix: require the reconnect negotiation to reproduce the existing mode, player count, and compatible delay; otherwise reject the reconnect.
-Medium-priority findings
-Connection cancellation is unsafe. The emulator is paused before IP validation, so an invalid address leaves it paused. While joining, Disconnect cannot close the locally scoped TcpClient; the background thread may later start a “ghost” session. Start path · early-return teardown
-Rollback savestates leak when a driver is replaced or destroyed. The strategy releases pruned entries, but has no disposal path; resync simply overwrites _driver, and teardown nulls it. Roughly 16–20 BizHawk state blobs can remain after every resync/session. State ring · driver replacement
-Rollback probe results survive ROM/core changes. Restart() does not invalidate _probeDepth; MeasureRollbackDepth() returns the old cached value. Switching from a light core to a heavy one can incorrectly enable rollback. Restart · cache
-Dead peers may never trigger reconnect. Pings are sent only after successfully advancing a frame. Once a lost peer causes lockstep to stall, pinging stops and the blocking TCP read can remain alive until the OS timeout. Frame-driven ping · reader loop
-Joiners never clear their resync counter. The host clears its counter after a matching checksum, but joiners only increment theirs. Seven separate, successfully recovered resyncs eventually disconnect a healthy joiner as a “persistent desync.” Host-only reset · joiner counter
-Coverage gaps
-Analog axes are always transmitted as neutral, so analog-dependent games are not currently supported. Input capture
-Desync detection hashes only main RAM, not CPU, mapper, PPU/APU, RTC, or other core state. Checksum implementation
-All synchronization integration tests use delay 2, and there is no RelayUdpTransport test. The multiplayer rollback test uses a direct full-mesh simulator and disables time-sync, so it does not model the actual two-hop relay path.
-The README is substantially behind the implementation: test count, removed ProbeToolForm, frame-driving method, and 3–4 player rollback status are stale.
-
-I inspected the full 58-file snapshot. I could not independently execute the reported 60 tests because this review environment lacks the .NET SDK; the repository also currently has no CI workflow. No code was changed.
+- **Analog axes aren't networked** — inputs are transmitted as digital buttons with analog axes held
+  neutral, so analog-stick games (N64, analog pads) aren't supported yet.
+- **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined
+  to non-RAM state can slip past the checksum until it perturbs RAM.
+- **The sync-settings check is coarse** — the handshake compares core + assembly version + system ID,
+  not the core's full sync-settings blob, so two peers with the same core but different per-core sync
+  settings can pass the handshake and then diverge. Match your core settings manually.
+- **NAT traversal is cone-only** — UDP Punch and the mesh connectivity checks open cone-NAT paths;
+  **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't
+  built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the
+  rendezvous for the joiner↔joiner mesh.
+- **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically
+  bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
+  for playing with people you trust; not a hostile-network guarantee.
+- **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
+- **Untested on real hardware** for 3–4 players and any over-the-internet NAT path (developed on a
+  single machine). Everything below the socket layer is unit-tested; the last mile needs two boxes.

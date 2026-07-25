@@ -14,6 +14,14 @@ namespace BizHawkNetplay.Core.Session
     /// </summary>
     public static class HandshakeCodec
     {
+        // Hard bounds on peer-supplied numbers. The wire is untrusted: without an upper clamp a peer can
+        // report delay=int.MaxValue, and the host would then loop billions of times seeding neutral
+        // inputs on the UI thread (a trivial hang/DoS). Player count bounds the pipeline's array sizing.
+        public const int MaxInputDelay = 60;   // generous vs the UI's 20, but finite
+        public const int MaxPlayers = 8;
+
+        private static int ClampDelay(int d) => d < 1 ? 1 : d > MaxInputDelay ? MaxInputDelay : d;
+
         public static byte[] Encode(PeerIdentity id, SessionPreferences prefs, int udpPort)
         {
             var sb = new StringBuilder();
@@ -74,9 +82,9 @@ namespace BizHawkNetplay.Core.Session
         public static (int assignedPort, int playerCount, int inputDelay, SyncMode mode) DecodeWelcome(byte[] body)
         {
             var map = ParseLines(body);
-            int port = Math.Max(0, GetInt(map, "port", 1));
-            int players = Math.Max(2, GetInt(map, "players", 2));
-            int delay = Math.Max(1, GetInt(map, "delay", 1));
+            int players = Math.Min(MaxPlayers, Math.Max(2, GetInt(map, "players", 2)));
+            int port = Math.Min(players - 1, Math.Max(0, GetInt(map, "port", 1)));
+            int delay = ClampDelay(GetInt(map, "delay", 1));
             var mode = Get(map, "mode") == "rollback" ? SyncMode.Rollback : SyncMode.Lockstep;
             return (port, players, delay, mode);
         }
@@ -99,8 +107,9 @@ namespace BizHawkNetplay.Core.Session
                 Get(map, "det") == "1",
                 GetInt(map, "depth", 0));
 
-            // Clamp delay to a sane floor so a malformed peer can't request delay < 1.
-            var prefs = new SessionPreferences(Math.Max(1, GetInt(map, "delay", 1)), Get(map, "rollback") == "1", Get(map, "pwhash"));
+            // Clamp delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge
+            // value that would hang the host seeding that many neutral frames on the UI thread.
+            var prefs = new SessionPreferences(ClampDelay(GetInt(map, "delay", 1)), Get(map, "rollback") == "1", Get(map, "pwhash"));
             int udpPort = GetInt(map, "udpport", 0);
             return (id, prefs, udpPort);
         }

@@ -92,6 +92,7 @@ namespace BizHawkNetplay.Tool
             public double PingMs = -1;        // guarded by _pingLock
             public int PingCount;             // guarded by _pingLock
             public long LastRecvTicks;        // UtcNow.Ticks of the last message from this peer (Interlocked)
+            public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
             public string Label = "";
         }
 
@@ -110,6 +111,7 @@ namespace BizHawkNetplay.Tool
         private SessionPreferences? _punchPrefs;
         private byte[]? _punchState;            // host only: the initial state to transfer once punched
         private TcpListener? _listener;
+        private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
         private FrameDriver? _driver;
         private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
@@ -122,6 +124,7 @@ namespace BizHawkNetplay.Tool
         private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
         private const int MaxResyncs = 6;
         private const double ResyncGraceSeconds = 2.0;
+        private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private int _stallLog;     // throttles verbose stall messages
 
@@ -434,11 +437,33 @@ namespace BizHawkNetplay.Tool
                 Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, GridLines = true,
                 HeaderStyle = ColumnHeaderStyle.Nonclickable,
             };
-            _playersList.Columns.Add("Player", 90);
-            _playersList.Columns.Add("Address", 250);
-            _playersList.Columns.Add("Ping", 80);
+            _playersList.Columns.Add("Player", 80);
+            _playersList.Columns.Add("Address", 220);
+            _playersList.Columns.Add("Ping", 70);
+            _playersList.Columns.Add("Link", 120);
             page.Controls.Add(_playersList);
             return page;
+        }
+
+        /// <summary>Whether a direct UDP path to this peer is currently confirmed open (mesh punch/keepalive).</summary>
+        private bool MeshLinkAlive(PeerLink link)
+        {
+            if (_punchMode) return true; // the punched link is confirmed before the session starts
+            var mesh = _mesh;
+            if (mesh == null) return false;
+            return (link.UdpEndpoint != null && mesh.IsEndpointAlive(link.UdpEndpoint))
+                || (link.ReflexiveEndpoint != null && mesh.IsEndpointAlive(link.ReflexiveEndpoint));
+        }
+
+        /// <summary>Human-readable direct-link state for the Players list.</summary>
+        private string MeshLinkStatus(PeerLink link)
+        {
+            if (_punchMode) return "direct (punched)";
+            var mesh = _mesh;
+            if (mesh == null) return "—";
+            if (link.UdpEndpoint != null && mesh.IsEndpointAlive(link.UdpEndpoint)) return "direct";
+            if (link.ReflexiveEndpoint != null && mesh.IsEndpointAlive(link.ReflexiveEndpoint)) return "direct (punched)";
+            return "connecting…";
         }
 
         /// <summary>Rebuild the players list from the current peers (self first). Cheap for 2–4 players.</summary>
@@ -452,6 +477,7 @@ namespace BizHawkNetplay.Tool
                 var me = new ListViewItem($"P{_localPort + 1} (you)");
                 me.SubItems.Add(_isHost ? "this machine (host)" : "this machine");
                 me.SubItems.Add("—");
+                me.SubItems.Add("—");
                 _playersList.Items.Add(me);
 
                 lock (_pingLock)
@@ -461,7 +487,15 @@ namespace BizHawkNetplay.Tool
                         var item = new ListViewItem($"P{link.RemotePort + 1}");
                         item.SubItems.Add(link.UdpEndpoint?.ToString() ?? link.Label);
                         item.SubItems.Add(link.PingMs < 0 ? "…" : $"{link.PingMs:F0} ms");
+                        item.SubItems.Add(MeshLinkStatus(link));
                         _playersList.Items.Add(item);
+
+                        // One-time log when a peer's direct UDP path first confirms (host-as-rendezvous punch).
+                        if (MeshLinkAlive(link) && !link.DirectLogged)
+                        {
+                            link.DirectLogged = true;
+                            Log($"{link.Label}: direct UDP path open");
+                        }
                     }
                 }
             }
@@ -485,6 +519,9 @@ namespace BizHawkNetplay.Tool
         {
             // ROM load / tool re-init: tear down any live session.
             if (_sessionActive) EndSession("emulator restarted");
+            // Invalidate the cached probe depth — the core/ROM may have changed, and a stale (deeper)
+            // measurement from a lighter core could wrongly grant rollback to a heavier one.
+            _probeDepth = -1;
             UpdateEnabled();
         }
 
@@ -509,6 +546,13 @@ namespace BizHawkNetplay.Tool
                 {
                     Log($"this core exposes only {players} controller port — configure at least 2 controllers to host netplay.");
                     SetBusy(false); return;
+                }
+
+                // Validate the join address BEFORE pausing — otherwise a typo'd IP leaves the emulator
+                // frozen on the early return with no session to un-freeze it.
+                if (!_hostRadio.Checked && !IPAddress.TryParse(_ipBox.Text.Trim(), out _))
+                {
+                    Log("Enter a valid host IP."); SetBusy(false); return;
                 }
 
                 // Freeze the emulator NOW. Otherwise it keeps free-running between probing/exporting
@@ -541,10 +585,8 @@ namespace BizHawkNetplay.Tool
                 }
                 else
                 {
-                    if (!IPAddress.TryParse(_ipBox.Text.Trim(), out var _))
-                    { Log("Enter a valid host IP."); SetBusy(false); return; }
                     _mesh = MeshUdpTransport.Bind(0); _transport = WrapSimLatency(_mesh);
-                    string ip = _ipBox.Text.Trim();
+                    string ip = _ipBox.Text.Trim(); // already validated above, before the pause
                     _pendingJoinIp = ip; // recorded into the recent-IPs list once the connect succeeds
                     StartThread(() => JoinThread(ip, port, id, prefs, _mesh.LocalPort));
                 }
@@ -826,11 +868,13 @@ namespace BizHawkNetplay.Tool
             {
                 UiLog($"connecting to {ip}:{port}…");
                 var tcp = new TcpClient();
+                _joiningTcp = tcp;          // so Disconnect can close a connect that's still blocking
                 tcp.Connect(ip, port);
                 try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                 var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                 var channel = new ControlChannel(tcp.GetStream());
                 var sp = Handshake.RunClientMulti(channel, id, prefs, udpLocalPort);
+                _joiningTcp = null;         // handed off to the session; teardown closes it via the PeerLink now
                 var link = new PeerLink
                 {
                     Tcp = tcp,
@@ -1045,6 +1089,17 @@ namespace BizHawkNetplay.Tool
                 // and a dead link is still detected while we're waiting on it).
                 MaybeSendPing();
                 CheckLinkTimeouts();
+
+                // Joiner: the host clears its resync counter once checksums re-agree, but a joiner gets no
+                // such signal. Decay ours after running well past the last resync without another one —
+                // otherwise a run of successful recoveries would eventually trip the "persistent desync"
+                // give-up limit on a perfectly healthy joiner.
+                if (!_isHost && _resyncCount > 0 && !_awaitingReconnect
+                    && (DateTime.UtcNow - _lastResync).TotalSeconds > ResyncRecoverySeconds)
+                {
+                    _resyncCount = 0;
+                    Log("back in sync — recovery confirmed");
+                }
 
                 // One-shot audio pipeline snapshot ~2s in, so a single test shows where sound breaks.
                 if (!_audioStatsLogged && _driver.CurrentFrame >= 120)
@@ -1358,6 +1413,7 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void RebuildDriver()
         {
+            try { _driver?.Dispose(); } catch { } // release the old rollback ring before replacing it
             _driver = CreateDriver();
             _startEmuFrame = APIs.Emulation.FrameCount();
             lock (_hashLock) { _frameHashes.Clear(); }
@@ -1701,6 +1757,8 @@ namespace BizHawkNetplay.Tool
 
             try { _listener?.Stop(); } catch { }
             _listener = null;
+            try { _joiningTcp?.Close(); } catch { } // unblock a join connect that's still dialing
+            _joiningTcp = null;
 
             var peers = new List<PeerLink>(_peers);
             _peers.Clear();
@@ -1708,6 +1766,7 @@ namespace BizHawkNetplay.Tool
 
             try { (_transport as IDisposable)?.Dispose(); } catch { }
             try { _punchLink?.Dispose(); } catch { } // in case _transport is a sim-latency wrapper over it
+            try { _driver?.Dispose(); } catch { } // release the rollback ring's savestates
             _transport = null; _mesh = null; _punchLink = null;
             _punchMode = false; _punchState = null;
             _driver = null;

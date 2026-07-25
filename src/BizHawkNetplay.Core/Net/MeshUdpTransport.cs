@@ -9,32 +9,52 @@ using System.Threading;
 namespace BizHawkNetplay.Core.Net
 {
     /// <summary>
-    /// Full-mesh UDP transport for the input hot path. Unlike <see cref="RelayUdpTransport"/> (a star
-    /// where the host forwards each peer's datagram to the others, two hops peer-to-peer), every peer
-    /// here sends its own input directly to every other peer — one hop, which is what keeps rollbacks
-    /// shallow with 3–4 players. It is the <see cref="ITransport"/> both the host and the joiners use;
-    /// the control channel stays a star (host-coordinated), and this only carries input.
+    /// Full-mesh UDP transport for the input hot path. Unlike a host-relay star (where the host forwards
+    /// each peer's datagram to the others, two hops peer-to-peer), every peer here sends its own input
+    /// directly to every other — one hop, which is what keeps rollbacks shallow with 3–4 players. It is
+    /// the <see cref="ITransport"/> both the host and the joiners use; the control channel stays a star.
     ///
-    /// <see cref="Send"/> transmits to every known peer; the receive loop accepts datagrams only from a
-    /// known peer endpoint (pinning out trivially spoofed off-path input) and queues them for the local
-    /// FrameDriver — it never forwards. For a 2-player session the peer set is a single endpoint and
-    /// this behaves exactly like point-to-point. Same <c>MAGIC + version</c> envelope as the other
-    /// transports, so a foreign or wrong-version packet is dropped before the codec sees it.
+    /// <b>Host-as-rendezvous connectivity checks.</b> On top of plain delivery, the mesh runs lightweight
+    /// ICE-lite punching: the host brokers everyone's candidate endpoints (LAN + STUN-reflexive) over the
+    /// control channel, and this transport actively probes each candidate with PUNCH datagrams until a
+    /// direct path is confirmed — opening NAT mappings without port-forwarding on cone NAT. The probes
+    /// double as a <b>keepalive</b>: during a lockstep stall no input flows, so an idle NAT mapping would
+    /// otherwise expire (~30 s) and silently kill the path — and the ping watchdog only watches the TCP
+    /// control link, not this one. <see cref="IsEndpointAlive"/> reports which candidates have answered,
+    /// so the UI can show whether a peer's direct link is up.
+    ///
+    /// Datagrams carry a <c>MAGIC + version + type</c> envelope and are pinned to a known peer endpoint
+    /// (foreign/off-path packets dropped before the codec sees them). Symmetric NAT, where a peer's real
+    /// source port differs from the candidate it advertised, still needs a relay — not built here.
     /// </summary>
     public sealed class MeshUdpTransport : ITransport, IDisposable
     {
         private static readonly byte[] Magic = { (byte)'B', (byte)'H', (byte)'N', (byte)'P' };
-        private const byte Version = 1;
-        private const int HeaderSize = 5; // MAGIC(4) + version(1)
+        private const byte Version = 2; // bumped: datagrams now carry a type byte (input vs punch)
+        private const int HeaderSize = 6; // MAGIC(4) + version(1) + type(1)
+
+        private const byte TInput = 0x10;
+        private const byte TPunch = 0x30;
+        private const byte TPunchAck = 0x31;
+
+        private const int PunchTickMs = 250;     // probe cadence while a candidate is unconfirmed
+        private const int KeepaliveMs = 3000;    // re-probe cadence once a candidate is alive (holds the NAT mapping)
+        private const int AliveWindowMs = 8000;  // no traffic for this long => the path is considered down again
 
         private readonly Socket _socket;
         private readonly ConcurrentQueue<byte[]> _inbound = new ConcurrentQueue<byte[]>();
         private readonly Thread _rxThread;
+        private readonly Thread _punchThread;
         private volatile bool _running = true;
         private volatile IPEndPoint[] _peers = Array.Empty<IPEndPoint>();
 
-        // Reflexive-address discovery: while a request is pending, the receive loop watches for the
-        // STUN response on this same socket (so the reflexive port is the one the mesh actually uses).
+        // Per-candidate liveness: endpoint -> last time we heard anything back from it (stopwatch ms).
+        private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new ConcurrentDictionary<IPEndPoint, long>();
+        private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new ConcurrentDictionary<IPEndPoint, long>();
+        private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+
+        // Reflexive-address discovery: while a request is pending, the receive loop watches for the STUN
+        // response on this same socket (so the reflexive port is the one the mesh actually uses).
         private volatile byte[]? _pendingStunTxn;
         private volatile IPEndPoint? _reflexive;
         private readonly ManualResetEventSlim _stunEvent = new ManualResetEventSlim(false);
@@ -45,6 +65,8 @@ namespace BizHawkNetplay.Core.Net
             _socket.Bind(new IPEndPoint(IPAddress.Any, localPort));
             _rxThread = new Thread(ReceiveLoop) { IsBackground = true, Name = "BizHawkNetplay-UDP-mesh" };
             _rxThread.Start();
+            _punchThread = new Thread(PunchLoop) { IsBackground = true, Name = "BizHawkNetplay-UDP-punch" };
+            _punchThread.Start();
         }
 
         /// <summary>The local UDP port actually bound (read this when binding to port 0).</summary>
@@ -52,22 +74,40 @@ namespace BizHawkNetplay.Core.Net
 
         public static MeshUdpTransport Bind(int localPort) => new MeshUdpTransport(localPort);
 
-        /// <summary>Set the full set of peer endpoints (IP + UDP port) to send to and accept from.</summary>
+        /// <summary>Set the full set of peer endpoints (IP + UDP port) to send to and accept from. Adding
+        /// a new candidate arms the punch loop for it; dropped candidates stop being probed.</summary>
         public void SetPeers(IEnumerable<IPEndPoint> peers)
         {
             if (peers == null) throw new ArgumentNullException(nameof(peers));
-            _peers = peers.ToArray();
+            var arr = peers.ToArray();
+            _peers = arr;
+            // Forget liveness for candidates no longer in the set (a rejoin can change addresses).
+            var keep = new HashSet<IPEndPoint>(arr);
+            foreach (var k in _alive.Keys.ToArray()) if (!keep.Contains(k)) _alive.TryRemove(k, out _);
+            foreach (var k in _lastPunch.Keys.ToArray()) if (!keep.Contains(k)) _lastPunch.TryRemove(k, out _);
         }
 
         public void Send(byte[] datagram)
         {
             if (datagram == null) throw new ArgumentNullException(nameof(datagram));
-            var framed = Frame(datagram);
+            var framed = Frame(TInput, datagram);
             var peers = _peers;
             foreach (var p in peers) SendFramed(framed, p);
         }
 
         public bool TryReceive(out byte[] datagram) => _inbound.TryDequeue(out datagram!);
+
+        /// <summary>True if this candidate endpoint has answered a probe or sent input recently — i.e. a
+        /// direct UDP path to it is currently open.</summary>
+        public bool IsEndpointAlive(IPEndPoint endpoint)
+            => endpoint != null && _alive.TryGetValue(endpoint, out var t) && Clock.ElapsedMilliseconds - t < AliveWindowMs;
+
+        /// <summary>Snapshot of the candidate endpoints with a currently-open direct path.</summary>
+        public IReadOnlyList<IPEndPoint> AliveEndpoints()
+        {
+            long now = Clock.ElapsedMilliseconds;
+            return _alive.Where(kv => now - kv.Value < AliveWindowMs).Select(kv => kv.Key).ToArray();
+        }
 
         /// <summary>
         /// Discover this socket's public (reflexive) address via STUN, without disturbing the running
@@ -96,6 +136,32 @@ namespace BizHawkNetplay.Core.Net
             return null;
         }
 
+        private void PunchLoop()
+        {
+            while (_running)
+            {
+                try
+                {
+                    long now = Clock.ElapsedMilliseconds;
+                    var peers = _peers;
+                    foreach (var p in peers)
+                    {
+                        bool alive = IsEndpointAlive(p);
+                        // Probe aggressively until confirmed, then just often enough to hold the mapping.
+                        int due = alive ? KeepaliveMs : PunchTickMs;
+                        bool neverSent = !_lastPunch.TryGetValue(p, out var lastSent);
+                        if (neverSent || now - lastSent >= due)
+                        {
+                            SendFramed(Frame(TPunch, Array.Empty<byte>()), p);
+                            _lastPunch[p] = now;
+                        }
+                    }
+                }
+                catch { /* transient; keep the loop alive */ }
+                Thread.Sleep(PunchTickMs);
+            }
+        }
+
         private void ReceiveLoop()
         {
             var buffer = new byte[2048];
@@ -122,24 +188,36 @@ namespace BizHawkNetplay.Core.Net
                 if (buffer[0] != Magic[0] || buffer[1] != Magic[1] ||
                     buffer[2] != Magic[2] || buffer[3] != Magic[3]) continue;
                 if (buffer[4] != Version) continue;
+                byte type = buffer[5];
 
                 var peers = _peers;
-                bool known = false;
-                for (int i = 0; i < peers.Length; i++) if (peers[i].Equals(from)) { known = true; break; }
-                if (!known) continue; // pin to known peers (blocks off-path input)
+                IPEndPoint? known = null;
+                for (int i = 0; i < peers.Length; i++) if (peers[i].Equals(from)) { known = peers[i]; break; }
+                if (known == null) continue; // pin to known peers (blocks off-path input)
 
+                _alive[known] = Clock.ElapsedMilliseconds; // any framed packet proves the path is up
+
+                if (type == TPunch)
+                {
+                    SendFramed(Frame(TPunchAck, Array.Empty<byte>()), known); // answer so the peer confirms us too
+                    continue;
+                }
+                if (type == TPunchAck) continue; // liveness already recorded above
+
+                // TInput
                 var payload = new byte[n - HeaderSize];
                 Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
                 _inbound.Enqueue(payload);
             }
         }
 
-        private static byte[] Frame(byte[] datagram)
+        private static byte[] Frame(byte type, byte[] payload)
         {
-            var framed = new byte[HeaderSize + datagram.Length];
+            var framed = new byte[HeaderSize + payload.Length];
             Buffer.BlockCopy(Magic, 0, framed, 0, 4);
             framed[4] = Version;
-            Buffer.BlockCopy(datagram, 0, framed, HeaderSize, datagram.Length);
+            framed[5] = type;
+            Buffer.BlockCopy(payload, 0, framed, HeaderSize, payload.Length);
             return framed;
         }
 
@@ -155,6 +233,7 @@ namespace BizHawkNetplay.Core.Net
             _running = false;
             try { _socket.Dispose(); } catch { /* ignore */ }
             try { if (_rxThread.IsAlive) _rxThread.Join(500); } catch { /* ignore */ }
+            try { if (_punchThread.IsAlive) _punchThread.Join(500); } catch { /* ignore */ }
             try { _stunEvent.Dispose(); } catch { /* ignore */ }
         }
     }
