@@ -109,6 +109,14 @@ namespace BizHawkNetplay.Core.Net
             return _alive.Where(kv => now - kv.Value < AliveWindowMs).Select(kv => kv.Key).ToArray();
         }
 
+        /// <summary>Forget the current path confirmations and make the punch loop probe every candidate
+        /// immediately. Used when control traffic is healthy but input progress has gone quiet.</summary>
+        public void RequestRepunch()
+        {
+            _alive.Clear();
+            _lastPunch.Clear();
+        }
+
         /// <summary>
         /// Discover this socket's public (reflexive) address via STUN, without disturbing the running
         /// receive loop — the response is caught there. Because it's the mesh's own socket, the port

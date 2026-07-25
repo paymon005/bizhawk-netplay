@@ -66,14 +66,14 @@ namespace BizHawkNetplay.Core.Session
         }
 
         /// <summary>
-        /// Suggested lockstep input delay for the current estimate: ceil(halfRtt / frameMs) + 1
+        /// Suggested lockstep input delay for the current estimate: ceil(halfRtt / frameMs) + 2
         /// frames (§1 non-functional target), clamped to at least 1.
         /// </summary>
         public int SuggestedDelayFrames(double frameMs)
         {
             var est = Estimate();
             if (est == null || frameMs <= 0) return 1;
-            int d = (int)Math.Ceiling(est.Value.baselinePingMs / frameMs) + 1;
+            int d = (int)Math.Ceiling(est.Value.baselinePingMs / frameMs) + 2;
             return d < 1 ? 1 : d;
         }
 

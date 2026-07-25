@@ -43,10 +43,10 @@ namespace BizHawkNetplay.Core.Net
 
         public bool TryReceive(out byte[] datagram)
         {
-            // Move everything the inner transport has ready into the delay buffer, stamped with when
-            // it becomes deliverable, then hand back the oldest datagram whose delay has elapsed.
+            // Pull at most one inner datagram per call. FrameDriver bounds calls per UI callback, so
+            // this decorator must not hide an unbounded inner drain behind a single TryReceive.
             long now = _nowMs();
-            while (_inner.TryReceive(out var d))
+            if (_inner.TryReceive(out var d))
                 _buffer.Enqueue(new Pending(now + _delayMs, d));
 
             if (_buffer.Count > 0 && _buffer.Peek().ReleaseMs <= now)

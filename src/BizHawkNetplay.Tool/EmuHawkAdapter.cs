@@ -93,6 +93,9 @@ namespace BizHawkNetplay.Tool
         public string CoreVersion =>
             _emulator.GetType().Assembly.GetName().Version?.ToString() ?? "0";
 
+        /// <summary>BizHawk system identifier (for conservative per-system netplay defaults).</summary>
+        public string SystemId => _emulator.SystemId;
+
         // NOTE (M1): replace with a hash of the core's real sync-settings blob obtained via the
         // settable-service interface. For M0 identity is core+version+system, enough to catch
         // gross mismatches at handshake.
@@ -251,6 +254,20 @@ namespace BizHawkNetplay.Tool
                 dev.WriteSamples(_pumpScratch, 0, needed);
             }
             catch { /* transient hiccup while the voice is being recreated — skip this tick, stay armed */ }
+        }
+
+        /// <summary>
+        /// Blit the core's freshly-rendered frame to EmuHawk's window. We hold EmuHawk paused and drive
+        /// frame-advance ourselves, so its own run loop never presents — a paused window keeps showing
+        /// the last frame its swapchain holds, which is why the host's picture froze while emulation
+        /// (audio, netplay) kept running. MainForm.Render() re-presents the current video provider; we
+        /// call it once per tick after stepping, the video twin of <see cref="PumpAudio"/>. Best-effort.
+        /// </summary>
+        public void PresentVideo()
+        {
+            var form = _mainForm;
+            if (form == null || form.IsDisposed) return;
+            try { form.Render(); } catch { /* transient present hiccup — next tick tries again */ }
         }
 
         /// <summary>True once <see cref="EnableAudio"/> has wired up the sound output for the session.</summary>

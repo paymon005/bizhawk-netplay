@@ -18,6 +18,9 @@ namespace BizHawkNetplay.Core.Session
         ResyncRequest = 11, // client -> host: "I saw a desync, please resync us"
         PeerList = 12, // host -> client: the other peers' UDP endpoints for the direct input mesh
         Candidate = 13, // client -> host: my reflexive (STUN) UDP endpoint, for NAT-traversal candidates
+        Ready = 14,    // multi-peer start barrier request/ack after state import data is received
+        Go = 15,       // host releases every ready joiner at once
+        ResyncBegin = 16, // host -> client: a large Resync frame follows; suspend ping timeout while receiving it
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Input;
 using BizHawkNetplay.Core.Net;
@@ -37,6 +38,15 @@ namespace BizHawkNetplay.Core.Sync
         private readonly int _rollbackWindow;
         private readonly int _maxLead;
         private FrameDecision _pendingDecision;
+
+        // Keep receive work bounded on the UI thread. A duplicate/flooded UDP queue is allowed to
+        // spill into a later timer callback instead of monopolizing one callback indefinitely.
+        private const int MaxDatagramsPerPump = 128;
+        private const long StallResendIntervalMs = 20; // at most 50 redundant windows/second
+        private readonly Stopwatch _sendClock = Stopwatch.StartNew();
+        private long _lastSendMs = long.MinValue;
+        private readonly DateTime[] _lastRemoteInputUtc;
+        private int _lastPacketsDrained;
 
         // Rolling window of the local port's most recent serialized inputs, for redundant sends.
         private readonly LinkedList<KeyValuePair<int, byte[]>> _sendWindow = new LinkedList<KeyValuePair<int, byte[]>>();
@@ -100,6 +110,7 @@ namespace BizHawkNetplay.Core.Sync
             for (int p = 0; p < ports; p++) _pipeline.SetLocal(p, p == localPort);
 
             _serializers = new InputSerializer[ports];
+            _lastRemoteInputUtc = new DateTime[ports];
             var payloadSizes = new int[ports];
             for (int p = 0; p < ports; p++)
             {
@@ -118,6 +129,7 @@ namespace BizHawkNetplay.Core.Sync
         public bool IsStalled { get; private set; }
         public InputSet? LastAppliedInputs { get; private set; }
         public ISyncStrategy Strategy => _strategy;
+        public int LastPacketsDrained => _lastPacketsDrained;
 
         /// <summary>
         /// Seed the local port's first D frames (nothing has been stamped for them yet) with
@@ -128,16 +140,18 @@ namespace BizHawkNetplay.Core.Sync
             if (_started) return;
             _started = true;
             var neutral = PortInput.Neutral(_adapter.GetControllerLayout(_localPort));
+            var now = DateTime.UtcNow;
+            for (int p = 0; p < _lastRemoteInputUtc.Length; p++) _lastRemoteInputUtc[p] = now;
             for (int f = 0; f < _delay; f++)
                 ProduceLocal(f, neutral);
-            SendWindow();
+            SendWindow(force: true);
         }
 
         public FrameStep OnPreFrame()
         {
             if (!_started) Start();
 
-            DrainNetwork();
+            DrainNetwork(MaxDatagramsPerPump);
             CaptureAndSendLocal();
 
             var decision = _strategy.BeginFrame(CurrentFrame);
@@ -170,12 +184,21 @@ namespace BizHawkNetplay.Core.Sync
         // actually polled and where joypad overrides stick). These decompose OnPreFrame so the
         // form can straddle that boundary; the loopback tests keep using OnPreFrame/OnPostFrame.
 
-        /// <summary>Drain remote inputs into the pipeline and (re)send our redundant window. Safe every tick, including stalls.</summary>
+        /// <summary>Drain a bounded number of remote input datagrams into the pipeline. Sending is kept
+        /// separate so one captured input produces one immediate packet rather than PumpNetwork and
+        /// CaptureLocalInput duplicating the same window back-to-back.</summary>
         public void PumpNetwork()
         {
             if (!_started) Start();
-            DrainNetwork();
-            SendWindow();
+            _lastPacketsDrained = DrainNetwork(MaxDatagramsPerPump);
+        }
+
+        /// <summary>During a stall, re-send the redundant local window on a wall-clock cadence. The
+        /// window already carries loss recovery, so sending it on every 2ms UI tick only creates floods.</summary>
+        public void ResendLocalInputIfDue()
+        {
+            if (!_started) Start();
+            SendWindow(force: false);
         }
 
         /// <summary>
@@ -201,8 +224,23 @@ namespace BizHawkNetplay.Core.Sync
             {
                 var local = _adapter.ReadLocalInput(_localPort);
                 ProduceLocal(stamp, local);
+                SendWindow(force: true);
             }
-            SendWindow();
+        }
+
+        /// <summary>Find the remote controller port whose valid input has been silent longest.</summary>
+        public bool TryGetMostSilentRemotePort(out int port, out TimeSpan silence)
+        {
+            port = -1;
+            silence = TimeSpan.Zero;
+            var now = DateTime.UtcNow;
+            for (int p = 0; p < _lastRemoteInputUtc.Length; p++)
+            {
+                if (p == _localPort || _lastRemoteInputUtc[p] == default) continue;
+                var age = now - _lastRemoteInputUtc[p];
+                if (port < 0 || age > silence) { port = p; silence = age; }
+            }
+            return port >= 0;
         }
 
         /// <summary>
@@ -224,14 +262,19 @@ namespace BizHawkNetplay.Core.Sync
 
         // --- internals ----------------------------------------------------------------
 
-        private void DrainNetwork()
+        private int DrainNetwork(int maxDatagrams)
         {
-            while (_transport.TryReceive(out var datagram))
+            int drained = 0;
+            while (drained < maxDatagrams && _transport.TryReceive(out var datagram))
             {
+                drained++;
                 if (!_codec.TryDecodeInput(datagram, out var frames)) continue;
                 foreach (var inFrame in frames)
                 {
                     if (inFrame.Port == _localPort) continue;      // never let the wire override our own port
+                    // Any well-decoded frame from a remote port proves that port's UDP path is alive,
+                    // including a redundant frame we already hold during a lockstep stall.
+                    _lastRemoteInputUtc[inFrame.Port] = DateTime.UtcNow;
                     // Genuine redundancy: we already hold this exact (port, frame). This is also the
                     // ONLY way an earlier-than-current frame reaches lockstep — it can't have advanced
                     // past a frame it lacked — so with _rollbackWindow==0 this matches the old
@@ -250,6 +293,7 @@ namespace BizHawkNetplay.Core.Sync
                     _strategy.OnRemoteInput(inFrame);
                 }
             }
+            return drained;
         }
 
         private void CaptureAndSendLocal()
@@ -259,8 +303,9 @@ namespace BizHawkNetplay.Core.Sync
             {
                 var local = _adapter.ReadLocalInput(_localPort);
                 ProduceLocal(stamp, local);
+                SendWindow(force: true);
             }
-            SendWindow(); // resend the redundant window every tick, including stalls, for fast recovery
+            else SendWindow(force: false);
         }
 
         private void ProduceLocal(int frame, PortInput input)
@@ -272,11 +317,14 @@ namespace BizHawkNetplay.Core.Sync
             _lastStamp = frame;
         }
 
-        private void SendWindow()
+        private void SendWindow(bool force)
         {
             if (_sendWindow.Count == 0) return;
+            long now = _sendClock.ElapsedMilliseconds;
+            if (!force && now - _lastSendMs < StallResendIntervalMs) return;
             var window = new List<KeyValuePair<int, byte[]>>(_sendWindow);
             _transport.Send(_codec.EncodeInput((byte)_localPort, window));
+            _lastSendMs = now;
         }
 
         /// <summary>Release the strategy's resources (e.g. rollback's savestate ring). Call when replacing

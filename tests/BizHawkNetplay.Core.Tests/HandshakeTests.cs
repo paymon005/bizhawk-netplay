@@ -142,6 +142,28 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void MultiPlayerReadyBarrier_DoesNotReleaseClientBeforeGo()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var client = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh, Id(), new SessionPreferences(2, false), 51001));
+                var greeting = Handshake.HostGreet(hostCh, Id(), new SessionPreferences(2, false), 47800);
+
+                Handshake.HostSendWelcome(hostCh, assignedPort: 1, playerCount: 2, inputDelay: 2,
+                    mode: SyncMode.Lockstep, state: new byte[1024], useReadyBarrier: true);
+                Handshake.HostWaitReady(hostCh);
+
+                Assert.False(client.IsCompleted);
+                Handshake.HostSendGo(hostCh);
+                Assert.Equal(1, client.GetAwaiter().GetResult().LocalPort);
+                Assert.Equal(51001, greeting.UdpPort);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
         public void RollbackDowngrades_WhenClientShallow()
         {
             var (hostCh, clientCh, dispose) = TcpPair();

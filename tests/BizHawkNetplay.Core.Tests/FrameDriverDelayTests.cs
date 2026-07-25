@@ -30,6 +30,20 @@ namespace BizHawkNetplay.Core.Tests
             }
         }
 
+        private sealed class CountingTransport : ITransport
+        {
+            private readonly Queue<byte[]> _in = new Queue<byte[]>();
+            public int Sends { get; private set; }
+            public int Pending => _in.Count;
+            public void Enqueue(byte[] datagram) => _in.Enqueue(datagram);
+            public void Send(byte[] datagram) => Sends++;
+            public bool TryReceive(out byte[] datagram)
+            {
+                if (_in.Count > 0) { datagram = _in.Dequeue(); return true; }
+                datagram = null!; return false;
+            }
+        }
+
         private static PortInput Btn(bool pressed)
         {
             var arr = new bool[8];
@@ -85,6 +99,29 @@ namespace BizHawkNetplay.Core.Tests
             Assert.True(da.CurrentFrame >= Target && db.CurrentFrame >= Target, "a 2-of-4-player session stalled");
             Assert.Equal(Players, da.LastAppliedInputs!.Ports.Length); // only the active ports are networked
             Assert.Equal(ea.HashMainMemory(), eb.HashMainMemory());    // and both stayed in sync
+        }
+
+        [Fact]
+        public void SplitPump_DoesNotDuplicateFreshInputAndBoundsReceiveWork()
+        {
+            var transport = new CountingTransport();
+            var emu = new FakeEmuAdapter(portCount: 2);
+            var driver = new FrameDriver(emu, transport, p => new LockstepStrategy(p), localPort: 0, delay: 2);
+
+            driver.Start();
+            Assert.Equal(1, transport.Sends); // neutral seed window
+            driver.PumpNetwork();
+            Assert.Equal(1, transport.Sends); // pump is drain-only
+            driver.CaptureLocalInput();
+            Assert.Equal(2, transport.Sends); // exactly one packet for the fresh stamp
+            driver.PumpNetwork();
+            driver.ResendLocalInputIfDue();
+            Assert.Equal(2, transport.Sends); // immediate 2ms-style retry is rate-limited
+
+            for (int i = 0; i < 200; i++) transport.Enqueue(new byte[] { 0xFF });
+            driver.PumpNetwork();
+            Assert.Equal(128, driver.LastPacketsDrained);
+            Assert.Equal(72, transport.Pending);
         }
 
         [Fact]

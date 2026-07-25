@@ -49,11 +49,11 @@ namespace BizHawkNetplay.Core.Tests
         public void SuggestedDelay_ScalesWithPing()
         {
             var est = new ClockEstimator();
-            // 50ms half-RTT (100ms RTT). At a 16.688ms Genesis frame: ceil(50/16.688)+1 = 4.
+            // 50ms half-RTT (100ms RTT). At a 16.688ms Genesis frame: ceil(50/16.688)+2 = 5.
             for (int i = 0; i < 10; i++)
                 est.AddSample(i * 200.0, i * 200.0 + 50.0, i * 200.0 + 100.0);
 
-            Assert.Equal(4, est.SuggestedDelayFrames(16.688));
+            Assert.Equal(5, est.SuggestedDelayFrames(16.688));
         }
 
         [Fact]

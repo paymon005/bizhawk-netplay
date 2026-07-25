@@ -22,6 +22,9 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 **same ROM** on the **same core and BizHawk build**. Prefer building it yourself? See
 [Building](#building) — the Release build produces the exact same files.
 
+> **Everyone must be on the same version.** The network protocol is versioned and the handshake
+> refuses a mismatch, so when you update, your friends must update to the same release too.
+
 ## Status
 
 Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
@@ -160,37 +163,22 @@ times save/load/frame-advance on the loaded core and prints the per-core rollbac
 and restoring your position so it doesn't disturb play.
 
 # To Do
-- **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and
-  audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are
-  thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.
+- **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 - **Guard movies / TAStudio / Lua:** detect and refuse them at session start instead of only documenting it.
-- **Compare real sync settings:** hash the core's actual sync-settings blob at handshake so mismatched
-  per-core settings (e.g. different N64 plugins) are caught up front instead of surfacing as a desync.
-- **Authenticate the session password:** today both peers just exchange a SHA-256 hash and compare, so
-  a peer on the wire can echo the hash back without knowing the password. A nonce challenge-response
-  with a slow KDF would make the password a real gate rather than a casual one.
+- **Compare real sync settings:** hash the core's actual sync-settings blob at handshake so mismatched per-core settings (e.g. different N64 plugins) are caught up front instead of surfacing as a desync.
+- **Authenticate the session password:** today both peers just exchange a SHA-256 hash and compare, so a peer on the wire can echo the hash back without knowing the password. A nonce challenge-response with a slow KDF would make the password a real gate rather than a casual one.
 
 ## Known limitations
 
 Things that are by-design gaps or not-yet-built, worth knowing before relying on it:
 
-- **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined
-  to non-RAM state can slip past the checksum until it perturbs RAM.
-- **The sync-settings check is coarse** — the handshake compares core + assembly version + system ID,
-  not the core's full sync-settings blob, so two peers with the same core but different per-core sync
-  settings (e.g. different N64 video plugins) can pass the handshake and then desync. Match settings on
-  both machines manually.
+- **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined to non-RAM state can slip past the checksum until it perturbs RAM.
+- **The sync-settings check is coarse** — the handshake compares core + assembly version + system ID, not the core's full sync-settings blob, so two peers with the same core but different per-core sync settings (e.g. different N64 video plugins) can pass the handshake and then desync. Match settings on both machines manually.
 - **NAT traversal is cone-only** — UDP Punch and the mesh connectivity checks open cone-NAT paths;
-  **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't
-  built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the
-  rendezvous for the joiner↔joiner mesh.
-- **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically
-  bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
+  **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the rendezvous for the joiner↔joiner mesh.
+- **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
   for playing with people you trust; not a hostile-network guarantee.
-- **The session password is a casual gate, not authentication** — peers exchange a SHA-256 hash and
-  compare it, so it keeps out someone who doesn't know the password but not someone on the wire who can
-  echo the hash. Treat it as "don't join by accident", not as protection against a determined attacker.
+- **The session password is a casual gate, not authentication** — peers exchange a SHA-256 hash and compare it, so it keeps out someone who doesn't know the password but not someone on the wire who can echo the hash. Treat it as "don't join by accident", not as protection against a determined attacker.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
-- **Untested on real hardware** for 3–4 players and any over-the-internet NAT path (developed on a
-  single machine). Everything below the socket layer is unit-tested; the last mile needs two boxes.
+- **Untested on real hardware** for 3–4 players and any over-the-internet NAT path (developed on a single machine). Everything below the socket layer is unit-tested; the last mile needs two boxes.

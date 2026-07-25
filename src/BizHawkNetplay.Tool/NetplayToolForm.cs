@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Net;
@@ -27,9 +28,9 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        private const int Protocol = 1;
+        private const int Protocol = 2; // v2 adds READY/GO and asynchronous resync framing
         private const int DefaultPort = 47800;
-        private const int ChecksumInterval = 60; // frames between desync-detection samples
+        private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
         public ApiContainer? _apiContainer { get; set; }
         private ApiContainer APIs => _apiContainer!;
@@ -92,11 +93,28 @@ namespace BizHawkNetplay.Tool
             public IPEndPoint UdpEndpoint = null!;      // LAN/observed endpoint (from TCP source + reported port)
             public IPEndPoint? ReflexiveEndpoint;       // public (STUN) endpoint, for NAT traversal; null until reported
             public Thread? Reader;
+            public Thread? Writer;
+            public readonly ConcurrentQueue<OutboundMessage> Outbound = new ConcurrentQueue<OutboundMessage>();
+            public readonly AutoResetEvent OutboundSignal = new AutoResetEvent(false);
+            public volatile bool WriterRunning;
+            public long QueuedBytes;
             public double PingMs = -1;        // guarded by _pingLock
             public int PingCount;             // guarded by _pingLock
             public long LastRecvTicks;        // UtcNow.Ticks of the last message from this peer (Interlocked)
+            public volatile bool ResyncReceiving; // large inbound state frame is allowed to exceed ping timeout
             public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
             public string Label = "";
+        }
+
+        private sealed class OutboundMessage
+        {
+            public OutboundMessage(ControlMessageType type, byte[] body, Action<bool>? completed)
+            {
+                Type = type; Body = body; Completed = completed;
+            }
+            public ControlMessageType Type { get; }
+            public byte[] Body { get; }
+            public Action<bool>? Completed { get; }
         }
 
         // --- Session state (all touched on the UI thread except where noted) ---
@@ -131,7 +149,8 @@ namespace BizHawkNetplay.Tool
         private const double ResyncGraceSeconds = 2.0;
         private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
-        private int _stallLog;     // throttles verbose stall messages
+        private double _lastStallLogMs = double.NegativeInfinity;
+        private bool _resyncInProgress;
 
         // Desync detection: the host aggregates every peer's checksum for a frame (its own + each
         // joiner's); once it has them all it verifies they agree. Joiners just report to the host.
@@ -165,6 +184,10 @@ namespace BizHawkNetplay.Tool
         private const double PingIntervalMs = 400;      // ~2.5 pings/sec
         private const double PingTimeoutSeconds = 3.0;  // no message for this long => presumed dropped
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
+        private const double UdpRepunchAfterSeconds = 1.5;
+        private const double UdpLostAfterSeconds = 8.0;
+        private double _lastUdpRepunchMs = double.NegativeInfinity;
+        private bool _udpWarningActive;
 
         // Sync mode + rollback config for the live session.
         private enum NetcodeChoice { Automatic = 0, Rollback = 1, Lockstep = 2 }
@@ -183,6 +206,15 @@ namespace BizHawkNetplay.Tool
 
         private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
         private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
+        private const int MaxFramesPerTick = 2;  // WinForms callbacks can arrive ~25ms apart; one frame caps near 40fps
+        private const double FrameTickWorkBudgetMs = 8.0;
+        private double _nextFrameDueMs;
+        private bool _frameTickRunning;
+        private double _lastUiRefreshMs = double.NegativeInfinity;
+        private double _lastSlowTickLogMs = double.NegativeInfinity;
+        private int _lastVerboseAudioFrame = -1;
+        private int _pacingRebases;
+        private double _lastHashMs;
 
         // Actual sustained emulation speed, sampled ~2x/sec, so the status bar can flag a CPU-bound
         // instance (the real cause of "lag" on a heavy core) rather than it looking like a netcode fault.
@@ -448,7 +480,7 @@ namespace BizHawkNetplay.Tool
             _allowNonDetCheck = new CheckBox
             {
                 Text = "Allow non-deterministic core (experimental — may desync)",
-                AutoSize = true, Location = new Point(12, 192),
+                AutoSize = true, Location = new Point(12, 192), Checked = true,
             };
 
             var nonDetHint = new Label
@@ -523,7 +555,7 @@ namespace BizHawkNetplay.Tool
                     {
                         var item = new ListViewItem($"P{link.RemotePort + 1}");
                         item.SubItems.Add(link.UdpEndpoint?.ToString() ?? link.Label);
-                        item.SubItems.Add(link.PingMs < 0 ? "…" : $"{link.PingMs:F0} ms");
+                        item.SubItems.Add(link.PingMs < 0 ? "…" : $"{link.PingMs + 2 * _simLatencyMs:F0} ms");
                         item.SubItems.Add(MeshLinkStatus(link));
                         _playersList.Items.Add(item);
 
@@ -609,6 +641,7 @@ namespace BizHawkNetplay.Tool
                 // forces it; Lockstep forces lockstep. We "want" rollback unless Lockstep is chosen, and
                 // probe accordingly. The host's choice is authoritative for the session's mode.
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
+                ApplyHeavyCoreNetcodeDefault();
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
                     SessionPreferences.HashPassword(_passwordBox.Text));
@@ -678,6 +711,7 @@ namespace BizHawkNetplay.Tool
                 APIs.EmuClient.Pause(); // freeze now so the resume frame is fixed before the peer arrives
 
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
+                ApplyHeavyCoreNetcodeDefault();
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
                 _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback,
                     SessionPreferences.HashPassword(_passwordBox.Text));
@@ -918,8 +952,18 @@ namespace BizHawkNetplay.Tool
                 // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
                 // (it reaches the host at the address it connected to, so the host is left off the list).
                 foreach (var link in links)
+                {
+                    try { link.Tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { }
                     Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state,
-                        CandidatesExcept(links, link));
+                        CandidatesExcept(links, link), useReadyBarrier: true);
+                }
+
+                // Nobody is released while the host is still synchronously shipping a large state to
+                // another joiner. Once every control link acknowledges that all start data arrived,
+                // send GO to the whole group and bring up the host locally.
+                foreach (var link in links) Handshake.HostWaitReady(link.Control);
+                foreach (var link in links) Handshake.HostSendGo(link.Control);
+                foreach (var link in links) try { link.Tcp.ReceiveTimeout = 0; } catch { }
 
                 // The host sends its own input directly to every joiner.
                 _mesh!.SetPeers(CandidatesExcept(links, null));
@@ -1014,6 +1058,7 @@ namespace BizHawkNetplay.Tool
             APIs.EmuClient.Pause(); // we own the clock now
             _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
             _resyncCount = 0;
+            _resyncInProgress = false;
             _lastResync = DateTime.MinValue;
             lock (_hashLock) { _frameHashes.Clear(); }
             _driver.Start();
@@ -1026,13 +1071,11 @@ namespace BizHawkNetplay.Tool
             Log(_adapter.AudioReady ? "audio enabled — " + _adapter.AudioDiagnostic
                                     : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
 
-            // One reader thread per control link.
+            // One reader and one serialized outbound writer per control link. The writer is what keeps
+            // checksums, pings, and especially whole-state resync transfers off EmuHawk's UI thread.
             foreach (var link in _peers)
             {
-                var l = link;
-                l.LastRecvTicks = DateTime.UtcNow.Ticks; // seed liveness so the watchdog has a baseline
-                l.Reader = new Thread(() => PeerReaderLoop(l)) { IsBackground = true, Name = "BizHawkNetplay-control" };
-                l.Reader.Start();
+                StartPeerIo(link);
             }
             _lastPingMs = -1; // send the first ping immediately
 
@@ -1043,6 +1086,14 @@ namespace BizHawkNetplay.Tool
             lock (_pingLock) { foreach (var link in _peers) { link.PingMs = -1; link.PingCount = 0; } }
             _pingClock.Restart();
             _paceClock.Restart();
+            _nextFrameDueMs = 0;
+            _lastUiRefreshMs = double.NegativeInfinity;
+            _lastSlowTickLogMs = double.NegativeInfinity;
+            _lastVerboseAudioFrame = -1;
+            _lastStallLogMs = double.NegativeInfinity;
+            _lastUdpRepunchMs = double.NegativeInfinity;
+            _udpWarningActive = false;
+            _pacingRebases = 0;
             _fpsClock.Restart(); _fpsCount = 0; _actualFps = -1;
             try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
             _frameTimer.Interval = 2;
@@ -1080,8 +1131,8 @@ namespace BizHawkNetplay.Tool
                 BeginInvokeUi(() =>
                 {
                     if (_sessionActive && _peers.Count > 0)
-                        try { _peers[0].Control.Send(ControlMessageType.Candidate, HandshakeCodec.EncodeEndpoints(new[] { reflexive })); }
-                        catch { /* link gone */ }
+                        QueueControl(_peers[0], ControlMessageType.Candidate,
+                            HandshakeCodec.EncodeEndpoints(new[] { reflexive }));
                 });
             })
             { IsBackground = true, Name = "BizHawkNetplay-stun-mesh" }.Start();
@@ -1101,15 +1152,20 @@ namespace BizHawkNetplay.Tool
         private void FrameTick()
         {
             if (!_sessionActive || _driver == null) return;
+            if (_frameTickRunning) return;
+
+            _frameTickRunning = true;
+            _frameTimer.Stop();
+            var tickWatch = System.Diagnostics.Stopwatch.StartNew();
+            double coreMs = 0, gateMs = 0, renderMs = 0;
+            int packetsDrained = 0;
+            int frameForTelemetry = _driver.CurrentFrame;
+            _lastHashMs = 0;
             try
             {
                 // Keep the audio device fed every tick, independent of how many frames we step this
                 // tick (or none, during a stall) — the ring buffer decouples playback from stepping.
                 _adapter?.PumpAudio();
-
-                // Frozen while a dropped peer is being waited on — don't advance until the rejoin
-                // resyncs everyone. Audio is already pumped (it drains to silence, which is correct).
-                if (_awaitingReconnect) return;
 
                 // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
                 // its own loop would advance the core on top of ours and desync — snap it back.
@@ -1132,40 +1188,93 @@ namespace BizHawkNetplay.Tool
                     return;
                 }
 
-                // Advance up to where wall-clock says we should be, bounded so a late tick doesn't
-                // burst into a huge catch-up. Each frame: drain network, capture local, gate, step.
-                int target = (int)(_paceClock.Elapsed.TotalMilliseconds / _frameMs);
-                int budget = 8;
-                while (_driver.CurrentFrame < target && budget-- > 0)
+                // Frozen while a dropped peer is being waited on — don't advance until the rejoin
+                // resyncs everyone. Sticky pause and drift validation above must still run here.
+                if (_awaitingReconnect)
                 {
-                    _driver.PumpNetwork();       // drain remote input + resend our redundant window
+                    MaybeSendPing();
+                    CheckLinkTimeouts();
+                    return;
+                }
+
+                // Drain once per callback; FrameDriver caps the number of datagrams consumed. This is
+                // deliberately separate from input sends, so Pump + Capture cannot duplicate a packet.
+                _driver.PumpNetwork();
+                packetsDrained = _driver.LastPacketsDrained;
+
+                // State capture/import stays on this thread, but whole-state transfer runs on each
+                // peer's writer thread. Hold the new baseline while that transfer is in flight.
+                if (_resyncInProgress)
+                {
+                    if (_isHost) _driver.ResendLocalInputIfDue();
+                    MaybeSendPing();
+                    CheckLinkTimeouts();
+                    return;
+                }
+
+                double nowMs = _paceClock.Elapsed.TotalMilliseconds;
+                if (nowMs - _nextFrameDueMs > 3.0 * _frameMs)
+                {
+                    // Discard wall-clock debt, not emulated frames. Chasing a large hitch indefinitely
+                    // is what starves WinForms presentation on slow cores.
+                    _nextFrameDueMs = nowMs;
+                    _pacingRebases++;
+                }
+
+                bool steppedThisTick = false;
+                int framesThisTick = 0;
+                while (framesThisTick < MaxFramesPerTick && nowMs + 0.25 >= _nextFrameDueMs)
+                {
+                    // Normally this loop runs once. A second frame compensates for an irregular ~25ms
+                    // WinForms callback without reviving the old eight-frame catch-up bursts. Never start
+                    // that second frame after the callback has already consumed its UI work budget.
+                    if (framesThisTick > 0 && tickWatch.Elapsed.TotalMilliseconds >= FrameTickWorkBudgetMs) break;
+
                     _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
+                    var phase = System.Diagnostics.Stopwatch.StartNew();
                     if (!_driver.CurrentFrameReady())
                     {
-                        if (Verbose && (++_stallLog % 30 == 0))
+                        gateMs += phase.Elapsed.TotalMilliseconds;
+                        _driver.ResendLocalInputIfDue();
+                        if (Verbose && nowMs - _lastStallLogMs >= 1000)
+                        {
+                            _lastStallLogMs = nowMs;
                             Log($"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
-                        break; // retry next tick
+                        }
+                        break;
                     }
-                    // Step the core with ONLY our merged inputs — deterministic, bypasses EmuHawk's
-                    // input chain and hotkeys. Under load we may step several frames this tick to catch
-                    // up; only the last one's picture is shown, so skip the intermediate video renders
-                    // (Dolphin-style frame-skip) to recover from hitches faster on heavy cores.
-                    bool renderThis = _driver.CurrentFrame + 1 >= target || budget == 0;
-                    _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderThis);
-                    _driver.CompleteFrame();
-                    MaybeSendChecksum();
-                    _fpsCount++;
-                    // A heavy catch-up burst can block this thread for many frames; feed the audio device
-                    // between them so it doesn't underrun/crackle while we're busy stepping (the ring
-                    // decouples playback from our bursty stepping — this keeps it topped up). Cheap and
-                    // self-limiting: PumpAudio only writes what the device currently needs.
-                    if ((_driver.CurrentFrame & 1) == 0) _adapter.PumpAudio();
+                    else
+                    {
+                        gateMs += phase.Elapsed.TotalMilliseconds; // includes rollback repair
+                        phase.Restart();
+                        _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderVideo: true);
+                        coreMs += phase.Elapsed.TotalMilliseconds;
+                        _driver.CompleteFrame();
+                        steppedThisTick = true;
+                        framesThisTick++;
+                        _nextFrameDueMs += _frameMs;
+                        MaybeSendChecksum();
+                        _fpsCount++;
+                    }
+                }
+
+                // We hold EmuHawk paused, so its own run loop never presents the frames we advance here —
+                // a paused window just keeps showing whatever its swapchain last held, which is why the
+                // host's picture froze while the core, audio and netplay all kept running. Present the
+                // latest frame ourselves, once per tick (the video twin of PumpAudio above).
+                if (steppedThisTick)
+                {
+                    var phase = System.Diagnostics.Stopwatch.StartNew();
+                    _adapter!.PresentVideo();
+                    renderMs = phase.Elapsed.TotalMilliseconds;
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
                 // and a dead link is still detected while we're waiting on it).
                 MaybeSendPing();
                 CheckLinkTimeouts();
+                CheckUdpInputProgress();
+                if (!_sessionActive || _driver == null) return;
 
                 // Joiner: the host clears its resync counter once checksums re-agree, but a joiner gets no
                 // such signal. Decay ours after running well past the last resync without another one —
@@ -1184,44 +1293,94 @@ namespace BizHawkNetplay.Tool
                     _audioStatsLogged = true;
                     Log(_adapter!.AudioStats());
                 }
-                else if (Verbose && _driver.CurrentFrame % 300 == 0 && _driver.CurrentFrame > 0)
+                else if (Verbose && _driver.CurrentFrame % 300 == 0 && _driver.CurrentFrame > 0
+                    && _driver.CurrentFrame != _lastVerboseAudioFrame)
                 {
+                    _lastVerboseAudioFrame = _driver.CurrentFrame;
                     Log(_adapter!.AudioStats());
                 }
 
-                double ping = -1;
-                lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
-
-                // Feed the sync strategy a clock/quality report so rollback's time-sync can size its
-                // prediction horizon. The sim latency (if any) isn't on the TCP ping path, so fold it
-                // into the reported RTT to keep the horizon consistent with the delayed UDP inputs.
-                double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
-                _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, 0));
-
-                string pingStr = ping < 0 ? "" : $" — ping {ping:F0}ms{(_peers.Count > 1 ? " (worst)" : "")}";
-                string rbStr = _driver.Strategy is RollbackStrategy rbs
-                    ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
-                    : "";
-
-                // Measure the emulation speed we're actually sustaining vs the core's real rate. A reading
-                // well under 100% means this machine can't run the core fast enough (CPU-bound) — the true
-                // cause of "lag" on a heavy core, and NOT a netcode problem. Surface it so it's unmistakable.
-                if (_fpsClock.ElapsedMilliseconds >= 500)
-                {
-                    _actualFps = _fpsCount * 1000.0 / _fpsClock.ElapsedMilliseconds;
-                    _fpsCount = 0;
-                    _fpsClock.Restart();
-                }
-                double targetFps = _frameMs > 0 ? 1000.0 / _frameMs : 60.0;
-                bool cpuBound = _actualFps >= 0 && _actualFps < targetFps * 0.95;
-                string speedStr = _actualFps < 0 ? ""
-                    : $" — {_actualFps:F0}/{targetFps:F0} fps ({_actualFps / targetFps * 100:F0}%{(cpuBound ? ", CPU-bound" : "")})";
-                Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}",
-                    cpuBound ? Color.DarkOrange : Color.Green);
-
-                if (_driver.CurrentFrame % 30 == 0) RefreshPlayersList(); // ~2x/sec: keep the players/ping list live
+                UpdateSessionUi(nowMs);
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
+            finally
+            {
+                tickWatch.Stop();
+                double elapsed = tickWatch.Elapsed.TotalMilliseconds;
+                double clockMs = _paceClock.Elapsed.TotalMilliseconds;
+                if (_sessionActive && elapsed >= Math.Max(12.0, _frameMs * 0.75)
+                    && clockMs - _lastSlowTickLogMs >= 1000)
+                {
+                    _lastSlowTickLogMs = clockMs;
+                    Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
+                        $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
+                        $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}");
+                }
+                _frameTickRunning = false;
+                if (_sessionActive && _driver != null) _frameTimer.Start();
+            }
+        }
+
+        private void UpdateSessionUi(double nowMs)
+        {
+            if (_driver == null || nowMs - _lastUiRefreshMs < 250) return;
+            _lastUiRefreshMs = nowMs;
+
+            double ping = -1;
+            lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
+            double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
+            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, 0));
+
+            string pingStr = ping < 0 ? ""
+                : $" — ping {effRttMs:F0}ms{(_simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "")}{(_peers.Count > 1 ? " (worst)" : "")}";
+            string rbStr = _driver.Strategy is RollbackStrategy rbs
+                ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
+                : "";
+
+            if (_fpsClock.ElapsedMilliseconds >= 500)
+            {
+                _actualFps = _fpsCount * 1000.0 / _fpsClock.ElapsedMilliseconds;
+                _fpsCount = 0;
+                _fpsClock.Restart();
+            }
+            double targetFps = _frameMs > 0 ? 1000.0 / _frameMs : 60.0;
+            bool cpuBound = _actualFps >= 0 && _actualFps < targetFps * 0.95;
+            string speedStr = _actualFps < 0 ? ""
+                : $" — {_actualFps:F0}/{targetFps:F0} fps ({_actualFps / targetFps * 100:F0}%{(cpuBound ? ", CPU-bound" : "")})";
+            string udpStr = _udpWarningActive ? " — UDP recovering" : "";
+            Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}{udpStr}",
+                _udpWarningActive || cpuBound ? Color.DarkOrange : Color.Green);
+            RefreshPlayersList();
+        }
+
+        private void CheckUdpInputProgress()
+        {
+            if (_driver == null || _awaitingReconnect || _resyncInProgress) return;
+            if (!_driver.TryGetMostSilentRemotePort(out int port, out var silence)) return;
+            double seconds = silence.TotalSeconds;
+            if (seconds < UdpRepunchAfterSeconds)
+            {
+                if (_udpWarningActive)
+                {
+                    _udpWarningActive = false;
+                    Log("UDP input path recovered");
+                }
+                return;
+            }
+
+            double nowMs = _paceClock.Elapsed.TotalMilliseconds;
+            if (nowMs - _lastUdpRepunchMs >= 1000)
+            {
+                _lastUdpRepunchMs = nowMs;
+                _mesh?.RequestRepunch();
+                if (!_udpWarningActive)
+                {
+                    _udpWarningActive = true;
+                    Log($"no UDP input from P{port + 1} for {seconds:F1}s — re-punching the input path");
+                }
+            }
+            if (seconds >= UdpLostAfterSeconds)
+                EndSession($"UDP input path lost for P{port + 1} ({seconds:F0}s without input; control link was still alive)");
         }
 
         private void MaybeSendChecksum()
@@ -1233,13 +1392,17 @@ namespace BizHawkNetplay.Tool
                 // Under rollback the current frame may be a prediction that legitimately differs
                 // between peers — checksum the newest FINAL interval boundary instead. Both peers
                 // quantize to the same boundary, so their reports line up for the host to compare.
+                var hashWatch = System.Diagnostics.Stopwatch.StartNew();
                 if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
+                _lastHashMs = hashWatch.Elapsed.TotalMilliseconds;
             }
             else
             {
                 frame = _driver.CurrentFrame;
                 if (frame % ChecksumInterval != 0) return;
+                var hashWatch = System.Diagnostics.Stopwatch.StartNew();
                 hash = _adapter!.HashMainMemory();
+                _lastHashMs = hashWatch.Elapsed.TotalMilliseconds;
             }
             if (_forceDesyncOnce)
             {
@@ -1260,8 +1423,7 @@ namespace BizHawkNetplay.Tool
             if (_isHost) RecordChecksum(frame, hash);
             else if (_peers.Count > 0)
             {
-                try { _peers[0].Control.Send(ControlMessageType.Checksum, EncodeChecksum(frame, hash)); }
-                catch { /* control link gone; the reader loop will end the session */ }
+                QueueControl(_peers[0], ControlMessageType.Checksum, EncodeChecksum(frame, hash));
             }
         }
 
@@ -1279,7 +1441,7 @@ namespace BizHawkNetplay.Tool
             var body = BitConverter.GetBytes(nowMs);
             foreach (var link in _peers)
             {
-                try { link.Control.Send(ControlMessageType.Ping, body); } catch { }
+                QueueControl(link, ControlMessageType.Ping, body);
             }
         }
 
@@ -1291,12 +1453,13 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void CheckLinkTimeouts()
         {
-            if (_awaitingReconnect) return; // already holding for a reconnect
+            if (_awaitingReconnect || _resyncInProgress) return; // a state transfer may legitimately exceed 3s
             long now = DateTime.UtcNow.Ticks;
             long limit = TimeSpan.FromSeconds(PingTimeoutSeconds).Ticks;
             PeerLink? dead = null;
             foreach (var link in _peers)
             {
+                if (link.ResyncReceiving) continue;
                 long last = Interlocked.Read(ref link.LastRecvTicks);
                 if (last != 0 && now - last > limit) { dead = link; break; }
             }
@@ -1323,12 +1486,88 @@ namespace BizHawkNetplay.Tool
             }
             if (minCount < 6 || worst < 0) return;
             _delayHintShown = true;
-            int suggested = (int)Math.Ceiling((worst / 2.0) / _frameMs) + 1;
+            // Include the simulated one-way UDP delay (RTT contribution = 2×) — the input actually rides
+            // that delayed channel, so the recommendation must reflect it even though the TCP ping doesn't.
+            double effWorst = worst + 2.0 * _simLatencyMs;
+            string simNote = _simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "";
+            int suggested = (int)Math.Ceiling((effWorst / 2.0) / _frameMs) + 2; // two frames of jitter headroom
             if (suggested > _sessionDelay)
-                Log($"worst link ping ~{worst:F0}ms: input delay {suggested} is recommended for smooth play " +
+                Log($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {suggested} is recommended for smooth play " +
                     $"(this session is {_sessionDelay}). If it stalls, reconnect with a higher 'Input delay'.");
             else
-                Log($"worst link ping ~{worst:F0}ms: input delay {_sessionDelay} is comfortable for this link.");
+                Log($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {_sessionDelay} is comfortable for this link.");
+        }
+
+        private void StartPeerIo(PeerLink link)
+        {
+            link.LastRecvTicks = DateTime.UtcNow.Ticks;
+            link.WriterRunning = true;
+            link.Writer = new Thread(() => PeerWriterLoop(link))
+            { IsBackground = true, Name = "BizHawkNetplay-control-writer" };
+            link.Reader = new Thread(() => PeerReaderLoop(link))
+            { IsBackground = true, Name = "BizHawkNetplay-control-reader" };
+            link.Writer.Start();
+            link.Reader.Start();
+        }
+
+        private const long MaxQueuedControlBytes = 80L * 1024 * 1024;
+
+        /// <summary>Queue one reliable control frame without ever waiting for socket flow control on
+        /// EmuHawk's UI thread. A per-peer writer preserves ControlChannel ordering.</summary>
+        private bool QueueControl(PeerLink link, ControlMessageType type, byte[] body, Action<bool>? completed = null)
+        {
+            if (body == null) body = Array.Empty<byte>();
+            if (!link.WriterRunning) { completed?.Invoke(false); return false; }
+            long bytes = body.LongLength + 5;
+            long queued = Interlocked.Add(ref link.QueuedBytes, bytes);
+            if (queued > MaxQueuedControlBytes)
+            {
+                Interlocked.Add(ref link.QueuedBytes, -bytes);
+                completed?.Invoke(false);
+                return false;
+            }
+            link.Outbound.Enqueue(new OutboundMessage(type, body, completed));
+            link.OutboundSignal.Set();
+            return true;
+        }
+
+        private void PeerWriterLoop(PeerLink link)
+        {
+            Exception? failure = null;
+            try
+            {
+                while (link.WriterRunning)
+                {
+                    if (!link.Outbound.TryDequeue(out var msg))
+                    {
+                        link.OutboundSignal.WaitOne(250);
+                        continue;
+                    }
+                    try
+                    {
+                        link.Control.Send(msg.Type, msg.Body);
+                        msg.Completed?.Invoke(true);
+                    }
+                    catch
+                    {
+                        try { msg.Completed?.Invoke(false); } catch { }
+                        throw;
+                    }
+                    finally { Interlocked.Add(ref link.QueuedBytes, -(msg.Body.LongLength + 5)); }
+                }
+            }
+            catch (Exception ex) { failure = ex; }
+            finally
+            {
+                link.WriterRunning = false;
+                while (link.Outbound.TryDequeue(out var pending))
+                {
+                    Interlocked.Add(ref link.QueuedBytes, -(pending.Body.LongLength + 5));
+                    try { pending.Completed?.Invoke(false); } catch { }
+                }
+                if (failure != null && _sessionActive)
+                    BeginInvokeUi(() => OnPeerLinkLost(link, "control send failed: " + failure.Message));
+            }
         }
 
         /// <summary>Reader loop for one control link. Dispatch depends on our role.</summary>
@@ -1348,7 +1587,7 @@ namespace BizHawkNetplay.Tool
                     else if (type == ControlMessageType.Ping && body.Length == 8)
                     {
                         if (!_simUnresponsive) // diagnostic: a "frozen" peer stops answering pings
-                            try { link.Control.Send(ControlMessageType.Pong, body); } catch { }
+                            QueueControl(link, ControlMessageType.Pong, body);
                     }
                     else if (type == ControlMessageType.Pong && body.Length == 8)
                     {
@@ -1389,8 +1628,19 @@ namespace BizHawkNetplay.Tool
                                 BeginInvokeUi(() => OnJoinerCandidate(link, eps[0]));
                         }
                     }
+                    else if (type == ControlMessageType.ResyncBegin)
+                    {
+                        link.ResyncReceiving = true;
+                        if (!_isHost) BeginInvokeUi(() =>
+                        {
+                            if (!_sessionActive) return;
+                            _resyncInProgress = true;
+                            Status("receiving authoritative resync state…", Color.DarkOrange);
+                        });
+                    }
                     else if (type == ControlMessageType.Resync)
                     {
+                        link.ResyncReceiving = false;
                         var state = body; // authoritative whole-core state from the host
                         if (!_isHost) BeginInvokeUi(() => ApplyResyncAsJoiner(state));
                     }
@@ -1443,27 +1693,23 @@ namespace BizHawkNetplay.Tool
 
         private void OnHostDesync(int frame)
         {
+            if (_resyncInProgress) return;
             if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // just resynced; give it time
             Log($"DESYNC at frame {frame} — peers disagree");
             PerformResyncAsHost();
         }
 
         /// <summary>
-        /// Host recovery: snapshot the diverged state to slot 10, broadcast an authoritative state to
-        /// every peer, and rebuild from a clean baseline. Joiners adopt it in <see cref="ApplyResyncAsJoiner"/>.
+        /// Host recovery: capture an authoritative state on the emulator thread, enqueue its transfer
+        /// to each peer's writer, and rebuild from a clean baseline. Simulation stays paused while the
+        /// writers handle socket/flow-control waits, but WinForms remains responsive.
         /// Bounded by <see cref="MaxResyncs"/> so a persistent (non-transient) desync gives up instead
         /// of looping; a short grace window debounces repeat triggers for the same desync.
         /// </summary>
         private void PerformResyncAsHost()
         {
-            if (!_sessionActive || !_isHost) return;
+            if (!_sessionActive || !_isHost || _resyncInProgress) return;
             if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // debounce
-            try
-            {
-                APIs.SaveState.SaveSlot(10, suppressOSD: false);
-                Log("saved diverged host state to slot 10 for inspection");
-            }
-            catch (Exception ex) { Log("(warning) couldn't save slot 10: " + ex.Message); }
 
             if (++_resyncCount > MaxResyncs)
             {
@@ -1473,9 +1719,40 @@ namespace BizHawkNetplay.Tool
             try
             {
                 var state = _adapter!.ExportState();
-                SendToAllPeers(ControlMessageType.Resync, state);
+                _resyncInProgress = true;
                 RebuildDriver();
-                Log($"resync #{_resyncCount}: sent {state.Length / 1024}KiB host state to {_peers.Count} peer(s); resuming");
+                int peerCount = _peers.Count;
+                int remaining = peerCount;
+                int failed = 0;
+                var transferWatch = System.Diagnostics.Stopwatch.StartNew();
+                Status($"resync #{_resyncCount}: sending {state.Length / 1024}KiB to {peerCount} peer(s)…", Color.DarkOrange);
+                Log($"resync #{_resyncCount}: captured {state.Length / 1024}KiB; transfer queued off the UI thread");
+
+                if (remaining == 0) { _resyncInProgress = false; return; }
+                foreach (var link in _peers)
+                {
+                    QueueControl(link, ControlMessageType.ResyncBegin, Array.Empty<byte>());
+                    QueueControl(link, ControlMessageType.Resync, state, ok =>
+                    {
+                        if (!ok) Interlocked.Exchange(ref failed, 1);
+                        if (Interlocked.Decrement(ref remaining) != 0) return;
+                        BeginInvokeUi(() =>
+                        {
+                            if (!_sessionActive) return;
+                            if (failed != 0)
+                            {
+                                _resyncInProgress = false;
+                                EndSession("resync transfer failed");
+                                return;
+                            }
+                            _resyncInProgress = false;
+                            _paceClock.Restart();
+                            _nextFrameDueMs = 0;
+                            Log($"resync #{_resyncCount}: all {peerCount} peer transfer(s) complete in " +
+                                $"{transferWatch.Elapsed.TotalMilliseconds:F0}ms; resuming");
+                        });
+                    });
+                }
             }
             catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
         }
@@ -1491,11 +1768,14 @@ namespace BizHawkNetplay.Tool
             }
             try
             {
+                _resyncInProgress = true;
+                Status($"applying {state.Length / 1024}KiB host resync…", Color.DarkOrange);
                 _adapter!.ImportState(state);
                 RebuildDriver();
+                _resyncInProgress = false;
                 Log($"resync #{_resyncCount}: imported {state.Length / 1024}KiB host state; resuming");
             }
-            catch (Exception ex) { EndSession("resync apply failed: " + ex.Message); }
+            catch (Exception ex) { _resyncInProgress = false; EndSession("resync apply failed: " + ex.Message); }
         }
 
         /// <summary>
@@ -1512,6 +1792,7 @@ namespace BizHawkNetplay.Tool
             _driver.Start();
             _lastResync = DateTime.UtcNow;
             _paceClock.Restart();
+            _nextFrameDueMs = 0;
         }
 
         /// <summary>
@@ -1529,6 +1810,17 @@ namespace BizHawkNetplay.Tool
 
             return new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
                 _localPort, _sessionDelay, redundancy: 8, portCount: _playerCount);
+        }
+
+        /// <summary>N64 rollback repair can synchronously resimulate a deep state ring on EmuHawk's UI
+        /// thread. Until that work is incrementally budgeted, favor responsiveness and reliability by
+        /// forcing this heavy system to lockstep even if Rollback was selected explicitly.</summary>
+        private void ApplyHeavyCoreNetcodeDefault()
+        {
+            if (_adapter == null || !string.Equals(_adapter.SystemId, "N64", StringComparison.OrdinalIgnoreCase)) return;
+            if (_netcodeChoice != NetcodeChoice.Lockstep)
+                Log("N64 uses lockstep for stability — deep rollback can freeze presentation on this core.");
+            _netcodeChoice = NetcodeChoice.Lockstep;
         }
 
         /// <summary>Wrap the input transport in the artificial-latency simulator if the diagnostic is set.</summary>
@@ -1602,14 +1894,6 @@ namespace BizHawkNetplay.Tool
             catch (Exception ex) { UiLog("(note) NAT setup skipped: " + ex.Message); }
         }
 
-        private void SendToAllPeers(ControlMessageType type, byte[] body)
-        {
-            foreach (var link in _peers)
-            {
-                try { link.Control.Send(type, body); } catch { }
-            }
-        }
-
         // ------------------------------------------------------------------ reconnect
 
         /// <summary>
@@ -1620,6 +1904,7 @@ namespace BizHawkNetplay.Tool
         private void OnPeerLinkLost(PeerLink link, string why)
         {
             if (!_sessionActive) return;
+            if (!_peers.Contains(link)) return; // reader/writer can both report the same broken link
 
             // Punch sessions have no TCP listener to re-accept on, so a lost link just ends for both roles.
             if (_punchMode)
@@ -1685,8 +1970,8 @@ namespace BizHawkNetplay.Tool
             UpdateMeshPeers();
             foreach (var l in _peers)
             {
-                try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(CandidatesExcept(_peers, l))); }
-                catch { /* link gone; its reader will handle it */ }
+                QueueControl(l, ControlMessageType.PeerList,
+                    HandshakeCodec.EncodeEndpoints(CandidatesExcept(_peers, l)));
             }
         }
 
@@ -1749,50 +2034,120 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// UI thread: finish a reconnect. Export the current authoritative state once, welcome the
-        /// rejoiner back into its old port with it, resync every surviving peer to the same state, and
-        /// rebuild our own driver — so everyone lands on a common frame-0 baseline and resumes together.
+        /// UI thread: capture the current authoritative state, then hand the potentially blocking
+        /// welcome/state transfer to a background thread. Simulation is already held for reconnect.
         /// </summary>
         private void CompleteReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp, IPEndPoint udpEp, int freedPort)
         {
             if (!_sessionActive || !_awaitingReconnect) { try { tcp.Close(); } catch { } return; }
             try
             {
+                _greetingTcp = tcp; // teardown can abort the background state/barrier transfer
                 var state = _adapter!.ExportState();
+                var meshPeers = CandidatesExcept(_peers, null);
+                Status($"P{freedPort + 1} rejoined — sending {state.Length / 1024}KiB state…", Color.DarkOrange);
 
                 // The rejoiner's mesh peers = every current survivor (it reaches the host directly). It
                 // adopts this state + mesh via Welcome and rebuilds fresh on its own side.
-                Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
-                    CandidatesExcept(_peers, null));
+                new Thread(() =>
+                {
+                    try
+                    {
+                        try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { }
+                        Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
+                            meshPeers, useReadyBarrier: true);
+                        Handshake.HostWaitReady(channel);
+                        try { tcp.ReceiveTimeout = 0; } catch { }
+                        BeginInvokeUi(() => FinishReconnect(tcp, channel, remoteIp, udpEp, freedPort, state));
+                    }
+                    catch (Exception ex)
+                    {
+                        try { tcp.Close(); } catch { }
+                        BeginInvokeUi(() => { if (_sessionActive) EndSession("reconnect state transfer failed: " + ex.Message); });
+                    }
+                }) { IsBackground = true, Name = "BizHawkNetplay-reconnect-state" }.Start();
+            }
+            catch (Exception ex) { EndSession("reconnect failed: " + ex.Message); }
+        }
 
+        private void FinishReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp,
+            IPEndPoint udpEp, int freedPort, byte[] state)
+        {
+            if (!_sessionActive || !_awaitingReconnect) { try { tcp.Close(); } catch { } return; }
+            try
+            {
                 var link = new PeerLink
                 {
                     Tcp = tcp, Control = channel, RemotePort = freedPort,
                     UdpEndpoint = udpEp, Label = $"P{freedPort + 1} ({remoteIp})",
                 };
-                link.LastRecvTicks = DateTime.UtcNow.Ticks; // seed liveness for the rejoined link
-                _peers.Add(link);
-                UpdateMeshPeers(); // our own mesh now includes the rejoiner
-                link.Reader = new Thread(() => PeerReaderLoop(link)) { IsBackground = true, Name = "BizHawkNetplay-control" };
-                link.Reader.Start();
-
                 // Bring each survivor up to date: refresh its mesh with the rejoiner's endpoint, then
-                // resync it to the same state. (For a 2P session there are no survivors.)
-                foreach (var l in _peers)
-                {
-                    if (ReferenceEquals(l, link)) continue;
-                    try { l.Control.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(CandidatesExcept(_peers, l))); } catch { }
-                    try { l.Control.Send(ControlMessageType.Resync, state); } catch { }
-                }
-
-                _awaitingReconnect = false;
-                _reconnectPort = -1;
-                _resyncCount = 0; // a rejoin is a fresh, healthy start — not a desync loop
+                // resync it to the same state. Do not release the rejoiner with GO until those queued
+                // state writes complete, otherwise the first peer can run while another is still loading.
+                var allPeers = new List<PeerLink>(_peers) { link };
+                var survivors = new List<PeerLink>(_peers);
+                _resyncInProgress = true;
                 RebuildDriver();
-                Log($"{link.Label} reconnected — resynced {_peers.Count} peer(s); resuming");
-                Status($"reconnected P{freedPort + 1} — resuming", Color.Green);
+                int remaining = survivors.Count;
+                int failed = 0;
+                if (remaining == 0)
+                {
+                    ReleaseReconnectedPeer(link, state.Length);
+                    return;
+                }
+                foreach (var survivor in survivors)
+                {
+                    QueueControl(survivor, ControlMessageType.PeerList,
+                        HandshakeCodec.EncodeEndpoints(CandidatesExcept(allPeers, survivor)));
+                    QueueControl(survivor, ControlMessageType.ResyncBegin, Array.Empty<byte>());
+                    QueueControl(survivor, ControlMessageType.Resync, state, ok =>
+                    {
+                        if (!ok) Interlocked.Exchange(ref failed, 1);
+                        if (Interlocked.Decrement(ref remaining) != 0) return;
+                        BeginInvokeUi(() =>
+                        {
+                            if (!_sessionActive) { try { tcp.Close(); } catch { } return; }
+                            if (failed != 0) { EndSession("reconnect resync transfer failed"); return; }
+                            ReleaseReconnectedPeer(link, state.Length);
+                        });
+                    });
+                }
             }
             catch (Exception ex) { EndSession("reconnect failed: " + ex.Message); }
+        }
+
+        private void ReleaseReconnectedPeer(PeerLink link, int stateLength)
+        {
+            // The client is still blocked in the READY/GO handshake, so send GO off-thread before its
+            // live reader/writer start consuming this ControlChannel.
+            new Thread(() =>
+            {
+                try
+                {
+                    Handshake.HostSendGo(link.Control);
+                    BeginInvokeUi(() =>
+                    {
+                        if (!_sessionActive || !_awaitingReconnect) { try { link.Tcp?.Close(); } catch { } return; }
+                        _peers.Add(link);
+                        _greetingTcp = null;
+                        UpdateMeshPeers();
+                        StartPeerIo(link);
+                        _awaitingReconnect = false;
+                        _resyncInProgress = false;
+                        _reconnectPort = -1;
+                        _resyncCount = 0;
+                        _paceClock.Restart();
+                        _nextFrameDueMs = 0;
+                        Log($"{link.Label} reconnected — {stateLength / 1024}KiB baseline synchronized; resuming");
+                        Status($"reconnected P{link.RemotePort + 1} — resuming", Color.Green);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    try { link.Tcp?.Close(); } catch { }
+                    BeginInvokeUi(() => { if (_sessionActive) EndSession("reconnect GO failed: " + ex.Message); });
+                }
+            }) { IsBackground = true, Name = "BizHawkNetplay-reconnect-go" }.Start();
         }
 
         private void FailSession(string reason)
@@ -1811,12 +2166,25 @@ namespace BizHawkNetplay.Tool
         private void EndSession(string reason)
         {
             if (!_sessionActive && _listener == null && _peers.Count == 0 && !_punchMode) { SetBusy(false); return; }
-            _sessionActive = false;
             _frameTimer.Stop();
+
+            // Preserve a clean "friend left" signal without doing socket I/O on the UI thread. Give
+            // the per-peer writers one very short opportunity; a state transfer or dead link is closed
+            // immediately after the deadline instead of making Disconnect appear frozen.
+            if (_sessionActive && _peers.Count > 0)
+            {
+                var bye = new CountdownEvent(_peers.Count);
+                foreach (var link in _peers)
+                    QueueControl(link, ControlMessageType.Bye, Array.Empty<byte>(), _ => { try { bye.Signal(); } catch { } });
+                try { bye.Wait(50); } catch { }
+                try { bye.Dispose(); } catch { }
+            }
+
+            _sessionActive = false;
+            _resyncInProgress = false;
             _simUnresponsive = false; _simUnresponsiveCheck.Checked = false; // clear the diagnostic
             try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
 
-            try { SendToAllPeers(ControlMessageType.Bye, Array.Empty<byte>()); } catch { }
             TeardownNetwork();
 
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
@@ -1858,6 +2226,11 @@ namespace BizHawkNetplay.Tool
 
             var peers = new List<PeerLink>(_peers);
             _peers.Clear();
+            foreach (var link in peers)
+            {
+                link.WriterRunning = false;
+                try { link.OutboundSignal.Set(); } catch { }
+            }
             foreach (var link in peers) { try { link.Tcp?.Close(); } catch { } }
 
             try { (_transport as IDisposable)?.Dispose(); } catch { }
@@ -1874,6 +2247,12 @@ namespace BizHawkNetplay.Tool
                 {
                     try { reader.Join(300); } catch { }
                 }
+                var writer = link.Writer;
+                if (writer != null && writer.IsAlive && writer != Thread.CurrentThread)
+                {
+                    try { writer.Join(300); } catch { }
+                }
+                try { link.OutboundSignal.Dispose(); } catch { }
             }
 
             if (reconnect != null && reconnect.IsAlive && reconnect != Thread.CurrentThread)

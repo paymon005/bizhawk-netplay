@@ -166,13 +166,29 @@ namespace BizHawkNetplay.Core.Session
         /// </summary>
         public static void HostSendWelcome(
             ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
-            IEnumerable<IPEndPoint>? meshPeers = null)
+            IEnumerable<IPEndPoint>? meshPeers = null, bool useReadyBarrier = false)
         {
             channel.Send(ControlMessageType.Welcome, HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode));
             channel.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(meshPeers ?? Array.Empty<IPEndPoint>()));
             channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
-            channel.Send(ControlMessageType.Start, Array.Empty<byte>());
+            channel.Send(useReadyBarrier ? ControlMessageType.Ready : ControlMessageType.Start, Array.Empty<byte>());
         }
+
+        /// <summary>Host side of the multi-peer barrier: wait until this joiner has received all start
+        /// data and acknowledged READY. Emulator state import still occurs on the joiner's UI thread
+        /// after the handshake returns, so GO aligns network release rather than claiming zero setup time.</summary>
+        public static void HostWaitReady(ControlChannel channel)
+        {
+            var (type, body) = channel.Receive();
+            if (type == ControlMessageType.Error)
+                throw new HandshakeException(Encoding.UTF8.GetString(body));
+            if (type != ControlMessageType.Ready)
+                throw new HandshakeException($"expected READY from joiner, got {type}");
+        }
+
+        /// <summary>Release one joiner after every participant has reached READY.</summary>
+        public static void HostSendGo(ControlChannel channel)
+            => channel.Send(ControlMessageType.Go, Array.Empty<byte>());
 
         /// <summary>
         /// Client (N-player): send HELLO, validate the host's HELLO, then take the authoritative
@@ -209,6 +225,13 @@ namespace BizHawkNetplay.Core.Session
                 }
                 if (t == ControlMessageType.PeerList) { meshPeers = HandshakeCodec.DecodeEndpoints(b); continue; }
                 if (t == ControlMessageType.State) { initialState = b; continue; }
+                if (t == ControlMessageType.Ready)
+                {
+                    if (initialState == null) throw new HandshakeException("host requested READY before sending state");
+                    channel.Send(ControlMessageType.Ready, Array.Empty<byte>());
+                    continue;
+                }
+                if (t == ControlMessageType.Go) break;
                 if (t == ControlMessageType.Start) break;
                 throw new HandshakeException($"unexpected control frame during start: {t}");
             }
