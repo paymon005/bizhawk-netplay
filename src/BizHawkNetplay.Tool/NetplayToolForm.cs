@@ -44,6 +44,7 @@ namespace BizHawkNetplay.Tool
         private ComboBox _ipBox = null!;
         private NumericUpDown _portBox = null!;
         private NumericUpDown _playersBox = null!;
+        private Label _playersHint = null!;
         private NumericUpDown _delayBox = null!;
         private Button _goButton = null!;
         private Button _disconnectButton = null!;
@@ -283,6 +284,7 @@ namespace BizHawkNetplay.Tool
             // Seed the connection log here rather than in the constructor: RichTextBox coloring forces
             // handle creation, which we'd rather not trigger while the form is still being built.
             if (_connLog.TextLength == 0) ConnLog("Ready — pick Host or Join, then Start.", Color.DimGray);
+            RefreshPlayerLimit(); // in case the tool opened with a core already loaded
             // The host restores our saved position AFTER OnShown returns (right after Show()), so a fix
             // applied here is immediately overwritten. Defer to the end of the message queue via
             // BeginInvoke — by then the final position is in place and we can pull it back if stranded.
@@ -341,6 +343,38 @@ namespace BizHawkNetplay.Tool
             _inputSourceCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
         }
 
+        /// <summary>
+        /// Cap the Players box at the loaded core's controller-port count and show that ceiling next to
+        /// it. A session can only fill ports the core actually exposes — Genesis is 2 until you enable
+        /// the 4-Way Play / Team Player adapter, N64 is 4 natively — and picking 4 on a 2-port core used
+        /// to be accepted, silently clamped, and only explained by a line in the Log tab.
+        ///
+        /// The clamp deliberately does NOT overwrite the remembered preference: someone who wants 4
+        /// players and switches from Genesis to N64 gets their 4 back rather than being stuck at the
+        /// lowest core they ever loaded. Called on every core/ROM change (<see cref="Restart"/>), which
+        /// is also when enabling a multitap in the core's sync settings takes effect.
+        /// </summary>
+        private void RefreshPlayerLimit()
+        {
+            int max = 8;          // no core loaded yet: leave the box's own ceiling in place
+            bool known = false;
+            try
+            {
+                if (_emulator != null) { max = Math.Max(2, EmuHawkAdapter.PortCountOf(_emulator)); known = true; }
+            }
+            catch { /* odd core definition — fall back to the unrestricted box */ }
+
+            _loadingSettings = true; // a programmatic clamp must not persist over the user's choice
+            try
+            {
+                int want = _settings != null ? _settings.Players : (int)_playersBox.Value;
+                _playersBox.Maximum = max;
+                _playersBox.Value = Clamp(want, (int)_playersBox.Minimum, max);
+                _playersHint.Text = known ? $"of {max}" : "";
+            }
+            finally { _loadingSettings = false; }
+        }
+
         private void SaveSettingsFromUi()
         {
             if (_loadingSettings || _settings == null) return;
@@ -397,6 +431,9 @@ namespace BizHawkNetplay.Tool
             _portBox = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = DefaultPort, Location = new Point(300, 43), Width = 70 };
             var playersLabel = new Label { Text = "Players:", AutoSize = true, Location = new Point(388, 46) };
             _playersBox = new NumericUpDown { Minimum = 2, Maximum = 8, Value = 2, Location = new Point(444, 43), Width = 46 };
+            // The ceiling is the core's controller-port count, so say what it is instead of letting
+            // someone pick 4 and only find out at start time that the core exposes 2 (see RefreshPlayerLimit).
+            _playersHint = new Label { Text = "", AutoSize = true, Location = new Point(494, 46), ForeColor = Color.DimGray };
 
             var passwordLabel = new Label { Text = "Password:", AutoSize = true, Location = new Point(12, 78) };
             _passwordBox = new TextBox { Location = new Point(80, 75), Width = 160, UseSystemPasswordChar = true };
@@ -445,7 +482,7 @@ namespace BizHawkNetplay.Tool
 
             page.Controls.AddRange(new Control[]
             {
-                _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox, playersLabel, _playersBox,
+                _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox, playersLabel, _playersBox, _playersHint,
                 passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
                 netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
                 _goButton, _disconnectButton, _pubAddrButton,
@@ -655,6 +692,7 @@ namespace BizHawkNetplay.Tool
             // Invalidate the cached probe depth — the core/ROM may have changed, and a stale (deeper)
             // measurement from a lighter core could wrongly grant rollback to a heavier one.
             _probeDepth = -1;
+            RefreshPlayerLimit(); // the new core may expose a different number of controller ports
             UpdateEnabled();
         }
 
@@ -688,7 +726,15 @@ namespace BizHawkNetplay.Tool
                 // reads the box here. Clamp to what the core supports.
                 int players = _hostRadio.Checked ? Math.Min(Math.Max(2, (int)_playersBox.Value), portCount) : portCount;
                 if (_hostRadio.Checked && (int)_playersBox.Value > portCount)
-                    Log($"this core has only {portCount} controller ports — hosting {players} players.");
+                {
+                    // Belt-and-braces: RefreshPlayerLimit normally keeps the box at or below this, so
+                    // reaching here means the core changed under us. Never clamp silently — an
+                    // unexplained "waiting for 1 player(s)" after asking for 4 is the confusing case.
+                    ConnLog($"hosting {players} players, not {(int)_playersBox.Value} — this core exposes only " +
+                            $"{portCount} controller port(s). Enable the core's multitap/adapter " +
+                            "(Genesis: 4-Way Play or Team Player) for more.", Color.DarkOrange);
+                    RefreshPlayerLimit();
+                }
 
                 // Validate the join address BEFORE pausing — otherwise a typo'd IP leaves the emulator
                 // frozen on the early return with no session to un-freeze it. The box takes either a
@@ -980,7 +1026,8 @@ namespace BizHawkNetplay.Tool
                 _listener = new TcpListener(IPAddress.Any, port);
                 _listener.Start();
                 int need = players - 1;
-                UiConnLog($"hosting on TCP+UDP {port} — waiting for {need} player(s) to join…", Color.DarkSlateBlue);
+                UiConnLog($"hosting a {players}-player session on TCP+UDP {port} — you are P1, " +
+                          $"waiting for {need} more to join…", Color.DarkSlateBlue);
 
                 // Best-effort NAT reachability (UPnP forward + public-address report). Non-fatal.
                 TryPublishHostAddress(port);

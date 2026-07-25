@@ -116,7 +116,10 @@ Settings worth knowing on the Connection tab:
 
 - **Players** (host decides) — how many of the core's controller ports to fill, from 2 up to the
   core's port count. So you can play 2-player on a core that exposes 4 ports (e.g. N64); the unused
-  ports read neutral.
+  ports read neutral. The box is capped at what the **loaded core** exposes, shown next to it as
+  *"of N"*: N64 is 4 natively, but Genesis is **2 until you enable the 4-Way Play / Team Player
+  adapter** in the core's controller settings (which reboots the core, and the cap follows). Both
+  players must have the same adapter setting — the handshake compares per-port layouts.
 - **My controls** — which of *your* controller-port bindings the tool reads (default *Use P1 pad*),
   independent of the port you're assigned in-game. So a player assigned P2/P3/P4 just uses their
   normal P1 pad with no rebinding.

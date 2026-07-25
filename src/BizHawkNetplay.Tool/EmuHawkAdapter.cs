@@ -675,6 +675,18 @@ namespace BizHawkNetplay.Tool
 
         // --- Layout derivation --------------------------------------------------------
 
+        /// <summary>
+        /// How many controller ports the loaded core exposes, without building a whole adapter (no
+        /// binding/config lookups). The UI needs this before a session to cap the player count — a core
+        /// only exposes more than its default ports once a multitap/adapter is enabled in its settings
+        /// (Genesis 4-Way Play / Team Player, SNES multitap), which reboots the core and re-reads this.
+        /// </summary>
+        public static int PortCountOf(IEmulator emulator)
+        {
+            if (emulator == null) throw new ArgumentNullException(nameof(emulator));
+            return BuildLayouts(emulator.ControllerDefinition).Length;
+        }
+
         private static CoreLayout[] BuildLayouts(ControllerDefinition def)
         {
             // Group the core's flat button/axis lists by player number into per-port layouts.
