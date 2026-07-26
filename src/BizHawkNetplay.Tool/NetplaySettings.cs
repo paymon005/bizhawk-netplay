@@ -19,7 +19,7 @@ namespace BizHawkNetplay.Tool
         public bool Upnp = true;
         public int Port = 47800;
         public int Players = 2;      // host: how many controller ports to fill
-        public int Delay = 2;
+        public int Delay = 1;        // the protocol floor: least felt latency, raise it if a link stalls
         public int Netcode = 0;     // index into the netcode dropdown (Automatic/Rollback/Lockstep)
         public int InputSource = 0; // index into the "My controls" dropdown (P1..P4, or Assigned port)
         public readonly List<string> RecentIps = new List<string>();

@@ -464,7 +464,9 @@ namespace BizHawkNetplay.Tool
             var passwordHint = new Label { Text = "(optional; must match on both ends)", AutoSize = true, Location = new Point(248, 78), ForeColor = Color.DimGray };
 
             var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 110) };
-            _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 2, Location = new Point(90, 107), Width = 50 };
+            // Default 1 — the protocol floor, so the tool starts at the least felt latency and the
+            // in-session hint tells you to raise it if your link actually needs more (see MaybeHintDelay).
+            _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 1, Location = new Point(90, 107), Width = 50 };
 
             var netcodeSelLabel = new Label { Text = "Netcode:", AutoSize = true, Location = new Point(155, 110) };
             _netcodeCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(215, 107), Width = 110 };
