@@ -85,6 +85,7 @@ namespace BizHawkNetplay.Tool
 
         private int _startEmuFrame; // emulator FrameCount at session start, for drift detection
         private TextBox _log = null!;
+        private int _logLines;      // lines currently in _log, tracked so trimming needn't split its text
 
         /// <summary>One control link to a peer. Host: one per joiner. Joiner: one (the host).</summary>
         private sealed class PeerLink
@@ -143,6 +144,8 @@ namespace BizHawkNetplay.Tool
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
         private const int ConnLogMaxLines = 200; // connection-log history cap, trimmed back to ConnLogKeepLines
         private const int ConnLogKeepLines = 120;
+        private const int LogMaxLines = 5000;    // Log-tab cap; generous (it's the diagnostic record) but bounded
+        private const int LogKeepLines = 3000;   // ...so one trim covers 2000 appends
         private FrameDriver? _driver;
         private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
@@ -2730,10 +2733,49 @@ namespace BizHawkNetplay.Tool
             _status.ForeColor = color;
         }
 
+        /// <summary>
+        /// Append to the Log tab, keeping only the most recent <see cref="LogMaxLines"/> lines.
+        ///
+        /// The cap is not cosmetic. This is a diagnostic firehose — verbose mode logs checksums, audio
+        /// stats and stall notices for as long as you play — and the backing Win32 EDIT control gets
+        /// slower to append to as its buffer grows, so an unbounded log quietly taxes the UI thread that
+        /// also owns the frame clock. Trimming rewrites the whole control, so it's amortized: it happens
+        /// once every (LogMaxLines - LogKeepLines) appends, not on every line.
+        /// </summary>
         private void Log(string message)
         {
             if (_log.IsDisposed) return;
             _log.AppendText(message + Environment.NewLine);
+
+            _logLines += 1 + CountNewlines(message); // a single message can carry several lines (e.g. AudioStats)
+            if (_logLines <= LogMaxLines) return;
+
+            int cut = IndexAfterNewline(_log.Text, _logLines - LogKeepLines);
+            if (cut <= 0) { _logLines = LogKeepLines; return; }
+            _log.Text = _log.Text.Substring(cut);
+            _logLines = LogKeepLines;
+            _log.SelectionStart = _log.TextLength; // setting Text resets the caret; stay pinned to the newest line
+            _log.ScrollToCaret();
+        }
+
+        private static int CountNewlines(string s)
+        {
+            int n = 0;
+            foreach (char c in s) if (c == '\n') n++;
+            return n;
+        }
+
+        /// <summary>Index just past the <paramref name="count"/>-th newline, or -1 if there aren't that many.</summary>
+        private static int IndexAfterNewline(string s, int count)
+        {
+            if (count <= 0) return 0;
+            int seen = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] != '\n') continue;
+                if (++seen == count) return i + 1;
+            }
+            return -1;
         }
 
         private void UiLog(string message) => BeginInvokeUi(() => Log(message));
