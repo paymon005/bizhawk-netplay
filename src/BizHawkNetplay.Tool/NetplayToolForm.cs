@@ -2133,42 +2133,37 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void CheckLinkTimeouts()
         {
+            // The decision rule (and why its ordering is load-bearing) lives in Core: LinkHealth.
             long now = MonotonicNow();
             long limit = MonotonicTicks(PingTimeoutSeconds);
             PeerLink? dead = null;
+            var verdict = LinkVerdict.Healthy;
             int unappliedEpoch = 0;
             int incompleteEpoch = 0;
             foreach (var link in _peers)
             {
-                // Pings only prove that the control reader is alive. A peer can keep answering them
-                // forever while never importing the state that gates this generation, so the apply
-                // barrier has its own payload-sized deadline and takes precedence over ping grace.
-                int awaiting = link.AwaitingAppliedEpoch;
-                if (awaiting != 0 && now > Interlocked.Read(ref link.AppliedDeadlineTicks))
+                var snapshot = new LinkHealth.LinkSnapshot(
+                    link.AwaitingAppliedEpoch,
+                    Interlocked.Read(ref link.AppliedDeadlineTicks),
+                    link.ResyncReceiving,
+                    Interlocked.Read(ref link.ResyncReceiveDeadlineTicks),
+                    Interlocked.Read(ref link.TimeoutGraceUntilTicks),
+                    Interlocked.Read(ref link.LastRecvTicks));
+                verdict = LinkHealth.Judge(snapshot, now, limit);
+                if (verdict != LinkVerdict.Healthy)
                 {
                     dead = link;
-                    unappliedEpoch = awaiting;
+                    unappliedEpoch = snapshot.AwaitingAppliedEpoch;
+                    incompleteEpoch = link.ReceivingResyncEpoch;
                     break;
                 }
-                if (link.ResyncReceiving)
-                {
-                    if (now > Interlocked.Read(ref link.ResyncReceiveDeadlineTicks))
-                    {
-                        dead = link;
-                        incompleteEpoch = link.ReceivingResyncEpoch;
-                        break;
-                    }
-                    continue; // pulling a state from them, within its bounded receive window
-                }
-                if (now < Interlocked.Read(ref link.TimeoutGraceUntilTicks)) continue; // digesting one we sent
-                long last = Interlocked.Read(ref link.LastRecvTicks);
-                if (last != 0 && now - last > limit) { dead = link; break; }
             }
-            if (dead != null && incompleteEpoch != 0)
+            if (dead == null) return;
+            if (verdict == LinkVerdict.ResyncReceiveDeadlineExpired)
                 EndSession($"{dead.Label} did not finish sending resync epoch {incompleteEpoch} before its deadline");
-            else if (dead != null && unappliedEpoch != 0)
+            else if (verdict == LinkVerdict.AppliedDeadlineExpired)
                 EndSession($"{dead.Label} did not apply resync epoch {unappliedEpoch} before its deadline");
-            else if (dead != null)
+            else
                 OnPeerLinkLost(dead, $"no response for {PingTimeoutSeconds:F0}s (ping timeout)");
         }
 
@@ -2561,11 +2556,14 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void PerformResyncAsHost()
         {
-            if (!_sessionActive || !_isHost || _resyncInProgress) return;
-            if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // debounce
+            if (!_sessionActive || !_isHost) return;
+            var gate = RecoveryPolicy.GateResync(_resyncInProgress,
+                MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds, _resyncCount + 1, MaxResyncs);
+            if (gate == ResyncGate.AlreadyInProgress || gate == ResyncGate.Debounced) return;
+            _resyncCount++;
             int attempt = CurrentConnectionAttempt;
 
-            if (++_resyncCount > MaxResyncs)
+            if (gate == ResyncGate.GiveUp)
             {
                 EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
                 return;
@@ -3057,23 +3055,21 @@ namespace BizHawkNetplay.Tool
                 return;
             }
 
-            if (!_isHost)
+            // What losing a peer means in each recovery phase is decided in Core: RecoveryPolicy.
+            switch (RecoveryPolicy.OnPeerLost(_isHost, _resyncInProgress, _awaitingReconnect))
             {
-                EndSession($"lost connection to {link.Label}: {why} — click Join to reconnect");
-                return;
-            }
-            if (_resyncInProgress)
-            {
-                // Some survivors may still be on the prior epoch, so advancing again would make the
-                // reconnect BEGIN skip an epoch for them. End cleanly instead of creating an
-                // ambiguous nested state barrier.
-                EndSession($"{link.Label} dropped during resync: {why}");
-                return;
-            }
-            if (_awaitingReconnect)
-            {
-                EndSession($"a second peer ({link.Label}) dropped during a reconnect: {why}");
-                return;
+                case PeerLossAction.EndSessionJoinerLostHost:
+                    EndSession($"lost connection to {link.Label}: {why} — click Join to reconnect");
+                    return;
+                case PeerLossAction.EndSessionDropDuringResync:
+                    // Some survivors may still be on the prior epoch, so advancing again would make
+                    // the reconnect BEGIN skip an epoch for them. End cleanly instead of creating an
+                    // ambiguous nested state barrier.
+                    EndSession($"{link.Label} dropped during resync: {why}");
+                    return;
+                case PeerLossAction.EndSessionSecondDropDuringReconnect:
+                    EndSession($"a second peer ({link.Label}) dropped during a reconnect: {why}");
+                    return;
             }
 
             _awaitingReconnect = true;
