@@ -135,7 +135,9 @@ namespace BizHawkNetplay.Tool
         private PeerIdentity? _punchId;         // prepared handshake identity, captured when punch setup began
         private SessionPreferences? _punchPrefs;
         private byte[]? _punchState;            // host only: the initial state to transfer once punched
-        private TcpListener? _listener;
+        // volatile: the accept thread reads this as its teardown signal (null => Disconnect stopped us),
+        // and it's written from the UI thread. Every other cross-thread field here is volatile too.
+        private volatile TcpListener? _listener;
         private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
         private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
@@ -190,8 +192,11 @@ namespace BizHawkNetplay.Tool
         private const double PingIntervalMs = 400;      // ~2.5 pings/sec
         private const double PingTimeoutSeconds = 3.0;  // no message for this long => presumed dropped
         // A peer we've just sent a whole state to goes quiet while its reader consumes that frame, so it
-        // gets a longer leash — but only that peer, and only until the transfer could plausibly be done.
-        private const double StateTransferGraceSeconds = 15.0;
+        // gets a longer leash — but only that peer, and only for as long as the transfer could plausibly
+        // take. Scaled by payload: a flat timeout would either hang on a dead peer or shoot a live one
+        // mid-transfer (an N64 state is megabytes; on a weak uplink that is minutes, not seconds).
+        private const double StateTransferGraceBaseSeconds = 10.0;   // read + import once it lands
+        private const double StateTransferMinBytesPerSec = 200 * 1024; // pessimistic floor for the wire
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
         private const double UdpRepunchAfterSeconds = 1.5;
         private const double UdpLostAfterSeconds = 8.0;
@@ -1642,9 +1647,16 @@ namespace BizHawkNetplay.Tool
                 OnPeerLinkLost(dead, $"no response for {PingTimeoutSeconds:F0}s (ping timeout)");
         }
 
-        /// <summary>Excuse one peer from the ping watchdog while a whole state is on its way to it.</summary>
-        private void GraceForStateTransfer(PeerLink link) => Interlocked.Exchange(
-            ref link.TimeoutGraceUntilTicks, DateTime.UtcNow.AddSeconds(StateTransferGraceSeconds).Ticks);
+        /// <summary>
+        /// Excuse one peer from the ping watchdog while a whole state of <paramref name="stateBytes"/> is
+        /// on its way to it. The window covers the transfer at a pessimistic wire rate plus the peer's
+        /// read+import — never open-ended, so a peer that dies mid-transfer is still caught, just later.
+        /// </summary>
+        private void GraceForStateTransfer(PeerLink link, int stateBytes)
+        {
+            double seconds = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
+            Interlocked.Exchange(ref link.TimeoutGraceUntilTicks, DateTime.UtcNow.AddSeconds(seconds).Ticks);
+        }
 
         /// <summary>
         /// Once ping is stable, if the negotiated input delay is lower than the worst link's round-trip
@@ -1910,7 +1922,7 @@ namespace BizHawkNetplay.Tool
                 if (remaining == 0) { _resyncInProgress = false; return; }
                 foreach (var link in _peers)
                 {
-                    GraceForStateTransfer(link); // it can't pong while its reader consumes the state frame
+                    GraceForStateTransfer(link, state.Length); // it can't pong while its reader consumes the frame
                     QueueControl(link, ControlMessageType.ResyncBegin, Array.Empty<byte>());
                     QueueControl(link, ControlMessageType.Resync, state, ok =>
                     {
@@ -2347,7 +2359,7 @@ namespace BizHawkNetplay.Tool
                 }
                 foreach (var survivor in survivors)
                 {
-                    GraceForStateTransfer(survivor); // same leash as a desync resync: a big frame is inbound
+                    GraceForStateTransfer(survivor, state.Length); // same leash: a big frame is inbound
                     QueueControl(survivor, ControlMessageType.PeerList,
                         HandshakeCodec.EncodeEndpoints(CandidatesExcept(allPeers, survivor)));
                     QueueControl(survivor, ControlMessageType.ResyncBegin, Array.Empty<byte>());
