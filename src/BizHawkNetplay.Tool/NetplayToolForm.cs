@@ -239,9 +239,9 @@ namespace BizHawkNetplay.Tool
 
         // Desync detection: the host aggregates every peer's checksum for a frame (its own + each
         // joiner's); once it has them all it verifies they agree. Joiners just report to the host.
+        // The aggregation rules live in Core (ChecksumLedger); the lock serializes UI + reader threads.
         private readonly object _hashLock = new object();
-        private readonly Dictionary<SessionGeneration, Dictionary<int, Dictionary<int, uint>>> _frameHashes =
-            new Dictionary<SessionGeneration, Dictionary<int, Dictionary<int, uint>>>();
+        private readonly ChecksumLedger _checksums = new ChecksumLedger();
 
         // Live round-trip time per control link, for connection-quality feedback.
         private readonly System.Diagnostics.Stopwatch _pingClock = new System.Diagnostics.Stopwatch();
@@ -1598,7 +1598,7 @@ namespace BizHawkNetplay.Tool
             _pendingReconnectStateLength = 0;
             _pendingReconnectGeneration = default;
             _lastResyncStamp = 0;
-            lock (_hashLock) { _frameHashes.Clear(); }
+            lock (_hashLock) { _checksums.Clear(); }
             _driver!.Start(); // idempotent; normally seeded before READY
             _driver.ResetRemoteInputLiveness();
             _sessionDriverPrepared = false;
@@ -2517,49 +2517,15 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void RecordChecksum(int attempt, SessionGeneration generation, int sourcePort, int frame, uint hash)
         {
-            bool complete = false, mismatch = false;
+            ChecksumOutcome outcome;
             lock (_hashLock)
             {
                 if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_isHost
-                    || generation != CurrentGeneration
-                    || sourcePort < 0 || sourcePort >= _playerCount) return;
-
-                if (!_frameHashes.TryGetValue(generation, out var frames))
-                {
-                    frames = new Dictionary<int, Dictionary<int, uint>>();
-                    _frameHashes[generation] = frames;
-                }
-                if (!frames.TryGetValue(frame, out var reports))
-                {
-                    reports = new Dictionary<int, uint>();
-                    frames[frame] = reports;
-                }
-                reports[sourcePort] = hash;
-                if (reports.Count >= _playerCount)
-                {
-                    complete = true;
-                    bool haveFirst = false;
-                    uint first = 0;
-                    foreach (uint report in reports.Values)
-                    {
-                        if (!haveFirst) { first = report; haveFirst = true; }
-                        else if (report != first) { mismatch = true; break; }
-                    }
-                    frames.Remove(frame);
-                }
-                // Drop very old partial entries (a peer that never reported a frame) to bound memory.
-                if (frames.Count > 32)
-                {
-                    var stale = new List<int>();
-                    foreach (var k in frames.Keys) if (k < frame - 600) stale.Add(k);
-                    foreach (var k in stale) frames.Remove(k);
-                }
-                var retired = new List<SessionGeneration>();
-                foreach (var key in _frameHashes.Keys) if (key != generation) retired.Add(key);
-                foreach (var key in retired) _frameHashes.Remove(key);
+                    || generation != CurrentGeneration) return;
+                outcome = _checksums.Record(generation, sourcePort, frame, hash, _playerCount);
             }
-            if (!complete) return;
-            if (mismatch) BeginInvokeUi(() =>
+            if (outcome == ChecksumOutcome.Pending) return;
+            if (outcome == ChecksumOutcome.Mismatch) BeginInvokeUi(() =>
             {
                 if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
                     OnHostDesync(frame);
@@ -2835,7 +2801,7 @@ namespace BizHawkNetplay.Tool
             try { _driver?.Dispose(); } catch { } // release the old rollback ring before replacing it
             _driver = CreateDriver();
             _startEmuFrame = APIs.Emulation.FrameCount();
-            lock (_hashLock) { _frameHashes.Clear(); }
+            lock (_hashLock) { _checksums.Clear(); }
             _driver.Start();
             _lastResyncStamp = MonotonicNow();
             RebaseFrameSchedule();
@@ -3503,7 +3469,7 @@ namespace BizHawkNetplay.Tool
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
             try { APIs.EmuClient.Unpause(); } catch { }
-            lock (_hashLock) { _frameHashes.Clear(); }
+            lock (_hashLock) { _checksums.Clear(); }
 
             _netcodeLabel.Text = "Netcode in use: —";
             _netcodeLabel.ForeColor = Color.DimGray;
