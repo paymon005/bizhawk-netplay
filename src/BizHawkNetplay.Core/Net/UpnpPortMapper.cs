@@ -121,9 +121,9 @@ namespace BizHawkNetplay.Core.Net
                 try { sock.SendTo(msg, mcast); } catch { }
             }
 
-            var deadline = DateTime.UtcNow + timeout;
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
             var buf = new byte[4096];
-            while (DateTime.UtcNow < deadline)
+            while (elapsed.Elapsed < timeout)
             {
                 int n;
                 try { EndPoint from = new IPEndPoint(IPAddress.Any, 0); n = sock.ReceiveFrom(buf, ref from); }

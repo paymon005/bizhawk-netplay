@@ -76,5 +76,11 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Null(SessionAuth.FromHex("nothex"));
             Assert.Null(SessionAuth.FromHex("abc")); // odd length
         }
+
+        [Fact]
+        public void NewSessionId_IsNonZero()
+        {
+            Assert.NotEqual(0UL, SessionAuth.NewSessionId());
+        }
     }
 }

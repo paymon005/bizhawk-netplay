@@ -30,6 +30,7 @@ namespace BizHawkNetplay.Core.Sync
         private readonly ISyncStrategy _strategy;
         private readonly InputSerializer[] _serializers;
         private readonly InputPacketCodec _codec;
+        private readonly SessionGeneration _generation;
 
         private readonly int _localPort;
         private readonly int _delay;
@@ -45,13 +46,22 @@ namespace BizHawkNetplay.Core.Sync
         private const long StallResendIntervalMs = 20; // at most 50 redundant windows/second
         private readonly Stopwatch _sendClock = Stopwatch.StartNew();
         private long _lastSendMs = long.MinValue;
-        private readonly DateTime[] _lastRemoteInputUtc;
+        private readonly long[] _lastRemoteInputStamp;
         private int _lastPacketsDrained;
 
         // Rolling window of the local port's most recent serialized inputs, for redundant sends.
         private readonly LinkedList<KeyValuePair<int, byte[]>> _sendWindow = new LinkedList<KeyValuePair<int, byte[]>>();
         private int _lastStamp = -1;
         private bool _started;
+
+        // Longer local-input history for answering gap requests: a frame that has aged out of the
+        // redundant send window can still be re-sent from here. Keys stay contiguous because stamps
+        // are produced strictly in order. A few payload-bytes per frame — memory is negligible.
+        private const int RetransmitKeepFrames = 240;   // ~4 s at 60 fps
+        private const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
+        private readonly Dictionary<int, byte[]> _sentPayloads = new Dictionary<int, byte[]>();
+        private int _oldestSentPayload = -1;
+        private readonly long[] _lastGapRequestMs;
 
         /// <param name="strategyFactory">Builds the sync strategy over the shared pipeline (the swap point).</param>
         /// <param name="localPort">The controller port this instance owns and sources locally.</param>
@@ -60,8 +70,8 @@ namespace BizHawkNetplay.Core.Sync
         /// How many recent inputs each datagram repeats (R). Tolerates up to R-1 consecutive losses
         /// with no stall. Should be ≥ 2·delay+1: in lockstep the ahead peer can lead the behind peer
         /// by up to D frames, so the redundant window must reach back far enough to still cover the
-        /// frame the behind peer needs. Below that, sustained loss can slide the window past a needed
-        /// frame and stall until retransmission (an M2 feature) recovers it.
+        /// frame the behind peer needs. Under rollback, a burst of ~R losses can still slide the
+        /// window past a needed frame; the gap-request retransmit path then recovers it.
         /// </param>
         /// <param name="rollbackWindow">
         /// How many frames the sim may run ahead of a remote port's confirmed input before a stale
@@ -69,6 +79,10 @@ namespace BizHawkNetplay.Core.Sync
         /// than the current frame are never needed, so they're dropped. Rollback passes its ring
         /// depth here so late corrections for already-simulated frames reach the pipeline and the
         /// far-future/history bounds stretch to cover the prediction horizon.
+        /// </param>
+        /// <param name="generation">
+        /// The negotiated session/timeline generation placed on every input datagram. Replace it
+        /// with <see cref="SessionGeneration.Next"/> whenever a resync rebuilds the driver.
         /// </param>
         public FrameDriver(
             IEmuAdapter adapter,
@@ -78,7 +92,8 @@ namespace BizHawkNetplay.Core.Sync
             int delay,
             int redundancy = 8,
             int rollbackWindow = 0,
-            int portCount = 0)
+            int portCount = 0,
+            SessionGeneration? generation = null)
         {
             _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
@@ -86,6 +101,7 @@ namespace BizHawkNetplay.Core.Sync
             if (delay < 1) throw new ArgumentOutOfRangeException(nameof(delay), "Input delay must be >= 1");
             if (redundancy < 1) throw new ArgumentOutOfRangeException(nameof(redundancy));
             if (rollbackWindow < 0) throw new ArgumentOutOfRangeException(nameof(rollbackWindow));
+            _generation = generation ?? SessionGeneration.Legacy;
 
             // The session may use fewer players than the core has controller ports (e.g. 2-player on an
             // N64's 4 ports). The driver then networks only the active ports; the core's remaining ports
@@ -110,14 +126,16 @@ namespace BizHawkNetplay.Core.Sync
             for (int p = 0; p < ports; p++) _pipeline.SetLocal(p, p == localPort);
 
             _serializers = new InputSerializer[ports];
-            _lastRemoteInputUtc = new DateTime[ports];
+            _lastRemoteInputStamp = new long[ports];
+            _lastGapRequestMs = new long[ports];
+            for (int p = 0; p < ports; p++) _lastGapRequestMs[p] = -GapRequestIntervalMs;
             var payloadSizes = new int[ports];
             for (int p = 0; p < ports; p++)
             {
                 _serializers[p] = new InputSerializer(adapter.GetControllerLayout(p));
                 payloadSizes[p] = _serializers[p].PayloadSize;
             }
-            _codec = new InputPacketCodec(payloadSizes);
+            _codec = new InputPacketCodec(payloadSizes, _generation);
             _strategy = strategyFactory(_pipeline);
 
             // Keep enough history to cover the delay pipeline, the redundancy window, and (for
@@ -130,6 +148,20 @@ namespace BizHawkNetplay.Core.Sync
         public InputSet? LastAppliedInputs { get; private set; }
         public ISyncStrategy Strategy => _strategy;
         public int LastPacketsDrained => _lastPacketsDrained;
+        public SessionGeneration Generation => _generation;
+
+        /// <summary>True when every port's real input for the frame after <see cref="CurrentFrame"/>
+        /// is already buffered. A scheduler may combine this with strategy-specific pacing state before
+        /// committing a two-frame presentation burst.</summary>
+        public bool NextFrameFullyConfirmed => _pipeline.AllConfirmed(CurrentFrame + 1);
+
+        /// <summary>Rebase UDP-silence tracking at GO. A driver may be seeded before READY, and time
+        /// spent waiting at the barrier must not look like an active-session input outage.</summary>
+        public void ResetRemoteInputLiveness()
+        {
+            long now = Stopwatch.GetTimestamp();
+            for (int p = 0; p < _lastRemoteInputStamp.Length; p++) _lastRemoteInputStamp[p] = now;
+        }
 
         /// <summary>
         /// Seed the local port's first D frames (nothing has been stamped for them yet) with
@@ -140,8 +172,8 @@ namespace BizHawkNetplay.Core.Sync
             if (_started) return;
             _started = true;
             var neutral = PortInput.Neutral(_adapter.GetControllerLayout(_localPort));
-            var now = DateTime.UtcNow;
-            for (int p = 0; p < _lastRemoteInputUtc.Length; p++) _lastRemoteInputUtc[p] = now;
+            long now = Stopwatch.GetTimestamp();
+            for (int p = 0; p < _lastRemoteInputStamp.Length; p++) _lastRemoteInputStamp[p] = now;
             for (int f = 0; f < _delay; f++)
                 ProduceLocal(f, neutral);
             SendWindow(force: true);
@@ -152,6 +184,7 @@ namespace BizHawkNetplay.Core.Sync
             if (!_started) Start();
 
             DrainNetwork(MaxDatagramsPerPump);
+            RequestMissingRemoteInputIfDue();
             CaptureAndSendLocal();
 
             var decision = _strategy.BeginFrame(CurrentFrame);
@@ -191,6 +224,7 @@ namespace BizHawkNetplay.Core.Sync
         {
             if (!_started) Start();
             _lastPacketsDrained = DrainNetwork(MaxDatagramsPerPump);
+            RequestMissingRemoteInputIfDue();
         }
 
         /// <summary>During a stall, re-send the redundant local window on a wall-clock cadence. The
@@ -233,11 +267,12 @@ namespace BizHawkNetplay.Core.Sync
         {
             port = -1;
             silence = TimeSpan.Zero;
-            var now = DateTime.UtcNow;
-            for (int p = 0; p < _lastRemoteInputUtc.Length; p++)
+            long now = Stopwatch.GetTimestamp();
+            for (int p = 0; p < _lastRemoteInputStamp.Length; p++)
             {
-                if (p == _localPort || _lastRemoteInputUtc[p] == default) continue;
-                var age = now - _lastRemoteInputUtc[p];
+                if (p == _localPort || _lastRemoteInputStamp[p] == 0) continue;
+                var age = TimeSpan.FromSeconds(
+                    (now - _lastRemoteInputStamp[p]) / (double)Stopwatch.Frequency);
                 if (port < 0 || age > silence) { port = p; silence = age; }
             }
             return port >= 0;
@@ -268,13 +303,20 @@ namespace BizHawkNetplay.Core.Sync
             while (drained < maxDatagrams && _transport.TryReceive(out var datagram))
             {
                 drained++;
-                if (!_codec.TryDecodeInput(datagram, out var frames)) continue;
+                if (!_codec.TryDecodeInput(datagram, out var frames))
+                {
+                    // Not an input window — maybe a peer asking us to re-send frames that slid out
+                    // of our redundant window (rollback loss recovery). Anything else is ignored.
+                    if (_codec.TryDecodeRequest(datagram, out byte target, out int fromFrame))
+                        ServeGapRequest(target, fromFrame);
+                    continue;
+                }
                 foreach (var inFrame in frames)
                 {
                     if (inFrame.Port == _localPort) continue;      // never let the wire override our own port
                     // Any well-decoded frame from a remote port proves that port's UDP path is alive,
                     // including a redundant frame we already hold during a lockstep stall.
-                    _lastRemoteInputUtc[inFrame.Port] = DateTime.UtcNow;
+                    _lastRemoteInputStamp[inFrame.Port] = Stopwatch.GetTimestamp();
                     // Genuine redundancy: we already hold this exact (port, frame). This is also the
                     // ONLY way an earlier-than-current frame reaches lockstep — it can't have advanced
                     // past a frame it lacked — so with _rollbackWindow==0 this matches the old
@@ -283,7 +325,11 @@ namespace BizHawkNetplay.Core.Sync
                     if (_pipeline.TryGet(inFrame.Port, inFrame.Frame, out _)) continue;
                     // Too old to act on: before the rollback ring / pruned history can reach. For
                     // lockstep (window 0) that is anything strictly before the current frame.
-                    if (inFrame.Frame < CurrentFrame - _rollbackWindow) continue;
+                    // Rollback gets one extra frame of grace below the window: a hard-cap stall at
+                    // frame N is waiting for exactly frame N - window - 1 (the first frame past the
+                    // stalled horizon), and the ring's prune margin keeps that frame's base state
+                    // alive for the repair — dropping it here would make the stall permanent.
+                    if (inFrame.Frame < CurrentFrame - _rollbackWindow - (_rollbackWindow > 0 ? 1 : 0)) continue;
                     // Impossibly far in the future — bogus, or a pre-resync datagram (high frame number)
                     // arriving after we rebuilt at frame 0. Left unchecked it would sit in the pipeline
                     // and reapply thousands of frames later.
@@ -314,7 +360,55 @@ namespace BizHawkNetplay.Core.Sync
             var payload = _serializers[_localPort].Serialize(input);
             _sendWindow.AddLast(new KeyValuePair<int, byte[]>(frame, payload));
             while (_sendWindow.Count > _redundancy) _sendWindow.RemoveFirst();
+            _sentPayloads[frame] = payload;
+            if (_oldestSentPayload < 0) _oldestSentPayload = frame;
+            while (_oldestSentPayload <= frame - RetransmitKeepFrames)
+                _sentPayloads.Remove(_oldestSentPayload++);
             _lastStamp = frame;
+        }
+
+        /// <summary>
+        /// Rollback's loss-recovery backstop. The redundant window covers short bursts, but under
+        /// rollback the sender does not stall near a frame the peer is missing — it keeps producing
+        /// until its own prediction cap — so a burst of ~R consecutive losses slides its window past
+        /// the missing frame and that frame would never be sent again, freezing both peers at their
+        /// caps with no way out. When a remote port's confirmed frontier falls a window's worth
+        /// behind, ask that port's owner to re-send from the first missing frame. Lockstep never
+        /// needs this: the behind peer stalls at the missing frame itself and R ≥ 2·delay+1 keeps
+        /// the peer's live window covering it.
+        /// </summary>
+        private void RequestMissingRemoteInputIfDue()
+        {
+            if (_rollbackWindow <= 0) return;
+            // Fire while still running when possible (gap ≥ R means the window may have slid), and
+            // guaranteed by the time the hard cap stalls us (gap = window+1) even when R > window.
+            int trigger = Math.Min(_redundancy, _rollbackWindow + 1);
+            long now = _sendClock.ElapsedMilliseconds;
+            for (int p = 0; p < _lastGapRequestMs.Length; p++)
+            {
+                if (p == _localPort) continue;
+                int frontier = _pipeline.ConfirmedFrontier(p);
+                if (CurrentFrame - 1 - frontier < trigger) continue;
+                if (now - _lastGapRequestMs[p] < GapRequestIntervalMs) continue;
+                _lastGapRequestMs[p] = now;
+                _transport.Send(_codec.EncodeRequest((byte)p, frontier + 1));
+            }
+        }
+
+        /// <summary>Answer a peer's gap request from the long retransmit history (no-op unless the
+        /// requested port is ours and the frame is still retained).</summary>
+        private void ServeGapRequest(byte targetPort, int fromFrame)
+        {
+            if (targetPort != _localPort) return;
+            if (!_sentPayloads.ContainsKey(fromFrame)) return; // aged out even of the long history
+            var window = new List<KeyValuePair<int, byte[]>>(_redundancy);
+            for (int f = fromFrame; f < fromFrame + _redundancy; f++)
+            {
+                if (!_sentPayloads.TryGetValue(f, out var payload)) break;
+                window.Add(new KeyValuePair<int, byte[]>(f, payload));
+            }
+            if (window.Count > 0)
+                _transport.Send(_codec.EncodeInput((byte)_localPort, window));
         }
 
         private void SendWindow(bool force)

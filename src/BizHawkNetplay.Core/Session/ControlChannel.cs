@@ -12,20 +12,21 @@ namespace BizHawkNetplay.Core.Session
         Start = 5,     // synchronized-start marker
         Error = 6,     // rejection with a reason string
         Bye = 7,       // graceful close
-        Ping = 8,      // RTT probe: body = [t0Ms:double] (sender's monotonic send time)
-        Pong = 9,      // RTT echo: body = [t0Ms:double] (the ping's t0, echoed back unchanged)
-        Resync = 10,   // host -> client: authoritative whole-core state to recover from a desync
+        Ping = 8,      // RTT probe: opaque 8-byte token, echoed during lobby setup and live play
+        Pong = 9,      // RTT echo: the ping's 8-byte token returned unchanged
+        Resync = 10,   // host -> client: [generation][authoritative whole-core state]
         ResyncRequest = 11, // client -> host: "I saw a desync, please resync us"
         PeerList = 12, // host -> client: the other peers' UDP endpoints for the direct input mesh
         Candidate = 13, // client -> host: my reflexive (STUN) UDP endpoint, for NAT-traversal candidates
         Ready = 14,    // multi-peer start barrier request/ack after state import data is received
         Go = 15,       // host releases every ready joiner at once
-        ResyncBegin = 16, // host -> client: a large Resync frame follows; suspend ping timeout while receiving it
+        ResyncBegin = 16, // host -> client: generation, state size, and wait budget for the Resync frame
         Auth = 17,     // session-password challenge-response proof (see SessionAuth)
-        // Pacing: [frame:int32][localAdvantage:int32] — where the sender is, and how far ahead it
-        // measures itself. Additive and safely ignorable: the reader drops unknown types, so a peer on
-        // an older build simply never reports and both ends fall back to RTT-derived pacing.
+        // Pacing: [generation:12][sequence:int32][ack:int32][frame:int32][localAdvantage:int32].
+        // Sequence/ack makes frame advantage valid only after a two-way sample and edge-triggered.
         Pacing = 18,
+        ResyncApplied = 19, // joiner -> host: authoritative state imported/rebuilt for this generation
+        ResyncResume = 20,  // host -> joiner: every peer applied this generation; resume stepping
     }
 
     /// <summary>

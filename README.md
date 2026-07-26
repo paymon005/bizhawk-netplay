@@ -4,9 +4,7 @@ A C# external tool (ApiHawk) that adds online multiplayer to any local-multiplay
 BizHawk can run, using **delayed lockstep** as the universal baseline and **GGPO-style
 rollback** as a probe-gated drop-in for cores that can afford it.
 
-Design principle: lockstep and rollback are the *same system* with one swappable component
-(`ISyncStrategy`). Everything else — transport, session, input serialization, determinism
-enforcement, desync detection — is shared and built once. See
+Design principle: lockstep and rollback are the *same system* with one swappable component (`ISyncStrategy`). Everything else — transport, session, input serialization, determinism enforcement, desync detection — is shared and built once. See
 [bizhawk-netplay-architecture.md](bizhawk-netplay-architecture.md) for the full design.
 
 ## Download & install
@@ -77,9 +75,7 @@ tests/
 
 ## Building
 
-Prereqs: .NET SDK (5.0+) and the .NET Framework 4.8 targeting pack. The tool compiles against
-a local BizHawk install; point `BizHawkHome` at yours if it differs from the default in
-[Directory.Build.props](Directory.Build.props):
+Prereqs: .NET SDK (5.0+) and the .NET Framework 4.8 targeting pack. The tool compiles against a local BizHawk install; point `BizHawkHome` at yours if it differs from the default in [Directory.Build.props](Directory.Build.props):
 
 ```sh
 # Core + tests (no BizHawk needed)
@@ -92,8 +88,7 @@ dotnet build src/BizHawkNetplay.Tool -p:BizHawkHome="X:\path\to\BizHawk"
 A successful Tool build copies `BizHawkNetplay.Tool.dll` + `BizHawkNetplay.Core.dll` into
 `<BizHawkHome>\ExternalTools\`. Disable with `-p:DeployToExternalTools=false`.
 
-**Cutting a release:** build Release, then attach the two DLLs to a GitHub Release — that's all a
-release is. Binaries are never committed; they live on the Releases page.
+**Cutting a release:** build Release, then attach the two DLLs to a GitHub Release — that's all a release is. Binaries are never committed; they live on the Releases page.
 
 ```powershell
 dotnet build src/BizHawkNetplay.Tool -c Release -p:DeployToExternalTools=false
@@ -101,94 +96,51 @@ gh release create v0.8.0 <release-output>\BizHawkNetplay.Tool.dll <release-outpu
     --title v0.8.0 --target main --notes-file notes.md
 ```
 
-Use `--notes-file`, not `--notes`: PowerShell re-parses quotes when building a native command line,
-so notes containing a `"` or a newline get split and `gh` rejects the fragments as bad asset paths.
+Use `--notes-file`, not `--notes`: PowerShell re-parses quotes when building a native command line, so notes containing a `"` or a newline get split and `gh` rejects the fragments as bad asset paths.
 
 ## Running netplay
 
-Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), then open
-**Tools → External Tools → BizHawk Netplay**.
+Both machines load the **same ROM** in EmuHawk (matching core + BizHawk build), then open **Tools → External Tools → BizHawk Netplay**.
 
 - **Host:** pick *Host*, choose a port (default 47800), *Start Hosting*.
-- **Join:** pick *Join*, enter the host's address, *Join*. The box takes either a bare IP (`1.2.3.4`,
-  using the *Port* box) or the `ip:port` form the host reads out (`1.2.3.4:47800`), in which case the
-  typed port wins and the *Port* box updates to match. Recent hosts are remembered in the dropdown,
-  with their ports.
+- **Join:** pick *Join*, enter the host's address, *Join*. The box takes either a bare IP (`1.2.3.4`, using the *Port* box) or the `ip:port` form the host reads out (`1.2.3.4:47800`), in which case the typed port wins and the *Port* box updates to match. Recent hosts are remembered in the dropdown, with their ports.
 - **UDP Punch** (2 players, no port-forwarding): each side picks its role, clicks *UDP Punch*, and
   gets a short **connect code**. Swap codes out of band (Discord/text), paste your friend's, and
   *Connect*. Both punch outbound and the whole session runs over that one UDP socket.
 
 Settings worth knowing on the Connection tab:
 
-- **Players** (host decides) — how many of the core's controller ports to fill, from 2 up to the
-  core's port count. So you can play 2-player on a core that exposes 4 ports (e.g. N64); the unused
-  ports read neutral. The box is capped at what the **loaded core** exposes, shown next to it as
-  *"of N"*: N64 is 4 natively, but Genesis is **2 until you enable the 4-Way Play / Team Player
-  adapter** in the core's controller settings (which reboots the core, and the cap follows). Both
-  players must have the same adapter setting — the handshake compares per-port layouts.
-- **My controls** — which of *your* controller-port bindings the tool reads (default *Use P1 pad*),
-  independent of the port you're assigned in-game. So a player assigned P2/P3/P4 just uses their
-  normal P1 pad with no rebinding.
-- **Password** (optional) — must match on both ends. Leave it empty for an open session. It's never
-  sent over the wire; both ends prove they know it via a nonce challenge-response (see *Known
-  limitations*). Getting it wrong costs the joiner their connection attempt, not the host's lobby —
-  the host logs the refusal and keeps waiting.
-- **Netcode** (host decides) — **Automatic** (rollback if every peer's core clears the capability probe,
-  else lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows
-  in a box on the tab. Rollback works at **3–4 players too**, not just 2: every peer predicts the other
-  ports and input travels peer-to-peer in one hop, so rollbacks fire more often than in a 2-player
-  session but run no deeper.
-- **Input delay** — what you feel. In **lockstep** it must cover the one-way latency (≈ RTT/2) or the
-  session stalls, so raise it on a bad link. In **rollback** prediction covers the link, so delay only
-  shrinks how deep the average rollback runs — 1–2 is usually right, and anything higher is felt latency
-  for nothing. The tool measures your link a few seconds in and tells you which way to move it, in
-  either direction. The session uses the **higher** of the two peers' asks, so both ends must change it.
-- **Connection status** — a running log of connection events right above the netcode box: hosting,
-  connecting, joined, refused (with the reason), dropped, reconnected, ended. Red is a refusal or
-  failure, green is connected. Everything else — per-frame diagnostics, audio, probe output — stays on
-  the *Log* tab.
+- **Players** (host decides) — how many of the core's controller ports to fill, from 2 up to the core's port count. So you can play 2-player on a core that exposes 4 ports (e.g. N64); the unused ports read neutral. The box is capped at what the **loaded core** exposes, shown next to it as *"of N"*: N64 is 4 natively, but Genesis is **2 until you enable the 4-Way Play / Team Player adapter** in the core's controller settings (which reboots the core, and the cap follows). Both players must have the same adapter setting — the handshake compares per-port layouts.
+- **My controls** — which of *your* controller-port bindings the tool reads (default *Use P1 pad*), independent of the port you're assigned in-game. So a player assigned P2/P3/P4 just uses their normal P1 pad with no rebinding.
+- **Password** (optional) — must match on both ends. Leave it empty for an open session. It's never sent over the wire; both ends prove they know it via a nonce challenge-response (see *Known limitations*). Getting it wrong costs the joiner their connection attempt, not the host's lobby — the host logs the refusal and keeps waiting.
+- **Netcode** (host decides) — **Automatic** (rollback if every peer's core clears the capability probe, else lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows in a box on the tab. Rollback works at **3–4 players too**, not just 2: every peer predicts the other ports and input travels peer-to-peer in one hop, so rollbacks fire more often than in a 2-player session but run no deeper.
+- **Input delay** — what you feel. In **lockstep** it must cover the one-way latency (≈ RTT/2) or the session stalls, so raise it on a bad link. In **rollback** prediction covers the link, so delay only shrinks how deep the average rollback runs — 1–2 is usually right, and anything higher is felt latency for nothing. The tool measures your link a few seconds in and tells you which way to move it, in either direction. The session uses the **higher** of the two peers' asks, so both ends must change it.
+- **Connection status** — a running log of connection events right above the netcode box: hosting, connecting, joined, refused (with the reason), dropped, reconnected, ended. Red is a refusal or failure, green is connected. Everything else — per-frame diagnostics, audio, probe output — stays on the *Log* tab.
 
-**Analog** sticks are networked (not just digital buttons), so N64/analog-pad games play with full
-stick control. During a session the status bar shows the emulation speed you're actually sustaining
-(e.g. `55/60 fps (92%)`) and flags **CPU-bound** in orange when your machine can't run the core fast
-enough — the true cause of "lag" on a heavy core, distinct from any netcode issue.
+**Analog** sticks are networked (not just digital buttons), so N64/analog-pad games play with full stick control. During a session the status bar shows the emulation speed you're actually sustaining
+(e.g. `55/60 fps (92%)`) and flags **CPU-bound** in orange when your machine can't run the core fast enough — the true cause of "lag" on a heavy core, distinct from any netcode issue.
 
-On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason
-otherwise), transfers the host's savestate so both sims start identical, then runs. It trades
-memory-hash checksums every 60 frames and, on a mismatch, resyncs everyone from the host's
-authoritative state (saving the diverged state to quick-slot 10 for inspection) rather than ending.
+On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason otherwise), transfers the host's savestate so both sims start identical, then runs. It trades memory-hash checksums every 60 frames and, on a mismatch, resyncs everyone from the host's authoritative state (saving the diverged state to quick-slot 10 for inspection) rather than ending.
 
-**Frame-driving model:** the tool pauses EmuHawk and steps the core exactly one confirmed frame per
-timer tick with only the merged network inputs — it *owns the clock* rather than fighting EmuHawk's
-own loop (which pausing would silence). This is what makes lockstep stalls safe, and it keeps input
-capture entirely out of the emulation path so both peers stay deterministic. Under load it renders
-only the last frame of a catch-up burst (Dolphin-style frame-skip) to keep heavy cores responsive.
+**Frame-driving model:** the tool pauses EmuHawk and steps the core exactly one confirmed frame per timer tick with only the merged network inputs — it *owns the clock* rather than fighting EmuHawk's own loop (which pausing would silence). This is what makes lockstep stalls safe, and it keeps input capture entirely out of the emulation path so both peers stay deterministic. Under load it renders only the last frame of a catch-up burst (Dolphin-style frame-skip) to keep heavy cores responsive.
 
 ### Heavy cores (N64 and friends)
 
-N64 works (connects, plays, stays in sync, analog moves), but BizHawk's N64 core is **interpreter-only
-(no dynamic recompiler)**, so it's CPU-heavy — worst when two instances share one machine. To get it
-to full speed:
+N64 works (connects, plays, stays in sync, analog moves), but BizHawk's N64 core is **interpreter-only (no dynamic recompiler)**, so it's CPU-heavy — worst when two instances share one machine. To get it to full speed:
 
 - **Core:** Mupen64Plus (not Ares64 — Ares is accurate but slower).
-- **Video plugin:** **Rice** (or Glide64mk2), *not* the default GLideN64, and never Angrylion (software
-  renderer). The plugin is the biggest adjustable cost.
+- **Video plugin:** **Rice** (or Glide64mk2), *not* the default GLideN64, and never Angrylion (software renderer). The plugin is the biggest adjustable cost.
 - **RSP:** Hle (the default). Keep GLideN64, if used, at native (1x) resolution with enhancements off.
 - Both machines must use **identical** N64 settings (they're sync settings — a mismatch desyncs).
-- N64 reports non-deterministic, so tick the **experimental override** on the Diagnostics tab on *both*
-  ends. In practice it stays in sync; desync detection guards you.
+- N64 reports non-deterministic, so tick the **experimental override** on the Diagnostics tab on *both* ends. In practice it stays in sync; desync detection guards you.
 
-Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster
-settings or a second machine, not netcode).
+Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster settings or a second machine, not netcode).
 
 See [Known limitations](#known-limitations) for the honest gaps (NAT scope, checksum scope, etc.).
 
 ## Capability probe
 
-The M0 probe lives inside the netplay tool as the **Capability Probe** button (EmuHawk requires
-exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It
-times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving
-and restoring your position so it doesn't disturb play.
+The M0 probe lives inside the netplay tool as the **Capability Probe** button (EmuHawk requires exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving and restoring your position so it doesn't disturb play.
 
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.

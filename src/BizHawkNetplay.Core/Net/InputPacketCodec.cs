@@ -11,23 +11,39 @@ namespace BizHawkNetplay.Core.Net
     /// port by the negotiated layout, so the wire format is derived, never per-game.
     ///
     /// Datagram layout (little-endian):
-    ///   [0]      type  (1 = input)
-    ///   [1]      port
-    ///   [2..5]   baseFrame (int32) — simulation frame of the first payload
-    ///   [6]      count — number of consecutive frames included
-    ///   [7..]    count × payloadSize[port] bytes
+    ///   [0]       type  (1 = input)
+    ///   [1]       port
+    ///   [2..9]    sessionId (uint64) — session-unique nonce
+    ///   [10..13]  epoch (int32) — input-timeline generation within the session
+    ///   [14..17]  baseFrame (int32) — simulation frame of the first payload
+    ///   [18]      count — number of consecutive frames included
+    ///   [19..]    count × payloadSize[port] bytes
+    ///
+    /// Gap-request layout (type 2), same [1..13] prefix:
+    ///   [14..17]  fromFrame (int32) — first missing frame the requester needs for `port`
+    /// A request asks the owner of `port` to re-send its inputs starting at fromFrame — the
+    /// recovery path for a frame that has aged out of the sender's redundant window. A peer on a
+    /// build without this type simply fails to decode it and ignores it.
     /// </summary>
     public sealed class InputPacketCodec
     {
         private const byte TypeInput = 1;
-        private const int HeaderSize = 7;
+        private const byte TypeRequest = 2;
+        private const int HeaderSize = 19;
+        private const int RequestSize = 18;
 
         private readonly int[] _payloadSizes; // indexed by port
+        private readonly SessionGeneration _generation;
 
-        public InputPacketCodec(int[] payloadSizesByPort)
+        public InputPacketCodec(int[] payloadSizesByPort, SessionGeneration? generation = null)
         {
             _payloadSizes = payloadSizesByPort ?? throw new ArgumentNullException(nameof(payloadSizesByPort));
+            _generation = generation ?? SessionGeneration.Legacy;
+            if (!_generation.IsValid)
+                throw new ArgumentOutOfRangeException(nameof(generation), "Generation must have a non-zero session ID and non-negative epoch");
         }
+
+        public SessionGeneration Generation => _generation;
 
         /// <summary>
         /// Encode a contiguous, ascending window of (frame, payload) for one port. Frames must be
@@ -44,8 +60,10 @@ namespace BizHawkNetplay.Core.Net
             var buffer = new byte[HeaderSize + window.Count * payloadSize];
             buffer[0] = TypeInput;
             buffer[1] = port;
-            WriteInt32(buffer, 2, baseFrame);
-            buffer[6] = (byte)window.Count;
+            WriteUInt64(buffer, 2, _generation.SessionId);
+            WriteInt32(buffer, 10, _generation.Epoch);
+            WriteInt32(buffer, 14, baseFrame);
+            buffer[18] = (byte)window.Count;
 
             int offset = HeaderSize;
             for (int i = 0; i < window.Count; i++)
@@ -62,21 +80,24 @@ namespace BizHawkNetplay.Core.Net
         }
 
         /// <summary>
-        /// Decode a datagram into per-frame <see cref="InputFrame"/>s. Returns false for unknown
-        /// or malformed datagrams rather than throwing — the input channel is untrusted UDP.
+        /// Decode a datagram into per-frame <see cref="InputFrame"/>s. Returns false for unknown,
+        /// malformed, or differently generated datagrams rather than throwing — the input channel
+        /// is untrusted UDP.
         /// </summary>
         public bool TryDecodeInput(byte[] datagram, out List<InputFrame> frames)
         {
             frames = new List<InputFrame>();
             if (datagram == null || datagram.Length < HeaderSize) return false;
             if (datagram[0] != TypeInput) return false;
+            if (ReadUInt64(datagram, 2) != _generation.SessionId ||
+                ReadInt32(datagram, 10) != _generation.Epoch) return false;
 
             byte port = datagram[1];
             if (port >= _payloadSizes.Length) return false;
             int payloadSize = _payloadSizes[port];
 
-            int baseFrame = ReadInt32(datagram, 2);
-            int count = datagram[6];
+            int baseFrame = ReadInt32(datagram, 14);
+            int count = datagram[18];
             if (payloadSize <= 0 || datagram.Length != HeaderSize + count * payloadSize) return false;
 
             int offset = HeaderSize;
@@ -90,12 +111,53 @@ namespace BizHawkNetplay.Core.Net
             return true;
         }
 
+        /// <summary>Encode a request for <paramref name="targetPort"/>'s inputs from <paramref name="fromFrame"/> on.</summary>
+        public byte[] EncodeRequest(byte targetPort, int fromFrame)
+        {
+            if (targetPort >= _payloadSizes.Length) throw new ArgumentOutOfRangeException(nameof(targetPort));
+            if (fromFrame < 0) throw new ArgumentOutOfRangeException(nameof(fromFrame));
+            var buffer = new byte[RequestSize];
+            buffer[0] = TypeRequest;
+            buffer[1] = targetPort;
+            WriteUInt64(buffer, 2, _generation.SessionId);
+            WriteInt32(buffer, 10, _generation.Epoch);
+            WriteInt32(buffer, 14, fromFrame);
+            return buffer;
+        }
+
+        /// <summary>Decode a gap request. Same tolerance rules as <see cref="TryDecodeInput"/>.</summary>
+        public bool TryDecodeRequest(byte[] datagram, out byte targetPort, out int fromFrame)
+        {
+            targetPort = 0;
+            fromFrame = 0;
+            if (datagram == null || datagram.Length != RequestSize) return false;
+            if (datagram[0] != TypeRequest) return false;
+            if (ReadUInt64(datagram, 2) != _generation.SessionId ||
+                ReadInt32(datagram, 10) != _generation.Epoch) return false;
+            targetPort = datagram[1];
+            if (targetPort >= _payloadSizes.Length) return false;
+            fromFrame = ReadInt32(datagram, 14);
+            return fromFrame >= 0;
+        }
+
         private static void WriteInt32(byte[] b, int o, int v)
         {
             b[o] = (byte)v; b[o + 1] = (byte)(v >> 8); b[o + 2] = (byte)(v >> 16); b[o + 3] = (byte)(v >> 24);
         }
 
+        private static void WriteUInt64(byte[] b, int o, ulong v)
+        {
+            for (int i = 0; i < 8; i++) b[o + i] = (byte)(v >> (8 * i));
+        }
+
         private static int ReadInt32(byte[] b, int o) =>
             b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24);
+
+        private static ulong ReadUInt64(byte[] b, int o)
+        {
+            ulong value = 0;
+            for (int i = 0; i < 8; i++) value |= (ulong)b[o + i] << (8 * i);
+            return value;
+        }
     }
 }

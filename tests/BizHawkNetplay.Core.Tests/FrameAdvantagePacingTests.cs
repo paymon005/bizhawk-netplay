@@ -112,5 +112,103 @@ namespace BizHawkNetplay.Core.Tests
             int stalls = RunFrames(s, pipe, emu, 0, 20);
             Assert.InRange(stalls, 1, 3);
         }
+
+        [Fact]
+        public void SameWireSample_CannotRearmConsumedDebt()
+        {
+            var s = NewStrategy(out var emu, out var pipe);
+            var neutral = PortInput.Neutral(emu.GetControllerLayout(1));
+            pipe.Add(1, 0, neutral);
+            var sample = new PacingInfo(20, 0, frameAdvantage: 4, hasFrameAdvantage: true, sampleSequence: 7);
+
+            s.OnPacingReport(sample);
+            Assert.True(s.BeginFrame(0).Stall);
+            Assert.True(s.BeginFrame(0).Stall);
+            Assert.False(s.BeginFrame(0).Stall);
+            s.EndFrame(0);
+
+            // UI refreshes may outnumber wire reports. Replaying revision 7 is a no-op.
+            s.OnPacingReport(sample);
+            pipe.Add(1, 1, neutral);
+            Assert.False(s.BeginFrame(1).Stall);
+            s.EndFrame(1);
+
+            // The same measured value from a genuinely new exchange may create fresh debt.
+            s.OnPacingReport(new PacingInfo(20, 0, 4, true, sampleSequence: 8));
+            pipe.Add(1, 2, neutral);
+            Assert.True(s.BeginFrame(2).Stall);
+        }
+
+        [Fact]
+        public void SoftCapStall_AlsoPaysOneAdvantageDebtFrame()
+        {
+            var s = NewStrategy(out var emu, out var pipe);
+            var neutral = PortInput.Neutral(emu.GetControllerLayout(1));
+            s.OnPacingReport(new PacingInfo(0, 0, frameAdvantage: 4,
+                hasFrameAdvantage: true, sampleSequence: 1)); // soft cap 3, debt 2
+
+            // With no remote frontier, frame 4 is beyond the soft cap. That stall must pay debt too.
+            Assert.True(s.BeginFrame(4).Stall);
+            Assert.True(s.LastStallWasTimeSync);
+
+            pipe.Add(1, 0, neutral); // horizon is now exactly the soft cap
+            Assert.True(s.BeginFrame(4).Stall);  // only one debt frame remains
+            Assert.False(s.BeginFrame(4).Stall);
+        }
+
+        [Fact]
+        public void MultiPeerFreshSample_DoesNotReplayAnotherPeersCachedDebt()
+        {
+            var tracker = new FrameAdvantageTracker();
+
+            Assert.True(tracker.Record(peerPort: 1, sequence: 1,
+                localAdvantage: 8, remoteAdvantage: 0, known: true));
+            Assert.Equal(4, tracker.Consume(out bool known, out int revision, out bool fresh));
+            Assert.True(known);
+            Assert.True(fresh);
+            Assert.Equal(1, revision);
+
+            // P2's genuinely new even sample must not make P1's unchanged +4 look new again.
+            Assert.True(tracker.Record(peerPort: 2, sequence: 1,
+                localAdvantage: 0, remoteAdvantage: 0, known: true));
+            Assert.Equal(4, tracker.Consume(out known, out revision, out fresh));
+            Assert.True(known);
+            Assert.False(fresh);
+            Assert.Equal(1, revision);
+
+            // A new sample from the peer defining the aggregate is a new pacing observation.
+            Assert.True(tracker.Record(peerPort: 1, sequence: 2,
+                localAdvantage: 8, remoteAdvantage: 0, known: true));
+            Assert.Equal(4, tracker.Consume(out known, out revision, out fresh));
+            Assert.True(fresh);
+            Assert.Equal(2, revision);
+        }
+
+        [Fact]
+        public void MultiPeerCachedRunnerUp_DoesNotBecomeFreshWhenLeaderChanges()
+        {
+            var tracker = new FrameAdvantageTracker();
+            tracker.Record(peerPort: 1, sequence: 1,
+                localAdvantage: 8, remoteAdvantage: 0, known: true); // +4, leader
+            tracker.Record(peerPort: 2, sequence: 1,
+                localAdvantage: 6, remoteAdvantage: 0, known: true); // +3, cached runner-up
+            Assert.Equal(4, tracker.Consume(out _, out int revision, out bool fresh));
+            Assert.True(fresh);
+            Assert.Equal(1, revision);
+
+            // P1's new +2 makes P2's old +3 the aggregate. P2 did not send a new sample, so its
+            // already-consumed report must not manufacture new debt during this handoff.
+            tracker.Record(peerPort: 1, sequence: 2,
+                localAdvantage: 4, remoteAdvantage: 0, known: true);
+            Assert.Equal(3, tracker.Consume(out _, out revision, out fresh));
+            Assert.False(fresh);
+            Assert.Equal(1, revision);
+
+            tracker.Record(peerPort: 2, sequence: 2,
+                localAdvantage: 6, remoteAdvantage: 0, known: true);
+            Assert.Equal(3, tracker.Consume(out _, out revision, out fresh));
+            Assert.True(fresh);
+            Assert.Equal(2, revision);
+        }
     }
 }

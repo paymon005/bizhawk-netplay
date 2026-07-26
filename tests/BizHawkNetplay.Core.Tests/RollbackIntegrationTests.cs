@@ -277,6 +277,56 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void OneWayLossBurst_RecoversViaGapRetransmission_InsteadOfFreezingForever()
+        {
+            // The F4 scenario: a one-way burst drops MORE consecutive datagrams than the redundant
+            // window covers, so the frame the receiver still needs slides out of the sender's live
+            // window and — without the gap-request path — would never be sent again. Both peers then
+            // hit their prediction caps and freeze permanently. With retransmission the starved peer
+            // asks for the missing run and both sides resume.
+            const int k = 4;
+            var clock = new Clock();
+            bool burst = false;
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k, dropA: _ => burst);
+            var a = BuildRollback(ta, 0);
+            var b = BuildRollback(tb, 1);
+
+            // Phase 1: healthy play.
+            long tick = 0;
+            for (int i = 0; i < 100; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
+            Assert.True(b.Driver.CurrentFrame >= 90, $"warmup made no progress ({b.Driver.CurrentFrame})");
+
+            // Phase 2: every datagram A sends is lost for well over a window's worth of frames.
+            // B's frontier for A pins just below the first lost frame; both peers run to their caps.
+            burst = true;
+            for (int i = 0; i < 80; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
+            Assert.True(b.Driver.IsStalled, "B should be cap-stalled while starved of A's input");
+
+            // Phase 3: the link heals. Gap requests are wall-clock throttled (50 ms per port), so tick
+            // with a real sleep until both sides have clearly resumed. Without the retransmit path this
+            // loop runs to exhaustion with both drivers frozen at their caps.
+            burst = false;
+            int targetA = a.Driver.CurrentFrame + 60;
+            int targetB = b.Driver.CurrentFrame + 60;
+            for (int i = 0; i < 5000 && (a.Driver.CurrentFrame < targetA || b.Driver.CurrentFrame < targetB); i++)
+            {
+                clock.Tick = ++tick;
+                a.Step();
+                b.Step();
+                System.Threading.Thread.Sleep(1);
+            }
+
+            Assert.True(a.Driver.CurrentFrame >= targetA && b.Driver.CurrentFrame >= targetB,
+                $"stuck after loss burst: A={a.Driver.CurrentFrame}/{targetA} B={b.Driver.CurrentFrame}/{targetB} " +
+                $"(A stalled={a.Driver.IsStalled}, B stalled={b.Driver.IsStalled})");
+
+            // The repaired timeline must be byte-identical to an ideal lockstep run.
+            int upTo = Math.Min(a.Driver.CurrentFrame, b.Driver.CurrentFrame) - k - Redundancy - Delay - 6;
+            AssertFinalizedCorrect(a, upTo);
+            AssertFinalizedCorrect(b, upTo);
+        }
+
+        [Fact]
         public void ConfirmedChecksums_AlignAndAgreeAcrossPeers()
         {
             // Rollback can't checksum the live frame (it may be a prediction), so it checksums the

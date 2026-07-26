@@ -38,20 +38,51 @@ namespace BizHawkNetplay.Core.Net
         private const byte TPunchAck = 0x31;
 
         private const int PunchTickMs = 250;     // probe cadence while a candidate is unconfirmed
-        private const int KeepaliveMs = 3000;    // re-probe cadence once a candidate is alive (holds the NAT mapping)
+        private const int KeepaliveMs = 1000;    // re-probe cadence once a candidate is alive (holds the NAT mapping)
         private const int AliveWindowMs = 8000;  // no traffic for this long => the path is considered down again
+        // Send-path selection is stricter than plain liveness: with keepalive acks arriving at least
+        // every ~1.25s on a healthy path (and input at frame rate on the active one), a candidate not
+        // heard from in this long has very likely died — fail input over to a sibling that is still
+        // answering instead of waiting out the full alive window on a black hole.
+        private const int FreshWindowMs = 2500;
 
         private readonly Socket _socket;
         private readonly ConcurrentQueue<byte[]> _inbound = new ConcurrentQueue<byte[]>();
         private readonly Thread _rxThread;
         private readonly Thread _punchThread;
         private volatile bool _running = true;
-        private volatile IPEndPoint[] _peers = Array.Empty<IPEndPoint>();
+        private volatile RouteTable _routeTable = RouteTable.Empty;
+
+        /// <summary>An immutable routing snapshot, atomically replaced when rendezvous data changes.</summary>
+        private sealed class RouteTable
+        {
+            public static readonly RouteTable Empty =
+                new RouteTable(Array.Empty<PeerRoute>(), Array.Empty<IPEndPoint>());
+
+            private readonly Dictionary<IPEndPoint, IPEndPoint> _knownEndpoints;
+
+            public RouteTable(PeerRoute[] routes, IPEndPoint[] endpoints)
+            {
+                Routes = routes;
+                Endpoints = endpoints;
+                _knownEndpoints = new Dictionary<IPEndPoint, IPEndPoint>();
+                foreach (var endpoint in endpoints) _knownEndpoints[endpoint] = endpoint;
+            }
+
+            public PeerRoute[] Routes { get; }
+            public IPEndPoint[] Endpoints { get; }
+
+            public bool TryResolve(IPEndPoint endpoint, out IPEndPoint known) =>
+                _knownEndpoints.TryGetValue(endpoint, out known!);
+        }
 
         // Per-candidate liveness: endpoint -> last time we heard anything back from it (stopwatch ms).
         private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new ConcurrentDictionary<IPEndPoint, long>();
         private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new ConcurrentDictionary<IPEndPoint, long>();
         private readonly ConcurrentDictionary<IPEndPoint, double> _rtt = new ConcurrentDictionary<IPEndPoint, double>();
+        // Last candidate input was actually sent through, per logical peer — the failover anchor
+        // while a repunch has the liveness table cleared.
+        private readonly ConcurrentDictionary<int, IPEndPoint> _lastSelected = new ConcurrentDictionary<int, IPEndPoint>();
         private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
 
         // Reflexive-address discovery: while a request is pending, the receive loop watches for the STUN
@@ -75,26 +106,85 @@ namespace BizHawkNetplay.Core.Net
 
         public static MeshUdpTransport Bind(int localPort) => new MeshUdpTransport(localPort);
 
-        /// <summary>Set the full set of peer endpoints (IP + UDP port) to send to and accept from. Adding
-        /// a new candidate arms the punch loop for it; dropped candidates stop being probed.</summary>
+        /// <summary>
+        /// Compatibility API for callers that have a flat endpoint list. Every unique endpoint is treated
+        /// as its own logical peer, preserving the old send-to-every-endpoint behavior.
+        /// </summary>
         public void SetPeers(IEnumerable<IPEndPoint> peers)
         {
             if (peers == null) throw new ArgumentNullException(nameof(peers));
-            var arr = peers.ToArray();
-            _peers = arr;
-            // Forget liveness for candidates no longer in the set (a rejoin can change addresses).
-            var keep = new HashSet<IPEndPoint>(arr);
+            var routes = new List<PeerRoute>();
+            var seen = new HashSet<IPEndPoint>();
+            int remotePort = 0;
+            foreach (var endpoint in peers)
+            {
+                if (endpoint == null)
+                    throw new ArgumentException("Peer endpoints cannot contain null", nameof(peers));
+                if (seen.Add(endpoint))
+                    routes.Add(new PeerRoute(remotePort++, new[] { endpoint }));
+            }
+            SetPeerRoutes(routes);
+        }
+
+        /// <summary>
+        /// Replace the logical peer routes. Candidates are de-duplicated globally as well as within each
+        /// route, so an endpoint advertised twice is probed and sent to only once. Repeated entries for the
+        /// same remote port are merged in their original order.
+        /// </summary>
+        public void SetPeerRoutes(IEnumerable<PeerRoute> routes)
+        {
+            if (routes == null) throw new ArgumentNullException(nameof(routes));
+
+            var portOrder = new List<int>();
+            var candidatesByPort = new Dictionary<int, List<IPEndPoint>>();
+            var endpoints = new List<IPEndPoint>();
+            var globallySeen = new HashSet<IPEndPoint>();
+            foreach (var route in routes)
+            {
+                if (route == null)
+                    throw new ArgumentException("Peer routes cannot contain null", nameof(routes));
+                if (!candidatesByPort.TryGetValue(route.RemotePort, out var candidates))
+                {
+                    candidates = new List<IPEndPoint>();
+                    candidatesByPort.Add(route.RemotePort, candidates);
+                    portOrder.Add(route.RemotePort);
+                }
+                foreach (var endpoint in route.Candidates)
+                {
+                    if (!globallySeen.Add(endpoint)) continue;
+                    candidates.Add(endpoint);
+                    endpoints.Add(endpoint);
+                }
+            }
+
+            var normalized = new PeerRoute[portOrder.Count];
+            for (int i = 0; i < normalized.Length; i++)
+            {
+                int port = portOrder[i];
+                normalized[i] = new PeerRoute(port, candidatesByPort[port]);
+            }
+
+            _routeTable = new RouteTable(normalized, endpoints.ToArray());
+
+            // Forget telemetry for candidates no longer in the set (a rejoin can change addresses).
+            var keep = new HashSet<IPEndPoint>(endpoints);
             foreach (var k in _alive.Keys.ToArray()) if (!keep.Contains(k)) _alive.TryRemove(k, out _);
             foreach (var k in _lastPunch.Keys.ToArray()) if (!keep.Contains(k)) _lastPunch.TryRemove(k, out _);
             foreach (var k in _rtt.Keys.ToArray()) if (!keep.Contains(k)) _rtt.TryRemove(k, out _);
+            foreach (var kv in _lastSelected.ToArray()) if (!keep.Contains(kv.Value)) _lastSelected.TryRemove(kv.Key, out _);
         }
 
         public void Send(byte[] datagram)
         {
             if (datagram == null) throw new ArgumentNullException(nameof(datagram));
             var framed = Frame(TInput, datagram);
-            var peers = _peers;
-            foreach (var p in peers) SendFramed(framed, p);
+            var table = _routeTable;
+            long now = Clock.ElapsedMilliseconds;
+            foreach (var route in table.Routes)
+            {
+                var endpoint = SelectSendCandidate(route, now);
+                if (endpoint != null) SendFramed(framed, endpoint);
+            }
         }
 
         public bool TryReceive(out byte[] datagram) => _inbound.TryDequeue(out datagram!);
@@ -102,7 +192,10 @@ namespace BizHawkNetplay.Core.Net
         /// <summary>True if this candidate endpoint has answered a probe or sent input recently — i.e. a
         /// direct UDP path to it is currently open.</summary>
         public bool IsEndpointAlive(IPEndPoint endpoint)
-            => endpoint != null && _alive.TryGetValue(endpoint, out var t) && Clock.ElapsedMilliseconds - t < AliveWindowMs;
+            => endpoint != null && IsEndpointAlive(endpoint, Clock.ElapsedMilliseconds);
+
+        private bool IsEndpointAlive(IPEndPoint endpoint, long now) =>
+            _alive.TryGetValue(endpoint, out var t) && now - t < AliveWindowMs;
 
         /// <summary>
         /// Smoothed round-trip time to a candidate, measured by the timestamped punch/ack exchange — i.e.
@@ -118,26 +211,96 @@ namespace BizHawkNetplay.Core.Net
             return true;
         }
 
-        /// <summary>The worst measured RTT over the endpoints with a live path; false if none measured.</summary>
+        /// <summary>
+        /// Select each logical peer's lowest-RTT live candidate, then return the worst of those per-peer
+        /// paths. Measurements for dead/stale candidates are deliberately excluded.
+        /// </summary>
         public bool TryGetWorstRttMs(out double rttMs)
         {
             rttMs = -1;
-            foreach (var p in _peers)
-                if (_rtt.TryGetValue(p, out double v) && v > rttMs) rttMs = v;
+            long now = Clock.ElapsedMilliseconds;
+            foreach (var route in _routeTable.Routes)
+            {
+                // A partial maximum is dangerously optimistic: one fast measured player must not
+                // hide another logical peer whose UDP path has no live RTT yet. Let the caller fall
+                // back to its complete TCP-per-peer sample set until every route is represented.
+                if (route.Candidates.Count == 0 || !TryGetBestLiveRtt(route, now, out double peerRtt))
+                {
+                    rttMs = -1;
+                    return false;
+                }
+                if (peerRtt > rttMs) rttMs = peerRtt;
+            }
             return rttMs >= 0;
         }
 
-        private void RecordRtt(IPEndPoint endpoint, double sample)
+        internal void RecordRtt(IPEndPoint endpoint, double sample)
         {
             // Same EMA shape as the control-channel ping, so the two readings are comparable.
             _rtt.AddOrUpdate(endpoint, sample, (_, prev) => 0.8 * prev + 0.2 * sample);
+        }
+
+        private IPEndPoint? SelectSendCandidate(PeerRoute route, long now)
+        {
+            IPEndPoint? firstFresh = null, bestFresh = null;
+            IPEndPoint? firstLive = null, bestLive = null;
+            double bestFreshRtt = double.MaxValue, bestLiveRtt = double.MaxValue;
+            foreach (var endpoint in route.Candidates)
+            {
+                if (!_alive.TryGetValue(endpoint, out var heard) || now - heard >= AliveWindowMs) continue;
+                bool fresh = now - heard < FreshWindowMs;
+                if (firstLive == null) firstLive = endpoint;
+                if (fresh && firstFresh == null) firstFresh = endpoint;
+                if (_rtt.TryGetValue(endpoint, out double rtt) && rtt >= 0)
+                {
+                    if (rtt < bestLiveRtt) { bestLiveRtt = rtt; bestLive = endpoint; }
+                    if (fresh && rtt < bestFreshRtt) { bestFreshRtt = rtt; bestFresh = endpoint; }
+                }
+            }
+
+            // Prefer candidates heard from RECENTLY. A path that dies mid-session keeps its (stale,
+            // low) RTT and stays inside the alive window for a while; if a sibling candidate is still
+            // answering keepalives, input must move there rather than stay pinned to a black hole
+            // until the alive window finally expires — which races the UDP-lost session watchdog.
+            var chosen = bestFresh ?? firstFresh ?? bestLive ?? firstLive;
+            if (chosen != null)
+            {
+                _lastSelected[route.RemotePort] = chosen;
+                return chosen;
+            }
+
+            // Nothing is confirmed right now (start-up, or a repunch just cleared the liveness table).
+            // Keep sending along the last path that actually worked: for an internet peer the first
+            // advertised candidate is typically the pre-NAT address, which is exactly the one that
+            // does NOT work when the reflexive path was carrying the session.
+            if (_lastSelected.TryGetValue(route.RemotePort, out var last) && route.Candidates.Contains(last))
+                return last;
+
+            // Before punching has ever confirmed anything, preserve deterministic forward progress
+            // through the first advertised candidate.
+            return route.Candidates.Count > 0 ? route.Candidates[0] : null;
+        }
+
+        private bool TryGetBestLiveRtt(PeerRoute route, long now, out double bestRtt)
+        {
+            bestRtt = double.MaxValue;
+            bool found = false;
+            foreach (var endpoint in route.Candidates)
+            {
+                if (!IsEndpointAlive(endpoint, now)) continue;
+                if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
+                if (rtt < bestRtt) bestRtt = rtt;
+                found = true;
+            }
+            if (!found) bestRtt = 0;
+            return found;
         }
 
         /// <summary>Snapshot of the candidate endpoints with a currently-open direct path.</summary>
         public IReadOnlyList<IPEndPoint> AliveEndpoints()
         {
             long now = Clock.ElapsedMilliseconds;
-            return _alive.Where(kv => now - kv.Value < AliveWindowMs).Select(kv => kv.Key).ToArray();
+            return _routeTable.Endpoints.Where(endpoint => IsEndpointAlive(endpoint, now)).ToArray();
         }
 
         /// <summary>Forget the current path confirmations and make the punch loop probe every candidate
@@ -146,6 +309,21 @@ namespace BizHawkNetplay.Core.Net
         {
             _alive.Clear();
             _lastPunch.Clear();
+        }
+
+        /// <summary>Forget confirmations only for one logical peer. Healthy routes keep their chosen
+        /// failover candidate while the silent peer is re-probed.</summary>
+        public void RequestRepunch(int remotePort)
+        {
+            foreach (var route in _routeTable.Routes)
+            {
+                if (route.RemotePort != remotePort) continue;
+                foreach (var endpoint in route.Candidates)
+                {
+                    _alive.TryRemove(endpoint, out _);
+                    _lastPunch.TryRemove(endpoint, out _);
+                }
+            }
         }
 
         /// <summary>
@@ -158,19 +336,23 @@ namespace BizHawkNetplay.Core.Net
             int perServer = Math.Max(400, (int)(timeout.TotalMilliseconds / StunClient.Servers.Length));
             foreach (var (host, port) in StunClient.Servers)
             {
+                if (!_running) return null;
                 var server = StunClient.ResolveV4(host, port);
                 if (server == null) continue;
 
                 var req = StunClient.BuildRequest(out var txn);
-                _reflexive = null;
-                _stunEvent.Reset();
-                _pendingStunTxn = txn;
-                try { _socket.SendTo(req, server); }
-                catch { _pendingStunTxn = null; continue; }
-
-                bool got = _stunEvent.Wait(perServer);
-                _pendingStunTxn = null;
-                if (got && _reflexive != null) return _reflexive;
+                try
+                {
+                    _reflexive = null;
+                    _stunEvent.Reset();
+                    _pendingStunTxn = txn;
+                    _socket.SendTo(req, server);
+                    bool got = _stunEvent.Wait(perServer);
+                    if (got && _reflexive != null) return _reflexive;
+                }
+                catch (ObjectDisposedException) { return null; }
+                catch (SocketException) { if (!_running) return null; }
+                finally { _pendingStunTxn = null; }
             }
             return null;
         }
@@ -182,8 +364,8 @@ namespace BizHawkNetplay.Core.Net
                 try
                 {
                     long now = Clock.ElapsedMilliseconds;
-                    var peers = _peers;
-                    foreach (var p in peers)
+                    var endpoints = _routeTable.Endpoints;
+                    foreach (var p in endpoints)
                     {
                         bool alive = IsEndpointAlive(p);
                         // Probe aggressively until confirmed, then just often enough to hold the mapping.
@@ -233,10 +415,8 @@ namespace BizHawkNetplay.Core.Net
                 if (buffer[4] != Version) continue;
                 byte type = buffer[5];
 
-                var peers = _peers;
-                IPEndPoint? known = null;
-                for (int i = 0; i < peers.Length; i++) if (peers[i].Equals(from)) { known = peers[i]; break; }
-                if (known == null) continue; // pin to known peers (blocks off-path input)
+                var source = (IPEndPoint)from;
+                if (!_routeTable.TryResolve(source, out var known)) continue; // pin to known peers
 
                 _alive[known] = Clock.ElapsedMilliseconds; // any framed packet proves the path is up
 

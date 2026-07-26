@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Text;
+using BizHawkNetplay.Core.Net;
+using BizHawkNetplay.Core.Probe;
 
 namespace BizHawkNetplay.Core.Session
 {
@@ -15,8 +18,8 @@ namespace BizHawkNetplay.Core.Session
     public sealed class SessionParams
     {
         public SessionParams(SyncMode mode, int inputDelay, int localPort, int remotePort,
-            int remoteUdpPort, byte[]? initialState, int playerCount = 2,
-            IReadOnlyList<IPEndPoint>? meshPeers = null)
+            int remoteUdpPort, byte[]? initialState, SessionGeneration generation,
+            int playerCount = 2, IReadOnlyList<PeerRoute>? peerRoutes = null)
         {
             Mode = mode;
             InputDelay = inputDelay;
@@ -24,8 +27,21 @@ namespace BizHawkNetplay.Core.Session
             RemotePort = remotePort;
             RemoteUdpPort = remoteUdpPort;
             InitialState = initialState;
+            Generation = generation.IsValid
+                ? generation
+                : throw new ArgumentException("A valid session generation is required", nameof(generation));
             PlayerCount = playerCount;
-            MeshPeers = meshPeers ?? Array.Empty<IPEndPoint>();
+            var routes = peerRoutes == null ? new List<PeerRoute>() : new List<PeerRoute>(peerRoutes);
+            PeerRoutes = routes.AsReadOnly();
+
+            // Compatibility projection for callers not yet route-aware. PeerRoutes is canonical: unlike
+            // this flattened view it preserves which fallback candidates belong to which remote player.
+            var endpoints = new List<IPEndPoint>();
+            var seen = new HashSet<IPEndPoint>();
+            foreach (var route in routes)
+                foreach (var candidate in route.Candidates)
+                    if (seen.Add(candidate)) endpoints.Add(candidate);
+            MeshPeers = endpoints.AsReadOnly();
         }
 
         public SyncMode Mode { get; }
@@ -41,6 +57,14 @@ namespace BizHawkNetplay.Core.Session
 
         /// <summary>Whole-core state to import before starting; null for the host (it keeps its own).</summary>
         public byte[]? InitialState { get; }
+
+        /// <summary>The input timeline accepted by this session. It changes on every resync/reconnect.</summary>
+        public SessionGeneration Generation { get; }
+
+        /// <summary>Candidate UDP endpoints grouped by the remote controller port they reach. For a
+        /// joiner these are the other joiners; the host/control peer remains described by
+        /// <see cref="RemotePort"/> and <see cref="RemoteUdpPort"/>.</summary>
+        public IReadOnlyList<PeerRoute> PeerRoutes { get; }
 
         /// <summary>The OTHER peers' UDP endpoints for the direct input mesh (excludes self and the host,
         /// which the joiner reaches at the address it connected to). Empty for a 2-player session.</summary>
@@ -59,7 +83,20 @@ namespace BizHawkNetplay.Core.Session
         /// <summary>Host side: accept a joiner, transfer initial state, agree on parameters.</summary>
         public static SessionParams RunHost(
             ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs,
-            byte[] hostState, int localUdpPort)
+            byte[] hostState, int localUdpPort, Action<SessionParams>? beforeGo = null,
+            bool forceHostRollback = false,
+            Func<ControlChannel, SyncMode, int, int>? selectInputDelay = null)
+            => RunHost(channel, hostId, hostPrefs, hostState, localUdpPort,
+                new SessionGeneration(SessionAuth.NewSessionId(), epoch: 1), beforeGo: beforeGo,
+                forceHostRollback: forceHostRollback, selectInputDelay: selectInputDelay);
+
+        /// <summary>Host side with an explicit input-timeline generation.</summary>
+        public static SessionParams RunHost(
+            ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs,
+            byte[] hostState, int localUdpPort, SessionGeneration generation,
+            IEnumerable<PeerRoute>? peerRoutes = null, Action<SessionParams>? beforeGo = null,
+            bool forceHostRollback = false,
+            Func<ControlChannel, SyncMode, int, int>? selectInputDelay = null)
         {
             var hostNonce = SessionAuth.NewNonce();
             channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, localUdpPort, hostNonce));
@@ -76,20 +113,42 @@ namespace BizHawkNetplay.Core.Session
                 throw new HandshakeException(result.RejectReason ?? "rejected");
             }
 
+            // A forced host may bypass only its own probe recommendation. The remote still has to opt
+            // into rollback and advertise a viable measured depth; otherwise WELCOME remains lockstep.
+            if (forceHostRollback && hostPrefs.WantRollback && clientPrefs.WantRollback
+                && clientId.MaxRollbackDepth >= ProbeResult.RollbackDepthThreshold)
+                result = NegotiationResult.Accept(SyncMode.Rollback, result.InputDelay);
+
             // Verify the session password (nonce challenge-response) before transferring any state.
             VerifyPassword(channel, hostPrefs.Password, hostNonce, joinNonce, isHost: true);
 
-            // Host owns port 0; transfer the reference state, then release the synchronized start.
-            channel.Send(ControlMessageType.State, hostState ?? Array.Empty<byte>());
-            channel.Send(ControlMessageType.Start, Array.Empty<byte>());
+            int finalDelay = result.InputDelay;
+            if (selectInputDelay != null)
+            {
+                // The callback may raise the negotiated floor from a pre-WELCOME lobby measurement,
+                // but it may never undo a peer's explicit request or exceed the wire safety bound.
+                int selected = selectInputDelay(channel, result.Mode, result.InputDelay);
+                finalDelay = Math.Max(result.InputDelay,
+                    Math.Min(HandshakeCodec.MaxInputDelay, Math.Max(1, selected)));
+            }
 
-            return new SessionParams(result.Mode, result.InputDelay, localPort: 0, remotePort: 1,
-                remoteUdpPort: clientUdpPort, initialState: null);
+            // Host owns port 0. The joiner must apply the state and rebuild for this generation before
+            // acknowledging READY; only then does GO release the shared frame clock.
+            HostSendWelcome(channel, assignedPort: 1, playerCount: 2, finalDelay, result.Mode,
+                hostState, generation, peerRoutes);
+            HostWaitReady(channel, generation);
+            var session = new SessionParams(result.Mode, finalDelay, localPort: 0, remotePort: 1,
+                remoteUdpPort: clientUdpPort, initialState: null, generation);
+            beforeGo?.Invoke(session);
+            HostSendGo(channel, generation);
+
+            return session;
         }
 
         /// <summary>Client side: join a host, receive initial state, agree on parameters.</summary>
         public static SessionParams RunClient(
-            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort)
+            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
+            Action<SessionParams>? beforeReady = null, Action? afterGreet = null)
         {
             var joinNonce = SessionAuth.NewNonce();
             channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
@@ -108,22 +167,9 @@ namespace BizHawkNetplay.Core.Session
 
             // Prove we know the session password (and verify the host does too) before taking any state.
             VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
+            afterGreet?.Invoke();
 
-            byte[]? initialState = null;
-            while (true)
-            {
-                var (t, b) = channel.Receive();
-                if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
-                if (t == ControlMessageType.State) { initialState = b; continue; }
-                if (t == ControlMessageType.Start) break;
-                throw new HandshakeException($"unexpected control frame during start: {t}");
-            }
-            if (initialState == null)
-                throw new HandshakeException("host never sent the initial state");
-
-            // Client owns port 1.
-            return new SessionParams(result.Mode, result.InputDelay, localPort: 1, remotePort: 0,
-                remoteUdpPort: hostUdpPort, initialState);
+            return ReceiveStartData(channel, hostUdpPort, beforeReady);
         }
 
         /// <summary>
@@ -171,7 +217,8 @@ namespace BizHawkNetplay.Core.Session
         // The 3–4 player flow splits the host side into per-joiner steps the caller orchestrates:
         // greet every joiner first (so all identities are validated and the authoritative input
         // delay = max over everyone is known), then send each a Welcome carrying its assigned port,
-        // the player count and the final delay, followed by the shared initial state and Start.
+        // the player count, final delay, generation and grouped routes, followed by the shared state.
+        // Every joiner applies that data before acknowledging READY; GO releases all of them together.
 
         /// <summary>Info a host records about one joiner after the HELLO exchange.</summary>
         public sealed class JoinerGreeting
@@ -216,41 +263,78 @@ namespace BizHawkNetplay.Core.Session
         }
 
         /// <summary>
-        /// Host, per joiner: send the assignment (port, player count, final delay, mode), the direct-mesh
-        /// peer endpoints (every OTHER joiner's UDP ip:port; empty for 2P), the initial state, and Start.
+        /// Measure the settled round-trip time of an authenticated lobby control link before WELCOME.
+        /// The client-side start loop echoes these probes while it waits. Median filtering keeps one
+        /// scheduler/TCP spike from permanently adding another frame of input latency.
+        /// </summary>
+        public static double MeasureLobbyRoundTrip(ControlChannel channel, int samples = 5)
+        {
+            if (channel == null) throw new ArgumentNullException(nameof(channel));
+            if (samples < 1 || samples > 20) throw new ArgumentOutOfRangeException(nameof(samples));
+
+            var measured = new double[samples];
+            for (int i = 0; i < samples; i++)
+            {
+                long token = Stopwatch.GetTimestamp() ^ ((long)i << 48);
+                var body = BitConverter.GetBytes(token);
+                var timer = Stopwatch.StartNew();
+                channel.Send(ControlMessageType.Ping, body);
+                var (type, reply) = channel.Receive();
+                timer.Stop();
+
+                if (type == ControlMessageType.Error)
+                    throw new HandshakeException(Encoding.UTF8.GetString(reply));
+                if (type != ControlMessageType.Pong || reply.Length != 8
+                    || BitConverter.ToInt64(reply, 0) != token)
+                    throw new HandshakeException($"expected lobby PONG from joiner, got {type}");
+                measured[i] = timer.Elapsed.TotalMilliseconds;
+            }
+
+            Array.Sort(measured);
+            int middle = measured.Length / 2;
+            return measured.Length % 2 == 0
+                ? (measured[middle - 1] + measured[middle]) / 2.0
+                : measured[middle];
+        }
+
+        /// <summary>
+        /// Host, per joiner: send the assignment, generation, grouped routes for every OTHER joiner,
+        /// and initial state, then request an apply-complete READY acknowledgement.
         /// </summary>
         public static void HostSendWelcome(
             ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
-            IEnumerable<IPEndPoint>? meshPeers = null, bool useReadyBarrier = false)
+            SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
         {
-            channel.Send(ControlMessageType.Welcome, HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode));
-            channel.Send(ControlMessageType.PeerList, HandshakeCodec.EncodeEndpoints(meshPeers ?? Array.Empty<IPEndPoint>()));
+            channel.Send(ControlMessageType.Welcome,
+                HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes));
             channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
-            channel.Send(useReadyBarrier ? ControlMessageType.Ready : ControlMessageType.Start, Array.Empty<byte>());
+            channel.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(generation));
         }
 
-        /// <summary>Host side of the multi-peer barrier: wait until this joiner has received all start
-        /// data and acknowledged READY. Emulator state import still occurs on the joiner's UI thread
-        /// after the handshake returns, so GO aligns network release rather than claiming zero setup time.</summary>
-        public static void HostWaitReady(ControlChannel channel)
+        /// <summary>Host side of the apply barrier: wait until this joiner imported the state and rebuilt
+        /// its driver for <paramref name="generation"/>.</summary>
+        public static void HostWaitReady(ControlChannel channel, SessionGeneration generation)
         {
             var (type, body) = channel.Receive();
             if (type == ControlMessageType.Error)
                 throw new HandshakeException(Encoding.UTF8.GetString(body));
             if (type != ControlMessageType.Ready)
                 throw new HandshakeException($"expected READY from joiner, got {type}");
+            RequireGeneration(ControlMessageType.Ready, body, generation);
         }
 
         /// <summary>Release one joiner after every participant has reached READY.</summary>
-        public static void HostSendGo(ControlChannel channel)
-            => channel.Send(ControlMessageType.Go, Array.Empty<byte>());
+        public static void HostSendGo(ControlChannel channel, SessionGeneration generation)
+            => channel.Send(ControlMessageType.Go, HandshakeCodec.EncodeGeneration(generation));
 
         /// <summary>
         /// Client (N-player): send HELLO, validate the host's HELLO, then take the authoritative
-        /// assignment from WELCOME (port/players/delay), receive the initial state, and wait for Start.
+        /// assignment/generation/routes from WELCOME, receive and apply the initial state, acknowledge
+        /// READY, and wait for generation-matching GO.
         /// </summary>
         public static SessionParams RunClientMulti(
-            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort)
+            ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
+            Action<SessionParams>? beforeReady = null, Action? afterGreet = null)
         {
             var joinNonce = SessionAuth.NewNonce();
             channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
@@ -268,37 +352,98 @@ namespace BizHawkNetplay.Core.Session
 
             // Prove we know the session password (and verify the host does too) before the Welcome flow.
             VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
+            afterGreet?.Invoke();
 
-            int assignedPort = 1, playerCount = 2, delay = result.InputDelay;
-            SyncMode mode = result.Mode;
+            return ReceiveStartData(channel, hostUdpPort, beforeReady);
+        }
+
+        /// <summary>Receive the authoritative WELCOME and state, let the caller apply them, acknowledge
+        /// that exact generation, then remain blocked until the host releases the same generation.</summary>
+        private static SessionParams ReceiveStartData(
+            ControlChannel channel, int hostUdpPort, Action<SessionParams>? beforeReady)
+        {
+            int assignedPort = 0, playerCount = 0, delay = 0;
+            SyncMode mode = SyncMode.Lockstep;
+            SessionGeneration generation = default;
+            IReadOnlyList<PeerRoute> peerRoutes = Array.Empty<PeerRoute>();
             byte[]? initialState = null;
-            IReadOnlyList<IPEndPoint> meshPeers = Array.Empty<IPEndPoint>();
+            bool haveWelcome = false;
+            bool readySent = false;
+            SessionParams? session = null;
+
             while (true)
             {
-                var (t, b) = channel.Receive();
-                if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
-                if (t == ControlMessageType.Welcome)
+                var (type, body) = channel.Receive();
+                if (type == ControlMessageType.Error)
+                    throw new HandshakeException(Encoding.UTF8.GetString(body));
+                if (type == ControlMessageType.Ping)
                 {
-                    (assignedPort, playerCount, delay, mode) = HandshakeCodec.DecodeWelcome(b);
+                    if (body.Length != 8)
+                        throw new HandshakeException("invalid lobby PING body");
+                    channel.Send(ControlMessageType.Pong, body);
                     continue;
                 }
-                if (t == ControlMessageType.PeerList) { meshPeers = HandshakeCodec.DecodeEndpoints(b); continue; }
-                if (t == ControlMessageType.State) { initialState = b; continue; }
-                if (t == ControlMessageType.Ready)
+                if (type == ControlMessageType.Welcome)
                 {
+                    if (haveWelcome) throw new HandshakeException("host sent WELCOME more than once");
+                    try
+                    {
+                        (assignedPort, playerCount, delay, mode, generation, peerRoutes) =
+                            HandshakeCodec.DecodeWelcome(body);
+                    }
+                    catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
+                    {
+                        throw new HandshakeException("invalid WELCOME: " + ex.Message);
+                    }
+                    haveWelcome = true;
+                    continue;
+                }
+                if (type == ControlMessageType.State)
+                {
+                    if (initialState != null) throw new HandshakeException("host sent STATE more than once");
+                    initialState = body;
+                    continue;
+                }
+                if (type == ControlMessageType.Ready)
+                {
+                    if (readySent) throw new HandshakeException("host requested READY more than once");
+                    if (!haveWelcome) throw new HandshakeException("host requested READY before sending WELCOME");
                     if (initialState == null) throw new HandshakeException("host requested READY before sending state");
-                    channel.Send(ControlMessageType.Ready, Array.Empty<byte>());
+                    RequireGeneration(ControlMessageType.Ready, body, generation);
+
+                    session = new SessionParams(mode, delay, localPort: assignedPort, remotePort: 0,
+                        remoteUdpPort: hostUdpPort, initialState, generation, playerCount, peerRoutes);
+                    beforeReady?.Invoke(session);
+                    channel.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(generation));
+                    readySent = true;
                     continue;
                 }
-                if (t == ControlMessageType.Go) break;
-                if (t == ControlMessageType.Start) break;
-                throw new HandshakeException($"unexpected control frame during start: {t}");
+                if (type == ControlMessageType.Go)
+                {
+                    if (!readySent || session == null)
+                        throw new HandshakeException("host sent GO before the client acknowledged READY");
+                    RequireGeneration(ControlMessageType.Go, body, generation);
+                    return session;
+                }
+                throw new HandshakeException($"unexpected control frame during start: {type}");
             }
-            if (initialState == null)
-                throw new HandshakeException("host never sent the initial state");
+        }
 
-            return new SessionParams(mode, delay, localPort: assignedPort, remotePort: 0,
-                remoteUdpPort: hostUdpPort, initialState, playerCount, meshPeers);
+        private static void RequireGeneration(
+            ControlMessageType messageType, byte[] body, SessionGeneration expected)
+        {
+            SessionGeneration actual;
+            try
+            {
+                actual = HandshakeCodec.DecodeGeneration(body);
+            }
+            catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
+            {
+                throw new HandshakeException($"invalid {messageType.ToString().ToUpperInvariant()} generation: {ex.Message}");
+            }
+            if (actual != expected)
+                throw new HandshakeException(
+                    $"{messageType.ToString().ToUpperInvariant()} generation mismatch: expected {expected}, got {actual}");
         }
     }
 }

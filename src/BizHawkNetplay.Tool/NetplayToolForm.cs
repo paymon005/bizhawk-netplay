@@ -28,7 +28,7 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        private const int Protocol = 4; // v4 replaces the password hash with a nonce challenge-response (SessionAuth)
+        private const int Protocol = 6; // v6 adds pre-WELCOME lobby RTT probing + automatic delay selection
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
@@ -46,6 +46,8 @@ namespace BizHawkNetplay.Tool
         private NumericUpDown _playersBox = null!;
         private Label _playersHint = null!;
         private NumericUpDown _delayBox = null!;
+        private CheckBox _autoDelayCheck = null!;
+        private NumericUpDown _autoDelayMaxBox = null!;
         private Button _goButton = null!;
         private Button _disconnectButton = null!;
         private Button _probeButton = null!;
@@ -76,6 +78,7 @@ namespace BizHawkNetplay.Tool
         private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
         private bool _loadingSettings;                  // suppress change-handler saves while applying loaded prefs
         private string? _pendingJoinIp;                 // regular-join IP awaiting a successful connect, then recorded
+        private int _connectionAttempt;                 // invalidates callbacks from canceled/replaced workers
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
         private bool _upnpEnabled;  // host: whether to attempt the UPnP auto-forward (captured from the checkbox)
@@ -101,10 +104,14 @@ namespace BizHawkNetplay.Tool
             public readonly AutoResetEvent OutboundSignal = new AutoResetEvent(false);
             public volatile bool WriterRunning;
             public long QueuedBytes;
+            public int Attempt;               // connection-attempt token for stale reader/writer callbacks
             public double PingMs = -1;        // guarded by _pingLock
             public int PingCount;             // guarded by _pingLock
-            public long LastRecvTicks;        // UtcNow.Ticks of the last message from this peer (Interlocked)
+            public long LastRecvTicks;        // Stopwatch ticks of the last message from this peer (Interlocked)
             public volatile bool ResyncReceiving; // large inbound state frame is allowed to exceed ping timeout
+            public int ReceivingResyncEpoch;      // expected generation while ResyncReceiving is true
+            public int ReceivingResyncBytes;      // declared state size, checked against the completed frame
+            public long ResyncReceiveDeadlineTicks; // bounds BEGIN-without-a-complete-state stalls
             public long TimeoutGraceUntilTicks;   // we sent this peer a whole state: its reader is busy consuming
                                                   // that frame and can't pong until it lands (Interlocked)
             // Frame-advantage exchange (ControlMessageType.Pacing), guarded by _pingLock. Advantage
@@ -113,6 +120,10 @@ namespace BizHawkNetplay.Tool
             public int LocalAdvantage;            // our frame minus theirs, as of their last report
             public int RemoteAdvantage;           // the same quantity as they measured it
             public bool AdvantageKnown;           // false until a peer on a build that reports has answered
+            public int PacingSendSequence;         // our monotonically increasing wire sample id
+            public int LastReceivedPacingSequence; // peer sample most recently incorporated
+            public int AwaitingAppliedEpoch;       // host barrier: non-zero until this peer applies that epoch
+            public long AppliedDeadlineTicks;      // bounds a peer that stays alive but never applies state
             public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
             public string Label = "";
         }
@@ -128,11 +139,52 @@ namespace BizHawkNetplay.Tool
             public Action<bool>? Completed { get; }
         }
 
+        /// <summary>
+        /// A socket receive timeout applies to each individual read, so a peer can otherwise keep a
+        /// greeting alive forever by sending one byte just before every timeout. This timer bounds the
+        /// whole authentication phase and closes the socket to unblock a pending read at the deadline.
+        /// </summary>
+        private sealed class AbsoluteSocketDeadline : IDisposable
+        {
+            private readonly TcpClient _tcp;
+            private readonly System.Threading.Timer _timer;
+            // 0 = armed, 1 = completed/disarmed, 2 = expired and owns closing the socket.
+            private int _state;
+
+            public AbsoluteSocketDeadline(TcpClient tcp, int timeoutMs)
+            {
+                _tcp = tcp;
+                _timer = new System.Threading.Timer(_ => Expire(), null, timeoutMs, Timeout.Infinite);
+            }
+
+            public bool Expired => Volatile.Read(ref _state) == 2;
+
+            public bool TryComplete()
+            {
+                int previous = Interlocked.CompareExchange(ref _state, 1, 0);
+                if (previous == 0)
+                    try { _timer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
+                return previous != 2;
+            }
+
+            private void Expire()
+            {
+                if (Interlocked.CompareExchange(ref _state, 2, 0) != 0) return;
+                try { _tcp.Close(); } catch { }
+            }
+
+            public void Dispose()
+            {
+                TryComplete();
+                try { _timer.Dispose(); } catch { }
+            }
+        }
+
         // --- Session state (all touched on the UI thread except where noted) ---
         private EmuHawkAdapter? _adapter;
         private ITransport? _transport;        // the FrameDriver's input channel (see below)
         private MeshUdpTransport? _mesh;       // direct peer-to-peer UDP: host and joiners both send to all peers
-        private List<IPEndPoint> _meshOthers = new List<IPEndPoint>(); // joiner: the non-host peers in our mesh
+        private List<PeerRoute> _meshOthers = new List<PeerRoute>(); // joiner: grouped routes to non-host peers
 
         // UDP-punch path (2-player, no port-forwarding): one socket does STUN + hole-punch, then carries
         // both the reliable control channel and the input hot path. Set up in two steps (generate our
@@ -142,17 +194,27 @@ namespace BizHawkNetplay.Tool
         private PeerIdentity? _punchId;         // prepared handshake identity, captured when punch setup began
         private SessionPreferences? _punchPrefs;
         private byte[]? _punchState;            // host only: the initial state to transfer once punched
+        private bool _punchAutoDelay;
+        private int _punchAutoDelayMax;
+        private double _punchFrameMs;
         // volatile: the accept thread reads this as its teardown signal (null => Disconnect stopped us),
         // and it's written from the UI thread. Every other cross-thread field here is volatile too.
         private volatile TcpListener? _listener;
         private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
         private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
+        private readonly object _handshakeClientsLock = new object();
+        private readonly HashSet<TcpClient> _handshakeClients = new HashSet<TcpClient>();
+        private bool _rejectNewHandshakeClients; // guarded by _handshakeClientsLock; closes accept-vs-teardown race
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
+        private const int LobbyProbeSamples = 5;
+        private const int LobbyProbeTimeoutMs = 5000;
         private const int ConnLogMaxLines = 200; // connection-log history cap, trimmed back to ConnLogKeepLines
         private const int ConnLogKeepLines = 120;
         private const int LogMaxLines = 5000;    // Log-tab cap; generous (it's the diagnostic record) but bounded
         private const int LogKeepLines = 3000;   // ...so one trim covers 2000 appends
         private FrameDriver? _driver;
+        private bool _sessionDriverPrepared; // built/started before READY, activated only after GO
+        private byte[]? _preJoinRestoreState; // restored if pre-READY import never reaches GO
         private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
         private volatile bool _sessionActive;
@@ -160,24 +222,26 @@ namespace BizHawkNetplay.Tool
         private int _playerCount = 2;
         private int _localPort;    // our controller port, for rebuilding the driver on resync
         private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
-        private DateTime _lastResync = DateTime.MinValue; // debounces near-simultaneous resync triggers
+        private long _lastResyncStamp; // monotonic timestamp; debounces near-simultaneous resync triggers
         private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
         private const int MaxResyncs = 6;
         private const double ResyncGraceSeconds = 2.0;
         private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
-        // Rollback needs D >= 1 (the protocol's floor, and a frame of delay shrinks average rollback
-        // depth for free); beyond that you're paying latency prediction was already covering. 1 is the
-        // minimum felt delay the design allows — the trade is slightly deeper average rollbacks, which
-        // costs resim work rather than latency. Lockstep's D, by contrast, must cover the one-way link.
-        private const int RollbackComfortableDelay = 1;
+        // Delay is selected before WELCOME and then remains fixed. In rollback it trades local response
+        // time for shallower visual corrections; in lockstep it also prevents routine network stalls.
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private double _lastStallLogMs = double.NegativeInfinity;
         private bool _resyncInProgress;
+        private bool _resyncReleaseQueued;
+        private readonly object _generationLock = new object();
+        private SessionGeneration _generation = SessionGeneration.Legacy;
+        private readonly FrameAdvantageTracker _frameAdvantage = new FrameAdvantageTracker();
 
         // Desync detection: the host aggregates every peer's checksum for a frame (its own + each
         // joiner's); once it has them all it verifies they agree. Joiners just report to the host.
         private readonly object _hashLock = new object();
-        private readonly Dictionary<int, List<uint>> _frameHashes = new Dictionary<int, List<uint>>();
+        private readonly Dictionary<SessionGeneration, Dictionary<int, Dictionary<int, uint>>> _frameHashes =
+            new Dictionary<SessionGeneration, Dictionary<int, Dictionary<int, uint>>>();
 
         // Live round-trip time per control link, for connection-quality feedback.
         private readonly System.Diagnostics.Stopwatch _pingClock = new System.Diagnostics.Stopwatch();
@@ -191,7 +255,12 @@ namespace BizHawkNetplay.Tool
         private volatile bool _awaitingReconnect;
         private int _reconnectPort = -1;           // controller port waiting to be refilled
         private Thread? _reconnectThread;
-        private DateTime _reconnectStarted;
+        private long _reconnectStartedStamp;
+        private byte[]? _reconnectState; // authoritative baseline captured at the instant the peer drops
+        private SessionGeneration _reconnectGeneration;
+        private PeerLink? _pendingReconnectLink; // READY, but held outside _peers until every survivor applies
+        private int _pendingReconnectStateLength;
+        private SessionGeneration _pendingReconnectGeneration;
         private const double ReconnectTimeoutSeconds = 60.0;
         // Host session context stashed so a rejoiner can be re-greeted with the same identity/params.
         private PeerIdentity? _hostIdentity;
@@ -211,6 +280,8 @@ namespace BizHawkNetplay.Tool
         // mid-transfer (an N64 state is megabytes; on a weak uplink that is minutes, not seconds).
         private const double StateTransferGraceBaseSeconds = 10.0;   // read + import once it lands
         private const double StateTransferMinBytesPerSec = 200 * 1024; // pessimistic floor for the wire
+        private const int MaxResyncStateBytes = 64 * 1024 * 1024 - 12; // ControlChannel cap minus generation
+        private const int MaxResyncAnnouncementWaitSeconds = 300;
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
         private const double UdpRepunchAfterSeconds = 1.5;
         private const double UdpLostAfterSeconds = 8.0;
@@ -237,6 +308,7 @@ namespace BizHawkNetplay.Tool
         private const int MaxFramesPerTick = 2;  // WinForms callbacks can arrive ~25ms apart; one frame caps near 40fps
         private const double FrameTickWorkBudgetMs = 8.0;
         private double _nextFrameDueMs;
+        private double _recentCoreFrameMs; // conservative rolling cost used before committing a hidden first frame
         private bool _frameTickRunning;
         private double _lastUiRefreshMs = double.NegativeInfinity;
         private double _lastSlowTickLogMs = double.NegativeInfinity;
@@ -298,6 +370,9 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
+            // Closing the tool is also a Disconnect, including the pre-session lobby/state-transfer
+            // phase. Otherwise accepted sockets and the paused emulator outlive the disposed form.
+            try { EndSession("tool closed"); } catch { try { TeardownNetwork(); } catch { } }
             try { _tips.Dispose(); } catch { }
             base.OnFormClosed(e);
         }
@@ -349,6 +424,9 @@ namespace BizHawkNetplay.Tool
                 _portBox.Value = Clamp(_settings.Port, (int)_portBox.Minimum, (int)_portBox.Maximum);
                 _playersBox.Value = Clamp(_settings.Players, (int)_playersBox.Minimum, (int)_playersBox.Maximum);
                 _delayBox.Value = Clamp(_settings.Delay, (int)_delayBox.Minimum, (int)_delayBox.Maximum);
+                _autoDelayCheck.Checked = _settings.AutoDelay;
+                _autoDelayMaxBox.Value = Clamp(_settings.AutoDelayMax,
+                    (int)_autoDelayMaxBox.Minimum, (int)_autoDelayMaxBox.Maximum);
                 if (_settings.Netcode >= 0 && _settings.Netcode < _netcodeCombo.Items.Count)
                     _netcodeCombo.SelectedIndex = _settings.Netcode;
                 if (_settings.InputSource >= 0 && _settings.InputSource < _inputSourceCombo.Items.Count)
@@ -363,6 +441,8 @@ namespace BizHawkNetplay.Tool
             _portBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _playersBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _delayBox.ValueChanged += (_, __) => SaveSettingsFromUi();
+            _autoDelayCheck.CheckedChanged += (_, __) => { UpdateEnabled(); SaveSettingsFromUi(); };
+            _autoDelayMaxBox.ValueChanged += (_, __) => SaveSettingsFromUi();
             _netcodeCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
             _inputSourceCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
         }
@@ -406,6 +486,8 @@ namespace BizHawkNetplay.Tool
             _settings.Port = (int)_portBox.Value;
             _settings.Players = (int)_playersBox.Value;
             _settings.Delay = (int)_delayBox.Value;
+            _settings.AutoDelay = _autoDelayCheck.Checked;
+            _settings.AutoDelayMax = (int)_autoDelayMaxBox.Value;
             _settings.Netcode = _netcodeCombo.SelectedIndex;
             _settings.InputSource = _inputSourceCombo.SelectedIndex;
             _settings.Save();
@@ -464,12 +546,29 @@ namespace BizHawkNetplay.Tool
             var passwordHint = new Label { Text = "(optional; must match on both ends)", AutoSize = true, Location = new Point(248, 78), ForeColor = Color.DimGray };
 
             var delayLabel = new Label { Text = "Input delay:", AutoSize = true, Location = new Point(12, 110) };
-            // Default 1 — the protocol floor, so the tool starts at the least felt latency and the
-            // in-session hint tells you to raise it if your link actually needs more (see MaybeHintDelay).
+            // This is always honored as a manual floor. Auto may raise it before WELCOME, but never
+            // changes the running timeline or lowers a value explicitly requested by either player.
             _delayBox = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 1, Location = new Point(90, 107), Width = 50 };
+            _autoDelayCheck = new CheckBox
+            {
+                Text = "Auto from ping", AutoSize = true, Checked = true, Location = new Point(150, 109),
+            };
+            var autoDelayMaxLabel = new Label { Text = "Max:", AutoSize = true, Location = new Point(270, 110) };
+            _autoDelayMaxBox = new NumericUpDown
+            {
+                Minimum = 1, Maximum = 20, Value = 8, Location = new Point(306, 107), Width = 45,
+            };
+            _tips.SetToolTip(_delayBox,
+                "Fixed input delay, or the minimum when Auto is enabled.\r\n" +
+                "Each frame reduces typical rollback correction but adds one frame of local response time.");
+            _tips.SetToolTip(_autoDelayCheck,
+                "Host only: measure every player's lobby ping and choose delay before play starts.\r\n" +
+                "The chosen delay stays fixed for the entire session.");
+            _tips.SetToolTip(_autoDelayMaxBox,
+                "Largest delay Auto may choose. Explicit player delay requests are still honored.");
 
-            var netcodeSelLabel = new Label { Text = "Netcode:", AutoSize = true, Location = new Point(155, 110) };
-            _netcodeCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(215, 107), Width = 110 };
+            var netcodeSelLabel = new Label { Text = "Netcode:", AutoSize = true, Location = new Point(366, 110) };
+            _netcodeCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(426, 107), Width = 120 };
             _netcodeCombo.Items.AddRange(new object[] { "Automatic", "Rollback", "Lockstep" });
             _netcodeCombo.SelectedIndex = 0; // Automatic: rollback if the core qualifies, else lockstep
 
@@ -509,7 +608,8 @@ namespace BizHawkNetplay.Tool
             page.Controls.AddRange(new Control[]
             {
                 _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox, playersLabel, _playersBox, _playersHint,
-                passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox,
+                passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox, _autoDelayCheck,
+                autoDelayMaxLabel, _autoDelayMaxBox,
                 netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
                 _goButton, _disconnectButton, _pubAddrButton,
                 connLogLabel, _connLog, _netcodeLabel, BuildPunchGroup(),
@@ -713,8 +813,10 @@ namespace BizHawkNetplay.Tool
 
         public override void Restart()
         {
-            // ROM load / tool re-init: tear down any live session.
-            if (_sessionActive) EndSession("emulator restarted");
+            // ROM load / tool re-init: also tear down a lobby, join, or state transfer. Those phases
+            // have already paused the emulator and captured an adapter for the old core even though
+            // _sessionActive is still false.
+            EndSession("emulator restarted");
             // Invalidate the cached probe depth — the core/ROM may have changed, and a stale (deeper)
             // measurement from a lighter core could wrongly grant rollback to a heavier one.
             _probeDepth = -1;
@@ -804,18 +906,24 @@ namespace BizHawkNetplay.Tool
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
                 var id = BuildIdentity(_adapter, wantRollback);
                 int port = (int)_portBox.Value;
+                bool autoDelay = _hostRadio.Checked && _autoDelayCheck.Checked;
+                int autoDelayMax = (int)_autoDelayMaxBox.Value;
+                double lobbyFrameMs = FrameMs();
                 _simLatencyMs = (int)_simLatencyBox.Value; // diagnostic artificial UDP delay for this session
                 _upnpEnabled = _upnpCheck.Checked;         // capture on the UI thread for the host accept thread
                 if (_simLatencyMs > 0)
                     Log($"simulating {_simLatencyMs}ms one-way UDP latency (~{2 * _simLatencyMs}ms RTT) — diagnostic");
 
+                int attempt = BeginConnectionAttempt();
                 SetBusy(true);
+                AllowHandshakeClients();
                 if (_hostRadio.Checked)
                 {
                     _mesh = MeshUdpTransport.Bind(port); _transport = WrapSimLatency(_mesh);
                     var state = _adapter.ExportState();
                     Log($"exported {state.Length / 1024}KiB initial state; hosting {players} players");
-                    StartThread(() => HostThread(port, id, prefs, state, _mesh.LocalPort, players));
+                    StartThread(() => HostThread(port, id, prefs, state, _mesh.LocalPort, players,
+                        autoDelay, autoDelayMax, lobbyFrameMs, _simLatencyMs, attempt));
                 }
                 else
                 {
@@ -824,7 +932,7 @@ namespace BizHawkNetplay.Tool
                     // Remember the address WITH its port: the dropdown's whole job is to let you rejoin
                     // the same host, which a bare IP can't do once the port isn't the default any more.
                     _pendingJoinIp = HostAddress.Format(joinIp, port); // recorded once the connect succeeds
-                    StartThread(() => JoinThread(ip, port, id, prefs, _mesh.LocalPort));
+                    StartThread(() => JoinThread(ip, port, id, prefs, _mesh.LocalPort, attempt));
                 }
             }
             catch (Exception ex)
@@ -876,9 +984,13 @@ namespace BizHawkNetplay.Tool
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
                 _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
                 _punchId = BuildIdentity(_adapter, wantRollback);
+                _punchAutoDelay = _isHost && _autoDelayCheck.Checked;
+                _punchAutoDelayMax = (int)_autoDelayMaxBox.Value;
+                _punchFrameMs = FrameMs();
                 _simLatencyMs = (int)_simLatencyBox.Value;
                 _punchState = _isHost ? _adapter.ExportState() : null;
 
+                int attempt = BeginConnectionAttempt();
                 _punchMode = true;
                 _punchLink = PunchedPeerLink.Bind(0);
                 _transport = WrapSimLatency(_punchLink);
@@ -891,14 +1003,19 @@ namespace BizHawkNetplay.Tool
                 int localPort = link.LocalPort;
                 new Thread(() =>
                 {
-                    var reflexive = link.DiscoverReflexive(TimeSpan.FromSeconds(3));
+                    IPEndPoint? reflexive = null;
+                    try { reflexive = link.DiscoverReflexive(TimeSpan.FromSeconds(3)); }
+                    catch when (!IsConnectionAttemptCurrent(attempt)) { return; }
+                    catch (Exception ex) { UiLog("(note) punch address discovery failed: " + ex.Message); }
+                    if (!IsConnectionAttemptCurrent(attempt)) return;
                     string lan = UpnpPortMapper.PrimaryLanIp();
                     IPEndPoint? lanEp = null;
                     try { lanEp = new IPEndPoint(IPAddress.Parse(lan), localPort); } catch { }
                     var loopEp = new IPEndPoint(IPAddress.Loopback, localPort);
                     BeginInvokeUi(() =>
                     {
-                        if (!_punchMode) return; // cancelled while discovering
+                        if (!IsConnectionAttemptCurrent(attempt) || !_punchMode
+                            || !ReferenceEquals(_punchLink, link)) return;
                         string primary = reflexive != null ? ConnectCode.Encode(reflexive)
                                        : lanEp != null ? ConnectCode.Encode(lanEp)
                                        : ConnectCode.Encode(loopEp);
@@ -938,6 +1055,7 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void OnPunchConnect()
         {
+            int attempt = CurrentConnectionAttempt;
             var link = _punchLink;
             if (!_punchMode || link == null) { Log("Click UDP Punch first."); return; }
             var peer = ConnectCode.TryDecode(_peerCodeBox.Text);
@@ -955,25 +1073,31 @@ namespace BizHawkNetplay.Tool
 
             bool isHost = _isHost;
             var id = _punchId!; var prefs = _punchPrefs!; var state = _punchState;
+            bool punchAutoDelay = _punchAutoDelay;
+            int punchAutoDelayMax = _punchAutoDelayMax;
+            double punchFrameMs = _punchFrameMs;
+            int simulatedOneWayMs = _simLatencyMs;
             new Thread(() =>
             {
-                bool ok = link.Punch(peer, TimeSpan.FromSeconds(15));
-                if (!ok)
-                {
-                    BeginInvokeUi(() =>
-                    {
-                        if (!_punchMode) return;
-                        _punchStatus.Text = "punch failed — no path opened (the other side may be on symmetric NAT).";
-                        _punchStatus.ForeColor = Color.Firebrick;
-                        ConnLog($"UDP punch to {peer} failed — no path opened (the other side may be on " +
-                                "symmetric NAT, or hasn't clicked Connect yet).", Color.Firebrick);
-                        _connectButton.Enabled = true; _peerCodeBox.Enabled = true;
-                    });
-                    return;
-                }
-                UiConnLog($"UDP punch opened a path to {link.PeerEndpoint}", Color.DarkSlateBlue);
+                if (!IsConnectionAttemptCurrent(attempt)) return;
                 try
                 {
+                    bool ok = link.Punch(peer, TimeSpan.FromSeconds(15));
+                    if (!IsConnectionAttemptCurrent(attempt)) return;
+                    if (!ok)
+                    {
+                        BeginInvokeUi(() =>
+                        {
+                            if (!IsConnectionAttemptCurrent(attempt) || !_punchMode) return;
+                            _punchStatus.Text = "punch failed — no path opened (the other side may be on symmetric NAT).";
+                            _punchStatus.ForeColor = Color.Firebrick;
+                            ConnLog($"UDP punch to {peer} failed — no path opened (the other side may be on " +
+                                    "symmetric NAT, or hasn't clicked Connect yet).", Color.Firebrick);
+                            _connectButton.Enabled = true; _peerCodeBox.Enabled = true;
+                        });
+                        return;
+                    }
+                    UiConnLog($"UDP punch opened a path to {link.PeerEndpoint}", Color.DarkSlateBlue);
                     // Punch is symmetric at the transport level — unlike the TCP path (listener vs dialer)
                     // both peers pick their role from a local radio button, so two Hosts (both P1, both own
                     // the state) or two Joins (both wait forever for a state neither sends) are possible.
@@ -991,39 +1115,78 @@ namespace BizHawkNetplay.Tool
                             : "both players clicked Join — one of you must Host instead.");
 
                     var ch = new ControlChannel(link.Control);
+                    var peerLink = new PeerLink
+                    {
+                        Tcp = null!,
+                        Control = ch,
+                        RemotePort = isHost ? 1 : 0,
+                        UdpEndpoint = link.PeerEndpoint!,
+                        Label = isHost
+                            ? $"P2 ({link.PeerEndpoint!.Address})"
+                            : $"host ({link.PeerEndpoint!.Address})",
+                    };
+                    bool initialStateApplied = false;
+                    Func<ControlChannel, SyncMode, int, int>? delaySelector = null;
+                    if (isHost && punchAutoDelay)
+                    {
+                        delaySelector = (control, selectedMode, manualFloor) =>
+                        {
+                            UiConnLog($"measuring lobby ping ({LobbyProbeSamples} samples)…",
+                                Color.DarkSlateBlue);
+                            double rtt = Handshake.MeasureLobbyRoundTrip(control, LobbyProbeSamples);
+                            return SelectLobbyDelay(manualFloor, punchAutoDelayMax, selectedMode, rtt,
+                                punchFrameMs, simulatedOneWayMs, players: 2);
+                        };
+                    }
                     var sp = isHost
-                        ? Handshake.RunHost(ch, id, prefs, state ?? Array.Empty<byte>(), link.LocalPort)
-                        : Handshake.RunClient(ch, id, prefs, link.LocalPort);
-                    BeginInvokeUi(() => BeginPunchSession(sp, ch, link.PeerEndpoint!, isHost));
+                        ? Handshake.RunHost(ch, id, prefs, state ?? Array.Empty<byte>(), link.LocalPort,
+                            beforeGo: ready => InvokeUiBlocking(() =>
+                            {
+                                if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
+                                PrepareSessionHost(new List<PeerLink> { peerLink }, 2,
+                                    ready.InputDelay, ready.Mode, ready.Generation);
+                            }), forceHostRollback: _netcodeChoice == NetcodeChoice.Rollback,
+                            selectInputDelay: delaySelector)
+                        : Handshake.RunClient(ch, id, prefs, link.LocalPort, beforeReady: ready =>
+                        {
+                            InvokeUiBlocking(() =>
+                            {
+                                if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
+                                PrepareSessionJoiner(ready, peerLink);
+                            });
+                            initialStateApplied = true;
+                        });
+                    BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt))
+                            BeginPunchSession(sp, peerLink, isHost, initialStateApplied);
+                    });
                 }
-                catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
+                catch (Exception ex)
+                {
+                    if (IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt)) FailSession(ex.Message);
+                    });
+                }
             })
             { IsBackground = true, Name = "BizHawkNetplay-punch-handshake" }.Start();
         }
 
         /// <summary>Hand a punched, handshaken link to the shared session bring-up (same as the TCP path).</summary>
-        private void BeginPunchSession(SessionParams sp, ControlChannel ch, IPEndPoint peerEp, bool isHost)
+        private void BeginPunchSession(SessionParams sp, PeerLink link, bool isHost, bool initialStateApplied)
         {
             try
             {
                 _punchGroup.Enabled = false; // freeze the punch controls for the session's duration
                 if (isHost)
                 {
-                    var link = new PeerLink
-                    {
-                        Tcp = null!, Control = ch, RemotePort = 1,
-                        UdpEndpoint = peerEp, Label = $"P2 ({peerEp.Address})",
-                    };
-                    BeginSessionHost(new List<PeerLink> { link }, players: 2, delay: sp.InputDelay, mode: sp.Mode);
+                    BeginSessionHost(new List<PeerLink> { link }, players: 2, delay: sp.InputDelay,
+                        mode: sp.Mode, generation: sp.Generation);
                 }
                 else
                 {
-                    var link = new PeerLink
-                    {
-                        Tcp = null!, Control = ch, RemotePort = 0,
-                        UdpEndpoint = peerEp, Label = $"host ({peerEp.Address})",
-                    };
-                    BeginSessionJoiner(sp, link); // imports state, sets fields, mesh setup no-ops (punch is 2P)
+                    BeginSessionJoiner(sp, link, initialStateApplied); // state was applied before READY
                 }
             }
             catch (Exception ex) { FailSession(ex.Message); }
@@ -1043,34 +1206,42 @@ namespace BizHawkNetplay.Tool
             _punchStatus.ForeColor = Color.DimGray;
         }
 
-        private void HostThread(int port, PeerIdentity id, SessionPreferences prefs, byte[] state, int udpLocalPort, int players)
+        private void HostThread(int port, PeerIdentity id, SessionPreferences prefs, byte[] state,
+            int udpLocalPort, int players, bool autoDelay, int autoDelayMax, double lobbyFrameMs,
+            int simulatedOneWayMs, int attempt)
         {
+            if (!IsConnectionAttemptCurrent(attempt)) return;
             // Remember what a rejoiner needs to be greeted with if a peer later drops.
             _hostIdentity = id; _hostPrefs = prefs; _hostTcpPort = port; _hostUdpPort = udpLocalPort;
+            TcpListener? hostListener = null;
             try
             {
-                _listener = new TcpListener(IPAddress.Any, port);
-                _listener.Start();
+                hostListener = new TcpListener(IPAddress.Any, port);
+                _listener = hostListener;
+                if (!IsConnectionAttemptCurrent(attempt)) { hostListener.Stop(); return; }
+                hostListener.Start();
                 int need = players - 1;
                 UiConnLog($"hosting a {players}-player session on TCP+UDP {port} — you are P1, " +
                           $"waiting for {need} more to join…", Color.DarkSlateBlue);
 
                 // Best-effort NAT reachability (UPnP forward + public-address report). Non-fatal.
-                TryPublishHostAddress(port);
+                TryPublishHostAddress(port, attempt);
 
                 var links = new List<PeerLink>();
                 var greetings = new List<Handshake.JoinerGreeting>();
                 while (links.Count < need)
                 {
-                    var listener = _listener;
-                    if (listener == null) return; // Disconnect tore the host down while we waited
+                    if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener)) return;
 
                     TcpClient tcp;
-                    try { tcp = listener.AcceptTcpClient(); }
-                    catch when (_listener == null) { return; } // teardown stopped the listener, not a failure
+                    try { tcp = hostListener.AcceptTcpClient(); }
+                    catch when (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener))
+                    { return; } // teardown stopped the listener, not a failure
+                    if (!IsConnectionAttemptCurrent(attempt)) { try { tcp.Close(); } catch { } return; }
 
                     try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                     try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // bound a silent joiner's HELLO
+                    if (!TrackHandshakeClient(tcp, attempt)) { try { tcp.Close(); } catch { } return; }
                     _greetingTcp = tcp; // so Disconnect/teardown can abort a joiner stuck mid-handshake
                     var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                     var channel = new ControlChannel(tcp.GetStream());
@@ -1078,7 +1249,8 @@ namespace BizHawkNetplay.Tool
                     Handshake.JoinerGreeting greet;
                     try
                     {
-                        greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+                        greet = WithAbsoluteSocketDeadline(tcp, HandshakeReceiveTimeoutMs,
+                            () => Handshake.HostGreet(channel, id, prefs, udpLocalPort));
                     }
                     catch (Exception ex)
                     {
@@ -1086,15 +1258,17 @@ namespace BizHawkNetplay.Tool
                         // that never arrived — is that joiner's problem, not the session's. Refusing them
                         // used to take the whole host down with it, so a typo'd password meant re-hosting;
                         // drop just this connection and keep the door open (same policy as a rejoin).
-                        _greetingTcp = null;
+                        if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
+                        UntrackHandshakeClient(tcp);
                         try { tcp.Close(); } catch { }
-                        if (_listener == null) return; // teardown aborted the greet mid-handshake
+                        if (!IsConnectionAttemptCurrent(attempt)
+                            || !ReferenceEquals(_listener, hostListener)) return;
                         UiConnLog($"refused a join from {remoteIp}: {ex.Message} — still hosting, " +
                                   $"waiting for {need - links.Count} player(s)", Color.Firebrick);
                         continue;
                     }
 
-                    _greetingTcp = null;
+                    if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
                     try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
                     int assignedPort = links.Count + 1;
                     links.Add(new PeerLink
@@ -1108,8 +1282,9 @@ namespace BizHawkNetplay.Tool
                     greetings.Add(greet);
                     UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);
                 }
-                try { _listener.Stop(); } catch { }
-                _listener = null;
+                try { hostListener.Stop(); } catch { }
+                if (ReferenceEquals(_listener, hostListener)) _listener = null;
+                if (!IsConnectionAttemptCurrent(attempt)) return;
 
                 // The host decides the authoritative delay (max anyone asked) once everyone's in.
                 int finalDelay = prefs.InputDelay;
@@ -1125,8 +1300,22 @@ namespace BizHawkNetplay.Tool
                 }
                 else if (_netcodeChoice == NetcodeChoice.Rollback)
                 {
-                    mode = SyncMode.Rollback; // forced — bypasses the probe gate
-                    UiLog("netcode forced to rollback — bypassing the capability probe (may stutter if a core can't keep up)");
+                    Handshake.JoinerGreeting? incapable = null;
+                    foreach (var g in greetings)
+                    {
+                        if (!g.Prefs.WantRollback || g.Id.MaxRollbackDepth < ProbeResult.RollbackDepthThreshold)
+                        { incapable = g; break; }
+                    }
+                    if (incapable != null)
+                    {
+                        mode = SyncMode.Lockstep;
+                        UiLog("rollback was forced locally, but a joiner reported rollback unavailable; using lockstep");
+                    }
+                    else
+                    {
+                        mode = SyncMode.Rollback; // bypass only this host's local recommendation
+                        UiLog("netcode forced to rollback — bypassing only the host's local probe recommendation");
+                    }
                 }
                 else // Automatic
                 {
@@ -1137,64 +1326,170 @@ namespace BizHawkNetplay.Tool
                     mode = allRollback ? SyncMode.Rollback : SyncMode.Lockstep;
                 }
 
+                if (autoDelay)
+                {
+                    UiConnLog($"measuring lobby ping ({LobbyProbeSamples} samples per player)…",
+                        Color.DarkSlateBlue);
+                    double worstRttMs = -1;
+                    foreach (var link in links)
+                    {
+                        if (!IsConnectionAttemptCurrent(attempt)) return;
+                        int oldReceiveTimeout = 0, oldSendTimeout = 0;
+                        try
+                        {
+                            oldReceiveTimeout = link.Tcp.ReceiveTimeout;
+                            oldSendTimeout = link.Tcp.SendTimeout;
+                            link.Tcp.ReceiveTimeout = LobbyProbeTimeoutMs;
+                            link.Tcp.SendTimeout = LobbyProbeTimeoutMs;
+                            double rtt = Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+                            if (rtt > worstRttMs) worstRttMs = rtt;
+                        }
+                        finally
+                        {
+                            try
+                            {
+                                link.Tcp.ReceiveTimeout = oldReceiveTimeout;
+                                link.Tcp.SendTimeout = oldSendTimeout;
+                            }
+                            catch { }
+                        }
+                    }
+                    finalDelay = SelectLobbyDelay(finalDelay, autoDelayMax, mode, worstRttMs,
+                        lobbyFrameMs, simulatedOneWayMs, players);
+                }
+
                 // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
                 // (it reaches the host at the address it connected to, so the host is left off the list).
+                var generation = new SessionGeneration(SessionAuth.NewSessionId(), 1);
+                // Trust the negotiated endpoints before asking clients to prepare their drivers: their
+                // pre-READY neutral windows can then queue instead of being rejected as foreign UDP.
+                _mesh!.SetPeerRoutes(RoutesExcept(links, null));
                 foreach (var link in links)
                 {
-                    try { link.Tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { }
+                    ConfigureStateTransferTimeouts(link.Tcp, state.Length);
                     Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state,
-                        CandidatesExcept(links, link), useReadyBarrier: true);
+                        generation, RoutesExcept(links, link));
                 }
 
                 // Nobody is released while the host is still synchronously shipping a large state to
                 // another joiner. Once every control link acknowledges that all start data arrived,
-                // send GO to the whole group and bring up the host locally.
-                foreach (var link in links) Handshake.HostWaitReady(link.Control);
-                foreach (var link in links) Handshake.HostSendGo(link.Control);
-                foreach (var link in links) try { link.Tcp.ReceiveTimeout = 0; } catch { }
+                // prepare the host's own generation-bound driver, then send GO to the whole group.
+                foreach (var link in links) Handshake.HostWaitReady(link.Control, generation);
+                InvokeUiBlocking(() =>
+                {
+                    if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
+                    PrepareSessionHost(links, players, finalDelay, mode, generation);
+                });
+                foreach (var link in links) Handshake.HostSendGo(link.Control, generation);
+                foreach (var link in links)
+                {
+                    try { link.Tcp.ReceiveTimeout = 0; link.Tcp.SendTimeout = 0; } catch { }
+                }
 
-                // The host sends its own input directly to every joiner.
-                _mesh!.SetPeers(CandidatesExcept(links, null));
-
-                BeginInvokeUi(() => BeginSessionHost(links, players, finalDelay, mode));
+                BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt))
+                        BeginSessionHost(links, players, finalDelay, mode, generation);
+                });
             }
-            catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
+            catch (Exception ex)
+            {
+                if (IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt)) FailSession(ex.Message);
+                });
+            }
+            finally
+            {
+                if (hostListener != null && !IsConnectionAttemptCurrent(attempt))
+                    try { hostListener.Stop(); } catch { }
+            }
         }
 
-        private void JoinThread(string ip, int port, PeerIdentity id, SessionPreferences prefs, int udpLocalPort)
+        private void JoinThread(string ip, int port, PeerIdentity id, SessionPreferences prefs,
+            int udpLocalPort, int attempt)
         {
+            if (!IsConnectionAttemptCurrent(attempt)) return;
+            TcpClient? tcp = null;
             try
             {
                 UiConnLog($"connecting to {ip}:{port}…", Color.DarkSlateBlue);
-                var tcp = new TcpClient();
+                tcp = new TcpClient();
                 _joiningTcp = tcp;          // so Disconnect can close a connect that's still blocking
+                if (!IsConnectionAttemptCurrent(attempt)) { tcp.Close(); return; }
+                if (!TrackHandshakeClient(tcp, attempt)) { try { tcp.Close(); } catch { } return; }
+                try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { }
                 tcp.Connect(ip, port);
                 try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                 var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                 var channel = new ControlChannel(tcp.GetStream());
-                var sp = Handshake.RunClientMulti(channel, id, prefs, udpLocalPort);
-                _joiningTcp = null;         // handed off to the session; teardown closes it via the PeerLink now
-                var link = new PeerLink
+                bool initialStateApplied = false;
+                PeerLink? preparedLink = null;
+                SessionParams sp;
+                using (var greetDeadline = new AbsoluteSocketDeadline(tcp, HandshakeReceiveTimeoutMs))
                 {
-                    Tcp = tcp,
-                    Control = channel,
-                    RemotePort = 0, // the host
-                    UdpEndpoint = new IPEndPoint(remoteIp, sp.RemoteUdpPort),
-                    Label = $"host ({remoteIp})",
-                };
-                BeginInvokeUi(() => BeginSessionJoiner(sp, link));
+                    try
+                    {
+                        sp = Handshake.RunClientMulti(channel, id, prefs, udpLocalPort, beforeReady: ready =>
+                        {
+                            InvokeUiBlocking(() =>
+                            {
+                                if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
+                                preparedLink = new PeerLink
+                                {
+                                    Tcp = tcp,
+                                    Control = channel,
+                                    RemotePort = 0,
+                                    UdpEndpoint = new IPEndPoint(remoteIp, ready.RemoteUdpPort),
+                                    Label = $"host ({remoteIp})",
+                                };
+                                PrepareSessionJoiner(ready, preparedLink);
+                            });
+                            initialStateApplied = true;
+                        }, afterGreet: () =>
+                        {
+                            if (!greetDeadline.TryComplete())
+                                throw new TimeoutException("host authentication exceeded the 15-second deadline");
+                            // A 3–4 player host may legitimately wait minutes for the remaining lobby slots.
+                            // The short timeout protects only HELLO/auth; Disconnect remains able to cancel
+                            // this now-unbounded lobby wait through the tracked socket.
+                            try { tcp.ReceiveTimeout = 0; } catch { }
+                        });
+                    }
+                    catch (Exception ex) when (greetDeadline.Expired)
+                    {
+                        throw new TimeoutException("host authentication exceeded the 15-second deadline", ex);
+                    }
+                }
+                if (ReferenceEquals(_joiningTcp, tcp)) _joiningTcp = null;
+                var link = preparedLink ?? throw new HandshakeException("client READY preparation did not complete");
+                BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt)) BeginSessionJoiner(sp, link, initialStateApplied);
+                    else { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } }
+                });
             }
-            catch (Exception ex) { BeginInvokeUi(() => FailSession(ex.Message)); }
+            catch (Exception ex)
+            {
+                if (tcp != null && ReferenceEquals(_joiningTcp, tcp)) _joiningTcp = null;
+                if (IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt)) FailSession(ex.Message);
+                });
+                else { UntrackHandshakeClient(tcp); try { tcp?.Close(); } catch { } }
+            }
         }
 
         // ------------------------------------------------------------------ session
 
-        private void BeginSessionHost(List<PeerLink> links, int players, int delay, SyncMode mode)
+        private void BeginSessionHost(List<PeerLink> links, int players, int delay, SyncMode mode,
+            SessionGeneration generation)
         {
             try
             {
-                _peers.Clear(); _peers.AddRange(links);
-                _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
+                if (!DriverPreparedFor(generation, mode))
+                    PrepareSessionHost(links, players, delay, mode, generation);
+                foreach (var link in links) UntrackHandshakeClient(link.Tcp);
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 ConnLog($"all {players} players connected — you are P1 (host)", Color.DarkGreen);
                 BeginSessionCommon(mode, $"{links.Count} peer(s)");
@@ -1202,20 +1497,13 @@ namespace BizHawkNetplay.Tool
             catch (Exception ex) { FailSession(ex.Message); }
         }
 
-        private void BeginSessionJoiner(SessionParams sp, PeerLink hostLink)
+        private void BeginSessionJoiner(SessionParams sp, PeerLink hostLink, bool initialStateApplied = false)
         {
             try
             {
-                if (sp.InitialState != null)
-                {
-                    _adapter!.ImportState(sp.InitialState);
-                    Log($"imported {sp.InitialState.Length / 1024}KiB host state");
-                }
-                _peers.Clear(); _peers.Add(hostLink);
-                _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
-                // Direct mesh: send to the host (at the address we connected to) plus every other joiner.
-                _meshOthers = new List<IPEndPoint>(sp.MeshPeers);
-                ApplyJoinerMesh();
+                if (!initialStateApplied || !DriverPreparedFor(sp.Generation, sp.Mode))
+                    PrepareSessionJoiner(sp, hostLink);
+                UntrackHandshakeClient(hostLink.Tcp);
                 // Both peers should print the SAME number here; if not, the start is misaligned.
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 ConnLog($"connected — joined as P{sp.LocalPort + 1} of {sp.PlayerCount}", Color.DarkGreen);
@@ -1225,8 +1513,41 @@ namespace BizHawkNetplay.Tool
             catch (Exception ex) { FailSession(ex.Message); }
         }
 
-        /// <summary>The role-independent session bring-up: driver, audio, per-link readers, pacing.</summary>
-        private void BeginSessionCommon(SyncMode mode, string remoteLabel)
+        private void PrepareSessionHost(List<PeerLink> links, int players, int delay, SyncMode mode,
+            SessionGeneration generation)
+        {
+            _peers.Clear(); _peers.AddRange(links);
+            _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
+            SetGeneration(generation);
+            _mesh?.SetPeerRoutes(RoutesExcept(links, null));
+            PrepareSessionDriver(mode);
+        }
+
+        private void PrepareSessionJoiner(SessionParams sp, PeerLink hostLink)
+        {
+            if (_preJoinRestoreState == null) _preJoinRestoreState = _adapter!.ExportState();
+            ApplyInitialState(sp);
+            _peers.Clear(); _peers.Add(hostLink);
+            _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
+            SetGeneration(sp.Generation);
+            _meshOthers = new List<PeerRoute>(sp.PeerRoutes);
+            ApplyJoinerMesh();
+            PrepareSessionDriver(sp.Mode);
+        }
+
+        private void ApplyInitialState(SessionParams sp)
+        {
+            if (sp.InitialState == null) return;
+            _adapter!.ImportState(sp.InitialState);
+            Log($"imported {sp.InitialState.Length / 1024}KiB host state");
+        }
+
+        private bool DriverPreparedFor(SessionGeneration generation, SyncMode mode) =>
+            _sessionDriverPrepared && _driver != null && _driver.Generation == generation && _mode == mode;
+
+        /// <summary>Construct and seed the exact generation-bound driver before READY. It may publish
+        /// neutral input, but no frame clock or control reader is activated until GO.</summary>
+        private void PrepareSessionDriver(SyncMode mode)
         {
             _mode = mode;
             if (mode == SyncMode.Rollback)
@@ -1242,7 +1563,17 @@ namespace BizHawkNetplay.Tool
                         "input goes peer-to-peer in one hop). Switch Netcode to Lockstep if it feels choppy.",
                         Color.DarkSlateBlue);
             }
+            try { _driver?.Dispose(); } catch { }
             _driver = CreateDriver();
+            _startEmuFrame = APIs.Emulation.FrameCount();
+            _driver.Start();
+            _sessionDriverPrepared = true;
+        }
+
+        /// <summary>The role-independent post-GO activation: audio, control I/O, and frame pacing.</summary>
+        private void BeginSessionCommon(SyncMode mode, string remoteLabel)
+        {
+            if (!DriverPreparedFor(CurrentGeneration, mode)) PrepareSessionDriver(mode);
 
             ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
             try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
@@ -1250,10 +1581,19 @@ namespace BizHawkNetplay.Tool
             _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
             _resyncCount = 0;
             _resyncInProgress = false;
-            _lastResync = DateTime.MinValue;
+            _resyncReleaseQueued = false;
+            _reconnectState = null;
+            _reconnectGeneration = default;
+            _pendingReconnectLink = null;
+            _pendingReconnectStateLength = 0;
+            _pendingReconnectGeneration = default;
+            _lastResyncStamp = 0;
             lock (_hashLock) { _frameHashes.Clear(); }
-            _driver.Start();
+            _driver!.Start(); // idempotent; normally seeded before READY
+            _driver.ResetRemoteInputLiveness();
+            _sessionDriverPrepared = false;
             _sessionActive = true;
+            _preJoinRestoreState = null; // GO committed the imported baseline
 
             // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
             // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
@@ -1278,6 +1618,7 @@ namespace BizHawkNetplay.Tool
             _pingClock.Restart();
             _paceClock.Restart();
             _nextFrameDueMs = 0;
+            _recentCoreFrameMs = 0;
             _lastUiRefreshMs = double.NegativeInfinity;
             _lastSlowTickLogMs = double.NegativeInfinity;
             _lastVerboseAudioFrame = -1;
@@ -1311,9 +1652,19 @@ namespace BizHawkNetplay.Tool
         {
             var mesh = _mesh;
             if (mesh == null) return;
+            int attempt = CurrentConnectionAttempt;
             new Thread(() =>
             {
-                var reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(2.5));
+                IPEndPoint? reflexive;
+                try { reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(2.5)); }
+                catch when (!IsConnectionAttemptCurrent(attempt)) { return; }
+                catch (Exception ex)
+                {
+                    if (IsConnectionAttemptCurrent(attempt))
+                        UiLog("(note) UDP address discovery failed: " + ex.Message);
+                    return;
+                }
+                if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh)) return;
                 if (reflexive == null)
                 {
                     UiLog("(note) couldn't determine our public UDP endpoint (STUN blocked) — internet peers may be unreachable");
@@ -1322,7 +1673,8 @@ namespace BizHawkNetplay.Tool
                 UiLog($"our public UDP endpoint is {reflexive} — sharing it for NAT traversal");
                 BeginInvokeUi(() =>
                 {
-                    if (_sessionActive && _peers.Count > 0)
+                    if (IsConnectionAttemptCurrent(attempt) && ReferenceEquals(_mesh, mesh)
+                        && _sessionActive && _peers.Count > 0)
                         QueueControl(_peers[0], ControlMessageType.Candidate,
                             HandshakeCodec.EncodeEndpoints(new[] { reflexive }));
                 });
@@ -1384,6 +1736,7 @@ namespace BizHawkNetplay.Tool
                 // resyncs everyone. Sticky pause and drift validation above must still run here.
                 if (_awaitingReconnect)
                 {
+                    if (_resyncInProgress) _driver.ResendLocalInputIfDue();
                     MaybeSendPing();
                     CheckLinkTimeouts();
                     return;
@@ -1398,7 +1751,10 @@ namespace BizHawkNetplay.Tool
                 // peer's writer thread. Hold the new baseline while that transfer is in flight.
                 if (_resyncInProgress)
                 {
-                    if (_isHost) _driver.ResendLocalInputIfDue();
+                    // Every peer may rebuild at a different instant. Keep publishing this epoch's
+                    // neutral/start window so an early sender is not lost by peers still rejecting
+                    // new-generation UDP with their old driver.
+                    _driver.ResendLocalInputIfDue();
                     MaybeSendPing();
                     CheckLinkTimeouts();
                     return;
@@ -1415,6 +1771,7 @@ namespace BizHawkNetplay.Tool
 
                 bool steppedThisTick = false;
                 int framesThisTick = 0;
+                bool committedSecondFrame = false;
                 while (framesThisTick < MaxFramesPerTick && nowMs + 0.25 >= _nextFrameDueMs)
                 {
                     // Normally this loop runs once. A second frame compensates for an irregular ~25ms
@@ -1422,7 +1779,7 @@ namespace BizHawkNetplay.Tool
                     // that second frame after the callback has already consumed its UI work budget.
                     if (framesThisTick > 0)
                     {
-                        if (tickWatch.Elapsed.TotalMilliseconds >= FrameTickWorkBudgetMs) break;
+                        if (!committedSecondFrame && tickWatch.Elapsed.TotalMilliseconds >= FrameTickWorkBudgetMs) break;
                         // A frame of core execution just happened, and packets that landed during it are
                         // already queued. Draining once per tick would judge this frame's readiness on
                         // network state captured before that work — turning an input that did arrive in
@@ -1437,10 +1794,19 @@ namespace BizHawkNetplay.Tool
                     {
                         gateMs += phase.Elapsed.TotalMilliseconds;
                         _driver.ResendLocalInputIfDue();
+                        bool timeSync = _driver.Strategy is RollbackStrategy stalledRollback
+                            && stalledRollback.LastStallWasTimeSync;
+                        if (timeSync)
+                        {
+                            // Advantage debt is denominated in emulated frames, not 2ms timer callbacks.
+                            _nextFrameDueMs += _frameMs;
+                        }
                         if (Verbose && nowMs - _lastStallLogMs >= 1000)
                         {
                             _lastStallLogMs = nowMs;
-                            Log($"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
+                            Log(timeSync
+                                ? $"time-sync yield at frame {_driver.CurrentFrame}"
+                                : $"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
                         }
                         break;
                     }
@@ -1448,11 +1814,32 @@ namespace BizHawkNetplay.Tool
                     {
                         gateMs += phase.Elapsed.TotalMilliseconds; // includes rollback repair
                         phase.Restart();
-                        _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderVideo: true);
-                        coreMs += phase.Elapsed.TotalMilliseconds;
+                        // When wall-clock debt already makes a second frame due, the first picture is
+                        // throwaway. Skip it only when frame two is input-safe and recent core cost says
+                        // both frames fit the UI budget. If one frame unexpectedly spikes after that
+                        // commitment, finish the visible second frame once; the conservative rolling
+                        // estimate prevents that spike from causing repeated two-frame callbacks.
+                        bool secondGateSafe = _driver.Strategy is LockstepStrategy
+                            || (_driver.Strategy is RollbackStrategy secondRollback
+                                && !secondRollback.HasPendingTimeSyncDebt);
+                        bool anotherFrameDue = framesThisTick + 1 < MaxFramesPerTick
+                            && nowMs + 0.25 >= _nextFrameDueMs + _frameMs
+                            && _recentCoreFrameMs > 0
+                            && tickWatch.Elapsed.TotalMilliseconds + 2.0 * _recentCoreFrameMs
+                                < FrameTickWorkBudgetMs
+                            && secondGateSafe
+                            && _driver.NextFrameFullyConfirmed;
+                        if (anotherFrameDue) committedSecondFrame = true;
+                        _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderVideo: !anotherFrameDue);
+                        double frameCoreMs = phase.Elapsed.TotalMilliseconds;
+                        coreMs += frameCoreMs;
+                        _recentCoreFrameMs = _recentCoreFrameMs <= 0
+                            ? frameCoreMs
+                            : Math.Max(frameCoreMs, _recentCoreFrameMs * 0.9);
                         _driver.CompleteFrame();
                         steppedThisTick = true;
                         framesThisTick++;
+                        if (framesThisTick >= 2) committedSecondFrame = false;
                         _nextFrameDueMs += _frameMs;
                         MaybeSendChecksum();
                         _fpsCount++;
@@ -1482,7 +1869,7 @@ namespace BizHawkNetplay.Tool
                 // otherwise a run of successful recoveries would eventually trip the "persistent desync"
                 // give-up limit on a perfectly healthy joiner.
                 if (!_isHost && _resyncCount > 0 && !_awaitingReconnect
-                    && (DateTime.UtcNow - _lastResync).TotalSeconds > ResyncRecoverySeconds)
+                    && MonotonicElapsedSeconds(_lastResyncStamp) > ResyncRecoverySeconds)
                 {
                     _resyncCount = 0;
                     Log("back in sync — recovery confirmed");
@@ -1529,8 +1916,9 @@ namespace BizHawkNetplay.Tool
 
             double ping = WorstPingMs(out bool udpMeasured);
             double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
-            int advantage = ComputeFrameAdvantage(out bool haveAdvantage);
-            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, advantage, haveAdvantage));
+            int advantage = ComputeFrameAdvantage(out bool haveAdvantage, out int revision, out bool freshAdvantage);
+            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, advantage,
+                haveAdvantage && freshAdvantage, revision));
 
             string pingStr = ping < 0 ? ""
                 : $" — ping {effRttMs:F0}ms{(udpMeasured ? " udp" : "")}" +
@@ -1585,21 +1973,10 @@ namespace BizHawkNetplay.Tool
         /// shared latency term — (ours − theirs) / 2 is the real skew, positive when we are the fast one.
         /// The worst (most ahead) peer decides, since that is the one we would out-run.
         /// </summary>
-        private int ComputeFrameAdvantage(out bool known)
+        private int ComputeFrameAdvantage(out bool known, out int revision, out bool fresh)
         {
-            known = false;
-            int worst = 0;
             lock (_pingLock)
-            {
-                foreach (var link in _peers)
-                {
-                    if (!link.AdvantageKnown) continue;
-                    known = true;
-                    int adv = (link.LocalAdvantage - link.RemoteAdvantage) / 2;
-                    if (adv > worst) worst = adv;
-                }
-            }
-            return known ? worst : 0;
+                return _frameAdvantage.Consume(out known, out revision, out fresh);
         }
 
         private void CheckUdpInputProgress()
@@ -1621,7 +1998,7 @@ namespace BizHawkNetplay.Tool
             if (nowMs - _lastUdpRepunchMs >= 1000)
             {
                 _lastUdpRepunchMs = nowMs;
-                _mesh?.RequestRepunch();
+                _mesh?.RequestRepunch(port);
                 if (!_udpWarningActive)
                 {
                     _udpWarningActive = true;
@@ -1669,10 +2046,13 @@ namespace BizHawkNetplay.Tool
                 Log($"checksum frame {frame}: local {hash:X8}{drift}");
             }
             // The host aggregates all peers' checksums itself; joiners just report theirs to the host.
-            if (_isHost) RecordChecksum(frame, hash);
+            var generation = _driver.Generation;
+            if (generation != CurrentGeneration) return;
+            if (_isHost) RecordChecksum(CurrentConnectionAttempt, generation, _localPort, frame, hash);
             else if (_peers.Count > 0)
             {
-                QueueControl(_peers[0], ControlMessageType.Checksum, EncodeChecksum(frame, hash));
+                QueueControl(_peers[0], ControlMessageType.Checksum,
+                    EncodeChecksum(generation, frame, hash));
             }
         }
 
@@ -1689,23 +2069,34 @@ namespace BizHawkNetplay.Tool
             _lastPingMs = nowMs;
             var body = BitConverter.GetBytes(nowMs);
             int frame = _driver?.CurrentFrame ?? 0;
+            var generation = CurrentGeneration;
             foreach (var link in _peers)
             {
                 QueueControl(link, ControlMessageType.Ping, body);
                 // Piggyback the frame-advantage exchange on the same cadence: where we are, and how far
                 // ahead we currently measure ourselves against this peer. Additive message type — a peer
                 // on an older build ignores it and simply never reports back.
-                int mine;
-                lock (_pingLock) mine = link.LocalAdvantage;
-                QueueControl(link, ControlMessageType.Pacing, EncodePacing(frame, mine));
+                int mine, sequence, acknowledges;
+                lock (_pingLock)
+                {
+                    mine = link.LocalAdvantage;
+                    sequence = ++link.PacingSendSequence;
+                    acknowledges = link.LastReceivedPacingSequence;
+                }
+                QueueControl(link, ControlMessageType.Pacing,
+                    EncodePacing(generation, sequence, acknowledges, frame, mine));
             }
         }
 
-        private static byte[] EncodePacing(int frame, int localAdvantage)
+        private static byte[] EncodePacing(SessionGeneration generation, int sequence,
+            int acknowledges, int frame, int localAdvantage)
         {
-            var b = new byte[8];
-            WriteInt32(b, 0, frame);
-            WriteInt32(b, 4, localAdvantage);
+            var b = new byte[28];
+            WriteGeneration(b, 0, generation);
+            WriteInt32(b, 12, sequence);
+            WriteInt32(b, 16, acknowledges);
+            WriteInt32(b, 20, frame);
+            WriteInt32(b, 24, localAdvantage);
             return b;
         }
 
@@ -1732,17 +2123,42 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void CheckLinkTimeouts()
         {
-            long now = DateTime.UtcNow.Ticks;
-            long limit = TimeSpan.FromSeconds(PingTimeoutSeconds).Ticks;
+            long now = MonotonicNow();
+            long limit = MonotonicTicks(PingTimeoutSeconds);
             PeerLink? dead = null;
+            int unappliedEpoch = 0;
+            int incompleteEpoch = 0;
             foreach (var link in _peers)
             {
-                if (link.ResyncReceiving) continue;                              // pulling a state from them
+                // Pings only prove that the control reader is alive. A peer can keep answering them
+                // forever while never importing the state that gates this generation, so the apply
+                // barrier has its own payload-sized deadline and takes precedence over ping grace.
+                int awaiting = link.AwaitingAppliedEpoch;
+                if (awaiting != 0 && now > Interlocked.Read(ref link.AppliedDeadlineTicks))
+                {
+                    dead = link;
+                    unappliedEpoch = awaiting;
+                    break;
+                }
+                if (link.ResyncReceiving)
+                {
+                    if (now > Interlocked.Read(ref link.ResyncReceiveDeadlineTicks))
+                    {
+                        dead = link;
+                        incompleteEpoch = link.ReceivingResyncEpoch;
+                        break;
+                    }
+                    continue; // pulling a state from them, within its bounded receive window
+                }
                 if (now < Interlocked.Read(ref link.TimeoutGraceUntilTicks)) continue; // digesting one we sent
                 long last = Interlocked.Read(ref link.LastRecvTicks);
                 if (last != 0 && now - last > limit) { dead = link; break; }
             }
-            if (dead != null)
+            if (dead != null && incompleteEpoch != 0)
+                EndSession($"{dead.Label} did not finish sending resync epoch {incompleteEpoch} before its deadline");
+            else if (dead != null && unappliedEpoch != 0)
+                EndSession($"{dead.Label} did not apply resync epoch {unappliedEpoch} before its deadline");
+            else if (dead != null)
                 OnPeerLinkLost(dead, $"no response for {PingTimeoutSeconds:F0}s (ping timeout)");
         }
 
@@ -1754,7 +2170,54 @@ namespace BizHawkNetplay.Tool
         private void GraceForStateTransfer(PeerLink link, int stateBytes)
         {
             double seconds = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
-            Interlocked.Exchange(ref link.TimeoutGraceUntilTicks, DateTime.UtcNow.AddSeconds(seconds).Ticks);
+            Interlocked.Exchange(ref link.TimeoutGraceUntilTicks, MonotonicDeadline(seconds));
+        }
+
+        private static long StateApplyDeadlineTicks(int stateBytes)
+        {
+            double seconds = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
+            return MonotonicDeadline(seconds);
+        }
+
+        private static long StateReceiveDeadlineTicks(int stateBytes, int waitSeconds)
+        {
+            // Reconnect freezes survivors before the host has even re-admitted the returning peer, and
+            // the host's own bounded pipeline then spans THREE sequential phases after a rejoin: the
+            // WELCOME/state send to the rejoiner, the rejoiner's import + READY, and only then the
+            // survivor's Resync transfer. Each phase is individually allowed a full transfer window by
+            // the host's socket deadlines, so budget all three here — a survivor must not end the
+            // session while the host is still inside its own healthy bounds. It is deliberately
+            // finite: BEGIN plus a silent/partial TCP frame must never freeze the emulator forever.
+            double onePhase = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
+            return MonotonicDeadline(waitSeconds + 3.0 * onePhase + 5.0);
+        }
+
+        /// <summary>Apply the host's pre-WELCOME RTT estimate without ever lowering an explicit ask.</summary>
+        private int SelectLobbyDelay(int manualFloor, int automaticMaximum, SyncMode mode,
+            double measuredRttMs, double frameMs, int simulatedOneWayMs, int players)
+        {
+            double effectiveRttMs = measuredRttMs + 2.0 * Math.Max(0, simulatedOneWayMs);
+            var choice = LobbyDelayPolicy.Choose(effectiveRttMs, frameMs, mode,
+                manualFloor, automaticMaximum);
+
+            string simulated = simulatedOneWayMs > 0
+                ? $", including {2 * simulatedOneWayMs}ms simulated"
+                : "";
+            string capped = choice.WasCapped
+                ? $"; smooth target {choice.AutomaticFrames} was capped at {automaticMaximum}"
+                : "";
+            string floor = manualFloor > automaticMaximum
+                ? $"; explicit floor {manualFloor} remains above the automatic max"
+                : $"; manual floor {manualFloor}, max {automaticMaximum}";
+            string meshNote = players > 2
+                ? " Host-to-player lobby links were measured; direct joiner-to-joiner paths can differ."
+                : "";
+
+            UiConnLog($"Auto delay: worst lobby RTT ~{effectiveRttMs:F0}ms{simulated} → " +
+                $"{choice.Frames} frame(s) for {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}" +
+                floor + capped + "." + meshNote,
+                choice.WasCapped ? Color.DarkOrange : Color.DarkGreen);
+            return choice.Frames;
         }
 
         /// <summary>
@@ -1781,35 +2244,15 @@ namespace BizHawkNetplay.Tool
             double effWorst = worst + 2.0 * _simLatencyMs;
             string simNote = _simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "";
 
-            // The session uses the HIGHER of the two peers' asks, so acting on any of this needs both ends.
-            const string bothEnds = "Both players must set it — the session uses the higher of the two asks.";
-
-            if (_mode == SyncMode.Rollback)
-            {
-                // Rollback predicts through the link, so delay is not what keeps peers in sync here — it
-                // only shrinks how deep the average rollback runs. Recommending lockstep-grade delay on
-                // top of prediction is pure added latency for no benefit, which is what this used to do.
-                if (_sessionDelay > RollbackComfortableDelay)
-                {
-                    double excessMs = (_sessionDelay - RollbackComfortableDelay) * _frameMs;
-                    ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: rollback hides this by predicting, so input " +
-                        $"delay {RollbackComfortableDelay} is usually enough. This session is {_sessionDelay}, which " +
-                        $"adds ~{excessMs:F0}ms of felt delay for no benefit. Reconnect lower to feel the difference. " +
-                        bothEnds, Color.DarkOrange);
-                }
-                else
-                {
-                    ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {_sessionDelay} suits rollback — " +
-                        "prediction covers the link.", Color.DimGray);
-                }
-                return;
-            }
-
-            int suggested = (int)Math.Ceiling((effWorst / 2.0) / _frameMs) + 2; // two frames of jitter headroom
+            var recommendation = LobbyDelayPolicy.Choose(effWorst, _frameMs, _mode,
+                manualFloor: 1, automaticMaximum: 20);
+            int suggested = recommendation.AutomaticFrames;
             if (suggested > _sessionDelay)
             {
-                ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {suggested} is recommended for smooth " +
-                    $"play (this session is {_sessionDelay}). If it stalls, reconnect higher. " + bothEnds,
+                ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: smooth " +
+                    $"{(_mode == SyncMode.Rollback ? "rollback" : "lockstep")} recommends delay {suggested} " +
+                    $"(this session is {_sessionDelay}). Raise the host's Auto max or manual floor, then reconnect; " +
+                    "the running delay stays fixed.",
                     Color.DarkOrange);
             }
             else if (_sessionDelay - suggested >= 2)
@@ -1818,7 +2261,8 @@ namespace BizHawkNetplay.Tool
                 // value picked for one bad link keeps costing latency on every good one afterwards.
                 double excessMs = (_sessionDelay - suggested) * _frameMs;
                 ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: this link only needs input delay {suggested}, and " +
-                    $"the session is running {_sessionDelay} — about {excessMs:F0}ms of avoidable delay. " + bothEnds,
+                    $"the session is running {_sessionDelay} — about {excessMs:F0}ms of extra response time. " +
+                    "Lower the host's floor/max for the next session if responsiveness matters more.",
                     Color.DarkOrange);
             }
             else
@@ -1830,7 +2274,8 @@ namespace BizHawkNetplay.Tool
 
         private void StartPeerIo(PeerLink link)
         {
-            link.LastRecvTicks = DateTime.UtcNow.Ticks;
+            link.Attempt = CurrentConnectionAttempt;
+            link.LastRecvTicks = MonotonicNow();
             link.WriterRunning = true;
             link.Writer = new Thread(() => PeerWriterLoop(link))
             { IsBackground = true, Name = "BizHawkNetplay-control-writer" };
@@ -1895,8 +2340,13 @@ namespace BizHawkNetplay.Tool
                     Interlocked.Add(ref link.QueuedBytes, -(pending.Body.LongLength + 5));
                     try { pending.Completed?.Invoke(false); } catch { }
                 }
-                if (failure != null && _sessionActive)
-                    BeginInvokeUi(() => OnPeerLinkLost(link, "control send failed: " + failure.Message));
+                int attempt = link.Attempt;
+                if (failure != null && _sessionActive && IsConnectionAttemptCurrent(attempt))
+                    BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt))
+                            OnPeerLinkLost(link, "control send failed: " + failure.Message);
+                    });
             }
         }
 
@@ -1905,14 +2355,16 @@ namespace BizHawkNetplay.Tool
         {
             try
             {
-                while (_sessionActive)
+                while (_sessionActive && IsConnectionAttemptCurrent(link.Attempt))
                 {
                     var (type, body) = link.Control.Receive();
-                    Interlocked.Exchange(ref link.LastRecvTicks, DateTime.UtcNow.Ticks); // liveness heartbeat
-                    if (type == ControlMessageType.Checksum && body.Length == 8)
+                    Interlocked.Exchange(ref link.LastRecvTicks, MonotonicNow()); // liveness heartbeat
+                    if (type == ControlMessageType.Checksum && body.Length == 20)
                     {
                         // Only the host aggregates; a joiner never receives checksums.
-                        if (_isHost) { DecodeChecksum(body, out int frame, out uint hash); RecordChecksum(frame, hash); }
+                        var generation = CurrentGeneration;
+                        if (_isHost && TryDecodeChecksum(body, generation, out int frame, out uint hash))
+                            RecordChecksum(link.Attempt, generation, link.RemotePort, frame, hash);
                     }
                     else if (type == ControlMessageType.Ping && body.Length == 8)
                     {
@@ -1930,22 +2382,37 @@ namespace BizHawkNetplay.Tool
                                 link.PingMs = link.PingMs < 0 ? rtt : 0.8 * link.PingMs + 0.2 * rtt;
                                 link.PingCount++;
                             }
-                            BeginInvokeUi(MaybeHintDelay);
+                            BeginInvokePeer(link, MaybeHintDelay);
                         }
                     }
-                    else if (type == ControlMessageType.Pacing && body.Length == 8)
+                    else if (type == ControlMessageType.Pacing && body.Length == 28)
                     {
-                        // Their frame at send time, and the advantage they measured over us. Ours is
-                        // measured fresh here; the difference of the two cancels the one-way latency
-                        // that inflates both, leaving the real skew (see ComputeFrameAdvantage).
-                        int theirFrame = ReadInt32(body, 0);
-                        int theirAdvantage = ReadInt32(body, 4);
-                        int myFrame = _driver?.CurrentFrame ?? 0;
-                        lock (_pingLock)
+                        if (!TryReadGeneration(body, 0, out var generation)) continue;
+                        int sequence = ReadInt32(body, 12);
+                        int acknowledges = ReadInt32(body, 16);
+                        int theirFrame = ReadInt32(body, 20);
+                        int theirAdvantage = ReadInt32(body, 24);
+                        if (sequence <= 0) continue;
+                        lock (_generationLock)
                         {
-                            link.LocalAdvantage = myFrame - theirFrame;
-                            link.RemoteAdvantage = theirAdvantage;
-                            link.AdvantageKnown = true;
+                            var driver = _driver;
+                            if (generation != _generation || driver == null
+                                || driver.Generation != generation) continue;
+                            int myFrame = driver.CurrentFrame;
+                            lock (_pingLock)
+                            {
+                                if (sequence <= link.LastReceivedPacingSequence) continue;
+                                link.LocalAdvantage = myFrame - theirFrame;
+                                link.RemoteAdvantage = theirAdvantage;
+                                link.LastReceivedPacingSequence = sequence;
+                                // The peer's advantage is initialized only after it acknowledges one of
+                                // our reports. This prevents both high-latency peers treating the other's
+                                // startup zero as a real measurement and both deciding they are ahead.
+                                link.AdvantageKnown = acknowledges > 0
+                                    && acknowledges <= link.PacingSendSequence;
+                                _frameAdvantage.Record(link.RemotePort, sequence,
+                                    link.LocalAdvantage, link.RemoteAdvantage, link.AdvantageKnown);
+                            }
                         }
                     }
                     else if (type == ControlMessageType.PeerList)
@@ -1953,12 +2420,12 @@ namespace BizHawkNetplay.Tool
                         // Host reshuffled the mesh (e.g. someone rejoined) — update who we send to.
                         if (!_isHost)
                         {
-                            var eps = HandshakeCodec.DecodeEndpoints(body);
-                            BeginInvokeUi(() =>
+                            var routes = HandshakeCodec.DecodeRoutes(body);
+                            BeginInvokePeer(link, () =>
                             {
-                                _meshOthers = eps;
+                                _meshOthers = routes;
                                 ApplyJoinerMesh();
-                                if (Verbose) Log($"mesh updated: {eps.Count} other peer(s)");
+                                if (Verbose) Log($"mesh updated: {routes.Count} other peer(s)");
                             });
                         }
                     }
@@ -1970,35 +2437,78 @@ namespace BizHawkNetplay.Tool
                         {
                             var eps = HandshakeCodec.DecodeEndpoints(body);
                             if (eps.Count > 0)
-                                BeginInvokeUi(() => OnJoinerCandidate(link, eps[0]));
+                                BeginInvokePeer(link, () => OnJoinerCandidate(link, eps[0]));
                         }
                     }
                     else if (type == ControlMessageType.ResyncBegin)
                     {
-                        link.ResyncReceiving = true;
-                        if (!_isHost) BeginInvokeUi(() =>
+                        if (!_isHost && TryDecodeResyncBegin(body, out var generation, out int stateBytes,
+                            out int waitSeconds)
+                            && generation == CurrentGeneration.Next())
                         {
-                            if (!_sessionActive) return;
-                            _resyncInProgress = true;
-                            Status("receiving authoritative resync state…", Color.DarkOrange);
-                        });
+                            link.ReceivingResyncEpoch = generation.Epoch;
+                            link.ReceivingResyncBytes = stateBytes;
+                            Interlocked.Exchange(ref link.ResyncReceiveDeadlineTicks,
+                                StateReceiveDeadlineTicks(stateBytes, waitSeconds));
+                            link.ResyncReceiving = true; // publish only after the deadline fields are complete
+                            BeginInvokePeer(link, () =>
+                            {
+                                if (!_sessionActive || generation != CurrentGeneration.Next()) return;
+                                _resyncInProgress = true;
+                                Status($"receiving authoritative resync epoch {generation.Epoch} state…",
+                                    Color.DarkOrange);
+                            });
+                        }
                     }
                     else if (type == ControlMessageType.Resync)
                     {
-                        link.ResyncReceiving = false;
-                        var state = body; // authoritative whole-core state from the host
-                        if (!_isHost) BeginInvokeUi(() => ApplyResyncAsJoiner(state));
+                        if (!_isHost && link.ResyncReceiving)
+                        {
+                            int expectedEpoch = link.ReceivingResyncEpoch;
+                            int expectedBytes = link.ReceivingResyncBytes;
+                            link.ResyncReceiving = false;
+                            link.ReceivingResyncEpoch = 0;
+                            link.ReceivingResyncBytes = 0;
+                            Interlocked.Exchange(ref link.ResyncReceiveDeadlineTicks, 0);
+                            if (TryDecodeStatePayload(body, out var generation, out var state)
+                                && generation.Epoch == expectedEpoch && generation == CurrentGeneration.Next()
+                                && state.Length == expectedBytes)
+                                BeginInvokePeer(link, () => ApplyResyncAsJoiner(generation, state));
+                            else
+                                BeginInvokePeer(link, () => EndSession("host sent an invalid or incomplete resync state"));
+                        }
+                    }
+                    else if (type == ControlMessageType.ResyncApplied)
+                    {
+                        if (_isHost && TryDecodeGeneration(body, out var generation)
+                            && generation == CurrentGeneration)
+                            BeginInvokePeer(link, () => OnPeerResyncApplied(link, generation));
+                    }
+                    else if (type == ControlMessageType.ResyncResume)
+                    {
+                        if (!_isHost && TryDecodeGeneration(body, out var generation)
+                            && generation == CurrentGeneration)
+                            BeginInvokePeer(link, () => ResumeResyncAsJoiner(generation));
                     }
                     else if (type == ControlMessageType.Bye)
                     {
-                        BeginInvokeUi(() => EndSession($"{link.Label} left the session"));
+                        int attempt = link.Attempt;
+                        BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt) && _peers.Contains(link))
+                                EndSession($"{link.Label} left the session");
+                        });
                         return;
                     }
                 }
             }
             catch (Exception ex)
             {
-                if (_sessionActive) BeginInvokeUi(() => OnPeerLinkLost(link, ex.Message));
+                int attempt = link.Attempt;
+                if (_sessionActive && IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt)) OnPeerLinkLost(link, ex.Message);
+                });
             }
         }
 
@@ -2007,39 +2517,73 @@ namespace BizHawkNetplay.Tool
         /// Once all <see cref="_playerCount"/> are in, they must agree; if not, resync everyone. Called
         /// from the UI thread (our own hash) and from reader threads (joiners'), hence the lock.
         /// </summary>
-        private void RecordChecksum(int frame, uint hash)
+        private void RecordChecksum(int attempt, SessionGeneration generation, int sourcePort, int frame, uint hash)
         {
             bool complete = false, mismatch = false;
             lock (_hashLock)
             {
-                if (!_frameHashes.TryGetValue(frame, out var list)) { list = new List<uint>(); _frameHashes[frame] = list; }
-                list.Add(hash);
-                if (list.Count >= _playerCount)
+                if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_isHost
+                    || generation != CurrentGeneration
+                    || sourcePort < 0 || sourcePort >= _playerCount) return;
+
+                if (!_frameHashes.TryGetValue(generation, out var frames))
+                {
+                    frames = new Dictionary<int, Dictionary<int, uint>>();
+                    _frameHashes[generation] = frames;
+                }
+                if (!frames.TryGetValue(frame, out var reports))
+                {
+                    reports = new Dictionary<int, uint>();
+                    frames[frame] = reports;
+                }
+                reports[sourcePort] = hash;
+                if (reports.Count >= _playerCount)
                 {
                     complete = true;
-                    for (int i = 1; i < list.Count; i++) if (list[i] != list[0]) { mismatch = true; break; }
-                    _frameHashes.Remove(frame);
+                    bool haveFirst = false;
+                    uint first = 0;
+                    foreach (uint report in reports.Values)
+                    {
+                        if (!haveFirst) { first = report; haveFirst = true; }
+                        else if (report != first) { mismatch = true; break; }
+                    }
+                    frames.Remove(frame);
                 }
                 // Drop very old partial entries (a peer that never reported a frame) to bound memory.
-                if (_frameHashes.Count > 32)
+                if (frames.Count > 32)
                 {
                     var stale = new List<int>();
-                    foreach (var k in _frameHashes.Keys) if (k < frame - 600) stale.Add(k);
-                    foreach (var k in stale) _frameHashes.Remove(k);
+                    foreach (var k in frames.Keys) if (k < frame - 600) stale.Add(k);
+                    foreach (var k in stale) frames.Remove(k);
                 }
+                var retired = new List<SessionGeneration>();
+                foreach (var key in _frameHashes.Keys) if (key != generation) retired.Add(key);
+                foreach (var key in retired) _frameHashes.Remove(key);
             }
             if (!complete) return;
-            if (mismatch) BeginInvokeUi(() => OnHostDesync(frame));
+            if (mismatch) BeginInvokeUi(() =>
+            {
+                if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
+                    OnHostDesync(frame);
+            });
             else if (_resyncCount != 0)
-                BeginInvokeUi(() => { if (_resyncCount != 0) { _resyncCount = 0; Log("back in sync — recovery confirmed"); } });
+                BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation && _resyncCount != 0)
+                    { _resyncCount = 0; Log("back in sync — recovery confirmed"); }
+                });
             else if (Verbose)
-                BeginInvokeUi(() => Log($"checksum frame {frame}: all {_playerCount} agree"));
+                BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
+                        Log($"checksum frame {frame}: all {_playerCount} agree");
+                });
         }
 
         private void OnHostDesync(int frame)
         {
             if (_resyncInProgress) return;
-            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // just resynced; give it time
+            if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // just resynced; give it time
             Log($"DESYNC at frame {frame} — peers disagree");
             PerformResyncAsHost();
         }
@@ -2054,7 +2598,8 @@ namespace BizHawkNetplay.Tool
         private void PerformResyncAsHost()
         {
             if (!_sessionActive || !_isHost || _resyncInProgress) return;
-            if ((DateTime.UtcNow - _lastResync).TotalSeconds < ResyncGraceSeconds) return; // debounce
+            if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // debounce
+            int attempt = CurrentConnectionAttempt;
 
             if (++_resyncCount > MaxResyncs)
             {
@@ -2064,49 +2609,54 @@ namespace BizHawkNetplay.Tool
             try
             {
                 var state = _adapter!.ExportState();
+                var generation = AdvanceGeneration();
                 _resyncInProgress = true;
+                _resyncReleaseQueued = false;
                 RebuildDriver();
                 int peerCount = _peers.Count;
-                int remaining = peerCount;
-                int failed = 0;
-                var transferWatch = System.Diagnostics.Stopwatch.StartNew();
-                Status($"resync #{_resyncCount}: sending {state.Length / 1024}KiB to {peerCount} peer(s)…", Color.DarkOrange);
-                Log($"resync #{_resyncCount}: captured {state.Length / 1024}KiB; transfer queued off the UI thread");
+                var generationBody = EncodeResyncBegin(generation, state.Length);
+                var stateBody = EncodeStatePayload(generation, state);
+                Status($"resync #{_resyncCount}: sending epoch {generation.Epoch} " +
+                    $"({state.Length / 1024}KiB) to {peerCount} peer(s)…", Color.DarkOrange);
+                Log($"resync #{_resyncCount}: captured {state.Length / 1024}KiB for epoch " +
+                    $"{generation.Epoch}; waiting for every peer to import it");
 
-                if (remaining == 0) { _resyncInProgress = false; return; }
+                if (peerCount == 0)
+                {
+                    _resyncInProgress = false;
+                    RebaseFrameSchedule();
+                    return;
+                }
                 foreach (var link in _peers)
                 {
                     GraceForStateTransfer(link, state.Length); // it can't pong while its reader consumes the frame
-                    QueueControl(link, ControlMessageType.ResyncBegin, Array.Empty<byte>());
-                    QueueControl(link, ControlMessageType.Resync, state, ok =>
-                    {
-                        if (!ok) Interlocked.Exchange(ref failed, 1);
-                        if (Interlocked.Decrement(ref remaining) != 0) return;
-                        BeginInvokeUi(() =>
+                    link.AwaitingAppliedEpoch = generation.Epoch;
+                    Interlocked.Exchange(ref link.AppliedDeadlineTicks, StateApplyDeadlineTicks(state.Length));
+                    if (!QueueControl(link, ControlMessageType.ResyncBegin, generationBody)
+                        || !QueueControl(link, ControlMessageType.Resync, stateBody, ok =>
                         {
-                            if (!_sessionActive) return;
-                            if (failed != 0)
+                            if (!ok) BeginInvokeUi(() =>
                             {
-                                _resyncInProgress = false;
-                                EndSession("resync transfer failed");
-                                return;
-                            }
-                            _resyncInProgress = false;
-                            _paceClock.Restart();
-                            _nextFrameDueMs = 0;
-                            Log($"resync #{_resyncCount}: all {peerCount} peer transfer(s) complete in " +
-                                $"{transferWatch.Elapsed.TotalMilliseconds:F0}ms; resuming");
-                        });
-                    });
+                                if (IsConnectionAttemptCurrent(attempt) && _sessionActive
+                                    && CurrentGeneration == generation)
+                                    EndSession("resync state transfer failed");
+                            });
+                        }))
+                    {
+                        EndSession("resync state transfer could not be queued");
+                        return;
+                    }
                 }
             }
             catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
         }
 
-        /// <summary>Joiner: adopt the host's authoritative state and rebuild from a clean baseline.</summary>
-        private void ApplyResyncAsJoiner(byte[] state)
+        /// <summary>Joiner: adopt the host's authoritative state and acknowledge only after the
+        /// emulator import and generation-bound driver rebuild have both completed.</summary>
+        private void ApplyResyncAsJoiner(SessionGeneration generation, byte[] state)
         {
-            if (!_sessionActive) return;
+            if (!_sessionActive || _isHost || generation != CurrentGeneration.Next()) return;
+            int attempt = CurrentConnectionAttempt;
             if (++_resyncCount > MaxResyncs)
             {
                 EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
@@ -2115,19 +2665,172 @@ namespace BizHawkNetplay.Tool
             try
             {
                 _resyncInProgress = true;
-                Status($"applying {state.Length / 1024}KiB host resync…", Color.DarkOrange);
+                Status($"applying {state.Length / 1024}KiB host resync epoch {generation.Epoch}…",
+                    Color.DarkOrange);
                 _adapter!.ImportState(state);
+                SetGeneration(generation);
                 RebuildDriver();
-                _resyncInProgress = false;
-                Log($"resync #{_resyncCount}: imported {state.Length / 1024}KiB host state; resuming");
+                if (_peers.Count == 0 || !QueueControl(_peers[0], ControlMessageType.ResyncApplied,
+                    HandshakeCodec.EncodeGeneration(generation), ok =>
+                    {
+                        if (!ok) BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt) && _sessionActive
+                                && CurrentGeneration == generation)
+                                EndSession("could not acknowledge applied resync state");
+                        });
+                    }))
+                {
+                    EndSession("could not queue the applied-state acknowledgement");
+                    return;
+                }
+                Log($"resync #{_resyncCount}: imported epoch {generation.Epoch} " +
+                    $"({state.Length / 1024}KiB); waiting for the host to release all peers");
             }
-            catch (Exception ex) { _resyncInProgress = false; EndSession("resync apply failed: " + ex.Message); }
+            catch (Exception ex) { EndSession("resync apply failed: " + ex.Message); }
+        }
+
+        private void OnPeerResyncApplied(PeerLink link, SessionGeneration generation)
+        {
+            if (!_sessionActive || !_isHost || generation != CurrentGeneration || !_peers.Contains(link)) return;
+            if (link.AwaitingAppliedEpoch != generation.Epoch) return; // stale or duplicate acknowledgement
+
+            link.AwaitingAppliedEpoch = 0;
+            Interlocked.Exchange(ref link.AppliedDeadlineTicks, 0);
+            Interlocked.Exchange(ref link.TimeoutGraceUntilTicks, 0);
+            if (Verbose) Log($"{link.Label} applied resync epoch {generation.Epoch}");
+
+            foreach (var peer in _peers)
+                if (peer.AwaitingAppliedEpoch == generation.Epoch) return;
+
+            if (_pendingReconnectLink != null && _pendingReconnectGeneration == generation)
+                ReleaseReconnectedPeer(_pendingReconnectLink, _pendingReconnectStateLength, generation);
+            else
+                ReleaseResyncAsHost(generation);
+        }
+
+        private void ReleaseResyncAsHost(SessionGeneration generation)
+        {
+            if (_resyncReleaseQueued || generation != CurrentGeneration) return;
+            _resyncReleaseQueued = true;
+            int attempt = CurrentConnectionAttempt;
+            QueueResyncResumeToPeers(generation, ok => BeginInvokeUi(() =>
+            {
+                if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive
+                    || CurrentGeneration != generation) return;
+                if (!ok) { EndSession("resync resume transfer failed"); return; }
+                _driver?.ResetRemoteInputLiveness();
+                _resyncInProgress = false;
+                RebaseFrameSchedule();
+                Log($"resync #{_resyncCount}: every peer applied epoch {generation.Epoch}; resuming");
+            }));
+        }
+
+        private void ResumeResyncAsJoiner(SessionGeneration generation)
+        {
+            if (!_sessionActive || _isHost || generation != CurrentGeneration || !_resyncInProgress) return;
+            _driver?.ResetRemoteInputLiveness();
+            _resyncInProgress = false;
+            RebaseFrameSchedule();
+            Log($"resync #{_resyncCount}: every peer applied epoch {generation.Epoch}; resuming");
+        }
+
+        private void QueueResyncResumeToPeers(SessionGeneration generation, Action<bool> completed)
+        {
+            var peers = new List<PeerLink>(_peers);
+            if (peers.Count == 0) { completed(true); return; }
+            int remaining = peers.Count;
+            int failed = 0;
+            var body = HandshakeCodec.EncodeGeneration(generation);
+            foreach (var peer in peers)
+            {
+                QueueControl(peer, ControlMessageType.ResyncResume, body, ok =>
+                {
+                    if (!ok) Interlocked.Exchange(ref failed, 1);
+                    if (Interlocked.Decrement(ref remaining) == 0)
+                        completed(failed == 0);
+                });
+            }
+        }
+
+        private void BeginInvokePeer(PeerLink link, Action action)
+        {
+            int attempt = link.Attempt;
+            BeginInvokeUi(() =>
+            {
+                if (IsConnectionAttemptCurrent(attempt) && _peers.Contains(link)) action();
+            });
+        }
+
+        private static byte[] EncodeResyncBegin(
+            SessionGeneration generation, int stateBytes, int waitSeconds = 0)
+        {
+            if (stateBytes < 0 || stateBytes > MaxResyncStateBytes)
+                throw new ArgumentOutOfRangeException(nameof(stateBytes));
+            if (waitSeconds < 0 || waitSeconds > MaxResyncAnnouncementWaitSeconds)
+                throw new ArgumentOutOfRangeException(nameof(waitSeconds));
+            var body = new byte[20];
+            WriteGeneration(body, 0, generation);
+            WriteInt32(body, 12, stateBytes);
+            WriteInt32(body, 16, waitSeconds);
+            return body;
+        }
+
+        private static bool TryDecodeResyncBegin(byte[] body, out SessionGeneration generation,
+            out int stateBytes, out int waitSeconds)
+        {
+            generation = default;
+            stateBytes = 0;
+            waitSeconds = 0;
+            if (body == null || body.Length != 20 || !TryReadGeneration(body, 0, out generation)) return false;
+            stateBytes = ReadInt32(body, 12);
+            waitSeconds = ReadInt32(body, 16);
+            return stateBytes >= 0 && stateBytes <= MaxResyncStateBytes
+                && waitSeconds >= 0 && waitSeconds <= MaxResyncAnnouncementWaitSeconds;
+        }
+
+        private static byte[] EncodeStatePayload(SessionGeneration generation, byte[] state)
+        {
+            if (state == null) throw new ArgumentNullException(nameof(state));
+            if (state.Length > MaxResyncStateBytes) throw new ArgumentException("Resync state exceeds control-frame cap", nameof(state));
+            var generationBody = HandshakeCodec.EncodeGeneration(generation);
+            var body = new byte[generationBody.Length + state.Length];
+            Buffer.BlockCopy(generationBody, 0, body, 0, generationBody.Length);
+            Buffer.BlockCopy(state, 0, body, generationBody.Length, state.Length);
+            return body;
+        }
+
+        private static bool TryDecodeStatePayload(byte[] body, out SessionGeneration generation, out byte[] state)
+        {
+            generation = default;
+            state = Array.Empty<byte>();
+            if (body == null || body.Length < 12) return false;
+            var generationBody = new byte[12];
+            Buffer.BlockCopy(body, 0, generationBody, 0, generationBody.Length);
+            if (!TryDecodeGeneration(generationBody, out generation)) return false;
+            state = new byte[body.Length - generationBody.Length];
+            Buffer.BlockCopy(body, generationBody.Length, state, 0, state.Length);
+            return true;
+        }
+
+        private static bool TryDecodeGeneration(byte[] body, out SessionGeneration generation)
+        {
+            try
+            {
+                generation = HandshakeCodec.DecodeGeneration(body);
+                return true;
+            }
+            catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
+            {
+                generation = default;
+                return false;
+            }
         }
 
         /// <summary>
         /// Rebuild the frame driver from the current core state as a fresh frame-0 baseline: new
         /// pipeline, cleared checksums, reset pacing and drift baseline. In-flight pre-resync UDP
-        /// datagrams carry high frame numbers and are dropped by the FrameDriver's far-future guard.
+        /// datagrams carry the prior generation and are rejected before their frame data is decoded.
         /// </summary>
         private void RebuildDriver()
         {
@@ -2136,9 +2839,51 @@ namespace BizHawkNetplay.Tool
             _startEmuFrame = APIs.Emulation.FrameCount();
             lock (_hashLock) { _frameHashes.Clear(); }
             _driver.Start();
-            _lastResync = DateTime.UtcNow;
-            _paceClock.Restart();
-            _nextFrameDueMs = 0;
+            _lastResyncStamp = MonotonicNow();
+            RebaseFrameSchedule();
+        }
+
+        /// <summary>Discard wall-clock debt after a protocol pause without changing the monotonic
+        /// clock used by UI, logging, and UDP-recovery timestamps.</summary>
+        private void RebaseFrameSchedule()
+        {
+            if (!_paceClock.IsRunning) _paceClock.Start();
+            _nextFrameDueMs = _paceClock.Elapsed.TotalMilliseconds;
+        }
+
+        private SessionGeneration CurrentGeneration
+        {
+            get { lock (_generationLock) return _generation; }
+        }
+
+        private void SetGeneration(SessionGeneration generation)
+        {
+            if (!generation.IsValid) throw new ArgumentOutOfRangeException(nameof(generation));
+            lock (_generationLock)
+            {
+                _generation = generation;
+                lock (_pingLock)
+                {
+                    _frameAdvantage.Reset();
+                    foreach (var link in _peers)
+                    {
+                        link.LocalAdvantage = 0;
+                        link.RemoteAdvantage = 0;
+                        link.AdvantageKnown = false;
+                        link.PacingSendSequence = 0;
+                        link.LastReceivedPacingSequence = 0;
+                        link.AwaitingAppliedEpoch = 0;
+                        Interlocked.Exchange(ref link.AppliedDeadlineTicks, 0);
+                    }
+                }
+            }
+        }
+
+        private SessionGeneration AdvanceGeneration()
+        {
+            var next = CurrentGeneration.Next();
+            SetGeneration(next);
+            return next;
         }
 
         /// <summary>
@@ -2152,10 +2897,12 @@ namespace BizHawkNetplay.Tool
             if (_mode == SyncMode.Rollback)
                 return new FrameDriver(_adapter!, _transport!,
                     p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth, FrameMs()),
-                    _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth, portCount: _playerCount);
+                    _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth,
+                    portCount: _playerCount, generation: CurrentGeneration);
 
             return new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
-                _localPort, _sessionDelay, redundancy: 8, portCount: _playerCount);
+                _localPort, _sessionDelay, redundancy: 8, portCount: _playerCount,
+                generation: CurrentGeneration);
         }
 
         /// <summary>N64 rollback repair can synchronously resimulate a deep state ring on EmuHawk's UI
@@ -2285,15 +3032,28 @@ namespace BizHawkNetplay.Tool
         /// joiners should use. Non-fatal — LAN/localhost play needs none of it. The mapping is removed on
         /// session end.
         /// </summary>
-        private void TryPublishHostAddress(int port)
+        private void TryPublishHostAddress(int port, int attempt)
         {
             try
             {
                 string lan = UpnpPortMapper.PrimaryLanIp();
                 if (_upnpEnabled)
                 {
-                    _upnpMapping = UpnpPortMapper.TryAddPortMapping(port, lan, "BizHawk Netplay", TimeSpan.FromSeconds(2.5));
-                    UiLog(_upnpMapping != null
+                    var mapping = UpnpPortMapper.TryAddPortMapping(
+                        port, lan, "BizHawk Netplay", TimeSpan.FromSeconds(2.5));
+                    if (!IsConnectionAttemptCurrent(attempt))
+                    {
+                        try { mapping?.Remove(TimeSpan.FromSeconds(2)); } catch { }
+                        return;
+                    }
+                    _upnpMapping = mapping;
+                    if (!IsConnectionAttemptCurrent(attempt))
+                    {
+                        if (ReferenceEquals(_upnpMapping, mapping)) _upnpMapping = null;
+                        try { mapping?.Remove(TimeSpan.FromSeconds(2)); } catch { }
+                        return;
+                    }
+                    UiLog(mapping != null
                         ? $"UPnP: forwarded port {port} (TCP+UDP) to {lan} on your router"
                         : $"UPnP: no router accepted a forward — for internet play, forward port {port} (TCP+UDP) to {lan} manually");
                 }
@@ -2303,11 +3063,15 @@ namespace BizHawkNetplay.Tool
                 }
 
                 var pub = StunClient.DiscoverPublicAddress(TimeSpan.FromSeconds(2.0));
+                if (!IsConnectionAttemptCurrent(attempt)) return;
                 UiLog(pub != null
                     ? $"internet joiners connect to {pub.Address}:{port}  (LAN: {lan}:{port})"
                     : $"couldn't determine your public IP (offline or STUN blocked); LAN joiners use {lan}:{port}");
             }
-            catch (Exception ex) { UiLog("(note) NAT setup skipped: " + ex.Message); }
+            catch (Exception ex)
+            {
+                if (IsConnectionAttemptCurrent(attempt)) UiLog("(note) NAT setup skipped: " + ex.Message);
+            }
         }
 
         // ------------------------------------------------------------------ reconnect
@@ -2334,6 +3098,14 @@ namespace BizHawkNetplay.Tool
                 EndSession($"lost connection to {link.Label}: {why} — click Join to reconnect");
                 return;
             }
+            if (_resyncInProgress)
+            {
+                // Some survivors may still be on the prior epoch, so advancing again would make the
+                // reconnect BEGIN skip an epoch for them. End cleanly instead of creating an
+                // ambiguous nested state barrier.
+                EndSession($"{link.Label} dropped during resync: {why}");
+                return;
+            }
             if (_awaitingReconnect)
             {
                 EndSession($"a second peer ({link.Label}) dropped during a reconnect: {why}");
@@ -2342,17 +3114,46 @@ namespace BizHawkNetplay.Tool
 
             _awaitingReconnect = true;
             _reconnectPort = link.RemotePort;
-            _reconnectStarted = DateTime.UtcNow;
+            _reconnectStartedStamp = MonotonicNow();
 
             _peers.Remove(link);
             try { link.Tcp?.Close(); } catch { }
-            UpdateMeshPeers(); // stop sending input to the dead endpoint
+            try
+            {
+                // Capture the boundary immediately and advance exactly once. Survivors receive BEGIN
+                // now, so they freeze instead of timing out their UDP input while the host waits up to
+                // a minute for the missing player to return.
+                var state = _adapter!.ExportState();
+                var generation = AdvanceGeneration();
+                _reconnectState = state;
+                _reconnectGeneration = generation;
+                _resyncInProgress = true;
+                _resyncReleaseQueued = false;
+                RebuildDriver();
+                RedistributeMesh(); // remove the dead endpoint from host and survivor route tables
+
+                var begin = EncodeResyncBegin(generation, state.Length, (int)ReconnectTimeoutSeconds);
+                foreach (var survivor in _peers)
+                {
+                    if (!QueueControl(survivor, ControlMessageType.ResyncBegin, begin))
+                    {
+                        EndSession("could not freeze survivors for reconnect");
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                EndSession("could not establish reconnect boundary: " + ex.Message);
+                return;
+            }
 
             ConnLog($"{link.Label} dropped ({why}) — holding the session; waiting up to " +
                 $"{ReconnectTimeoutSeconds:F0}s for a rejoin on TCP {_hostTcpPort}…", Color.DarkOrange);
             Status($"P{_reconnectPort + 1} dropped — waiting to rejoin…", Color.DarkOrange);
 
-            _reconnectThread = new Thread(() => ReconnectAcceptLoop(_reconnectPort))
+            int attempt = CurrentConnectionAttempt;
+            _reconnectThread = new Thread(() => ReconnectAcceptLoop(_reconnectPort, attempt))
             { IsBackground = true, Name = "BizHawkNetplay-reconnect" };
             _reconnectThread.Start();
         }
@@ -2360,23 +3161,24 @@ namespace BizHawkNetplay.Tool
         /// <summary>All candidate UDP endpoints of the given links (LAN plus reflexive/public where
         /// known), optionally excluding one — the peer set the mesh sends to and accepts from. The mesh
         /// tolerates dead candidates, so including both lets the same session work on LAN and over NAT.</summary>
-        private static List<IPEndPoint> CandidatesExcept(IReadOnlyList<PeerLink> links, PeerLink? except)
+        private static List<PeerRoute> RoutesExcept(IReadOnlyList<PeerLink> links, PeerLink? except)
         {
-            var eps = new List<IPEndPoint>();
+            var routes = new List<PeerRoute>();
             foreach (var l in links)
             {
                 if (ReferenceEquals(l, except)) continue;
-                eps.Add(l.UdpEndpoint);
-                if (l.ReflexiveEndpoint != null) eps.Add(l.ReflexiveEndpoint);
+                var candidates = new List<IPEndPoint> { l.UdpEndpoint };
+                if (l.ReflexiveEndpoint != null) candidates.Add(l.ReflexiveEndpoint);
+                routes.Add(new PeerRoute(l.RemotePort, candidates));
             }
-            return eps;
+            return routes;
         }
 
         /// <summary>Host: point our mesh at every currently-connected joiner's candidate endpoints.</summary>
         private void UpdateMeshPeers()
         {
             if (_mesh == null) return;
-            try { _mesh.SetPeers(CandidatesExcept(_peers, null)); } catch { }
+            try { _mesh.SetPeerRoutes(RoutesExcept(_peers, null)); } catch { }
         }
 
         /// <summary>Host: re-point our own mesh and re-send each joiner its candidate peer list (used
@@ -2387,7 +3189,7 @@ namespace BizHawkNetplay.Tool
             foreach (var l in _peers)
             {
                 QueueControl(l, ControlMessageType.PeerList,
-                    HandshakeCodec.EncodeEndpoints(CandidatesExcept(_peers, l)));
+                    HandshakeCodec.EncodeRoutes(RoutesExcept(_peers, l)));
             }
         }
 
@@ -2395,9 +3197,12 @@ namespace BizHawkNetplay.Tool
         private void ApplyJoinerMesh()
         {
             if (_mesh == null || _peers.Count == 0) return;
-            var eps = new List<IPEndPoint> { _peers[0].UdpEndpoint }; // the host
-            eps.AddRange(_meshOthers);
-            try { _mesh.SetPeers(eps); } catch { }
+            var routes = new List<PeerRoute>
+            {
+                new PeerRoute(_peers[0].RemotePort, new[] { _peers[0].UdpEndpoint }) // the host
+            };
+            routes.AddRange(_meshOthers);
+            try { _mesh.SetPeerRoutes(routes); } catch { }
         }
 
         /// <summary>
@@ -2405,46 +3210,72 @@ namespace BizHawkNetplay.Tool
         /// player to reconnect. Re-greet — which re-validates ROM/core/layout still match — then hand
         /// off to the UI thread to welcome them back. Gives up (ends the session) after the timeout.
         /// </summary>
-        private void ReconnectAcceptLoop(int freedPort)
+        private void ReconnectAcceptLoop(int freedPort, int attempt)
         {
             TcpListener? listener = null;
             try
             {
                 listener = new TcpListener(IPAddress.Any, _hostTcpPort);
                 listener.Start();
-                while (_sessionActive && _awaitingReconnect)
+                while (_sessionActive && _awaitingReconnect && IsConnectionAttemptCurrent(attempt))
                 {
-                    if ((DateTime.UtcNow - _reconnectStarted).TotalSeconds > ReconnectTimeoutSeconds)
+                    if (MonotonicElapsedSeconds(_reconnectStartedStamp) > ReconnectTimeoutSeconds)
                     {
-                        BeginInvokeUi(() => { if (_awaitingReconnect) EndSession("no rejoin within the timeout"); });
+                        BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt) && _awaitingReconnect)
+                                EndSession("no rejoin within the timeout");
+                        });
                         return;
                     }
                     if (!listener.Pending()) { Thread.Sleep(100); continue; }
 
                     var tcp = listener.AcceptTcpClient();
+                    if (!IsConnectionAttemptCurrent(attempt)) { try { tcp.Close(); } catch { } return; }
+                    if (!TrackHandshakeClient(tcp, attempt)) { try { tcp.Close(); } catch { } return; }
                     try { tcp.NoDelay = true; } catch { }
                     try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // a silent rejoiner can't wedge the wait
                     var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint!).Address;
                     var channel = new ControlChannel(tcp.GetStream());
                     try
                     {
-                        var greet = Handshake.HostGreet(channel, _hostIdentity!, _hostPrefs!, _hostUdpPort);
+                        double remainingSeconds = ReconnectTimeoutSeconds
+                            - MonotonicElapsedSeconds(_reconnectStartedStamp);
+                        int greetDeadlineMs = Math.Max(1, Math.Min(HandshakeReceiveTimeoutMs,
+                            (int)Math.Ceiling(remainingSeconds * 1000.0)));
+                        var greet = WithAbsoluteSocketDeadline(tcp, greetDeadlineMs,
+                            () => Handshake.HostGreet(channel, _hostIdentity!, _hostPrefs!, _hostUdpPort));
+                        if (_mode == SyncMode.Rollback
+                            && (!greet.Prefs.WantRollback
+                                || greet.Id.MaxRollbackDepth < ProbeResult.RollbackDepthThreshold))
+                            throw new HandshakeException(
+                                "rejoining peer no longer reports the rollback capability required by this session");
                         try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads
                         var udpEp = new IPEndPoint(remoteIp, greet.UdpPort);
-                        BeginInvokeUi(() => CompleteReconnect(tcp, channel, remoteIp, udpEp, freedPort));
+                        BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt))
+                                CompleteReconnect(tcp, channel, remoteIp, udpEp, freedPort, attempt);
+                            else { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } }
+                        });
                         return; // one rejoin fills the slot
                     }
                     catch (Exception ex)
                     {
                         // Rejected (e.g. wrong ROM/core) — refuse this one and keep waiting for a valid rejoin.
                         UiConnLog($"rejected a rejoin attempt: {ex.Message}", Color.Firebrick);
+                        UntrackHandshakeClient(tcp);
                         try { tcp.Close(); } catch { }
                     }
                 }
             }
             catch (Exception ex)
             {
-                BeginInvokeUi(() => { if (_awaitingReconnect) EndSession("reconnect listener failed: " + ex.Message); });
+                BeginInvokeUi(() =>
+                {
+                    if (IsConnectionAttemptCurrent(attempt) && _awaitingReconnect)
+                        EndSession("reconnect listener failed: " + ex.Message);
+                });
             }
             finally { try { listener?.Stop(); } catch { } }
         }
@@ -2453,15 +3284,22 @@ namespace BizHawkNetplay.Tool
         /// UI thread: capture the current authoritative state, then hand the potentially blocking
         /// welcome/state transfer to a background thread. Simulation is already held for reconnect.
         /// </summary>
-        private void CompleteReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp, IPEndPoint udpEp, int freedPort)
+        private void CompleteReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp,
+            IPEndPoint udpEp, int freedPort, int attempt)
         {
-            if (!_sessionActive || !_awaitingReconnect) { try { tcp.Close(); } catch { } return; }
+            if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
+            { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
             try
             {
                 _greetingTcp = tcp; // teardown can abort the background state/barrier transfer
-                var state = _adapter!.ExportState();
-                var meshPeers = CandidatesExcept(_peers, null);
-                Status($"P{freedPort + 1} rejoined — sending {state.Length / 1024}KiB state…", Color.DarkOrange);
+                var state = _reconnectState
+                    ?? throw new InvalidOperationException("reconnect baseline is unavailable");
+                var generation = _reconnectGeneration;
+                if (!generation.IsValid || generation != CurrentGeneration)
+                    throw new InvalidOperationException("reconnect generation is no longer current");
+                var meshPeers = RoutesExcept(_peers, null);
+                Status($"P{freedPort + 1} rejoined — sending epoch {generation.Epoch} " +
+                    $"({state.Length / 1024}KiB)…", Color.DarkOrange);
 
                 // The rejoiner's mesh peers = every current survivor (it reaches the host directly). It
                 // adopts this state + mesh via Welcome and rebuilds fresh on its own side.
@@ -2469,17 +3307,28 @@ namespace BizHawkNetplay.Tool
                 {
                     try
                     {
-                        try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { }
+                        ConfigureStateTransferTimeouts(tcp, state.Length);
                         Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
-                            meshPeers, useReadyBarrier: true);
-                        Handshake.HostWaitReady(channel);
-                        try { tcp.ReceiveTimeout = 0; } catch { }
-                        BeginInvokeUi(() => FinishReconnect(tcp, channel, remoteIp, udpEp, freedPort, state));
+                            generation, meshPeers);
+                        Handshake.HostWaitReady(channel, generation);
+                        try { tcp.ReceiveTimeout = 0; tcp.SendTimeout = 0; } catch { }
+                        BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt))
+                                FinishReconnect(tcp, channel, remoteIp, udpEp, freedPort, state,
+                                    generation, attempt);
+                            else { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } }
+                        });
                     }
                     catch (Exception ex)
                     {
                         try { tcp.Close(); } catch { }
-                        BeginInvokeUi(() => { if (_sessionActive) EndSession("reconnect state transfer failed: " + ex.Message); });
+                        UntrackHandshakeClient(tcp);
+                        BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt) && _sessionActive)
+                                EndSession("reconnect state transfer failed: " + ex.Message);
+                        });
                     }
                 }) { IsBackground = true, Name = "BizHawkNetplay-reconnect-state" }.Start();
             }
@@ -2487,9 +3336,12 @@ namespace BizHawkNetplay.Tool
         }
 
         private void FinishReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp,
-            IPEndPoint udpEp, int freedPort, byte[] state)
+            IPEndPoint udpEp, int freedPort, byte[] state, SessionGeneration generation, int attempt)
         {
-            if (!_sessionActive || !_awaitingReconnect) { try { tcp.Close(); } catch { } return; }
+            if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
+            { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
+            if (generation != CurrentGeneration)
+            { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
             try
             {
                 var link = new PeerLink
@@ -2502,77 +3354,116 @@ namespace BizHawkNetplay.Tool
                 // state writes complete, otherwise the first peer can run while another is still loading.
                 var allPeers = new List<PeerLink>(_peers) { link };
                 var survivors = new List<PeerLink>(_peers);
-                _resyncInProgress = true;
-                RebuildDriver();
-                int remaining = survivors.Count;
-                int failed = 0;
-                if (remaining == 0)
+                _pendingReconnectLink = link;
+                _pendingReconnectStateLength = state.Length;
+                _pendingReconnectGeneration = generation;
+                var stateBody = EncodeStatePayload(generation, state);
+                if (survivors.Count == 0)
                 {
-                    ReleaseReconnectedPeer(link, state.Length);
+                    ReleaseReconnectedPeer(link, state.Length, generation);
                     return;
                 }
                 foreach (var survivor in survivors)
                 {
                     GraceForStateTransfer(survivor, state.Length); // same leash: a big frame is inbound
+                    survivor.AwaitingAppliedEpoch = generation.Epoch;
+                    Interlocked.Exchange(ref survivor.AppliedDeadlineTicks, StateApplyDeadlineTicks(state.Length));
                     QueueControl(survivor, ControlMessageType.PeerList,
-                        HandshakeCodec.EncodeEndpoints(CandidatesExcept(allPeers, survivor)));
-                    QueueControl(survivor, ControlMessageType.ResyncBegin, Array.Empty<byte>());
-                    QueueControl(survivor, ControlMessageType.Resync, state, ok =>
-                    {
-                        if (!ok) Interlocked.Exchange(ref failed, 1);
-                        if (Interlocked.Decrement(ref remaining) != 0) return;
-                        BeginInvokeUi(() =>
+                        HandshakeCodec.EncodeRoutes(RoutesExcept(allPeers, survivor)));
+                    if (!QueueControl(survivor, ControlMessageType.Resync, stateBody, ok =>
                         {
-                            if (!_sessionActive) { try { tcp.Close(); } catch { } return; }
-                            if (failed != 0) { EndSession("reconnect resync transfer failed"); return; }
-                            ReleaseReconnectedPeer(link, state.Length);
-                        });
-                    });
+                            if (!ok) BeginInvokeUi(() =>
+                            {
+                                if (IsConnectionAttemptCurrent(attempt) && _sessionActive
+                                    && CurrentGeneration == generation)
+                                    EndSession("reconnect resync transfer failed");
+                            });
+                        }))
+                    {
+                        EndSession("reconnect resync transfer could not be queued");
+                        return;
+                    }
                 }
             }
             catch (Exception ex) { EndSession("reconnect failed: " + ex.Message); }
         }
 
-        private void ReleaseReconnectedPeer(PeerLink link, int stateLength)
+        private void ReleaseReconnectedPeer(PeerLink link, int stateLength, SessionGeneration generation)
         {
-            // The client is still blocked in the READY/GO handshake, so send GO off-thread before its
-            // live reader/writer start consuming this ControlChannel.
-            new Thread(() =>
+            if (_resyncReleaseQueued || generation != CurrentGeneration) return;
+            _resyncReleaseQueued = true;
+            int attempt = CurrentConnectionAttempt;
+
+            // Survivors leave their resync wait only after all of them — and the rejoiner waiting in
+            // READY/GO — have applied this generation. Flush their RESUME markers first, then release
+            // the rejoiner's handshake off-thread before its live reader starts consuming the channel.
+            QueueResyncResumeToPeers(generation, resumesOk => BeginInvokeUi(() =>
             {
-                try
+                if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
                 {
-                    Handshake.HostSendGo(link.Control);
-                    BeginInvokeUi(() =>
-                    {
-                        if (!_sessionActive || !_awaitingReconnect) { try { link.Tcp?.Close(); } catch { } return; }
-                        _peers.Add(link);
-                        _greetingTcp = null;
-                        UpdateMeshPeers();
-                        StartPeerIo(link);
-                        _awaitingReconnect = false;
-                        _resyncInProgress = false;
-                        _reconnectPort = -1;
-                        _resyncCount = 0;
-                        _paceClock.Restart();
-                        _nextFrameDueMs = 0;
-                        ConnLog($"{link.Label} reconnected — {stateLength / 1024}KiB baseline synchronized; resuming",
-                            Color.DarkGreen);
-                        Status($"reconnected P{link.RemotePort + 1} — resuming", Color.Green);
-                    });
-                }
-                catch (Exception ex)
-                {
+                    UntrackHandshakeClient(link.Tcp);
                     try { link.Tcp?.Close(); } catch { }
-                    BeginInvokeUi(() => { if (_sessionActive) EndSession("reconnect GO failed: " + ex.Message); });
+                    return;
                 }
-            }) { IsBackground = true, Name = "BizHawkNetplay-reconnect-go" }.Start();
+                if (!resumesOk) { EndSession("reconnect resume transfer failed"); return; }
+
+                new Thread(() =>
+                {
+                    try
+                    {
+                        Handshake.HostSendGo(link.Control, generation);
+                        BeginInvokeUi(() =>
+                        {
+                            if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive
+                                || !_awaitingReconnect || generation != CurrentGeneration)
+                            { UntrackHandshakeClient(link.Tcp); try { link.Tcp?.Close(); } catch { } return; }
+                            _peers.Add(link);
+                            UntrackHandshakeClient(link.Tcp);
+                            _greetingTcp = null;
+                            _reconnectState = null;
+                            _reconnectGeneration = default;
+                            _pendingReconnectLink = null;
+                            _pendingReconnectStateLength = 0;
+                            _pendingReconnectGeneration = default;
+                            UpdateMeshPeers();
+                            StartPeerIo(link);
+                            _driver?.ResetRemoteInputLiveness();
+                            _awaitingReconnect = false;
+                            _resyncInProgress = false;
+                            _reconnectPort = -1;
+                            _resyncCount = 0;
+                            RebaseFrameSchedule();
+                            ConnLog($"{link.Label} reconnected — epoch {generation.Epoch}, " +
+                                $"{stateLength / 1024}KiB baseline synchronized; resuming", Color.DarkGreen);
+                            Status($"reconnected P{link.RemotePort + 1} — resuming", Color.Green);
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        try { link.Tcp?.Close(); } catch { }
+                        UntrackHandshakeClient(link.Tcp);
+                        BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt) && _sessionActive)
+                                EndSession("reconnect GO failed: " + ex.Message);
+                        });
+                    }
+                }) { IsBackground = true, Name = "BizHawkNetplay-reconnect-go" }.Start();
+            }));
         }
 
         private void FailSession(string reason)
         {
+            bool wasActive = _sessionActive;
             _pendingJoinIp = null; // a failed connect shouldn't land in the recent-IPs list
             ConnLog("connection failed: " + reason, Color.Firebrick);
+            _frameTimer.Stop();
+            _sessionActive = false;
+            _resyncInProgress = false;
+            _resyncReleaseQueued = false;
+            try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
             TeardownNetwork();
+            if (!wasActive) RestorePreJoinState();
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false);
             try { APIs.EmuClient.Unpause(); } catch { } // undo the freeze from OnGo
@@ -2583,7 +3474,11 @@ namespace BizHawkNetplay.Tool
 
         private void EndSession(string reason)
         {
-            if (!_sessionActive && _listener == null && _peers.Count == 0 && !_punchMode) { SetBusy(false); return; }
+            if (!_sessionActive && _listener == null && _joiningTcp == null && _greetingTcp == null
+                && _peers.Count == 0
+                && !_punchMode && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
+            { SetBusy(false); return; }
+            bool wasActive = _sessionActive;
             _frameTimer.Stop();
 
             // Preserve a clean "friend left" signal without doing socket I/O on the UI thread. Give
@@ -2600,10 +3495,12 @@ namespace BizHawkNetplay.Tool
 
             _sessionActive = false;
             _resyncInProgress = false;
+            _resyncReleaseQueued = false;
             _simUnresponsive = false; _simUnresponsiveCheck.Checked = false; // clear the diagnostic
             try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
 
             TeardownNetwork();
+            if (!wasActive) RestorePreJoinState();
 
             try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
             ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
@@ -2620,8 +3517,22 @@ namespace BizHawkNetplay.Tool
             SetBusy(false);
         }
 
+        private void RestorePreJoinState()
+        {
+            var state = _preJoinRestoreState;
+            _preJoinRestoreState = null;
+            if (state == null || _adapter == null) return;
+            try
+            {
+                _adapter.ImportState(state);
+                Log("restored the pre-join emulator state after the start barrier was canceled");
+            }
+            catch (Exception ex) { Log("(warning) could not restore the pre-join state: " + ex.Message); }
+        }
+
         private void TeardownNetwork()
         {
+            InvalidateConnectionAttempt();
             // Remove any UPnP forward we added, off-thread (it's a router round-trip).
             var upnp = _upnpMapping;
             _upnpMapping = null;
@@ -2631,6 +3542,11 @@ namespace BizHawkNetplay.Tool
 
             // Stop any in-flight reconnect wait first; its loop exits once these flags clear.
             _awaitingReconnect = false;
+            _reconnectState = null;
+            _reconnectGeneration = default;
+            _pendingReconnectLink = null;
+            _pendingReconnectStateLength = 0;
+            _pendingReconnectGeneration = default;
             var reconnect = _reconnectThread;
             _reconnectThread = null;
             _reconnectPort = -1;
@@ -2641,6 +3557,15 @@ namespace BizHawkNetplay.Tool
             _joiningTcp = null;
             try { _greetingTcp?.Close(); } catch { } // abort a joiner we're blocked greeting (Disconnect mid-handshake)
             _greetingTcp = null;
+
+            List<TcpClient> handshakes;
+            lock (_handshakeClientsLock)
+            {
+                _rejectNewHandshakeClients = true;
+                handshakes = new List<TcpClient>(_handshakeClients);
+                _handshakeClients.Clear();
+            }
+            foreach (var tcp in handshakes) { try { tcp.Close(); } catch { } }
 
             var peers = new List<PeerLink>(_peers);
             _peers.Clear();
@@ -2657,6 +3582,7 @@ namespace BizHawkNetplay.Tool
             _transport = null; _mesh = null; _punchLink = null;
             _punchMode = false; _punchState = null;
             _driver = null;
+            _sessionDriverPrepared = false;
 
             foreach (var link in peers)
             {
@@ -2838,28 +3764,132 @@ namespace BizHawkNetplay.Tool
             return 1000.0 / 60.0;
         }
 
-        private static byte[] EncodeChecksum(int frame, uint hash)
+        private static byte[] EncodeChecksum(SessionGeneration generation, int frame, uint hash)
         {
-            var b = new byte[8];
-            b[0] = (byte)(frame >> 24); b[1] = (byte)(frame >> 16); b[2] = (byte)(frame >> 8); b[3] = (byte)frame;
-            b[4] = (byte)(hash >> 24); b[5] = (byte)(hash >> 16); b[6] = (byte)(hash >> 8); b[7] = (byte)hash;
+            var b = new byte[20];
+            WriteGeneration(b, 0, generation);
+            WriteInt32(b, 12, frame);
+            b[16] = (byte)(hash >> 24); b[17] = (byte)(hash >> 16);
+            b[18] = (byte)(hash >> 8); b[19] = (byte)hash;
             return b;
         }
 
-        private static void DecodeChecksum(byte[] b, out int frame, out uint hash)
+        private static bool TryDecodeChecksum(byte[] b, SessionGeneration expected, out int frame, out uint hash)
         {
-            frame = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-            hash = ((uint)b[4] << 24) | ((uint)b[5] << 16) | ((uint)b[6] << 8) | b[7];
+            frame = 0; hash = 0;
+            if (b == null || b.Length != 20 || !TryReadGeneration(b, 0, out var generation)
+                || generation != expected) return false;
+            frame = ReadInt32(b, 12);
+            hash = ((uint)b[16] << 24) | ((uint)b[17] << 16) | ((uint)b[18] << 8) | b[19];
+            return true;
+        }
+
+        private static void WriteGeneration(byte[] b, int offset, SessionGeneration generation)
+        {
+            ulong id = generation.SessionId;
+            for (int i = 7; i >= 0; i--) { b[offset + i] = (byte)id; id >>= 8; }
+            WriteInt32(b, offset + 8, generation.Epoch);
+        }
+
+        private static bool TryReadGeneration(byte[] b, int offset, out SessionGeneration generation)
+        {
+            generation = SessionGeneration.Legacy;
+            if (b == null || offset < 0 || b.Length - offset < 12) return false;
+            ulong id = 0;
+            for (int i = 0; i < 8; i++) id = (id << 8) | b[offset + i];
+            int epoch = ReadInt32(b, offset + 8);
+            if (id == 0 || epoch < 0) return false;
+            generation = new SessionGeneration(id, epoch);
+            return true;
         }
 
         private void StartThread(Action body) =>
             new Thread(() => body()) { IsBackground = true, Name = "BizHawkNetplay-connect" }.Start();
+
+        private int BeginConnectionAttempt() => Interlocked.Increment(ref _connectionAttempt);
+        private int CurrentConnectionAttempt => Volatile.Read(ref _connectionAttempt);
+        private bool IsConnectionAttemptCurrent(int attempt) =>
+            attempt == Volatile.Read(ref _connectionAttempt);
+        private void InvalidateConnectionAttempt() => Interlocked.Increment(ref _connectionAttempt);
+
+        private void AllowHandshakeClients()
+        {
+            lock (_handshakeClientsLock) _rejectNewHandshakeClients = false;
+        }
+
+        private bool TrackHandshakeClient(TcpClient? tcp, int attempt)
+        {
+            if (tcp == null) return false;
+            lock (_handshakeClientsLock)
+            {
+                if (_rejectNewHandshakeClients || !IsConnectionAttemptCurrent(attempt)) return false;
+                _handshakeClients.Add(tcp);
+                return true;
+            }
+        }
+
+        private void UntrackHandshakeClient(TcpClient? tcp)
+        {
+            if (tcp == null) return;
+            lock (_handshakeClientsLock) _handshakeClients.Remove(tcp);
+        }
+
+        private bool HasHandshakeClients()
+        {
+            lock (_handshakeClientsLock) return _handshakeClients.Count != 0;
+        }
+
+        private static long MonotonicNow() => System.Diagnostics.Stopwatch.GetTimestamp();
+
+        private static long MonotonicTicks(double seconds) =>
+            (long)Math.Ceiling(Math.Max(0, seconds) * System.Diagnostics.Stopwatch.Frequency);
+
+        private static long MonotonicDeadline(double seconds) =>
+            MonotonicNow() + MonotonicTicks(seconds);
+
+        private static double MonotonicElapsedSeconds(long startedAt) => startedAt == 0
+            ? double.PositiveInfinity
+            : (MonotonicNow() - startedAt) / (double)System.Diagnostics.Stopwatch.Frequency;
+
+        private static int StateTransferTimeoutMs(int stateBytes)
+        {
+            double seconds = StateTransferGraceBaseSeconds
+                + Math.Max(0, stateBytes) / StateTransferMinBytesPerSec;
+            return (int)Math.Min(int.MaxValue, Math.Max(HandshakeReceiveTimeoutMs, seconds * 1000.0));
+        }
+
+        private static void ConfigureStateTransferTimeouts(TcpClient? tcp, int stateBytes)
+        {
+            if (tcp == null) return;
+            int timeout = StateTransferTimeoutMs(stateBytes);
+            try { tcp.ReceiveTimeout = timeout; tcp.SendTimeout = timeout; } catch { }
+        }
+
+        private static T WithAbsoluteSocketDeadline<T>(TcpClient tcp, int timeoutMs, Func<T> action)
+        {
+            using (var deadline = new AbsoluteSocketDeadline(tcp, timeoutMs))
+            {
+                try
+                {
+                    T result = action();
+                    if (!deadline.TryComplete())
+                        throw new TimeoutException("peer authentication deadline expired");
+                    return result;
+                }
+                catch (Exception ex) when (deadline.Expired && !(ex is TimeoutException))
+                {
+                    throw new TimeoutException("peer authentication deadline expired", ex);
+                }
+            }
+        }
 
         private void UpdateEnabled()
         {
             bool host = _hostRadio.Checked;
             _ipBox.Enabled = !host;
             _playersBox.Enabled = host; // only the host chooses the player count
+            _autoDelayCheck.Enabled = host;
+            _autoDelayMaxBox.Enabled = host && _autoDelayCheck.Checked;
             _goButton.Text = host ? "Start Hosting" : "Join";
         }
 
@@ -2870,6 +3900,8 @@ namespace BizHawkNetplay.Tool
             _ipBox.Enabled = !busy && _joinRadio.Checked;
             _playersBox.Enabled = !busy && _hostRadio.Checked;
             _portBox.Enabled = _delayBox.Enabled = !busy;
+            _autoDelayCheck.Enabled = !busy && _hostRadio.Checked;
+            _autoDelayMaxBox.Enabled = !busy && _hostRadio.Checked && _autoDelayCheck.Checked;
             _netcodeCombo.Enabled = _passwordBox.Enabled = _upnpCheck.Enabled = !busy;
             _inputSourceCombo.Enabled = !busy;
             _probeButton.Enabled = !busy;
@@ -2961,6 +3993,13 @@ namespace BizHawkNetplay.Tool
 
         /// <summary>Thread-safe <see cref="ConnLog"/> for the accept/join/reconnect background threads.</summary>
         private void UiConnLog(string message, Color color) => BeginInvokeUi(() => ConnLog(message, color));
+
+        private void InvokeUiBlocking(Action action)
+        {
+            if (IsDisposed) throw new ObjectDisposedException(nameof(NetplayToolForm));
+            if (!InvokeRequired) { action(); return; }
+            Invoke(action);
+        }
 
         private void BeginInvokeUi(Action action)
         {

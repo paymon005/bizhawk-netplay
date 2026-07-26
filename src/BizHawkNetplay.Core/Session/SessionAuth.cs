@@ -33,6 +33,21 @@ namespace BizHawkNetplay.Core.Session
             return n;
         }
 
+        /// <summary>A fresh non-zero identifier for one netplay session.</summary>
+        public static ulong NewSessionId()
+        {
+            var bytes = new byte[sizeof(ulong)];
+            using var rng = RandomNumberGenerator.Create();
+            ulong id;
+            do
+            {
+                rng.GetBytes(bytes);
+                id = BitConverter.ToUInt64(bytes, 0);
+            }
+            while (id == 0);
+            return id;
+        }
+
         /// <summary>
         /// The proof a peer sends for its <paramref name="role"/>. The two nonces are passed in their fixed
         /// roles (host's first, joiner's second) so both ends derive identical inputs no matter who computes.

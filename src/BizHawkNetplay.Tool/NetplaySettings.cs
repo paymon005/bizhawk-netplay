@@ -7,7 +7,7 @@ namespace BizHawkNetplay.Tool
 {
     /// <summary>
     /// Small persisted UI preferences for the netplay tool: the toggles worth remembering between
-    /// sessions (UPnP, port, delay, netcode) plus a most-recently-used list of join IPs surfaced as a
+    /// sessions (UPnP, port, manual/automatic delay, netcode) plus a most-recently-used list of join IPs surfaced as a
     /// dropdown on the Host IP box. Stored as a tiny <c>key=value</c> file under <c>%AppData%</c> rather
     /// than beside the DLL, which a redeploy overwrites. Loading and saving are best-effort — a missing
     /// or corrupt file just yields defaults, never an error that could disrupt play.
@@ -19,7 +19,9 @@ namespace BizHawkNetplay.Tool
         public bool Upnp = true;
         public int Port = 47800;
         public int Players = 2;      // host: how many controller ports to fill
-        public int Delay = 1;        // the protocol floor: least felt latency, raise it if a link stalls
+        public int Delay = 1;        // fixed delay, or the manual floor when lobby auto-selection is enabled
+        public bool AutoDelay = true; // host measures lobby RTT and raises Delay before GO
+        public int AutoDelayMax = 8; // cap automatic increases without overriding an explicit peer request
         public int Netcode = 0;     // index into the netcode dropdown (Automatic/Rollback/Lockstep)
         public int InputSource = 0; // index into the "My controls" dropdown (P1..P4, or Assigned port)
         public readonly List<string> RecentIps = new List<string>();
@@ -48,6 +50,8 @@ namespace BizHawkNetplay.Tool
                         case "port": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var p)) s.Port = p; break;
                         case "players": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var pl)) s.Players = pl; break;
                         case "delay": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d)) s.Delay = d; break;
+                        case "autodelay": s.AutoDelay = val == "1" || string.Equals(val, "true", StringComparison.OrdinalIgnoreCase); break;
+                        case "autodelaymax": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var adm)) s.AutoDelayMax = adm; break;
                         case "netcode": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)) s.Netcode = n; break;
                         case "inputsrc": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ins)) s.InputSource = ins; break;
                         case "ip": if (val.Length > 0 && s.RecentIps.Count < MaxRecentIps && !s.RecentIps.Contains(val)) s.RecentIps.Add(val); break;
@@ -70,6 +74,8 @@ namespace BizHawkNetplay.Tool
                     "port=" + Port.ToString(CultureInfo.InvariantCulture),
                     "players=" + Players.ToString(CultureInfo.InvariantCulture),
                     "delay=" + Delay.ToString(CultureInfo.InvariantCulture),
+                    "autodelay=" + (AutoDelay ? "1" : "0"),
+                    "autodelaymax=" + AutoDelayMax.ToString(CultureInfo.InvariantCulture),
                     "netcode=" + Netcode.ToString(CultureInfo.InvariantCulture),
                     "inputsrc=" + InputSource.ToString(CultureInfo.InvariantCulture),
                 };

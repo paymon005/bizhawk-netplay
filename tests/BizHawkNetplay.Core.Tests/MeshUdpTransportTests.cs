@@ -21,6 +21,17 @@ namespace BizHawkNetplay.Core.Tests
         private static IPEndPoint Loop(int port) => new IPEndPoint(IPAddress.Loopback, port);
 
         [Fact]
+        public void PeerRoute_DeDuplicatesCandidatesInOrder()
+        {
+            var first = Loop(47800);
+            var second = Loop(47801);
+            var route = new PeerRoute(3, new[] { first, Loop(47800), second, Loop(47801) });
+
+            Assert.Equal(3, route.RemotePort);
+            Assert.Equal(new[] { first, second }, route.Candidates);
+        }
+
+        [Fact]
         public void EachPeerReceivesFromEveryOther()
         {
             var a = MeshUdpTransport.Bind(0);
@@ -38,6 +49,182 @@ namespace BizHawkNetplay.Core.Tests
                 Assert.Equal(new byte[] { 42 }, WaitRecv(c));
             }
             finally { a.Dispose(); b.Dispose(); c.Dispose(); }
+        }
+
+        [Fact]
+        public void SetPeerRoutes_GloballyDeduplicatesCandidates()
+        {
+            var sender = MeshUdpTransport.Bind(0);
+            var receiver = MeshUdpTransport.Bind(0);
+            try
+            {
+                var receiverEndpoint = Loop(receiver.LocalPort);
+                sender.SetPeerRoutes(new[]
+                {
+                    new PeerRoute(1, new[] { receiverEndpoint }),
+                    // The same socket cannot be two logical destinations. Keep the first ownership and
+                    // do not duplicate the input send merely because rendezvous advertised it twice.
+                    new PeerRoute(2, new[] { Loop(receiver.LocalPort) }),
+                });
+                receiver.SetPeers(new[] { Loop(sender.LocalPort) });
+
+                sender.Send(new byte[] { 7 });
+                Assert.Equal(new byte[] { 7 }, WaitRecv(receiver));
+                AssertNoRecv(receiver);
+            }
+            finally { sender.Dispose(); receiver.Dispose(); }
+        }
+
+        [Fact]
+        public void Routes_SelectBestLiveCandidate_ThenFailOver_AndIgnoreDeadRtt()
+        {
+            var sender = MeshUdpTransport.Bind(0);
+            var fast = MeshUdpTransport.Bind(0);
+            var backup = MeshUdpTransport.Bind(0);
+            var otherPeer = MeshUdpTransport.Bind(0);
+            try
+            {
+                var senderEndpoint = Loop(sender.LocalPort);
+                var fastEndpoint = Loop(fast.LocalPort);
+                var backupEndpoint = Loop(backup.LocalPort);
+                var otherEndpoint = Loop(otherPeer.LocalPort);
+                sender.SetPeerRoutes(new[]
+                {
+                    new PeerRoute(1, new[] { fastEndpoint, backupEndpoint }),
+                    new PeerRoute(2, new[] { otherEndpoint }),
+                });
+                sender.RecordRtt(fastEndpoint, 1);
+                Assert.False(sender.TryGetWorstRttMs(out _)); // every logical route needs a live measurement
+                fast.SetPeers(new[] { senderEndpoint });
+                backup.SetPeers(new[] { senderEndpoint });
+                otherPeer.SetPeers(new[] { senderEndpoint });
+
+                // Every candidate is actively probed, even though only one candidate per route carries
+                // input. Once all are live, make the ordering deterministic for this loopback test.
+                WaitUntil(() => sender.IsEndpointAlive(fastEndpoint)
+                             && sender.IsEndpointAlive(backupEndpoint)
+                             && sender.IsEndpointAlive(otherEndpoint),
+                    "not every route candidate became live");
+                for (int i = 0; i < 12; i++)
+                {
+                    sender.RecordRtt(fastEndpoint, 1);
+                    sender.RecordRtt(backupEndpoint, 1000);
+                    sender.RecordRtt(otherEndpoint, 200);
+                }
+
+                Assert.True(sender.TryGetRttMs(fastEndpoint, out double fastRtt));
+                Assert.True(sender.TryGetRttMs(backupEndpoint, out double backupRtt));
+                Assert.True(sender.TryGetRttMs(otherEndpoint, out double otherRtt));
+                Assert.True(fastRtt < otherRtt && otherRtt < backupRtt);
+                Assert.True(sender.TryGetWorstRttMs(out double worst));
+                Assert.InRange(Math.Abs(worst - otherRtt), 0, 0.001); // max(min(fast, backup), other)
+
+                sender.Send(new byte[] { 10 });
+                Assert.Equal(new byte[] { 10 }, WaitRecv(fast));
+                Assert.Equal(new byte[] { 10 }, WaitRecv(otherPeer));
+                AssertNoRecv(backup); // one send for P1, through its lowest-RTT live candidate
+
+                // Kill the selected path and clear confirmations. The punch loop reconfirms the two live
+                // sockets; the stale low RTT for `fast` remains stored but must not keep that dead route.
+                fast.Dispose();
+                sender.RequestRepunch();
+                WaitUntil(() => !sender.IsEndpointAlive(fastEndpoint)
+                             && sender.IsEndpointAlive(backupEndpoint)
+                             && sender.IsEndpointAlive(otherEndpoint),
+                    "live backup route was not selected after repunch");
+
+                sender.Send(new byte[] { 11 });
+                Assert.Equal(new byte[] { 11 }, WaitRecv(backup));
+                Assert.Equal(new byte[] { 11 }, WaitRecv(otherPeer));
+                Assert.True(sender.TryGetWorstRttMs(out worst));
+                Assert.True(worst > otherRtt, "failover should report the live backup, not stale fast-path RTT");
+
+                // Leave only the dead endpoint configured. Its historical RTT is still present, but a
+                // route with no live candidate must not produce a UDP RTT measurement.
+                sender.SetPeerRoutes(new[] { new PeerRoute(1, new[] { fastEndpoint }) });
+                Assert.True(sender.TryGetRttMs(fastEndpoint, out _));
+                Assert.False(sender.TryGetWorstRttMs(out _));
+            }
+            finally { sender.Dispose(); fast.Dispose(); backup.Dispose(); otherPeer.Dispose(); }
+        }
+
+        [Fact]
+        public void InputFailsOverToFreshSibling_WhenSelectedPathGoesQuiet()
+        {
+            // F6: the selected candidate dies *silently* mid-session — its liveness entry and its
+            // (stale, lowest) RTT both linger inside the 8s alive window. A sibling candidate that is
+            // still answering keepalives must take over the input path well before that window
+            // expires; pinned sends into the black hole for the full 8s lose the race against the
+            // UDP-lost session watchdog.
+            var sender = MeshUdpTransport.Bind(0);
+            var fast = MeshUdpTransport.Bind(0);
+            var backup = MeshUdpTransport.Bind(0);
+            try
+            {
+                var senderEndpoint = Loop(sender.LocalPort);
+                var fastEndpoint = Loop(fast.LocalPort);
+                var backupEndpoint = Loop(backup.LocalPort);
+                sender.SetPeerRoutes(new[] { new PeerRoute(1, new[] { fastEndpoint, backupEndpoint }) });
+                fast.SetPeers(new[] { senderEndpoint });
+                backup.SetPeers(new[] { senderEndpoint });
+                WaitUntil(() => sender.IsEndpointAlive(fastEndpoint) && sender.IsEndpointAlive(backupEndpoint),
+                    "both candidates should come alive");
+                for (int i = 0; i < 12; i++)
+                {
+                    sender.RecordRtt(fastEndpoint, 1);
+                    sender.RecordRtt(backupEndpoint, 50);
+                }
+
+                sender.Send(new byte[] { 32 });
+                Assert.Equal(new byte[] { 32 }, WaitRecv(fast));
+                AssertNoRecv(backup);
+
+                // The fast path dies without a goodbye. Input must reach the backup once the dead
+                // path's freshness lapses — well under the 8s alive window (and far under the 8s
+                // session-kill watchdog it would otherwise race).
+                fast.Dispose();
+                var sw = Stopwatch.StartNew();
+                bool failedOver = false;
+                while (sw.ElapsedMilliseconds < 4500 && !failedOver)
+                {
+                    sender.Send(new byte[] { 33 });
+                    if (backup.TryReceive(out var got) && got.Length == 1 && got[0] == 33) failedOver = true;
+                    else Thread.Sleep(100);
+                }
+                Assert.True(failedOver,
+                    $"input stayed pinned to the dead candidate for {sw.ElapsedMilliseconds}ms");
+            }
+            finally { sender.Dispose(); fast.Dispose(); backup.Dispose(); }
+        }
+
+        [Fact]
+        public void RepunchFallsBackToLastKnownGoodCandidate_NotFirstAdvertised()
+        {
+            // F8: RequestRepunch clears the liveness table while re-probing a silent peer. With
+            // nothing confirmed, input must keep riding the last path that actually worked — not
+            // fall back to the first advertised candidate, which for an internet peer is typically
+            // the unreachable pre-NAT address.
+            var sender = MeshUdpTransport.Bind(0);
+            var unreachableFirst = MeshUdpTransport.Bind(0);
+            var working = MeshUdpTransport.Bind(0);
+            try
+            {
+                var senderEndpoint = Loop(sender.LocalPort);
+                var unreachableEndpoint = Loop(unreachableFirst.LocalPort);
+                var workingEndpoint = Loop(working.LocalPort);
+                unreachableFirst.Dispose(); // plays the dead pre-NAT candidate: never answers
+                sender.SetPeerRoutes(new[] { new PeerRoute(1, new[] { unreachableEndpoint, workingEndpoint }) });
+                working.SetPeers(new[] { senderEndpoint });
+                WaitUntil(() => sender.IsEndpointAlive(workingEndpoint), "working path never confirmed");
+
+                sender.Send(new byte[] { 40 });
+                Assert.Equal(new byte[] { 40 }, WaitRecv(working));
+
+                sender.RequestRepunch(1);
+                sender.Send(new byte[] { 41 }); // liveness just cleared — must still reach the peer
+                Assert.Equal(new byte[] { 41 }, WaitRecv(working));
+            }
+            finally { sender.Dispose(); unreachableFirst.Dispose(); working.Dispose(); }
         }
 
         [Fact]
@@ -187,6 +374,27 @@ namespace BizHawkNetplay.Core.Tests
                 Thread.Sleep(1);
             }
             throw new Xunit.Sdk.XunitException("no datagram received within 2s");
+        }
+
+        private static void AssertNoRecv(ITransport transport, int durationMs = 250)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < durationMs)
+            {
+                Assert.False(transport.TryReceive(out _), "unexpected duplicate datagram");
+                Thread.Sleep(2);
+            }
+        }
+
+        private static void WaitUntil(Func<bool> condition, string message, int timeoutMs = 3000)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                if (condition()) return;
+                Thread.Sleep(10);
+            }
+            throw new Xunit.Sdk.XunitException(message);
         }
     }
 }

@@ -101,9 +101,9 @@ namespace BizHawkNetplay.Core.Net
         public bool Punch(IPEndPoint peerHint, TimeSpan timeout)
         {
             if (peerHint == null) throw new ArgumentNullException(nameof(peerHint));
-            var deadline = DateTime.UtcNow + timeout;
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
             var probe = Frame(TPunch, Array.Empty<byte>());
-            while (DateTime.UtcNow < deadline && _running)
+            while (elapsed.Elapsed < timeout && _running)
             {
                 if (_peer == null) { try { _socket.SendTo(probe, peerHint); } catch { } }
                 if (_connected.Wait(250)) return true;

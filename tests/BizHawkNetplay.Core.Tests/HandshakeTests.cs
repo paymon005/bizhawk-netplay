@@ -1,7 +1,9 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
+using BizHawkNetplay.Core.Net;
 using BizHawkNetplay.Core.Session;
 using Xunit;
 
@@ -16,6 +18,9 @@ namespace BizHawkNetplay.Core.Tests
     {
         private static PeerIdentity Id(string rom = "ROMHASH", int depth = 20) =>
             new PeerIdentity(1, rom, "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, depth);
+
+        private static SessionGeneration Generation(ulong sessionId = 0x1234UL, int epoch = 1) =>
+            new SessionGeneration(sessionId, epoch);
 
         private static (ControlChannel host, ControlChannel client, Action dispose) TcpPair()
         {
@@ -67,8 +72,120 @@ namespace BizHawkNetplay.Core.Tests
                 // UDP ports were exchanged so each side knows where to send inputs.
                 Assert.Equal(51000, hostParams.RemoteUdpPort);
                 Assert.Equal(47800, clientParams.RemoteUdpPort);
+                Assert.True(hostParams.Generation.IsValid);
+                Assert.Equal(1, hostParams.Generation.Epoch);
+                Assert.Equal(hostParams.Generation, clientParams.Generation);
             }
             finally { dispose(); }
+        }
+
+        [Fact]
+        public void LobbyProbeCanRaiseDelayBeforeEitherDriverIsPrepared()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                double measuredRtt = -1;
+                var hostTask = Task.Run(() => Handshake.RunHost(
+                    hostCh, Id(), new SessionPreferences(1, wantRollback: true), new byte[32], 47800,
+                    selectInputDelay: (channel, mode, floor) =>
+                    {
+                        Assert.Equal(SyncMode.Rollback, mode);
+                        Assert.Equal(1, floor);
+                        measuredRtt = Handshake.MeasureLobbyRoundTrip(channel, samples: 3);
+                        return 4;
+                    }));
+
+                var client = Handshake.RunClient(
+                    clientCh, Id(), new SessionPreferences(1, wantRollback: true), 51000);
+                var host = hostTask.GetAwaiter().GetResult();
+
+                Assert.True(measuredRtt >= 0);
+                Assert.Equal(4, host.InputDelay);
+                Assert.Equal(4, client.InputDelay);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void TwoPlayerHandshake_WaitsForPostApplyCallbackBeforeReady()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            using var callbackEntered = new ManualResetEventSlim();
+            using var releaseApply = new ManualResetEventSlim();
+            using var hostPrepared = new ManualResetEventSlim();
+            using var releaseGo = new ManualResetEventSlim();
+            var generation = Generation(0x7777UL, epoch: 3);
+            var hostState = new byte[4096];
+            try
+            {
+                var host = Task.Run(() => Handshake.RunHost(
+                    hostCh, Id(), new SessionPreferences(2, false), hostState, 47800, generation,
+                    beforeGo: _ =>
+                    {
+                        hostPrepared.Set();
+                        Assert.True(releaseGo.Wait(TimeSpan.FromSeconds(5)));
+                    }));
+                var client = Task.Run(() => Handshake.RunClient(
+                    clientCh, Id(), new SessionPreferences(2, false), 51000,
+                    beforeReady: p =>
+                    {
+                        Assert.Equal(hostState, p.InitialState);
+                        Assert.Equal(generation, p.Generation);
+                        callbackEntered.Set();
+                        Assert.True(releaseApply.Wait(TimeSpan.FromSeconds(5)));
+                    }));
+
+                Assert.True(callbackEntered.Wait(TimeSpan.FromSeconds(5)));
+                Assert.False(host.IsCompleted); // host cannot observe READY until application returns
+                Assert.False(client.IsCompleted);
+
+                releaseApply.Set();
+                Assert.True(hostPrepared.Wait(TimeSpan.FromSeconds(5)));
+                Assert.False(client.IsCompleted); // client remains behind GO until host preparation finishes
+                releaseGo.Set();
+                Assert.Equal(generation, client.GetAwaiter().GetResult().Generation);
+                Assert.Equal(generation, host.GetAwaiter().GetResult().Generation);
+            }
+            finally
+            {
+                releaseApply.Set();
+                releaseGo.Set();
+                dispose();
+            }
+        }
+
+        [Fact]
+        public void WelcomeCodec_RoundTripsGenerationAndGroupedRoutes()
+        {
+            var generation = Generation(ulong.MaxValue, epoch: 17);
+            var lan = new IPEndPoint(IPAddress.Parse("192.168.1.40"), 51002);
+            var reflexive = new IPEndPoint(IPAddress.Parse("2001:db8::40"), 61002);
+            var body = HandshakeCodec.EncodeWelcome(assignedPort: 1, playerCount: 4, inputDelay: 5,
+                SyncMode.Rollback, generation, new[]
+                {
+                    new PeerRoute(2, new[] { lan, reflexive }),
+                    new PeerRoute(2, new[] { lan }), // repeated group/candidate is coalesced
+                    new PeerRoute(3, Array.Empty<IPEndPoint>()),
+                });
+
+            var (port, players, delay, mode, decodedGeneration, routes) = HandshakeCodec.DecodeWelcome(body);
+            Assert.Equal(1, port);
+            Assert.Equal(4, players);
+            Assert.Equal(5, delay);
+            Assert.Equal(SyncMode.Rollback, mode);
+            Assert.Equal(generation, decodedGeneration);
+            Assert.Collection(routes,
+                r =>
+                {
+                    Assert.Equal(2, r.RemotePort);
+                    Assert.Equal(new[] { lan, reflexive }, r.Candidates);
+                },
+                r =>
+                {
+                    Assert.Equal(3, r.RemotePort);
+                    Assert.Empty(r.Candidates);
+                });
         }
 
         [Fact]
@@ -153,7 +270,10 @@ namespace BizHawkNetplay.Core.Tests
                 var goodClient = Task.Run(() =>
                     Handshake.RunClientMulti(clientCh, Id(), new SessionPreferences(2, false, "hunter2"), 51002));
                 var greet = Handshake.HostGreet(hostCh, Id(), hostPrefs, 47800);
-                Handshake.HostSendWelcome(hostCh, 1, 2, 2, SyncMode.Lockstep, hostState);
+                var generation = Generation();
+                Handshake.HostSendWelcome(hostCh, 1, 2, 2, SyncMode.Lockstep, hostState, generation);
+                Handshake.HostWaitReady(hostCh, generation);
+                Handshake.HostSendGo(hostCh, generation);
 
                 var p = goodClient.GetAwaiter().GetResult();
                 Assert.Equal(51002, greet.UdpPort);
@@ -181,14 +301,26 @@ namespace BizHawkNetplay.Core.Tests
                 var g1 = Handshake.HostGreet(hostCh1, Id(), hostPrefs, 47800);
                 var g2 = Handshake.HostGreet(hostCh2, Id(), hostPrefs, 47800);
 
+                // Lobby auto-selection probes every authenticated link while all joiners are still
+                // waiting for WELCOME; neither client may mistake the probe for start data.
+                Assert.True(Handshake.MeasureLobbyRoundTrip(hostCh1, samples: 2) >= 0);
+                Assert.True(Handshake.MeasureLobbyRoundTrip(hostCh2, samples: 2) >= 0);
+
                 // Authoritative delay is the max over everyone: max(3, 2, 5) = 5.
                 int delay = Math.Max(hostPrefs.InputDelay, Math.Max(g1.Prefs.InputDelay, g2.Prefs.InputDelay));
                 const int players = 3;
                 // Each joiner is told the OTHER joiner's UDP endpoint for the direct mesh.
                 var j1Ep = new IPEndPoint(IPAddress.Loopback, g1.UdpPort);
                 var j2Ep = new IPEndPoint(IPAddress.Loopback, g2.UdpPort);
-                Handshake.HostSendWelcome(hostCh1, 1, players, delay, SyncMode.Lockstep, hostState, new[] { j2Ep });
-                Handshake.HostSendWelcome(hostCh2, 2, players, delay, SyncMode.Lockstep, hostState, new[] { j1Ep });
+                var generation = Generation();
+                Handshake.HostSendWelcome(hostCh1, 1, players, delay, SyncMode.Lockstep, hostState, generation,
+                    new[] { new PeerRoute(remotePort: 2, new[] { j2Ep }) });
+                Handshake.HostSendWelcome(hostCh2, 2, players, delay, SyncMode.Lockstep, hostState, generation,
+                    new[] { new PeerRoute(remotePort: 1, new[] { j1Ep }) });
+                Handshake.HostWaitReady(hostCh1, generation);
+                Handshake.HostWaitReady(hostCh2, generation);
+                Handshake.HostSendGo(hostCh1, generation);
+                Handshake.HostSendGo(hostCh2, generation);
 
                 var p1 = c1.GetAwaiter().GetResult();
                 var p2 = c2.GetAwaiter().GetResult();
@@ -199,6 +331,12 @@ namespace BizHawkNetplay.Core.Tests
                 // Mesh endpoints reached each joiner: P1 learns P2's, P2 learns P1's.
                 Assert.Equal(new[] { j2Ep }, p1.MeshPeers);
                 Assert.Equal(new[] { j1Ep }, p2.MeshPeers);
+                Assert.Equal(2, Assert.Single(p1.PeerRoutes).RemotePort);
+                Assert.Equal(j2Ep, Assert.Single(Assert.Single(p1.PeerRoutes).Candidates));
+                Assert.Equal(1, Assert.Single(p2.PeerRoutes).RemotePort);
+                Assert.Equal(j1Ep, Assert.Single(Assert.Single(p2.PeerRoutes).Candidates));
+                Assert.Equal(generation, p1.Generation);
+                Assert.Equal(generation, p2.Generation);
 
                 Assert.Equal(1, p1.LocalPort);
                 Assert.Equal(2, p2.LocalPort);
@@ -220,18 +358,60 @@ namespace BizHawkNetplay.Core.Tests
             var (hostCh, clientCh, dispose) = TcpPair();
             try
             {
+                SessionParams? applied = null;
                 var client = Task.Run(() => Handshake.RunClientMulti(
-                    clientCh, Id(), new SessionPreferences(2, false), 51001));
+                    clientCh, Id(), new SessionPreferences(2, false), 51001,
+                    beforeReady: p => applied = p));
                 var greeting = Handshake.HostGreet(hostCh, Id(), new SessionPreferences(2, false), 47800);
 
+                var generation = Generation();
                 Handshake.HostSendWelcome(hostCh, assignedPort: 1, playerCount: 2, inputDelay: 2,
-                    mode: SyncMode.Lockstep, state: new byte[1024], useReadyBarrier: true);
-                Handshake.HostWaitReady(hostCh);
+                    mode: SyncMode.Lockstep, state: new byte[1024], generation);
+                Handshake.HostWaitReady(hostCh, generation);
 
+                Assert.NotNull(applied);
+                Assert.Equal(1024, applied!.InitialState!.Length);
+                Assert.Equal(generation, applied.Generation);
                 Assert.False(client.IsCompleted);
-                Handshake.HostSendGo(hostCh);
+                Handshake.HostSendGo(hostCh, generation);
                 Assert.Equal(1, client.GetAwaiter().GetResult().LocalPort);
                 Assert.Equal(51001, greeting.UdpPort);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void HostReadyBarrier_RejectsWrongGeneration()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var expected = Generation(0x2222UL, epoch: 4);
+                clientCh.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(expected.Next()));
+
+                var ex = Assert.Throws<HandshakeException>(() => Handshake.HostWaitReady(hostCh, expected));
+                Assert.Contains("READY generation mismatch", ex.Message);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void ClientReadyBarrier_RejectsWrongGenerationGo()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var generation = Generation(0x3333UL, epoch: 2);
+                var client = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh, Id(), new SessionPreferences(2, false), 51001));
+                Handshake.HostGreet(hostCh, Id(), new SessionPreferences(2, false), 47800);
+                Handshake.HostSendWelcome(hostCh, 1, 2, 2, SyncMode.Lockstep,
+                    new byte[128], generation);
+                Handshake.HostWaitReady(hostCh, generation);
+                hostCh.Send(ControlMessageType.Go, HandshakeCodec.EncodeGeneration(generation.Next()));
+
+                var ex = Assert.Throws<HandshakeException>(() => client.GetAwaiter().GetResult());
+                Assert.Contains("GO generation mismatch", ex.Message);
             }
             finally { dispose(); }
         }
@@ -251,6 +431,40 @@ namespace BizHawkNetplay.Core.Tests
                 Assert.Equal(SyncMode.Lockstep, clientParams.Mode);
             }
             finally { dispose(); }
+        }
+
+        [Fact]
+        public void ForcedRollback_BypassesOnlyHostProbe_NotClientCapability()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var hostTask = Task.Run(() => Handshake.RunHost(
+                    hostCh, Id(depth: 2), new SessionPreferences(2, wantRollback: true),
+                    new byte[10], 47800, forceHostRollback: true));
+                var clientParams = Handshake.RunClient(
+                    clientCh, Id(depth: 30), new SessionPreferences(2, wantRollback: true), 51000);
+                var hostParams = hostTask.GetAwaiter().GetResult();
+
+                Assert.Equal(SyncMode.Rollback, hostParams.Mode);
+                Assert.Equal(SyncMode.Rollback, clientParams.Mode);
+            }
+            finally { dispose(); }
+
+            var (hostCh2, clientCh2, dispose2) = TcpPair();
+            try
+            {
+                var hostTask = Task.Run(() => Handshake.RunHost(
+                    hostCh2, Id(depth: 2), new SessionPreferences(2, wantRollback: true),
+                    new byte[10], 47800, forceHostRollback: true));
+                var clientParams = Handshake.RunClient(
+                    clientCh2, Id(depth: 2), new SessionPreferences(2, wantRollback: false), 51000);
+                var hostParams = hostTask.GetAwaiter().GetResult();
+
+                Assert.Equal(SyncMode.Lockstep, hostParams.Mode);
+                Assert.Equal(SyncMode.Lockstep, clientParams.Mode);
+            }
+            finally { dispose2(); }
         }
     }
 }

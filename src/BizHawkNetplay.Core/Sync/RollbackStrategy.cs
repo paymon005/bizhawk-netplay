@@ -54,6 +54,7 @@ namespace BizHawkNetplay.Core.Sync
         private readonly List<int> _pruneScratch = new List<int>();
 
         private int _advantageStallFrames;      // frames still owed back because we measured ourselves ahead
+        private int _lastAdvantageSequence = -1; // makes periodic UI refreshes edge-triggered
         private int _rollbackTo = int.MaxValue; // earliest frame a late input contradicted (pending repair)
         private int _savedFrame = -1;           // frame whose entering-state is currently snapshotted
         private int _lastRunFrame = -1;         // highest frame actually simulated so far
@@ -95,6 +96,13 @@ namespace BizHawkNetplay.Core.Sync
         public int PredictionStalls { get; private set; }
         public int TimeSyncStalls { get; private set; }
         public int SoftCap => _softCap;
+        /// <summary>Whether the next otherwise-runnable frame will be yielded for measured clock skew.</summary>
+        public bool HasPendingTimeSyncDebt => _advantageStallFrames > 0;
+
+        /// <summary>True when the latest rejected frame was deliberate time synchronization rather
+        /// than the hard prediction-safety gate. A real-time scheduler should pay one frame period for
+        /// this stall instead of retrying it a couple of milliseconds later.</summary>
+        public bool LastStallWasTimeSync { get; private set; }
 
         public FrameDecision BeginFrame(int frame)
         {
@@ -103,6 +111,7 @@ namespace BizHawkNetplay.Core.Sync
             ExecutePendingRollback(frame);
 
             int horizon = RemoteHorizon(frame);
+            LastStallWasTimeSync = false;
 
             // 2a) Hard cap. Never run so far past the slowest remote port that a late correction could
             //     target a frame already evicted from the ring — that would be an unrecoverable desync.
@@ -120,8 +129,13 @@ namespace BizHawkNetplay.Core.Sync
             //     hide. This is rollback's only routine backpressure and is rare on a sane link.
             if (horizon > _softCap)
             {
+                // A soft-cap stall already gives the faster peer one frame back. If measured-advantage
+                // debt is outstanding, pay it here too so the two time-sync mechanisms do not charge
+                // twice for the same skew.
+                if (_advantageStallFrames > 0) _advantageStallFrames--;
                 TimeSyncStalls++;
                 IsStalled = true;
+                LastStallWasTimeSync = true;
                 return FrameDecision.StallDecision;
             }
 
@@ -133,6 +147,7 @@ namespace BizHawkNetplay.Core.Sync
                 _advantageStallFrames--;
                 TimeSyncStalls++;
                 IsStalled = true;
+                LastStallWasTimeSync = true;
                 return FrameDecision.StallDecision;
             }
             IsStalled = false;
@@ -233,12 +248,21 @@ namespace BizHawkNetplay.Core.Sync
             // ahead — so a cap derived from it throttles whoever happens to trip it, not whoever is
             // actually running fast. A measured frame advantage is signed and says exactly that, so
             // when we have one, the peer that is genuinely ahead gives the surplus back itself.
-            if (info.HasFrameAdvantage && info.FrameAdvantage >= AdvantageStallThreshold)
+            bool freshAdvantage = !info.HasSampleSequence || info.SampleSequence != _lastAdvantageSequence;
+            if (freshAdvantage)
             {
-                // Yield about half the surplus per report, capped: the other side is closing the gap
-                // from its end too, so giving all of it back would overshoot into a stall-tug-of-war.
-                int owed = Math.Min(info.FrameAdvantage / 2, MaxAdvantageStall);
-                if (owed > _advantageStallFrames) _advantageStallFrames = owed;
+                if (info.HasSampleSequence) _lastAdvantageSequence = info.SampleSequence;
+                if (info.HasFrameAdvantage && info.FrameAdvantage >= AdvantageStallThreshold)
+                {
+                    // Yield about half the surplus per new report, capped: the other side is closing
+                    // the gap too, so giving all of it back would overshoot into a tug-of-war.
+                    _advantageStallFrames = Math.Min(info.FrameAdvantage / 2, MaxAdvantageStall);
+                }
+                else
+                {
+                    // A newer measurement supersedes any unspent debt from an older one.
+                    _advantageStallFrames = 0;
+                }
             }
         }
 
