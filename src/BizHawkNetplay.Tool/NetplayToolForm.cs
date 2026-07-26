@@ -165,9 +165,11 @@ namespace BizHawkNetplay.Tool
         private const int MaxResyncs = 6;
         private const double ResyncGraceSeconds = 2.0;
         private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
-        // Rollback needs D >= 1 (it shrinks average rollback depth); beyond ~2 you're just paying latency
-        // that prediction was already covering. Lockstep's D, by contrast, must cover the whole one-way link.
-        private const int RollbackComfortableDelay = 2;
+        // Rollback needs D >= 1 (the protocol's floor, and a frame of delay shrinks average rollback
+        // depth for free); beyond that you're paying latency prediction was already covering. 1 is the
+        // minimum felt delay the design allows — the trade is slightly deeper average rollbacks, which
+        // costs resim work rather than latency. Lockstep's D, by contrast, must cover the one-way link.
+        private const int RollbackComfortableDelay = 1;
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private double _lastStallLogMs = double.NegativeInfinity;
         private bool _resyncInProgress;
@@ -1416,7 +1418,16 @@ namespace BizHawkNetplay.Tool
                     // Normally this loop runs once. A second frame compensates for an irregular ~25ms
                     // WinForms callback without reviving the old eight-frame catch-up bursts. Never start
                     // that second frame after the callback has already consumed its UI work budget.
-                    if (framesThisTick > 0 && tickWatch.Elapsed.TotalMilliseconds >= FrameTickWorkBudgetMs) break;
+                    if (framesThisTick > 0)
+                    {
+                        if (tickWatch.Elapsed.TotalMilliseconds >= FrameTickWorkBudgetMs) break;
+                        // A frame of core execution just happened, and packets that landed during it are
+                        // already queued. Draining once per tick would judge this frame's readiness on
+                        // network state captured before that work — turning an input that did arrive in
+                        // time into a stall that costs the whole tick.
+                        _driver.PumpNetwork();
+                        packetsDrained += _driver.LastPacketsDrained;
+                    }
 
                     _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
                     var phase = System.Diagnostics.Stopwatch.StartNew();
