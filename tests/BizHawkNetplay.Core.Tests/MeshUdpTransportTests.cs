@@ -139,11 +139,16 @@ namespace BizHawkNetplay.Core.Tests
                 Assert.True(sender.TryGetWorstRttMs(out worst));
                 Assert.True(worst > otherRtt, "failover should report the live backup, not stale fast-path RTT");
 
-                // Leave only the dead endpoint configured. Its historical RTT is still present, but a
-                // route with no live candidate must not produce a UDP RTT measurement.
+                // Leave only the dead endpoint configured. A once-measured route that has gone quiet
+                // falls back to its stored (stale) measurement rather than failing the aggregate —
+                // on a joiner the TCP fallback only covers the host link, so collapsing here would
+                // swap a real 180ms peer path for a 15ms host ping mid-recovery (F9). Only a route
+                // that was NEVER measured (asserted above, before the punch confirmed anything)
+                // makes TryGetWorstRttMs return false.
                 sender.SetPeerRoutes(new[] { new PeerRoute(1, new[] { fastEndpoint }) });
-                Assert.True(sender.TryGetRttMs(fastEndpoint, out _));
-                Assert.False(sender.TryGetWorstRttMs(out _));
+                Assert.True(sender.TryGetRttMs(fastEndpoint, out double staleRtt));
+                Assert.True(sender.TryGetWorstRttMs(out worst));
+                Assert.InRange(Math.Abs(worst - staleRtt), 0, 0.001);
             }
             finally { sender.Dispose(); fast.Dispose(); backup.Dispose(); otherPeer.Dispose(); }
         }

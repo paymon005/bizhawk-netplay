@@ -6,24 +6,11 @@ what was addressed — and how — stays greppable.
 
 ## Open
 
-**KI-1 (was F9, low) — joiner pacing RTT collapses to host-only TCP ping in 3+ player games.**
-`MeshUdpTransport.TryGetWorstRttMs` returns false unless *every* route has a live measured
-candidate, and the TCP fallback (`NetplayToolForm.WorstPingMs`) only covers the host link on a
-joiner. During a peer's path-recovery window a joiner's worst-RTT can drop from e.g. 180 ms to
-15 ms, shrinking the rollback soft cap and causing extra time-sync stalls. Transient; 3+ player
-joiners only. Fix sketch: let `TryGetWorstRttMs` fall back to a route's last known (stale) RTT
-instead of failing the whole aggregate, or have the joiner track per-peer UDP RTT history.
-
 **KI-2 (was P2, medium) — initial join-state transfer is unbounded.**
 After auth the joiner sets `ReceiveTimeout = 0` (`NetplayToolForm.cs` ~1449-1457), so a joiner
 waiting for WELCOME/state hangs forever if the host stalls mid-transfer; only manual Disconnect
 escapes. Resync/reconnect transfers are correctly bounded — extend the same size-scaled deadline
 scheme to the first join.
-
-**KI-3 (was F7, low, pre-existing) — cancelled host attempt can leave a stale `_listener`.**
-Microseconds-wide race between `TeardownNetwork` and `HostThread`'s assignment; consequence is one
-spurious full teardown (including an `Unpause()`) on the next `EndSession`. Fix: null `_listener`
-on the stale-token exit path (~line 1221).
 
 **KI-4 (was F3, low, pre-existing) — `OnPeerLinkLost` leaks the writer thread.**
 `_peers.Remove(link)` + `Tcp.Close()` without `link.WriterRunning = false`: the writer spins on
@@ -58,6 +45,18 @@ future change reintroduces an unfillable gap the watchdog will again sleep throu
 matters: track frontier progress per port instead of decode activity.
 
 ## Fixed (2026-07-26)
+
+**F9 / KI-1 (low) — joiner pacing RTT collapsed to host-only TCP ping in 3+ player games.**
+`TryGetWorstRttMs` now falls back to a route's last stored (stale) RTT when its candidates have
+all gone quiet, instead of failing the whole aggregate; only a route that has *never* been
+measured still returns false (the caller then correctly uses its complete TCP sample set). The
+initial-measurement conservatism is preserved; the mid-session collapse during a peer's
+path-recovery window is gone.
+
+**F7 / KI-3 (low, pre-existing) — cancelled host attempt could leave a stale `_listener`.**
+`HostThread`'s `finally` now CAS-nulls `_listener` (only if it still points at this attempt's
+listener) on every stale-attempt exit, closing the microseconds-wide race with `TeardownNetwork`
+that caused one spurious full teardown — including an `Unpause()` — on the next `EndSession`.
 
 **F4 (high, pre-existing) — rollback froze both sides permanently after a one-way UDP loss burst.**
 Fixed in `FrameDriver` + `InputPacketCodec`: (1) new gap-request datagram (type 2, generation-

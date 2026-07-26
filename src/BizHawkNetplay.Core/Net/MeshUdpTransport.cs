@@ -213,7 +213,11 @@ namespace BizHawkNetplay.Core.Net
 
         /// <summary>
         /// Select each logical peer's lowest-RTT live candidate, then return the worst of those per-peer
-        /// paths. Measurements for dead/stale candidates are deliberately excluded.
+        /// paths. A route whose candidates have all gone quiet falls back to its last stored measurement
+        /// rather than failing the whole aggregate: on a joiner the TCP fallback only covers the host
+        /// link, so collapsing here would report e.g. a 15 ms host ping in place of a 180 ms peer path
+        /// and mis-size the rollback soft cap exactly while that peer's path is recovering. Only a route
+        /// that has NEVER been measured makes this return false (caller then uses its TCP samples).
         /// </summary>
         public bool TryGetWorstRttMs(out double rttMs)
         {
@@ -222,9 +226,9 @@ namespace BizHawkNetplay.Core.Net
             foreach (var route in _routeTable.Routes)
             {
                 // A partial maximum is dangerously optimistic: one fast measured player must not
-                // hide another logical peer whose UDP path has no live RTT yet. Let the caller fall
-                // back to its complete TCP-per-peer sample set until every route is represented.
-                if (route.Candidates.Count == 0 || !TryGetBestLiveRtt(route, now, out double peerRtt))
+                // hide another logical peer whose UDP path has no RTT at all yet.
+                if (route.Candidates.Count == 0 ||
+                    (!TryGetBestLiveRtt(route, now, out double peerRtt) && !TryGetBestStoredRtt(route, out peerRtt)))
                 {
                     rttMs = -1;
                     return false;
@@ -288,6 +292,22 @@ namespace BizHawkNetplay.Core.Net
             foreach (var endpoint in route.Candidates)
             {
                 if (!IsEndpointAlive(endpoint, now)) continue;
+                if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
+                if (rtt < bestRtt) bestRtt = rtt;
+                found = true;
+            }
+            if (!found) bestRtt = 0;
+            return found;
+        }
+
+        /// <summary>Last measured RTT for a route regardless of liveness — the stale fallback for a
+        /// once-measured path that has gone quiet (repunch in flight, NAT rebind, resync).</summary>
+        private bool TryGetBestStoredRtt(PeerRoute route, out double bestRtt)
+        {
+            bestRtt = double.MaxValue;
+            bool found = false;
+            foreach (var endpoint in route.Candidates)
+            {
                 if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
                 if (rtt < bestRtt) bestRtt = rtt;
                 found = true;

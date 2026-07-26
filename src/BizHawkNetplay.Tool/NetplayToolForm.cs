@@ -1402,7 +1402,18 @@ namespace BizHawkNetplay.Tool
             finally
             {
                 if (hostListener != null && !IsConnectionAttemptCurrent(attempt))
+                {
                     try { hostListener.Stop(); } catch { }
+                    // If teardown ran between our token check and `_listener = hostListener`, its
+                    // null-out happened first and the field still points at this dead listener.
+                    // Clear it — only if it is still ours — so the next EndSession's idle fast-path
+                    // isn't fooled into a spurious full teardown (which would also un-pause an
+                    // emulator the user may have deliberately paused). CAS, not check-then-assign:
+                    // a newer attempt may have already installed its own listener.
+#pragma warning disable 0420 // Interlocked on a volatile field is the intended usage here
+                    Interlocked.CompareExchange(ref _listener, null, hostListener);
+#pragma warning restore 0420
+                }
             }
         }
 
