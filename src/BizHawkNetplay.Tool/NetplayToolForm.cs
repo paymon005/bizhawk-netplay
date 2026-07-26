@@ -278,8 +278,7 @@ namespace BizHawkNetplay.Tool
         // gets a longer leash — but only that peer, and only for as long as the transfer could plausibly
         // take. Scaled by payload: a flat timeout would either hang on a dead peer or shoot a live one
         // mid-transfer (an N64 state is megabytes; on a weak uplink that is minutes, not seconds).
-        private const double StateTransferGraceBaseSeconds = 10.0;   // read + import once it lands
-        private const double StateTransferMinBytesPerSec = 200 * 1024; // pessimistic floor for the wire
+        // State-transfer deadline math lives in Core (StateTransferBudget) so its invariants are tested.
         private const int MaxResyncStateBytes = 64 * 1024 * 1024 - 12; // ControlChannel cap minus generation
         private const int MaxResyncAnnouncementWaitSeconds = 300;
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
@@ -2180,28 +2179,16 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void GraceForStateTransfer(PeerLink link, int stateBytes)
         {
-            double seconds = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
-            Interlocked.Exchange(ref link.TimeoutGraceUntilTicks, MonotonicDeadline(seconds));
+            Interlocked.Exchange(ref link.TimeoutGraceUntilTicks,
+                MonotonicDeadline(StateTransferBudget.ApplyDeadlineSeconds(stateBytes)));
         }
 
-        private static long StateApplyDeadlineTicks(int stateBytes)
-        {
-            double seconds = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
-            return MonotonicDeadline(seconds);
-        }
+        private static long StateApplyDeadlineTicks(int stateBytes) =>
+            MonotonicDeadline(StateTransferBudget.ApplyDeadlineSeconds(stateBytes));
 
-        private static long StateReceiveDeadlineTicks(int stateBytes, int waitSeconds)
-        {
-            // Reconnect freezes survivors before the host has even re-admitted the returning peer, and
-            // the host's own bounded pipeline then spans THREE sequential phases after a rejoin: the
-            // WELCOME/state send to the rejoiner, the rejoiner's import + READY, and only then the
-            // survivor's Resync transfer. Each phase is individually allowed a full transfer window by
-            // the host's socket deadlines, so budget all three here — a survivor must not end the
-            // session while the host is still inside its own healthy bounds. It is deliberately
-            // finite: BEGIN plus a silent/partial TCP frame must never freeze the emulator forever.
-            double onePhase = StateTransferGraceBaseSeconds + stateBytes / StateTransferMinBytesPerSec;
-            return MonotonicDeadline(waitSeconds + 3.0 * onePhase + 5.0);
-        }
+        // Why the survivor budget spans the host's whole 3-phase pipeline: see StateTransferBudget.
+        private static long StateReceiveDeadlineTicks(int stateBytes, int waitSeconds) =>
+            MonotonicDeadline(StateTransferBudget.SurvivorReceiveDeadlineSeconds(stateBytes, waitSeconds));
 
         /// <summary>Apply the host's pre-WELCOME RTT estimate without ever lowering an explicit ask.</summary>
         private int SelectLobbyDelay(int manualFloor, int automaticMaximum, SyncMode mode,
@@ -3862,12 +3849,8 @@ namespace BizHawkNetplay.Tool
             ? double.PositiveInfinity
             : (MonotonicNow() - startedAt) / (double)System.Diagnostics.Stopwatch.Frequency;
 
-        private static int StateTransferTimeoutMs(int stateBytes)
-        {
-            double seconds = StateTransferGraceBaseSeconds
-                + Math.Max(0, stateBytes) / StateTransferMinBytesPerSec;
-            return (int)Math.Min(int.MaxValue, Math.Max(HandshakeReceiveTimeoutMs, seconds * 1000.0));
-        }
+        private static int StateTransferTimeoutMs(int stateBytes) =>
+            StateTransferBudget.SocketTimeoutMs(stateBytes, HandshakeReceiveTimeoutMs);
 
         private static void ConfigureStateTransferTimeouts(TcpClient? tcp, int stateBytes)
         {
