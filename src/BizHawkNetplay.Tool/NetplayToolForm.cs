@@ -104,6 +104,8 @@ namespace BizHawkNetplay.Tool
             public int PingCount;             // guarded by _pingLock
             public long LastRecvTicks;        // UtcNow.Ticks of the last message from this peer (Interlocked)
             public volatile bool ResyncReceiving; // large inbound state frame is allowed to exceed ping timeout
+            public long TimeoutGraceUntilTicks;   // we sent this peer a whole state: its reader is busy consuming
+                                                  // that frame and can't pong until it lands (Interlocked)
             public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
             public string Label = "";
         }
@@ -187,6 +189,9 @@ namespace BizHawkNetplay.Tool
         private double _lastPingMs = -1;                // _pingClock time of the last ping we sent
         private const double PingIntervalMs = 400;      // ~2.5 pings/sec
         private const double PingTimeoutSeconds = 3.0;  // no message for this long => presumed dropped
+        // A peer we've just sent a whole state to goes quiet while its reader consumes that frame, so it
+        // gets a longer leash — but only that peer, and only until the transfer could plausibly be done.
+        private const double StateTransferGraceSeconds = 15.0;
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
         private const double UdpRepunchAfterSeconds = 1.5;
         private const double UdpLostAfterSeconds = 8.0;
@@ -1613,22 +1618,33 @@ namespace BizHawkNetplay.Tool
         /// dropped (frozen peer or a silent cable-pull that never broke TCP) and routed into the same
         /// drop handling as a broken connection. Pings/pongs are serviced on the reader thread regardless
         /// of stepping, so a merely stalled — but alive — peer keeps answering and is never flagged here.
+        ///
+        /// The exemptions are per link, not global. Blanket-skipping every peer whenever a resync or a
+        /// reconnect was in flight left the other peers unwatched exactly when a session is most fragile:
+        /// with 3–4 players, a second peer pulling its cable while the host waited on the first went
+        /// unnoticed until the 60s rejoin timer expired. A peer is excused only if it's the one busy with
+        /// a whole-state transfer — receiving one (<see cref="PeerLink.ResyncReceiving"/>) or still
+        /// consuming one we sent it (<see cref="PeerLink.TimeoutGraceUntilTicks"/>).
         /// </summary>
         private void CheckLinkTimeouts()
         {
-            if (_awaitingReconnect || _resyncInProgress) return; // a state transfer may legitimately exceed 3s
             long now = DateTime.UtcNow.Ticks;
             long limit = TimeSpan.FromSeconds(PingTimeoutSeconds).Ticks;
             PeerLink? dead = null;
             foreach (var link in _peers)
             {
-                if (link.ResyncReceiving) continue;
+                if (link.ResyncReceiving) continue;                              // pulling a state from them
+                if (now < Interlocked.Read(ref link.TimeoutGraceUntilTicks)) continue; // digesting one we sent
                 long last = Interlocked.Read(ref link.LastRecvTicks);
                 if (last != 0 && now - last > limit) { dead = link; break; }
             }
             if (dead != null)
                 OnPeerLinkLost(dead, $"no response for {PingTimeoutSeconds:F0}s (ping timeout)");
         }
+
+        /// <summary>Excuse one peer from the ping watchdog while a whole state is on its way to it.</summary>
+        private void GraceForStateTransfer(PeerLink link) => Interlocked.Exchange(
+            ref link.TimeoutGraceUntilTicks, DateTime.UtcNow.AddSeconds(StateTransferGraceSeconds).Ticks);
 
         /// <summary>
         /// Once ping is stable, if the negotiated input delay is lower than the worst link's round-trip
@@ -1894,6 +1910,7 @@ namespace BizHawkNetplay.Tool
                 if (remaining == 0) { _resyncInProgress = false; return; }
                 foreach (var link in _peers)
                 {
+                    GraceForStateTransfer(link); // it can't pong while its reader consumes the state frame
                     QueueControl(link, ControlMessageType.ResyncBegin, Array.Empty<byte>());
                     QueueControl(link, ControlMessageType.Resync, state, ok =>
                     {
@@ -2330,6 +2347,7 @@ namespace BizHawkNetplay.Tool
                 }
                 foreach (var survivor in survivors)
                 {
+                    GraceForStateTransfer(survivor); // same leash as a desync resync: a big frame is inbound
                     QueueControl(survivor, ControlMessageType.PeerList,
                         HandshakeCodec.EncodeEndpoints(CandidatesExcept(allPeers, survivor)));
                     QueueControl(survivor, ControlMessageType.ResyncBegin, Array.Empty<byte>());
