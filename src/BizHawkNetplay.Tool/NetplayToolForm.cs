@@ -159,6 +159,9 @@ namespace BizHawkNetplay.Tool
         private const int MaxResyncs = 6;
         private const double ResyncGraceSeconds = 2.0;
         private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
+        // Rollback needs D >= 1 (it shrinks average rollback depth); beyond ~2 you're just paying latency
+        // that prediction was already covering. Lockstep's D, by contrast, must cover the whole one-way link.
+        private const int RollbackComfortableDelay = 2;
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private double _lastStallLogMs = double.NegativeInfinity;
         private bool _resyncInProgress;
@@ -1223,8 +1226,11 @@ namespace BizHawkNetplay.Tool
                 int d = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
                 _rollbackDepth = Math.Max(ProbeResult.RollbackDepthThreshold, Math.Min(d, RollbackDepthCap));
                 if (_playerCount > 2)
-                    Log($"rollback with {_playerCount} players is experimental — inputs relay through the " +
-                        "host (two hops), so rollbacks may run deeper. Uncheck 'Prefer rollback' if it feels choppy.");
+                    ConnLog($"rollback with {_playerCount} players: every peer predicts the other " +
+                        $"{_playerCount - 1} ports, so a correction from any of them rolls everyone back — " +
+                        "expect rollbacks to fire more often than in a 2-player session (they are no deeper: " +
+                        "input goes peer-to-peer in one hop). Switch Netcode to Lockstep if it feels choppy.",
+                        Color.DarkSlateBlue);
             }
             _driver = CreateDriver();
 
@@ -1684,12 +1690,52 @@ namespace BizHawkNetplay.Tool
             // that delayed channel, so the recommendation must reflect it even though the TCP ping doesn't.
             double effWorst = worst + 2.0 * _simLatencyMs;
             string simNote = _simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "";
+
+            // The session uses the HIGHER of the two peers' asks, so acting on any of this needs both ends.
+            const string bothEnds = "Both players must set it — the session uses the higher of the two asks.";
+
+            if (_mode == SyncMode.Rollback)
+            {
+                // Rollback predicts through the link, so delay is not what keeps peers in sync here — it
+                // only shrinks how deep the average rollback runs. Recommending lockstep-grade delay on
+                // top of prediction is pure added latency for no benefit, which is what this used to do.
+                if (_sessionDelay > RollbackComfortableDelay)
+                {
+                    double excessMs = (_sessionDelay - RollbackComfortableDelay) * _frameMs;
+                    ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: rollback hides this by predicting, so input " +
+                        $"delay {RollbackComfortableDelay} is usually enough. This session is {_sessionDelay}, which " +
+                        $"adds ~{excessMs:F0}ms of felt delay for no benefit. Reconnect lower to feel the difference. " +
+                        bothEnds, Color.DarkOrange);
+                }
+                else
+                {
+                    ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {_sessionDelay} suits rollback — " +
+                        "prediction covers the link.", Color.DimGray);
+                }
+                return;
+            }
+
             int suggested = (int)Math.Ceiling((effWorst / 2.0) / _frameMs) + 2; // two frames of jitter headroom
             if (suggested > _sessionDelay)
-                Log($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {suggested} is recommended for smooth play " +
-                    $"(this session is {_sessionDelay}). If it stalls, reconnect with a higher 'Input delay'.");
+            {
+                ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {suggested} is recommended for smooth " +
+                    $"play (this session is {_sessionDelay}). If it stalls, reconnect higher. " + bothEnds,
+                    Color.DarkOrange);
+            }
+            else if (_sessionDelay - suggested >= 2)
+            {
+                // Only ever nagging upward left people permanently over-delayed: the box is sticky, so a
+                // value picked for one bad link keeps costing latency on every good one afterwards.
+                double excessMs = (_sessionDelay - suggested) * _frameMs;
+                ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: this link only needs input delay {suggested}, and " +
+                    $"the session is running {_sessionDelay} — about {excessMs:F0}ms of avoidable delay. " + bothEnds,
+                    Color.DarkOrange);
+            }
             else
-                Log($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {_sessionDelay} is comfortable for this link.");
+            {
+                ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: input delay {_sessionDelay} is comfortable for " +
+                    "this link.", Color.DimGray);
+            }
         }
 
         private void StartPeerIo(PeerLink link)

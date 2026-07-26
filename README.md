@@ -132,9 +132,16 @@ Settings worth knowing on the Connection tab:
   sent over the wire; both ends prove they know it via a nonce challenge-response (see *Known
   limitations*). Getting it wrong costs the joiner their connection attempt, not the host's lobby —
   the host logs the refusal and keeps waiting.
-- **Netcode** (host decides) — **Automatic** (rollback if both cores clear the capability probe, else
-  lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows in
-  a box on the tab.
+- **Netcode** (host decides) — **Automatic** (rollback if every peer's core clears the capability probe,
+  else lockstep), **Rollback** (forced, probe bypassed), or **Lockstep** (forced). The active mode shows
+  in a box on the tab. Rollback works at **3–4 players too**, not just 2: every peer predicts the other
+  ports and input travels peer-to-peer in one hop, so rollbacks fire more often than in a 2-player
+  session but run no deeper.
+- **Input delay** — what you feel. In **lockstep** it must cover the one-way latency (≈ RTT/2) or the
+  session stalls, so raise it on a bad link. In **rollback** prediction covers the link, so delay only
+  shrinks how deep the average rollback runs — 1–2 is usually right, and anything higher is felt latency
+  for nothing. The tool measures your link a few seconds in and tells you which way to move it, in
+  either direction. The session uses the **higher** of the two peers' asks, so both ends must change it.
 - **Connection status** — a running log of connection events right above the netcode box: hosting,
   connecting, joined, refused (with the reason), dropped, reconnected, ended. Red is a refusal or
   failure, green is connected. Everything else — per-frame diagnostics, audio, probe output — stays on
