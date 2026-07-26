@@ -107,6 +107,12 @@ namespace BizHawkNetplay.Tool
             public volatile bool ResyncReceiving; // large inbound state frame is allowed to exceed ping timeout
             public long TimeoutGraceUntilTicks;   // we sent this peer a whole state: its reader is busy consuming
                                                   // that frame and can't pong until it lands (Interlocked)
+            // Frame-advantage exchange (ControlMessageType.Pacing), guarded by _pingLock. Advantage
+            // measured locally is inflated by one-way latency; subtracting the peer's own measurement
+            // cancels that term, which is why both numbers have to travel.
+            public int LocalAdvantage;            // our frame minus theirs, as of their last report
+            public int RemoteAdvantage;           // the same quantity as they measured it
+            public bool AdvantageKnown;           // false until a peer on a build that reports has answered
             public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
             public string Label = "";
         }
@@ -1508,13 +1514,14 @@ namespace BizHawkNetplay.Tool
             if (_driver == null || nowMs - _lastUiRefreshMs < 250) return;
             _lastUiRefreshMs = nowMs;
 
-            double ping = -1;
-            lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
+            double ping = WorstPingMs(out bool udpMeasured);
             double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
-            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, 0));
+            int advantage = ComputeFrameAdvantage(out bool haveAdvantage);
+            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, advantage, haveAdvantage));
 
             string pingStr = ping < 0 ? ""
-                : $" — ping {effRttMs:F0}ms{(_simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "")}{(_peers.Count > 1 ? " (worst)" : "")}";
+                : $" — ping {effRttMs:F0}ms{(udpMeasured ? " udp" : "")}" +
+                  $"{(_simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "")}{(_peers.Count > 1 ? " (worst)" : "")}";
             string rbStr = _driver.Strategy is RollbackStrategy rbs
                 ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
                 : "";
@@ -1533,6 +1540,53 @@ namespace BizHawkNetplay.Tool
             Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}{udpStr}",
                 _udpWarningActive || cpuBound ? Color.DarkOrange : Color.Green);
             RefreshPlayersList();
+        }
+
+        /// <summary>
+        /// Worst round-trip across peers, preferring the mesh's own measurement over the control link's.
+        /// Input rides UDP; once the mesh punches direct paths that isn't even the same route as TCP, and
+        /// TCP's number is inflated by its queueing and retransmits. Since this figure both advises the
+        /// player's input delay and sizes rollback's prediction horizon, measuring the wrong path costs
+        /// real latency. Falls back to the TCP ping when no peer's ack carried a timestamp (older build).
+        /// </summary>
+        private double WorstPingMs(out bool udpMeasured)
+        {
+            udpMeasured = false;
+            var mesh = _mesh;
+            if (mesh != null && mesh.TryGetWorstRttMs(out double udp) && udp >= 0)
+            {
+                udpMeasured = true;
+                return udp;
+            }
+            double ping = -1;
+            lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
+            return ping;
+        }
+
+        /// <summary>
+        /// How many frames ahead of the peers we are actually running, or 0 when unmeasured.
+        ///
+        /// Measured one-sidedly this is useless: our view of a peer's frame is stale by the one-way
+        /// latency, so both peers always compute themselves "ahead" by about that much even when
+        /// perfectly aligned. Each peer therefore reports its own figure, and the difference cancels the
+        /// shared latency term — (ours − theirs) / 2 is the real skew, positive when we are the fast one.
+        /// The worst (most ahead) peer decides, since that is the one we would out-run.
+        /// </summary>
+        private int ComputeFrameAdvantage(out bool known)
+        {
+            known = false;
+            int worst = 0;
+            lock (_pingLock)
+            {
+                foreach (var link in _peers)
+                {
+                    if (!link.AdvantageKnown) continue;
+                    known = true;
+                    int adv = (link.LocalAdvantage - link.RemoteAdvantage) / 2;
+                    if (adv > worst) worst = adv;
+                }
+            }
+            return known ? worst : 0;
         }
 
         private void CheckUdpInputProgress()
@@ -1621,11 +1675,34 @@ namespace BizHawkNetplay.Tool
             if (_lastPingMs >= 0 && nowMs - _lastPingMs < PingIntervalMs) return;
             _lastPingMs = nowMs;
             var body = BitConverter.GetBytes(nowMs);
+            int frame = _driver?.CurrentFrame ?? 0;
             foreach (var link in _peers)
             {
                 QueueControl(link, ControlMessageType.Ping, body);
+                // Piggyback the frame-advantage exchange on the same cadence: where we are, and how far
+                // ahead we currently measure ourselves against this peer. Additive message type — a peer
+                // on an older build ignores it and simply never reports back.
+                int mine;
+                lock (_pingLock) mine = link.LocalAdvantage;
+                QueueControl(link, ControlMessageType.Pacing, EncodePacing(frame, mine));
             }
         }
+
+        private static byte[] EncodePacing(int frame, int localAdvantage)
+        {
+            var b = new byte[8];
+            WriteInt32(b, 0, frame);
+            WriteInt32(b, 4, localAdvantage);
+            return b;
+        }
+
+        private static void WriteInt32(byte[] b, int o, int v)
+        {
+            b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v;
+        }
+
+        private static int ReadInt32(byte[] b, int o) =>
+            (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3];
 
         /// <summary>
         /// Watchdog: a link that hasn't sent us anything for <see cref="PingTimeoutSeconds"/> is presumed
@@ -1675,15 +1752,15 @@ namespace BizHawkNetplay.Tool
         private void MaybeHintDelay()
         {
             if (_delayHintShown || _peers.Count == 0) return;
-            double worst = -1; int minCount = int.MaxValue;
+            int minCount = int.MaxValue;
             lock (_pingLock)
             {
                 foreach (var link in _peers)
-                {
-                    if (link.PingMs > worst) worst = link.PingMs;
                     if (link.PingCount < minCount) minCount = link.PingCount;
-                }
             }
+            // Gate on control-channel samples either way — it's the count that proves the session has
+            // been running long enough for any reading to have settled.
+            double worst = WorstPingMs(out _);
             if (minCount < 6 || worst < 0) return;
             _delayHintShown = true;
             // Include the simulated one-way UDP delay (RTT contribution = 2×) — the input actually rides
@@ -1841,6 +1918,21 @@ namespace BizHawkNetplay.Tool
                                 link.PingCount++;
                             }
                             BeginInvokeUi(MaybeHintDelay);
+                        }
+                    }
+                    else if (type == ControlMessageType.Pacing && body.Length == 8)
+                    {
+                        // Their frame at send time, and the advantage they measured over us. Ours is
+                        // measured fresh here; the difference of the two cancels the one-way latency
+                        // that inflates both, leaving the real skew (see ComputeFrameAdvantage).
+                        int theirFrame = ReadInt32(body, 0);
+                        int theirAdvantage = ReadInt32(body, 4);
+                        int myFrame = _driver?.CurrentFrame ?? 0;
+                        lock (_pingLock)
+                        {
+                            link.LocalAdvantage = myFrame - theirFrame;
+                            link.RemoteAdvantage = theirAdvantage;
+                            link.AdvantageKnown = true;
                         }
                     }
                     else if (type == ControlMessageType.PeerList)

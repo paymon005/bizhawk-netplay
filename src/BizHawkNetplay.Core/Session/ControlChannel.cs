@@ -22,6 +22,10 @@ namespace BizHawkNetplay.Core.Session
         Go = 15,       // host releases every ready joiner at once
         ResyncBegin = 16, // host -> client: a large Resync frame follows; suspend ping timeout while receiving it
         Auth = 17,     // session-password challenge-response proof (see SessionAuth)
+        // Pacing: [frame:int32][localAdvantage:int32] — where the sender is, and how far ahead it
+        // measures itself. Additive and safely ignorable: the reader drops unknown types, so a peer on
+        // an older build simply never reports and both ends fall back to RTT-derived pacing.
+        Pacing = 18,
     }
 
     /// <summary>

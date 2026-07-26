@@ -32,6 +32,11 @@ namespace BizHawkNetplay.Core.Sync
         // Time-sync soft cap = (one-way latency in frames) + SoftMargin, floored at MinSoftCap.
         private const int SoftMargin = 2;
         private const int MinSoftCap = 3;
+        // Measured frame advantage: ignore anything under this (ordinary jitter, and a 1-frame lead is
+        // not worth a stall), and never give back more than MaxAdvantageStall frames from one report —
+        // yielding the whole surplus at once overshoots and sets up an oscillation with the peer.
+        private const int AdvantageStallThreshold = 2;
+        private const int MaxAdvantageStall = 3;
 
         private readonly InputPipeline _pipeline;
         private readonly IEmuAdapter _adapter;
@@ -48,6 +53,7 @@ namespace BizHawkNetplay.Core.Sync
         private readonly Dictionary<int, InputSet> _applied = new Dictionary<int, InputSet>();
         private readonly List<int> _pruneScratch = new List<int>();
 
+        private int _advantageStallFrames;      // frames still owed back because we measured ourselves ahead
         private int _rollbackTo = int.MaxValue; // earliest frame a late input contradicted (pending repair)
         private int _savedFrame = -1;           // frame whose entering-state is currently snapshotted
         private int _lastRunFrame = -1;         // highest frame actually simulated so far
@@ -114,6 +120,17 @@ namespace BizHawkNetplay.Core.Sync
             //     hide. This is rollback's only routine backpressure and is rare on a sane link.
             if (horizon > _softCap)
             {
+                TimeSyncStalls++;
+                IsStalled = true;
+                return FrameDecision.StallDecision;
+            }
+
+            // 2c) Measured-advantage stall. We know from the pacing exchange that we are genuinely
+            //     running ahead of the peer, so hand a frame back. Unlike 2b this doesn't wait for the
+            //     horizon to grow — it corrects the skew before it turns into rollback depth at all.
+            if (_advantageStallFrames > 0)
+            {
+                _advantageStallFrames--;
                 TimeSyncStalls++;
                 IsStalled = true;
                 return FrameDecision.StallDecision;
@@ -211,6 +228,18 @@ namespace BizHawkNetplay.Core.Sync
             if (cap < MinSoftCap) cap = MinSoftCap;
             if (cap > _maxRollback) cap = _maxRollback;
             _softCap = cap;
+
+            // Round-trip time is symmetric: it says how far apart the peers are, never which one is
+            // ahead — so a cap derived from it throttles whoever happens to trip it, not whoever is
+            // actually running fast. A measured frame advantage is signed and says exactly that, so
+            // when we have one, the peer that is genuinely ahead gives the surplus back itself.
+            if (info.HasFrameAdvantage && info.FrameAdvantage >= AdvantageStallThreshold)
+            {
+                // Yield about half the surplus per report, capped: the other side is closing the gap
+                // from its end too, so giving all of it back would overshoot into a stall-tug-of-war.
+                int owed = Math.Min(info.FrameAdvantage / 2, MaxAdvantageStall);
+                if (owed > _advantageStallFrames) _advantageStallFrames = owed;
+            }
         }
 
         // --- internals ----------------------------------------------------------------

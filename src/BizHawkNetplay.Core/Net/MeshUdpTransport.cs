@@ -51,6 +51,7 @@ namespace BizHawkNetplay.Core.Net
         // Per-candidate liveness: endpoint -> last time we heard anything back from it (stopwatch ms).
         private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new ConcurrentDictionary<IPEndPoint, long>();
         private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new ConcurrentDictionary<IPEndPoint, long>();
+        private readonly ConcurrentDictionary<IPEndPoint, double> _rtt = new ConcurrentDictionary<IPEndPoint, double>();
         private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
 
         // Reflexive-address discovery: while a request is pending, the receive loop watches for the STUN
@@ -85,6 +86,7 @@ namespace BizHawkNetplay.Core.Net
             var keep = new HashSet<IPEndPoint>(arr);
             foreach (var k in _alive.Keys.ToArray()) if (!keep.Contains(k)) _alive.TryRemove(k, out _);
             foreach (var k in _lastPunch.Keys.ToArray()) if (!keep.Contains(k)) _lastPunch.TryRemove(k, out _);
+            foreach (var k in _rtt.Keys.ToArray()) if (!keep.Contains(k)) _rtt.TryRemove(k, out _);
         }
 
         public void Send(byte[] datagram)
@@ -101,6 +103,35 @@ namespace BizHawkNetplay.Core.Net
         /// direct UDP path to it is currently open.</summary>
         public bool IsEndpointAlive(IPEndPoint endpoint)
             => endpoint != null && _alive.TryGetValue(endpoint, out var t) && Clock.ElapsedMilliseconds - t < AliveWindowMs;
+
+        /// <summary>
+        /// Smoothed round-trip time to a candidate, measured by the timestamped punch/ack exchange — i.e.
+        /// on the path input actually travels, rather than the TCP control link. False when nothing has
+        /// answered yet, or when the peer runs a build whose acks carry no timestamp.
+        /// </summary>
+        public bool TryGetRttMs(IPEndPoint endpoint, out double rttMs)
+        {
+            rttMs = 0;
+            if (endpoint == null) return false;
+            if (!_rtt.TryGetValue(endpoint, out double v)) return false;
+            rttMs = v;
+            return true;
+        }
+
+        /// <summary>The worst measured RTT over the endpoints with a live path; false if none measured.</summary>
+        public bool TryGetWorstRttMs(out double rttMs)
+        {
+            rttMs = -1;
+            foreach (var p in _peers)
+                if (_rtt.TryGetValue(p, out double v) && v > rttMs) rttMs = v;
+            return rttMs >= 0;
+        }
+
+        private void RecordRtt(IPEndPoint endpoint, double sample)
+        {
+            // Same EMA shape as the control-channel ping, so the two readings are comparable.
+            _rtt.AddOrUpdate(endpoint, sample, (_, prev) => 0.8 * prev + 0.2 * sample);
+        }
 
         /// <summary>Snapshot of the candidate endpoints with a currently-open direct path.</summary>
         public IReadOnlyList<IPEndPoint> AliveEndpoints()
@@ -160,7 +191,11 @@ namespace BizHawkNetplay.Core.Net
                         bool neverSent = !_lastPunch.TryGetValue(p, out var lastSent);
                         if (neverSent || now - lastSent >= due)
                         {
-                            SendFramed(Frame(TPunch, Array.Empty<byte>()), p);
+                            // Stamp the probe so its ack measures the round trip on THIS path — the one
+                            // input actually rides. The control channel's ping measures TCP, which is a
+                            // different route once the mesh is direct, and is inflated by TCP's own
+                            // queueing and retransmits.
+                            SendFramed(Frame(TPunch, BitConverter.GetBytes(now)), p);
                             _lastPunch[p] = now;
                         }
                     }
@@ -207,10 +242,25 @@ namespace BizHawkNetplay.Core.Net
 
                 if (type == TPunch)
                 {
-                    SendFramed(Frame(TPunchAck, Array.Empty<byte>()), known); // answer so the peer confirms us too
+                    // Echo the probe's timestamp back untouched so the sender can time the round trip.
+                    // A peer on an older build sends an empty probe and gets an empty ack — the RTT is
+                    // simply never measured there, and the caller falls back to the control-channel ping.
+                    var echo = n >= HeaderSize + 8 ? new byte[8] : Array.Empty<byte>();
+                    if (echo.Length == 8) Buffer.BlockCopy(buffer, HeaderSize, echo, 0, 8);
+                    SendFramed(Frame(TPunchAck, echo), known); // answer so the peer confirms us too
                     continue;
                 }
-                if (type == TPunchAck) continue; // liveness already recorded above
+                if (type == TPunchAck)
+                {
+                    if (n >= HeaderSize + 8)
+                    {
+                        long sentAt = BitConverter.ToInt64(buffer, HeaderSize);
+                        double rtt = Clock.ElapsedMilliseconds - sentAt;
+                        // Guard against a stale/garbled echo outliving a clock restart.
+                        if (rtt >= 0 && rtt < 10_000) RecordRtt(known, rtt);
+                    }
+                    continue; // liveness already recorded above
+                }
 
                 // TInput
                 var payload = new byte[n - HeaderSize];

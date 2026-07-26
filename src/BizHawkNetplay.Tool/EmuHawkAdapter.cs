@@ -38,6 +38,9 @@ namespace BizHawkNetplay.Tool
         private NetplaySoundBuffer? _soundBuffer;
         private short[] _pumpScratch = Array.Empty<short>();
         private int _soundChannels = 2;
+        // Standing audio cushion in ms — a permanent video→audio offset, so keep it as small as the
+        // pump jitter allows (see EnableAudio). ~2.5 frames at 60fps.
+        private const int AudioPrimeMs = 40;
         private bool _audioReady;
         private bool _coreSyncSound = true;              // drain via GetSamplesSync (else GetSamplesAsync)
         private short[] _asyncScratch = Array.Empty<short>();
@@ -390,9 +393,16 @@ namespace BizHawkNetplay.Tool
                 _asyncScratch = new short[Math.Max(_soundChannels, SamplesPerFrame() * _soundChannels)];
                 _soundBuffer = new NetplaySoundBuffer(_sound.SampleRate, _soundChannels, capacityMs: 400);
                 // Prime a standing cushion of silence so pump jitter / brief network hitches don't
-                // underrun the ring (which would inject audible silence). ~80ms trades a little latency
-                // for clean playback.
-                int prime = _sound.SampleRate * _soundChannels * 80 / 1000;
+                // underrun the ring (which would inject audible silence).
+                //
+                // This cushion is a PERMANENT offset, not a startup cost: sound plays this far behind the
+                // frame that produced it for the whole session, and players feel that as input lag even
+                // though the simulation is unaffected. It was 80ms — more than the entire input delay of a
+                // tuned rollback session — sized when audio was pumped from a coarse, coalesced WM_TIMER.
+                // The tick now runs at 2ms with timeBeginPeriod(1) and pumps every tick, so the jitter it
+                // covers is far smaller. AudioStats() reports the ring's fill level: if it never
+                // approaches empty during play, this can come down further.
+                int prime = _sound.SampleRate * _soundChannels * AudioPrimeMs / 1000;
                 _soundBuffer.Enqueue(new short[prime], prime);
 
                 // Detach EmuHawk's input pin so its run-loop UpdateSound(atten=0, while we hold it paused)
