@@ -69,5 +69,30 @@ namespace BizHawkNetplay.Core.Tests
         {
             Assert.Null(ConnectCode.TryDecode(code));
         }
+
+        [Fact]
+        public void TryParseTarget_AcceptsCodesAndLiteralEndpoints()
+        {
+            // A joiner can paste either the host's connect code or the ip:port straight off the
+            // host's invite line ("internet joiners connect to 72.217.44.36:47800").
+            var ep = new IPEndPoint(IPAddress.Parse("72.217.44.36"), 47800);
+            Assert.Equal(ep, ConnectCode.TryParseTarget(ConnectCode.Encode(ep)));
+            Assert.Equal(ep, ConnectCode.TryParseTarget("72.217.44.36:47800"));
+            Assert.Equal(ep, ConnectCode.TryParseTarget("  72.217.44.36:47800  "));
+        }
+
+        [Theory]
+        [InlineData("72.217.44.36")]        // no port
+        [InlineData("72.217.44.36:")]       // empty port
+        [InlineData("72.217.44.36:0")]      // port out of range
+        [InlineData("72.217.44.36:70000")]  // port out of range
+        [InlineData("nonsense:47800")]      // not an address
+        [InlineData("::1:47800")]           // IPv6 not supported by codes
+        [InlineData("")]
+        [InlineData(null)]
+        public void TryParseTarget_RejectsMalformedEndpoints(string? text)
+        {
+            Assert.Null(ConnectCode.TryParseTarget(text));
+        }
     }
 }

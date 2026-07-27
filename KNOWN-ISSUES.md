@@ -16,6 +16,13 @@ rejoin) before trusting them; rollback with 3+ players and symmetric NAT remain 
 punch, lobby RTT probe, and auto-delay (4) all worked; the session then hit the mutual soft-cap
 freeze fixed in v0.10.2 (see Fixed below). Retest on v0.10.2.
 
+**KI-10 (feature) — the connect-code punch session is 2-player only.**
+3–4 players work over a normal TCP-hosted lobby (the host auto-punches the joiner↔joiner UDP mesh
+legs), but that requires the HOST to be reachable (forwarded port or UPnP). A host who can't
+forward at all can only run 2-player via codes. The N-player version of the RemotePlay-style flow
+— host collects one code per joiner, each punched link carrying that joiner's control channel over
+its own `ReliableUdpStream` on the host's one socket — is designed but not built.
+
 **KI-9 (design note) — the UDP liveness watchdog measures datagram arrival, not progress.**
 `FrameDriver` stamps `_lastRemoteInputStamp` for every well-decoded frame, including redundant
 resends that can never advance the frontier, so `CheckUdpInputProgress` sees a "live" port even

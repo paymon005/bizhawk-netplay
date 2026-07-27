@@ -193,6 +193,7 @@ namespace BizHawkNetplay.Tool
         private PeerIdentity? _punchId;         // prepared handshake identity, captured when punch setup began
         private SessionPreferences? _punchPrefs;
         private byte[]? _punchState;            // host only: the initial state to transfer once punched
+        private bool _punchHandshakeStarted;    // one handshake per punch attempt (auto-adopt vs Connect race)
         private bool _punchAutoDelay;
         private int _punchAutoDelayMax;
         private double _punchFrameMs;
@@ -207,6 +208,9 @@ namespace BizHawkNetplay.Tool
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
         private const int LobbyProbeSamples = 5;
         private const int LobbyProbeTimeoutMs = 5000;
+        // How long a started punch keeps knocking. Long on purpose: the asymmetric flow means one
+        // side starts minutes before the other finishes reading a text message.
+        private const int PunchPatienceSeconds = 300;
         private const int ConnLogMaxLines = 200; // connection-log history cap, trimmed back to ConnLogKeepLines
         private const int ConnLogKeepLines = 120;
         private const int LogMaxLines = 5000;    // Log-tab cap; generous (it's the diagnostic record) but bounded
@@ -628,7 +632,7 @@ namespace BizHawkNetplay.Tool
 
             var step1 = new Label
             {
-                Text = "1. Click UDP Punch. Your code appears below — send it to your friend:",
+                Text = "Your code (appears after UDP Punch) — send it to the other player:",
                 AutoSize = true, Location = new Point(12, 24),
             };
             _myCodeBox = new TextBox
@@ -642,10 +646,10 @@ namespace BizHawkNetplay.Tool
 
             var step2 = new Label
             {
-                Text = "2. Paste your friend's code and Connect:",
+                Text = "Their code or ip:port — joiners: paste the host's here FIRST, then one click connects:",
                 AutoSize = true, Location = new Point(12, 84),
             };
-            _peerCodeBox = new TextBox { Location = new Point(12, 106), Width = 240, Enabled = false };
+            _peerCodeBox = new TextBox { Location = new Point(12, 106), Width = 240 };
             _connectButton = new Button { Text = "Connect", Location = new Point(260, 105), Width = 80, Enabled = false };
             _connectButton.Click += (_, __) => OnPunchConnect();
 
@@ -1019,15 +1023,26 @@ namespace BizHawkNetplay.Tool
                         _copyCodeButton.Enabled = true;
                         _peerCodeBox.Enabled = true;
                         _connectButton.Enabled = true;
-                        _punchStatus.Text = reflexive != null
-                            ? "share your code, paste your friend's, then Connect."
-                            : "STUN unavailable — using a local code (internet peers may be unreachable).";
                         Log(reflexive != null
                             ? $"UDP punch — your public code: {primary}   (endpoint {reflexive})"
                             : "UDP punch — couldn't reach a STUN server; internet peers may be unreachable");
                         if (lanEp != null) Log($"UDP punch — same-LAN code: {ConnectCode.Encode(lanEp)}   ({lanEp})");
                         Log($"UDP punch — same-machine test code: {ConnectCode.Encode(loopEp)}   ({loopEp})");
                         Log("(both ends must use matching code types: public over the internet, LAN on one router, same-machine for local testing)");
+                        if (ConnectCode.TryParseTarget(_peerCodeBox.Text) != null)
+                        {
+                            // The other side's target was pasted up front (the joiner flow): this
+                            // one click showed our code AND starts punching. We keep punching
+                            // patiently; the other side completes whenever it acts.
+                            OnPunchConnect();
+                        }
+                        else
+                        {
+                            _punchStatus.Text = reflexive != null
+                                ? "share your code — connects by itself when the other side punches; or paste their code and Connect."
+                                : "STUN unavailable — using a local code (internet peers may be unreachable).";
+                            StartPunchAutoAdoptWaiter(link, attempt);
+                        }
                     });
                 })
                 { IsBackground = true, Name = "BizHawkNetplay-punch-stun" }.Start();
@@ -1037,6 +1052,35 @@ namespace BizHawkNetplay.Tool
                 Log("punch setup failed: " + ex.Message);
                 EndSession("punch setup failed");
             }
+        }
+
+        /// <summary>
+        /// The listening half of the asymmetric punch: we shared our code and simply wait. The
+        /// other side (who has it) punches toward us; if we're reachable — forwarded, UPnP, or a
+        /// friendly NAT — the link auto-adopts them and the handshake starts with nothing pasted on
+        /// this side at all: the RemotePlay flow (host clicks Punch once, then joiners' codes are
+        /// only needed when the host's own NAT keeps their probes out, where paste + Connect
+        /// remains the fallback that opens our side).
+        /// </summary>
+        private void StartPunchAutoAdoptWaiter(PunchedPeerLink link, int attempt)
+        {
+            new Thread(() =>
+            {
+                while (IsConnectionAttemptCurrent(attempt)
+                       && ReferenceEquals(_punchLink, link)
+                       && !link.WaitForPunch(TimeSpan.FromMilliseconds(250)))
+                { }
+                if (!IsConnectionAttemptCurrent(attempt) || link.PeerEndpoint == null) return;
+                BeginInvokeUi(() =>
+                {
+                    if (!IsConnectionAttemptCurrent(attempt) || !_punchMode
+                        || !ReferenceEquals(_punchLink, link) || _punchHandshakeStarted) return;
+                    _peerCodeBox.Text = link.PeerEndpoint!.ToString();
+                    _punchStatus.Text = "the other side reached us — connecting…";
+                    OnPunchConnect();
+                });
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-punch-wait" }.Start();
         }
 
         private void CopyMyCode()
@@ -1054,13 +1098,15 @@ namespace BizHawkNetplay.Tool
             int attempt = CurrentConnectionAttempt;
             var link = _punchLink;
             if (!_punchMode || link == null) { Log("Click UDP Punch first."); return; }
-            var peer = ConnectCode.TryDecode(_peerCodeBox.Text);
+            if (_punchHandshakeStarted) return; // auto-adopt and a manual Connect can race; first one wins
+            var peer = ConnectCode.TryParseTarget(_peerCodeBox.Text);
             if (peer == null)
             {
-                _punchStatus.Text = "that code doesn't look right — check it and retry.";
+                _punchStatus.Text = "that doesn't look like a connect code or an ip:port — check it and retry.";
                 _punchStatus.ForeColor = Color.Firebrick;
                 return;
             }
+            _punchHandshakeStarted = true;
 
             _connectButton.Enabled = false;
             _peerCodeBox.Enabled = false;
@@ -1078,17 +1124,35 @@ namespace BizHawkNetplay.Tool
                 if (!IsConnectionAttemptCurrent(attempt)) return;
                 try
                 {
-                    bool ok = link.Punch(peer, TimeSpan.FromSeconds(15));
+                    // Punch patiently in slices, not one 15s shot: the sides no longer need to act
+                    // simultaneously — whoever starts first keeps knocking (opening its own NAT the
+                    // whole time) until the other side punches back, pastes our code, or the window
+                    // finally lapses.
+                    bool ok = false;
+                    var punchWatch = System.Diagnostics.Stopwatch.StartNew();
+                    while (!ok && punchWatch.Elapsed.TotalSeconds < PunchPatienceSeconds
+                           && IsConnectionAttemptCurrent(attempt))
+                    {
+                        ok = link.Punch(peer, TimeSpan.FromSeconds(5));
+                        if (!ok) BeginInvokeUi(() =>
+                        {
+                            if (IsConnectionAttemptCurrent(attempt) && _punchMode)
+                                _punchStatus.Text = $"punching toward {peer}… {punchWatch.Elapsed.TotalSeconds:F0}s " +
+                                    "— completes when the other side punches too.";
+                        });
+                    }
                     if (!IsConnectionAttemptCurrent(attempt)) return;
                     if (!ok)
                     {
                         BeginInvokeUi(() =>
                         {
                             if (!IsConnectionAttemptCurrent(attempt) || !_punchMode) return;
-                            _punchStatus.Text = "punch failed — no path opened (the other side may be on symmetric NAT).";
+                            _punchHandshakeStarted = false;
+                            _punchStatus.Text = $"no path opened in {PunchPatienceSeconds / 60} minutes " +
+                                "(wrong code, the other side never punched, or symmetric NAT).";
                             _punchStatus.ForeColor = Color.Firebrick;
-                            ConnLog($"UDP punch to {peer} failed — no path opened (the other side may be on " +
-                                    "symmetric NAT, or hasn't clicked Connect yet).", Color.Firebrick);
+                            ConnLog($"UDP punch to {peer} gave up after {PunchPatienceSeconds / 60} minutes — " +
+                                    "wrong code, the other side never punched, or symmetric NAT.", Color.Firebrick);
                             _connectButton.Enabled = true; _peerCodeBox.Enabled = true;
                         });
                         return;
@@ -1212,7 +1276,7 @@ namespace BizHawkNetplay.Tool
             _myCodeBox.Text = "";
             _peerCodeBox.Text = "";
             _copyCodeButton.Enabled = false;
-            _peerCodeBox.Enabled = false;
+            _peerCodeBox.Enabled = true; // a joiner pastes the host's code BEFORE clicking Punch
             _connectButton.Enabled = false;
             _punchStatus.Text = "";
             _punchStatus.ForeColor = Color.DimGray;
@@ -3478,7 +3542,7 @@ namespace BizHawkNetplay.Tool
             try { _punchLink?.Dispose(); } catch { } // in case _transport is a sim-latency wrapper over it
             try { _driver?.Dispose(); } catch { } // release the rollback ring's savestates
             _transport = null; _mesh = null; _punchLink = null;
-            _punchMode = false; _punchState = null;
+            _punchMode = false; _punchState = null; _punchHandshakeStarted = false;
             _driver = null;
             _sessionDriverPrepared = false;
 

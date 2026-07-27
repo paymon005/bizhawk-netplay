@@ -111,6 +111,19 @@ namespace BizHawkNetplay.Core.Net
             return _peer != null;
         }
 
+        /// <summary>
+        /// Passively wait for any peer's punch to confirm the path, sending no probes — the
+        /// listening half of the asymmetric flow, where the other side (which has our code) does
+        /// the active punching. Useful when this side is reachable (forwarded, UPnP, or friendly
+        /// NAT): the session forms without this side ever needing the peer's code.
+        /// </summary>
+        public bool WaitForPunch(TimeSpan timeout)
+        {
+            if (_peer != null) return true;
+            try { return _connected.Wait(timeout) || _peer != null; }
+            catch (ObjectDisposedException) { return _peer != null; }
+        }
+
         // ---------------------------------------------------------------- ITransport (input)
 
         public void Send(byte[] datagram)

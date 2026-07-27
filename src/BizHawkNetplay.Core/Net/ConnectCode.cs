@@ -84,6 +84,25 @@ namespace BizHawkNetplay.Core.Net
             return new IPEndPoint(ip, port);
         }
 
+        /// <summary>
+        /// Parse either a connect code or a literal <c>ip:port</c> — RemotePlay-style, so a joiner
+        /// can type the host's advertised endpoint straight from the host's invite line without
+        /// anyone encoding it. Codes never contain ':' or '.', so the two forms can't collide.
+        /// </summary>
+        public static IPEndPoint? TryParseTarget(string? text)
+        {
+            var decoded = TryDecode(text);
+            if (decoded != null) return decoded;
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            var s = text!.Trim();
+            int colon = s.LastIndexOf(':');
+            if (colon <= 0 || colon == s.Length - 1) return null;
+            if (!IPAddress.TryParse(s.Substring(0, colon), out var ip)) return null;
+            if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return null;
+            if (!int.TryParse(s.Substring(colon + 1), out int port) || port < 1 || port > 65535) return null;
+            return new IPEndPoint(ip, port);
+        }
+
         private static byte Checksum(byte[] b, int len)
         {
             // Simple additive-rotate checksum: order-sensitive (catches transposed groups), 1 byte.

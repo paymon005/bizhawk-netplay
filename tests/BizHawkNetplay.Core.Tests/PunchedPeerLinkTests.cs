@@ -33,6 +33,30 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void PassiveSide_AutoAdoptsAnActivePuncher_WithoutTheirCode()
+        {
+            // The asymmetric (RemotePlay-style) flow: the listener shared its code and just waits —
+            // it never learns the other side's endpoint out of band. The active side punches toward
+            // the code; the listener adopts whoever's punch arrives and confirms the path.
+            using var listener = PunchedPeerLink.Bind(0);
+            using var active = PunchedPeerLink.Bind(0);
+
+            var waiting = Task.Run(() =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (sw.Elapsed < TimeSpan.FromSeconds(5))
+                    if (listener.WaitForPunch(TimeSpan.FromMilliseconds(100))) return true;
+                return false;
+            });
+            bool punched = active.Punch(new IPEndPoint(IPAddress.Loopback, listener.LocalPort), TimeSpan.FromSeconds(5));
+
+            Assert.True(punched, "active side failed to punch");
+            Assert.True(waiting.Result, "listener never adopted the puncher");
+            Assert.Equal(active.LocalPort, listener.PeerEndpoint!.Port);
+            Assert.Equal(listener.LocalPort, active.PeerEndpoint!.Port);
+        }
+
+        [Fact]
         public void FullPunchSession_HandshakeOverControl_AndInputOverTransport()
         {
             using var host = PunchedPeerLink.Bind(0);
