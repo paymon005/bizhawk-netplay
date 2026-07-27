@@ -646,7 +646,7 @@ namespace BizHawkNetplay.Tool
 
             var step2 = new Label
             {
-                Text = "Their code or ip:port — joiners: paste the host's here FIRST, then one click connects:",
+                Text = "Their code — or just the host's IP (joiners: enter it FIRST, then UDP Punch):",
                 AutoSize = true, Location = new Point(12, 84),
             };
             _peerCodeBox = new TextBox { Location = new Point(12, 106), Width = 240 };
@@ -992,7 +992,16 @@ namespace BizHawkNetplay.Tool
 
                 int attempt = BeginConnectionAttempt();
                 _punchMode = true;
-                _punchLink = PunchedPeerLink.Bind(0);
+                // RemotePlay model: the HOST listens on the well-known port from the Port box, so a
+                // joiner needs only the host's IP as a target — no host-side code required. The
+                // joiner's own socket stays ephemeral; its endpoint travels to the host as the code.
+                int punchPort = _isHost ? (int)_portBox.Value : 0;
+                try { _punchLink = PunchedPeerLink.Bind(punchPort); }
+                catch (SocketException)
+                {
+                    throw new InvalidOperationException(
+                        $"UDP port {punchPort} is already in use — close whatever holds it, or change Port");
+                }
                 _transport = WrapSimLatency(_punchLink);
                 SetBusy(true);
                 _punchButton.Enabled = false;
@@ -1029,7 +1038,8 @@ namespace BizHawkNetplay.Tool
                         if (lanEp != null) Log($"UDP punch — same-LAN code: {ConnectCode.Encode(lanEp)}   ({lanEp})");
                         Log($"UDP punch — same-machine test code: {ConnectCode.Encode(loopEp)}   ({loopEp})");
                         Log("(both ends must use matching code types: public over the internet, LAN on one router, same-machine for local testing)");
-                        if (ConnectCode.TryParseTarget(_peerCodeBox.Text) != null)
+                        if (_isHost) Log($"UDP punch — listening on UDP {localPort}: a joiner can target just your IP");
+                        if (TryParsePunchTarget(_peerCodeBox.Text) != null)
                         {
                             // The other side's target was pasted up front (the joiner flow): this
                             // one click showed our code AND starts punching. We keep punching
@@ -1038,9 +1048,11 @@ namespace BizHawkNetplay.Tool
                         }
                         else
                         {
-                            _punchStatus.Text = reflexive != null
-                                ? "share your code — connects by itself when the other side punches; or paste their code and Connect."
-                                : "STUN unavailable — using a local code (internet peers may be unreachable).";
+                            _punchStatus.Text = reflexive == null
+                                ? "STUN unavailable — using a local code (internet peers may be unreachable)."
+                                : _isHost
+                                    ? "share your IP — a joiner's punch connects by itself; paste their code + Connect if it doesn't."
+                                    : "share your code — connects by itself when the other side punches; or paste their code and Connect.";
                             StartPunchAutoAdoptWaiter(link, attempt);
                         }
                     });
@@ -1083,6 +1095,20 @@ namespace BizHawkNetplay.Tool
             { IsBackground = true, Name = "BizHawkNetplay-punch-wait" }.Start();
         }
 
+        /// <summary>A punch target: a connect code, an <c>ip:port</c>, or a bare IP — the port then
+        /// defaults to the Port box, the RemotePlay convention where the host listens on the
+        /// well-known port and only its IP needs sharing.</summary>
+        private IPEndPoint? TryParsePunchTarget(string? text)
+        {
+            var target = ConnectCode.TryParseTarget(text);
+            if (target != null) return target;
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            return IPAddress.TryParse(text!.Trim(), out var ip)
+                && ip.AddressFamily == AddressFamily.InterNetwork
+                ? new IPEndPoint(ip, (int)_portBox.Value)
+                : null;
+        }
+
         private void CopyMyCode()
         {
             try { if (!string.IsNullOrEmpty(_myCodeBox.Text)) Clipboard.SetText(_myCodeBox.Text); }
@@ -1099,10 +1125,10 @@ namespace BizHawkNetplay.Tool
             var link = _punchLink;
             if (!_punchMode || link == null) { Log("Click UDP Punch first."); return; }
             if (_punchHandshakeStarted) return; // auto-adopt and a manual Connect can race; first one wins
-            var peer = ConnectCode.TryParseTarget(_peerCodeBox.Text);
+            var peer = TryParsePunchTarget(_peerCodeBox.Text);
             if (peer == null)
             {
-                _punchStatus.Text = "that doesn't look like a connect code or an ip:port — check it and retry.";
+                _punchStatus.Text = "that doesn't look like a connect code, an ip:port, or an IP — check it and retry.";
                 _punchStatus.ForeColor = Color.Firebrick;
                 return;
             }
