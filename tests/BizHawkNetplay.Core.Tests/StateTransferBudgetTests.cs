@@ -33,15 +33,28 @@ namespace BizHawkNetplay.Core.Tests
         public void SurvivorReceiveDeadline_CoversTheHostsWholePipeline(int stateBytes, int waitSeconds)
         {
             // The rejoin can be admitted as late as the end of the wait window, after which the host
-            // legitimately spends up to HostPipelinePhases full phases before the survivor's bytes
-            // even finish. The survivor's clock starts at BEGIN (the start of the wait window), so
-            // its budget must strictly exceed the sum — that strictness is exactly what review
-            // finding F5 was about (it budgeted one phase too few and killed healthy recoveries).
+            // legitimately spends up to THREE full phases (state to rejoiner → rejoiner import/READY
+            // → survivor transfer) before the survivor's bytes even finish. The survivor's clock
+            // starts at BEGIN (the start of the wait window), so its budget must strictly exceed
+            // that sum — review finding F5 budgeted one phase too few and killed healthy recoveries.
+            // The 3 here is deliberately a literal, independent of HostPipelinePhases: deriving it
+            // from the same constant would reduce this test to "slack > 0" and let the exact F5
+            // regression pass.
             double hostWorstCase = waitSeconds
-                + StateTransferBudget.HostPipelinePhases * StateTransferBudget.OnePhaseSeconds(stateBytes);
+                + 3 * (10.0 + stateBytes / (200.0 * 1024));
             Assert.True(
                 StateTransferBudget.SurvivorReceiveDeadlineSeconds(stateBytes, waitSeconds) > hostWorstCase,
-                $"survivor budget must strictly exceed the host's {StateTransferBudget.HostPipelinePhases}-phase worst case");
+                "survivor budget must strictly exceed the host's three-phase worst case");
+        }
+
+        [Fact]
+        public void SurvivorReceiveDeadline_ExactValueForTheF5Scenario()
+        {
+            // 4 MiB at the 200 KiB/s floor: one phase = 10 + 4194304/204800 = 30.48 s;
+            // 60 s wait + 3 × 30.48 + 5 s slack = 156.44 s. Hand-computed, so a change to the
+            // phase count or the slack — not just to the shape of the formula — fails here.
+            Assert.Equal(156.44,
+                StateTransferBudget.SurvivorReceiveDeadlineSeconds(4 * 1024 * 1024, 60), 6);
         }
 
         [Fact]

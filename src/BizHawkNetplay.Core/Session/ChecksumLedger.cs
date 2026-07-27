@@ -45,7 +45,9 @@ namespace BizHawkNetplay.Core.Session
         /// </summary>
         public ChecksumOutcome Record(SessionGeneration generation, int sourcePort, int frame, uint hash, int playerCount)
         {
-            if (playerCount < 1) throw new ArgumentOutOfRangeException(nameof(playerCount));
+            // Defensive, never throwing: Record runs on control-reader threads under the caller's
+            // lock — a nonsense player count must degrade to "nothing resolves", not an exception.
+            if (playerCount < 1) return ChecksumOutcome.Pending;
             if (sourcePort < 0 || sourcePort >= playerCount) return ChecksumOutcome.Pending;
 
             if (!_byGeneration.TryGetValue(generation, out var frames))

@@ -2158,7 +2158,12 @@ namespace BizHawkNetplay.Tool
                 }
             }
             if (dead == null) return;
-            if (verdict == LinkVerdict.ResyncReceiveDeadlineExpired)
+            // Guard against the completion race: the reader clears ResyncReceiving/epoch/deadline as
+            // separate writes, so a scan can catch ResyncReceiving still true with the deadline
+            // already zeroed — a spurious "expired" with epoch 0. Route that through the ordinary
+            // drop path (whose _sessionActive/_peers guards make it a no-op for a healthy link)
+            // instead of unconditionally ending the session.
+            if (verdict == LinkVerdict.ResyncReceiveDeadlineExpired && incompleteEpoch != 0)
                 EndSession($"{dead.Label} did not finish sending resync epoch {incompleteEpoch} before its deadline");
             else if (verdict == LinkVerdict.AppliedDeadlineExpired)
                 EndSession($"{dead.Label} did not apply resync epoch {unappliedEpoch} before its deadline");

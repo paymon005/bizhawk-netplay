@@ -111,6 +111,10 @@ namespace BizHawkNetplay.Core.Tests
             // A reconnect wait freezes with BOTH flags set; only one outstanding drop is supported.
             Assert.Equal(PeerLossAction.EndSessionSecondDropDuringReconnect,
                 RecoveryPolicy.OnPeerLost(isHost: true, resyncInProgress: true, awaitingReconnect: true));
+            // The transient window where the reconnect flag is up before the resync flag follows
+            // must resolve the same way.
+            Assert.Equal(PeerLossAction.EndSessionSecondDropDuringReconnect,
+                RecoveryPolicy.OnPeerLost(isHost: true, resyncInProgress: false, awaitingReconnect: true));
         }
 
         // ---- resync gate -----------------------------------------------------------
