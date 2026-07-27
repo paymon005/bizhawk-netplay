@@ -50,6 +50,17 @@ namespace BizHawkNetplay.Core.Session
             _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         }
 
+        /// <summary>
+        /// Optional per-frame progress bound: maps a frame's declared body length to a read timeout
+        /// in milliseconds. When set (and the stream supports timeouts), the wait for a frame's
+        /// FIRST byte stays governed by the stream's own timeout — an idle channel may legitimately
+        /// be silent for minutes (a joiner waiting out the host's lobby) — but once a header has
+        /// arrived, the body must keep flowing: its reads run under the mapped timeout, so a peer
+        /// that dies mid-transfer surfaces as an <see cref="IOException"/> instead of hanging the
+        /// receive forever. The stream's previous timeout is restored after every frame.
+        /// </summary>
+        public Func<int, int>? BodyReadTimeoutMs { get; set; }
+
         public void Send(ControlMessageType type, byte[] body)
         {
             if (body == null) body = Array.Empty<byte>();
@@ -74,8 +85,27 @@ namespace BizHawkNetplay.Core.Session
             int len = ReadInt32BE(header, 1);
             if (len < 0 || len > MaxFrameLength)
                 throw new InvalidDataException($"Frame length {len} out of range");
-            var body = len == 0 ? Array.Empty<byte>() : ReadFully(len);
+            var body = len == 0 ? Array.Empty<byte>() : ReadBody(len);
             return (type, body);
+        }
+
+        private byte[] ReadBody(int len)
+        {
+            var bodyTimeout = BodyReadTimeoutMs;
+            if (bodyTimeout == null || !_stream.CanTimeout) return ReadFully(len);
+
+            int previous = _stream.ReadTimeout;
+            try
+            {
+                _stream.ReadTimeout = Math.Max(1, bodyTimeout(len));
+                return ReadFully(len);
+            }
+            finally
+            {
+                // A NetworkStream reports 0 for "no timeout" but only accepts Infinite (-1) back.
+                try { _stream.ReadTimeout = previous > 0 ? previous : System.Threading.Timeout.Infinite; }
+                catch { /* restoring on a dead stream is best-effort */ }
+            }
         }
 
         private byte[] ReadFully(int count)

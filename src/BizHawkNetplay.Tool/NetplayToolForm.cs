@@ -1459,8 +1459,13 @@ namespace BizHawkNetplay.Tool
                                 throw new TimeoutException("host authentication exceeded the 15-second deadline");
                             // A 3–4 player host may legitimately wait minutes for the remaining lobby slots.
                             // The short timeout protects only HELLO/auth; Disconnect remains able to cancel
-                            // this now-unbounded lobby wait through the tracked socket.
+                            // this now-unbounded lobby wait through the tracked socket. The IDLE wait is
+                            // unbounded, but any frame that has STARTED arriving — the WELCOME/state
+                            // included — must keep flowing at the modeled floor rate: a host that dies
+                            // mid-transfer fails the join instead of hanging it forever (KI-2).
                             try { tcp.ReceiveTimeout = 0; } catch { }
+                            channel.BodyReadTimeoutMs = len =>
+                                StateTransferBudget.SocketTimeoutMs(len, HandshakeReceiveTimeoutMs);
                         });
                     }
                     catch (Exception ex) when (greetDeadline.Expired)

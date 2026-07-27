@@ -6,12 +6,6 @@ what was addressed — and how — stays greppable.
 
 ## Open
 
-**KI-2 (was P2, medium) — initial join-state transfer is unbounded.**
-After auth the joiner sets `ReceiveTimeout = 0` (`NetplayToolForm.cs` ~1449-1457), so a joiner
-waiting for WELCOME/state hangs forever if the host stalls mid-transfer; only manual Disconnect
-escapes. Resync/reconnect transfers are correctly bounded — extend the same size-scaled deadline
-scheme to the first join.
-
 **KI-4 (was F3, low, pre-existing) — `OnPeerLinkLost` leaks the writer thread.**
 `_peers.Remove(link)` + `Tcp.Close()` without `link.WriterRunning = false`: the writer spins on
 `OutboundSignal.WaitOne(250)` forever and `TeardownNetwork` never reaps it (link left `_peers`).
@@ -45,6 +39,15 @@ future change reintroduces an unfillable gap the watchdog will again sleep throu
 matters: track frontier progress per port instead of decode activity.
 
 ## Fixed (2026-07-26)
+
+**P2 / KI-2 (medium) — initial join-state transfer was unbounded.**
+`ControlChannel` gained an optional per-frame progress bound (`BodyReadTimeoutMs`): the wait for a
+frame's first byte stays unbounded (a joiner legitimately idles for minutes while the host's lobby
+fills), but once a frame's header has arrived, its body reads run under a size-scaled timeout. The
+joiner arms it right where it used to set `ReceiveTimeout = 0`, so a host that dies mid-WELCOME/
+state now fails the join with an error instead of hanging until a manual Disconnect. The punch
+path's `ReliableUdpStream` doesn't support read timeouts, so the hook is inert there (KI-6 remains
+the tracking item for that path).
 
 **F9 / KI-1 (low) — joiner pacing RTT collapsed to host-only TCP ping in 3+ player games.**
 `TryGetWorstRttMs` now falls back to a route's last stored (stale) RTT when its candidates have

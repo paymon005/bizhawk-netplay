@@ -1,0 +1,155 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using BizHawkNetplay.Core.Session;
+using Xunit;
+
+namespace BizHawkNetplay.Core.Tests
+{
+    /// <summary>
+    /// The control channel's per-frame progress bound (KI-2): an idle channel may be silent for
+    /// minutes (a joiner waiting out the host's lobby), but once a frame's header has arrived its
+    /// body must keep flowing — a peer that dies mid-transfer must fail the receive, not hang it.
+    /// </summary>
+    public class ControlChannelTests
+    {
+        /// <summary>Socket-like stream: hands out queued chunks; when drained, times out (throws
+        /// IOException) if a read timeout is set, and loudly refuses to "block forever" otherwise —
+        /// which is exactly what a real NetworkStream would do, minus the eternity.</summary>
+        private sealed class SocketLikeStream : Stream
+        {
+            private readonly Queue<byte[]> _chunks = new Queue<byte[]>();
+            private byte[]? _current;
+            private int _offset;
+            private int _readTimeout = System.Threading.Timeout.Infinite;
+
+            public readonly List<int> TimeoutsSeenPerRead = new List<int>();
+
+            public void Enqueue(byte[] chunk) => _chunks.Enqueue(chunk);
+
+            public override bool CanTimeout => true;
+            public override int ReadTimeout
+            {
+                get => _readTimeout;
+                set => _readTimeout = value;
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                TimeoutsSeenPerRead.Add(_readTimeout);
+                if (_current == null || _offset >= _current.Length)
+                {
+                    if (_chunks.Count == 0)
+                    {
+                        if (_readTimeout > 0)
+                            throw new IOException("read timed out (simulated socket receive timeout)");
+                        throw new InvalidOperationException(
+                            "unbounded read on a stalled stream — this receive would hang forever");
+                    }
+                    _current = _chunks.Dequeue();
+                    _offset = 0;
+                }
+                int n = Math.Min(count, _current.Length - _offset);
+                Buffer.BlockCopy(_current, _offset, buffer, offset, n);
+                _offset += n;
+                return n;
+            }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+            public override void Flush() { }
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        }
+
+        private static byte[] Header(ControlMessageType type, int length)
+        {
+            var h = new byte[5];
+            h[0] = (byte)type;
+            h[1] = (byte)(length >> 24); h[2] = (byte)(length >> 16);
+            h[3] = (byte)(length >> 8); h[4] = (byte)length;
+            return h;
+        }
+
+        [Fact]
+        public void BodyTimeout_AppliesOnlyToBodyReads_AndIsRestoredAfterTheFrame()
+        {
+            var stream = new SocketLikeStream();
+            stream.Enqueue(Header(ControlMessageType.State, 6));
+            stream.Enqueue(new byte[] { 1, 2, 3 });
+            stream.Enqueue(new byte[] { 4, 5, 6 });
+
+            var channel = new ControlChannel(stream) { BodyReadTimeoutMs = len => 1234 };
+            var (type, body) = channel.Receive();
+
+            Assert.Equal(ControlMessageType.State, type);
+            Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, body);
+            // The header wait ran unbounded (the legitimate idle/lobby wait); the body reads ran
+            // under the mapped timeout; and the stream is back to unbounded for the next frame.
+            Assert.Equal(System.Threading.Timeout.Infinite, stream.TimeoutsSeenPerRead[0]);
+            for (int i = 1; i < stream.TimeoutsSeenPerRead.Count; i++)
+                Assert.Equal(1234, stream.TimeoutsSeenPerRead[i]);
+            Assert.Equal(System.Threading.Timeout.Infinite, stream.ReadTimeout);
+        }
+
+        [Fact]
+        public void PeerDyingMidTransfer_FailsTheReceive_InsteadOfHangingForever()
+        {
+            // The KI-2 scenario: the WELCOME/state frame starts arriving, then the host stalls.
+            var stream = new SocketLikeStream();
+            stream.Enqueue(Header(ControlMessageType.State, 100));
+            stream.Enqueue(new byte[40]); // …and nothing more, ever
+
+            var channel = new ControlChannel(stream) { BodyReadTimeoutMs = len => 15000 };
+            Assert.Throws<IOException>(() => channel.Receive());
+            // Restored even on the failure path — the socket isn't left with a stale timeout.
+            Assert.Equal(System.Threading.Timeout.Infinite, stream.ReadTimeout);
+        }
+
+        [Fact]
+        public void WithoutTheBound_TheSameStallReadsUnbounded()
+        {
+            // Pre-fix behavior, made loud by the fake: no body timeout means the mid-frame stall
+            // is an unbounded read — the join hung until a manual Disconnect.
+            var stream = new SocketLikeStream();
+            stream.Enqueue(Header(ControlMessageType.State, 100));
+            stream.Enqueue(new byte[40]);
+
+            var channel = new ControlChannel(stream);
+            Assert.Throws<InvalidOperationException>(() => channel.Receive());
+        }
+
+        [Fact]
+        public void ZeroLengthFrames_NeverConsultTheMapping()
+        {
+            var stream = new SocketLikeStream();
+            stream.Enqueue(Header(ControlMessageType.Ready, 0));
+            var channel = new ControlChannel(stream)
+            {
+                BodyReadTimeoutMs = _ => throw new InvalidOperationException("must not be called for empty bodies"),
+            };
+            var (type, body) = channel.Receive();
+            Assert.Equal(ControlMessageType.Ready, type);
+            Assert.Empty(body);
+        }
+
+        [Fact]
+        public void StreamsWithoutTimeoutSupport_AreUnaffected()
+        {
+            // Loopback/test streams (MemoryStream pairs) report CanTimeout=false; the hook must be
+            // inert there rather than throwing on ReadTimeout access.
+            var frame = new List<byte>(Header(ControlMessageType.Checksum, 3)) { 7, 8, 9 };
+            var channel = new ControlChannel(new MemoryStream(frame.ToArray()))
+            {
+                BodyReadTimeoutMs = len => 5,
+            };
+            var (type, body) = channel.Receive();
+            Assert.Equal(ControlMessageType.Checksum, type);
+            Assert.Equal(new byte[] { 7, 8, 9 }, body);
+        }
+    }
+}
