@@ -16,13 +16,6 @@ rejoin) before trusting them; rollback with 3+ players and symmetric NAT remain 
 punch, lobby RTT probe, and auto-delay (4) all worked; the session then hit the mutual soft-cap
 freeze fixed in v0.10.2 (see Fixed below). Retest on v0.10.2.
 
-**KI-10 (feature) — the connect-code punch session is 2-player only.**
-3–4 players work over a normal TCP-hosted lobby (the host auto-punches the joiner↔joiner UDP mesh
-legs), but that requires the HOST to be reachable (forwarded port or UPnP). A host who can't
-forward at all can only run 2-player via codes. The N-player version of the RemotePlay-style flow
-— host collects one code per joiner, each punched link carrying that joiner's control channel over
-its own `ReliableUdpStream` on the host's one socket — is designed but not built.
-
 **KI-9 (design note) — the UDP liveness watchdog measures datagram arrival, not progress.**
 `FrameDriver` stamps `_lastRemoteInputStamp` for every well-decoded frame, including redundant
 resends that can never advance the frontier, so `CheckUdpInputProgress` sees a "live" port even
@@ -30,6 +23,19 @@ when input is useless — confirmed in the wild by the 2026-07-27 session, whose
 never tripped the 8s watchdog. The hole-evidence gap-request trigger (v0.10.2) removes the known
 permanent-freeze scenarios; nothing to do unless that path ever regresses. If it matters again:
 track per-port frontier progress instead of decode activity.
+
+## Fixed (2026-07-27, v0.11.0)
+
+**KI-10 — punch admission into normal hosted lobbies (N-player, RemotePlay-style).**
+`MeshUdpTransport` gained per-endpoint reliable control streams (`OpenControl`) carried on the
+session's own socket, demuxed by a segment type and accepted only for explicitly opened endpoints.
+The host just clicks Start Hosting; pasting a NAT'd joiner's connect code punches toward it from
+the mesh socket and hands the confirmed stream to the lobby thread, which greets it exactly like a
+TCP accept — same WELCOME/READY/GO, one code per joiner, TCP and punched joiners mixed freely. On
+the joiner side, Join + UDP Punch targets the host's IP and produces the code; the session that
+forms is a normal mesh session (input, resync, auto-delay — everything), with no TCP anywhere on
+the punched link. A punched link that drops ends the session (no TCP rejoin path) rather than
+holding the 60 s reconnect wait.
 
 ## Fixed (2026-07-27, v0.10.2)
 

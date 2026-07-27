@@ -92,7 +92,8 @@ namespace BizHawkNetplay.Tool
         /// <summary>One control link to a peer. Host: one per joiner. Joiner: one (the host).</summary>
         private sealed class PeerLink
         {
-            public TcpClient Tcp = null!;
+            public TcpClient Tcp = null!;      // null for a punched link (control rides the mesh socket)
+            public System.IO.Stream? ControlStream; // punched links: the reliable stream under Control
             public ControlChannel Control = null!;
             public int RemotePort;            // the controller port this peer owns (host peer = 0)
             public IPEndPoint UdpEndpoint = null!;      // LAN/observed endpoint (from TCP source + reported port)
@@ -194,6 +195,17 @@ namespace BizHawkNetplay.Tool
         private SessionPreferences? _punchPrefs;
         private byte[]? _punchState;            // host only: the initial state to transfer once punched
         private bool _punchHandshakeStarted;    // one handshake per punch attempt (auto-adopt vs Connect race)
+
+        // Punched joiners admitted into a normal hosted lobby (RemotePlay-style): the UI-side punch
+        // worker confirms the path and enqueues the confirmed control stream; the lobby thread greets
+        // it exactly like a TCP accept. Targets are UI-thread only; the queue crosses to the lobby.
+        private sealed class PunchAdmission
+        {
+            public IPEndPoint Endpoint = null!;
+            public System.IO.Stream Control = null!;
+        }
+        private readonly ConcurrentQueue<PunchAdmission> _punchAdmissions = new ConcurrentQueue<PunchAdmission>();
+        private readonly List<IPEndPoint> _lobbyPunchTargets = new List<IPEndPoint>();
         private bool _punchAutoDelay;
         private int _punchAutoDelayMax;
         private double _punchFrameMs;
@@ -626,7 +638,7 @@ namespace BizHawkNetplay.Tool
         {
             _punchGroup = new GroupBox
             {
-                Text = "UDP Punch — connect with no port-forwarding (2 players)",
+                Text = "UDP Punch — connect with no port-forwarding",
                 Location = new Point(12, 350), Size = new Size(544, 176),
             };
 
@@ -924,6 +936,12 @@ namespace BizHawkNetplay.Tool
                     Log($"exported {state.Length / 1024}KiB initial state; hosting {players} players");
                     StartThread(() => HostThread(port, id, prefs, state, _mesh.LocalPort, players,
                         autoDelay, autoDelayMax, lobbyFrameMs, _simLatencyMs, attempt));
+                    // RemotePlay-style punch admission: while the lobby waits, a NAT'd joiner's
+                    // pasted connect code admits them with no port-forwarding on their side.
+                    _lobbyPunchTargets.Clear();
+                    _connectButton.Enabled = true;
+                    _punchStatus.Text = "hosting — paste a joiner's punch code here to admit them without port-forwarding.";
+                    _punchStatus.ForeColor = Color.DimGray;
                 }
                 else
                 {
@@ -989,6 +1007,23 @@ namespace BizHawkNetplay.Tool
                 _punchFrameMs = FrameMs();
                 _simLatencyMs = (int)_simLatencyBox.Value;
                 _punchState = _isHost ? _adapter.ExportState() : null;
+
+                if (_joinRadio.Checked)
+                {
+                    // Joiner punch-join (RemotePlay-style): the target is the host's IP, and the
+                    // session that forms is a NORMAL joined session on the mesh socket — N-player,
+                    // resync, everything — with no TCP anywhere on the link.
+                    var host = TryParsePunchTarget(_peerCodeBox.Text);
+                    if (host == null)
+                    {
+                        APIs.EmuClient.Unpause();
+                        _punchStatus.Text = "enter the host's IP (or ip:port) above, then click UDP Punch.";
+                        _punchStatus.ForeColor = Color.Firebrick;
+                        return;
+                    }
+                    StartPunchJoin(host);
+                    return;
+                }
 
                 int attempt = BeginConnectionAttempt();
                 _punchMode = true;
@@ -1067,6 +1102,111 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
+        /// Joiner-side punch join (RemotePlay-style): punch the host's known endpoint from the SAME
+        /// mesh socket the session will use, show our code for the host to paste, and once the path
+        /// confirms run the ordinary join handshake over a reliable control stream on that socket.
+        /// From the session's point of view this is a normal joiner — mesh input, N players, resync.
+        /// </summary>
+        private void StartPunchJoin(IPEndPoint host)
+        {
+            int attempt = BeginConnectionAttempt();
+            AllowHandshakeClients();
+            var mesh = MeshUdpTransport.Bind(0);
+            _mesh = mesh;
+            _transport = WrapSimLatency(mesh);
+            mesh.SetPeerRoutes(new List<PeerRoute> { new PeerRoute(0, new[] { host }) });
+            SetBusy(true);
+            _punchButton.Enabled = false;
+            _peerCodeBox.Enabled = false;
+            _connectButton.Enabled = false;
+            _punchStatus.Text = "finding your public address…";
+            _punchStatus.ForeColor = Color.DimGray;
+            var id = _punchId!;
+            var prefs = _punchPrefs!;
+
+            new Thread(() =>
+            {
+                try
+                {
+                    IPEndPoint? reflexive = null;
+                    try { reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(3)); }
+                    catch { /* best-effort; the LAN fallback below still works on one router */ }
+                    if (!IsConnectionAttemptCurrent(attempt)) return;
+                    IPEndPoint? lanEp = null;
+                    try { lanEp = new IPEndPoint(IPAddress.Parse(UpnpPortMapper.PrimaryLanIp()), mesh.LocalPort); }
+                    catch { }
+                    var codeEp = reflexive ?? lanEp ?? new IPEndPoint(IPAddress.Loopback, mesh.LocalPort);
+                    string code = ConnectCode.Encode(codeEp);
+                    BeginInvokeUi(() =>
+                    {
+                        if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh)) return;
+                        _myCodeBox.Text = code;
+                        _copyCodeButton.Enabled = true;
+                        _punchStatus.Text = $"punching {host} — send your code to the host and wait…";
+                        Log($"UDP punch join — your code: {code}   (endpoint {codeEp})");
+                    });
+
+                    // The mesh's punch loop probes the host continuously (opening our NAT the whole
+                    // time); the path confirms whenever the host pastes our code — or immediately,
+                    // if the host's port is reachable.
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    while (IsConnectionAttemptCurrent(attempt) && sw.Elapsed.TotalSeconds < PunchPatienceSeconds
+                           && !mesh.IsEndpointAlive(host))
+                        Thread.Sleep(100);
+                    if (!IsConnectionAttemptCurrent(attempt)) return;
+                    if (!mesh.IsEndpointAlive(host))
+                        throw new TimeoutException(
+                            $"no punch answer from {host} after {PunchPatienceSeconds / 60} minutes — " +
+                            "did the host paste your code?");
+
+                    var control = mesh.OpenControl(host);
+                    if (!_lifecycle.Track(control, attempt)) return;
+                    var channel = new ControlChannel(control);
+                    var peerLink = new PeerLink
+                    {
+                        Tcp = null!,
+                        ControlStream = control,
+                        Control = channel,
+                        RemotePort = 0,
+                        UdpEndpoint = host, // the punched path IS the working endpoint
+                        Label = $"host ({host.Address})",
+                    };
+                    bool initialStateApplied = false;
+                    try { control.ReadTimeout = HandshakeReceiveTimeoutMs; } catch { }
+                    var sp = Handshake.RunClientMulti(channel, id, prefs, mesh.LocalPort, beforeReady: ready =>
+                    {
+                        InvokeUiBlocking(() =>
+                        {
+                            if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
+                            PrepareSessionJoiner(ready, peerLink);
+                        });
+                        initialStateApplied = true;
+                    }, afterGreet: () =>
+                    {
+                        // Auth done. The lobby wait is legitimately unbounded (the host may wait
+                        // minutes for other players); started frames must still finish.
+                        try { control.ReadTimeout = Timeout.Infinite; } catch { }
+                        channel.BodyReadTimeoutMs = len =>
+                            StateTransferBudget.SocketTimeoutMs(len, HandshakeReceiveTimeoutMs);
+                    });
+                    BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt)) BeginSessionJoiner(sp, peerLink, initialStateApplied);
+                        else { _lifecycle.Untrack(control); try { control.Dispose(); } catch { } }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    if (IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt)) FailSession(ex.Message);
+                    });
+                }
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-punch-join" }.Start();
+        }
+
+        /// <summary>
         /// The listening half of the asymmetric punch: we shared our code and simply wait. The
         /// other side (who has it) punches toward us; if we're reachable — forwarded, UPnP, or a
         /// friendly NAT — the link auto-adopts them and the handshake starts with nothing pasted on
@@ -1095,6 +1235,57 @@ namespace BizHawkNetplay.Tool
             { IsBackground = true, Name = "BizHawkNetplay-punch-wait" }.Start();
         }
 
+        /// <summary>
+        /// Host-side punch admission (RemotePlay-style): the hosting lobby is already up; pasting a
+        /// joiner's connect code makes the mesh punch toward it from the SAME socket the session
+        /// will use, and hands the confirmed control stream to the lobby thread, which greets it
+        /// exactly like a TCP accept.
+        /// </summary>
+        private void StartPunchAdmit(IPEndPoint joiner)
+        {
+            int attempt = CurrentConnectionAttempt;
+            var mesh = _mesh;
+            if (mesh == null) return;
+            if (!_lobbyPunchTargets.Contains(joiner)) _lobbyPunchTargets.Add(joiner);
+            var routes = new List<PeerRoute>();
+            for (int i = 0; i < _lobbyPunchTargets.Count; i++)
+                routes.Add(new PeerRoute(1 + i, new[] { _lobbyPunchTargets[i] })); // placeholder ports; real routes are set at GO
+            try { mesh.SetPeerRoutes(routes); } catch { }
+            _punchStatus.Text = $"punching toward {joiner}…";
+            _punchStatus.ForeColor = Color.DimGray;
+            ConnLog($"punching toward {joiner} — they join the lobby when the path opens…", Color.DarkSlateBlue);
+
+            new Thread(() =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (IsConnectionAttemptCurrent(attempt) && ReferenceEquals(_mesh, mesh)
+                       && sw.Elapsed.TotalSeconds < PunchPatienceSeconds && !mesh.IsEndpointAlive(joiner))
+                    Thread.Sleep(100);
+                if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh)) return;
+                if (!mesh.IsEndpointAlive(joiner))
+                {
+                    BeginInvokeUi(() =>
+                    {
+                        if (!IsConnectionAttemptCurrent(attempt)) return;
+                        _punchStatus.Text = $"no punch answer from {joiner} — check the code, and that they clicked UDP Punch.";
+                        _punchStatus.ForeColor = Color.Firebrick;
+                    });
+                    return;
+                }
+                var control = mesh.OpenControl(joiner);
+                if (!_lifecycle.Track(control, attempt)) return; // teardown won the race; mesh disposal closes it
+                _punchAdmissions.Enqueue(new PunchAdmission { Endpoint = joiner, Control = control });
+                BeginInvokeUi(() =>
+                {
+                    if (!IsConnectionAttemptCurrent(attempt)) return;
+                    _punchStatus.Text = $"punched {joiner} — admitting…";
+                    _punchStatus.ForeColor = Color.DimGray;
+                    _peerCodeBox.Text = ""; // ready for the next joiner's code
+                });
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-punch-admit" }.Start();
+        }
+
         /// <summary>A punch target: a connect code, an <c>ip:port</c>, or a bare IP — the port then
         /// defaults to the Port box, the RemotePlay convention where the host listens on the
         /// well-known port and only its IP needs sharing.</summary>
@@ -1121,10 +1312,6 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void OnPunchConnect()
         {
-            int attempt = CurrentConnectionAttempt;
-            var link = _punchLink;
-            if (!_punchMode || link == null) { Log("Click UDP Punch first."); return; }
-            if (_punchHandshakeStarted) return; // auto-adopt and a manual Connect can race; first one wins
             var peer = TryParsePunchTarget(_peerCodeBox.Text);
             if (peer == null)
             {
@@ -1132,6 +1319,21 @@ namespace BizHawkNetplay.Tool
                 _punchStatus.ForeColor = Color.Firebrick;
                 return;
             }
+            // Hosting lobby (RemotePlay-style): the pasted code admits a punched joiner into the
+            // running lobby — paste one code per NAT'd joiner, TCP joiners keep connecting normally.
+            if (_listener != null && !_sessionActive && !_punchMode)
+            {
+                StartPunchAdmit(peer);
+                return;
+            }
+            int attempt = CurrentConnectionAttempt;
+            var link = _punchLink;
+            if (!_punchMode || link == null)
+            {
+                Log("Click UDP Punch first (or Start Hosting, then paste a joiner's code here).");
+                return;
+            }
+            if (_punchHandshakeStarted) return; // auto-adopt and a manual Connect can race; first one wins
             _punchHandshakeStarted = true;
 
             _connectButton.Enabled = false;
@@ -1335,6 +1537,16 @@ namespace BizHawkNetplay.Tool
                 {
                     if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener)) return;
 
+                    // A punched joiner admitted from the UI (a pasted connect code) enters this SAME
+                    // lobby as a TCP accept would: same greet, same WELCOME/READY/GO — no TCP on its
+                    // link. This is what makes punch admission N-player for free.
+                    if (_punchAdmissions.TryDequeue(out var admission))
+                    {
+                        GreetPunchedJoiner(admission, id, prefs, udpLocalPort, links, greetings, need, attempt);
+                        continue;
+                    }
+                    if (!hostListener.Pending()) { Thread.Sleep(50); continue; }
+
                     TcpClient tcp;
                     try { tcp = hostListener.AcceptTcpClient(); }
                     catch when (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener))
@@ -1386,6 +1598,13 @@ namespace BizHawkNetplay.Tool
                 }
                 try { hostListener.Stop(); } catch { }
                 if (ReferenceEquals(_listener, hostListener)) _listener = null;
+                // A code pasted just as the lobby filled has no seat — close its stream cleanly.
+                while (_punchAdmissions.TryDequeue(out var leftover))
+                {
+                    _lifecycle.Untrack(leftover.Control);
+                    try { leftover.Control.Dispose(); } catch { }
+                    _mesh?.CloseControl(leftover.Endpoint);
+                }
                 if (!IsConnectionAttemptCurrent(attempt)) return;
 
                 // The host decides the authoritative delay (max anyone asked) once everyone's in.
@@ -1436,25 +1655,8 @@ namespace BizHawkNetplay.Tool
                     foreach (var link in links)
                     {
                         if (!IsConnectionAttemptCurrent(attempt)) return;
-                        int oldReceiveTimeout = 0, oldSendTimeout = 0;
-                        try
-                        {
-                            oldReceiveTimeout = link.Tcp.ReceiveTimeout;
-                            oldSendTimeout = link.Tcp.SendTimeout;
-                            link.Tcp.ReceiveTimeout = LobbyProbeTimeoutMs;
-                            link.Tcp.SendTimeout = LobbyProbeTimeoutMs;
-                            double rtt = Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
-                            if (rtt > worstRttMs) worstRttMs = rtt;
-                        }
-                        finally
-                        {
-                            try
-                            {
-                                link.Tcp.ReceiveTimeout = oldReceiveTimeout;
-                                link.Tcp.SendTimeout = oldSendTimeout;
-                            }
-                            catch { }
-                        }
+                        double rtt = ProbeLobbyRtt(link);
+                        if (rtt > worstRttMs) worstRttMs = rtt;
                     }
                     finalDelay = SelectLobbyDelay(finalDelay, autoDelayMax, mode, worstRttMs,
                         lobbyFrameMs, simulatedOneWayMs, players);
@@ -1468,7 +1670,7 @@ namespace BizHawkNetplay.Tool
                 _mesh!.SetPeerRoutes(RoutesExcept(links, null));
                 foreach (var link in links)
                 {
-                    ConfigureStateTransferTimeouts(link.Tcp, state.Length);
+                    ConfigureStateTransferTimeouts(link, state.Length);
                     Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state,
                         generation, RoutesExcept(links, link));
                 }
@@ -1483,10 +1685,7 @@ namespace BizHawkNetplay.Tool
                     PrepareSessionHost(links, players, finalDelay, mode, generation);
                 });
                 foreach (var link in links) Handshake.HostSendGo(link.Control, generation);
-                foreach (var link in links)
-                {
-                    try { link.Tcp.ReceiveTimeout = 0; link.Tcp.SendTimeout = 0; } catch { }
-                }
+                foreach (var link in links) RestoreSessionControlTimeouts(link);
 
                 BeginInvokeUi(() =>
                 {
@@ -1517,6 +1716,115 @@ namespace BizHawkNetplay.Tool
 #pragma warning restore 0420
                 }
             }
+        }
+
+        /// <summary>Greet a punched joiner exactly like a TCP accept — over the reliable control
+        /// stream on the mesh socket, bounded by its read timeout instead of a socket deadline. A
+        /// refused greet (wrong password/ROM/core) costs only that joiner, same as the TCP policy.</summary>
+        private void GreetPunchedJoiner(PunchAdmission admission, PeerIdentity id, SessionPreferences prefs,
+            int udpLocalPort, List<PeerLink> links, List<Handshake.JoinerGreeting> greetings, int need, int attempt)
+        {
+            var channel = new ControlChannel(admission.Control);
+            Handshake.JoinerGreeting greet;
+            try
+            {
+                try { admission.Control.ReadTimeout = HandshakeReceiveTimeoutMs; } catch { }
+                greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+                try { admission.Control.ReadTimeout = Timeout.Infinite; } catch { }
+            }
+            catch (Exception ex)
+            {
+                _lifecycle.Untrack(admission.Control);
+                try { admission.Control.Dispose(); } catch { }
+                _mesh?.CloseControl(admission.Endpoint);
+                if (!IsConnectionAttemptCurrent(attempt)) return;
+                UiConnLog($"refused a punched join from {admission.Endpoint.Address}: {ex.Message} — " +
+                          $"still hosting, waiting for {need - links.Count} player(s)", Color.Firebrick);
+                return;
+            }
+            int assignedPort = links.Count + 1;
+            links.Add(new PeerLink
+            {
+                Tcp = null!,
+                ControlStream = admission.Control,
+                Control = channel,
+                RemotePort = assignedPort,
+                UdpEndpoint = admission.Endpoint, // the punched path IS the peer's working endpoint
+                Label = $"P{assignedPort + 1} ({admission.Endpoint.Address})",
+            });
+            greetings.Add(greet);
+            UiConnLog($"P{assignedPort + 1} joined via UDP punch from {admission.Endpoint.Address} " +
+                      $"({links.Count}/{need})", Color.DarkGreen);
+        }
+
+        /// <summary>Lobby RTT probe with the deadline on whichever pipe the link actually uses.</summary>
+        private static double ProbeLobbyRtt(PeerLink link)
+        {
+            if (link.Tcp != null)
+            {
+                int oldReceive = 0, oldSend = 0;
+                try
+                {
+                    oldReceive = link.Tcp.ReceiveTimeout;
+                    oldSend = link.Tcp.SendTimeout;
+                    link.Tcp.ReceiveTimeout = LobbyProbeTimeoutMs;
+                    link.Tcp.SendTimeout = LobbyProbeTimeoutMs;
+                    return Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+                }
+                finally
+                {
+                    try { link.Tcp.ReceiveTimeout = oldReceive; link.Tcp.SendTimeout = oldSend; } catch { }
+                }
+            }
+            if (link.ControlStream is { CanTimeout: true } stream)
+            {
+                int old = stream.ReadTimeout;
+                try
+                {
+                    stream.ReadTimeout = LobbyProbeTimeoutMs;
+                    return Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+                }
+                finally
+                {
+                    try { stream.ReadTimeout = old > 0 ? old : Timeout.Infinite; } catch { }
+                }
+            }
+            return Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+        }
+
+        /// <summary>State-transfer deadline on whichever pipe the link uses (TCP socket timeouts, or
+        /// the punched control stream's read timeout).</summary>
+        private static void ConfigureStateTransferTimeouts(PeerLink link, int stateBytes)
+        {
+            if (link.Tcp != null) { ConfigureStateTransferTimeouts(link.Tcp, stateBytes); return; }
+            if (link.ControlStream is { CanTimeout: true } stream)
+            {
+                try { stream.ReadTimeout = StateTransferTimeoutMs(stateBytes); } catch { }
+            }
+        }
+
+        /// <summary>Post-GO: idle reads go unbounded on every link type, and any frame that has
+        /// started arriving stays bounded by its declared size — TCP and punched links alike.</summary>
+        private static void RestoreSessionControlTimeouts(PeerLink link)
+        {
+            if (link.Tcp != null)
+            {
+                try { link.Tcp.ReceiveTimeout = 0; link.Tcp.SendTimeout = 0; } catch { }
+            }
+            else if (link.ControlStream is { CanTimeout: true } stream)
+            {
+                try { stream.ReadTimeout = Timeout.Infinite; } catch { }
+            }
+            link.Control.BodyReadTimeoutMs = len =>
+                StateTransferBudget.SocketTimeoutMs(len, HandshakeReceiveTimeoutMs);
+        }
+
+        /// <summary>Release whatever handshake resource teardown was tracking for this link (the TCP
+        /// socket, or a punched link's control stream) — the session owns it from here.</summary>
+        private void UntrackHandshakeResources(PeerLink link)
+        {
+            UntrackHandshakeClient(link.Tcp);
+            if (link.ControlStream != null) _lifecycle.Untrack(link.ControlStream);
         }
 
         private void JoinThread(string ip, int port, PeerIdentity id, SessionPreferences prefs,
@@ -1607,7 +1915,7 @@ namespace BizHawkNetplay.Tool
             {
                 if (!DriverPreparedFor(generation, mode))
                     PrepareSessionHost(links, players, delay, mode, generation);
-                foreach (var link in links) UntrackHandshakeClient(link.Tcp);
+                foreach (var link in links) UntrackHandshakeResources(link);
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 ConnLog($"all {players} players connected — you are P1 (host)", Color.DarkGreen);
                 BeginSessionCommon(mode, $"{links.Count} peer(s)");
@@ -1621,7 +1929,7 @@ namespace BizHawkNetplay.Tool
             {
                 if (!initialStateApplied || !DriverPreparedFor(sp.Generation, sp.Mode))
                     PrepareSessionJoiner(sp, hostLink);
-                UntrackHandshakeClient(hostLink.Tcp);
+                UntrackHandshakeResources(hostLink);
                 // Both peers should print the SAME number here; if not, the start is misaligned.
                 Log($"emulator frame at start: {APIs.Emulation.FrameCount()}");
                 ConnLog($"connected — joined as P{sp.LocalPort + 1} of {sp.PlayerCount}", Color.DarkGreen);
@@ -3085,6 +3393,13 @@ namespace BizHawkNetplay.Tool
                 EndSession($"lost connection to {link.Label}: {why}");
                 return;
             }
+            // Same for a punched link inside a hosted session: the reconnect wait can only re-accept
+            // over TCP, which this link never had — recovery is a fresh punch, not a 60s hold.
+            if (link.Tcp == null)
+            {
+                EndSession($"lost connection to {link.Label}: {why} (punched link — no TCP rejoin path)");
+                return;
+            }
 
             // What losing a peer means in each recovery phase is decided in Core: RecoveryPolicy.
             switch (RecoveryPolicy.OnPeerLost(_isHost, _resyncInProgress, _awaitingReconnect))
@@ -3569,6 +3884,11 @@ namespace BizHawkNetplay.Tool
             try { _driver?.Dispose(); } catch { } // release the rollback ring's savestates
             _transport = null; _mesh = null; _punchLink = null;
             _punchMode = false; _punchState = null; _punchHandshakeStarted = false;
+            _lobbyPunchTargets.Clear();
+            while (_punchAdmissions.TryDequeue(out var admission))
+            {
+                try { admission.Control.Dispose(); } catch { }
+            }
             _driver = null;
             _sessionDriverPrepared = false;
 

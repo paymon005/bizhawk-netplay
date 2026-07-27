@@ -258,6 +258,76 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void PunchedJoiner_RunsTheFullHandshake_OverMeshControlStreams()
+        {
+            // The unified punch-join transport: joiner targets the host's known endpoint, host adds
+            // the joiner's endpoint (the "pasted code"), the mesh punch confirms both ways, and the
+            // ordinary handshake — state transfer included — runs over reliable control streams
+            // carried on the SAME sockets the session's input will use. No TCP anywhere.
+            var host = MeshUdpTransport.Bind(0);
+            var joiner = MeshUdpTransport.Bind(0);
+            try
+            {
+                var hostEndpoint = Loop(host.LocalPort);
+                var joinerEndpoint = Loop(joiner.LocalPort);
+                joiner.SetPeerRoutes(new[] { new PeerRoute(0, new[] { hostEndpoint }) });
+                host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { joinerEndpoint }) });
+                WaitUntil(() => host.IsEndpointAlive(joinerEndpoint) && joiner.IsEndpointAlive(hostEndpoint),
+                    "mesh punch never confirmed both ways");
+
+                var hostCh = new ControlChannel(host.OpenControl(joinerEndpoint));
+                var joinCh = new ControlChannel(joiner.OpenControl(hostEndpoint));
+                var state = new byte[60_000];
+                new Random(7).NextBytes(state);
+                PeerIdentity Id() => new PeerIdentity(1, "ROM", "GPGX", "2.11.1.0", "SYNC", new[] { "L0", "L1" }, true, 20);
+
+                var hostTask = System.Threading.Tasks.Task.Run(() =>
+                    Handshake.RunHost(hostCh, Id(), new SessionPreferences(2, false), state, host.LocalPort));
+                var joinParams = Handshake.RunClient(joinCh, Id(), new SessionPreferences(2, false), joiner.LocalPort);
+                hostTask.GetAwaiter().GetResult();
+
+                Assert.Equal(state, joinParams.InitialState);
+                Assert.Equal(host.LocalPort, joinParams.RemoteUdpPort);
+            }
+            finally { host.Dispose(); joiner.Dispose(); }
+        }
+
+        [Fact]
+        public void ControlSegments_BeforeTheStreamIsOpened_AreDroppedButRetransmissionConverges()
+        {
+            // Security half: segments for an endpoint nobody opened a stream for are dropped with no
+            // state allocated. Liveness half: because the sender's reliable layer retransmits, a
+            // stream opened LATE (the host pastes the code a moment after the joiner starts talking)
+            // still converges — nothing is lost, just delayed.
+            var host = MeshUdpTransport.Bind(0);
+            var joiner = MeshUdpTransport.Bind(0);
+            try
+            {
+                var hostEndpoint = Loop(host.LocalPort);
+                var joinerEndpoint = Loop(joiner.LocalPort);
+                joiner.SetPeerRoutes(new[] { new PeerRoute(0, new[] { hostEndpoint }) });
+                host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { joinerEndpoint }) });
+                WaitUntil(() => joiner.IsEndpointAlive(hostEndpoint), "joiner never punched the host");
+
+                var joinerStream = joiner.OpenControl(hostEndpoint);
+                var hello = new byte[] { 1, 2, 3, 4, 5 };
+                joinerStream.Write(hello, 0, hello.Length); // host side not opened yet — dropped
+                Thread.Sleep(300);
+
+                var hostStream = host.OpenControl(joinerEndpoint); // "the code gets pasted"
+                var got = new byte[hello.Length];
+                int read = 0;
+                var sw = Stopwatch.StartNew();
+                while (read < got.Length && sw.ElapsedMilliseconds < 5000)
+                    read += hostStream.Read(got, read, got.Length - read);
+
+                Assert.Equal(hello.Length, read);
+                Assert.Equal(hello, got);
+            }
+            finally { host.Dispose(); joiner.Dispose(); }
+        }
+
+        [Fact]
         public void ForeignSenderIsIgnored()
         {
             var a = MeshUdpTransport.Bind(0);

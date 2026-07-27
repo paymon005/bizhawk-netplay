@@ -34,6 +34,7 @@ namespace BizHawkNetplay.Core.Net
         private const int HeaderSize = 6; // MAGIC(4) + version(1) + type(1)
 
         private const byte TInput = 0x10;
+        private const byte TCtrlSeg = 0x20; // reliable control-stream segment (punched-joiner admission)
         private const byte TPunch = 0x30;
         private const byte TPunchAck = 0x31;
 
@@ -83,6 +84,11 @@ namespace BizHawkNetplay.Core.Net
         // Last candidate input was actually sent through, per logical peer — the failover anchor
         // while a repunch has the liveness table cleared.
         private readonly ConcurrentDictionary<int, IPEndPoint> _lastSelected = new ConcurrentDictionary<int, IPEndPoint>();
+
+        // Reliable control streams carried on this same socket, keyed by peer endpoint — what lets a
+        // hole-punched joiner run the ordinary handshake into a normal hosted lobby with no TCP.
+        private readonly ConcurrentDictionary<IPEndPoint, ReliableUdpStream> _controlStreams =
+            new ConcurrentDictionary<IPEndPoint, ReliableUdpStream>();
         private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
 
         // Reflexive-address discovery: while a request is pending, the receive loop watches for the STUN
@@ -333,6 +339,32 @@ namespace BizHawkNetplay.Core.Net
             return _routeTable.Endpoints.Where(endpoint => IsEndpointAlive(endpoint, now)).ToArray();
         }
 
+        /// <summary>
+        /// Open (or get) the reliable, ordered control stream to one peer endpoint, carried on this
+        /// same socket demultiplexed by a segment type. Wrap it in a
+        /// <see cref="Session.ControlChannel"/> and the ordinary handshake / state transfer /
+        /// checksum machinery runs over it unchanged — this is what lets a hole-punched joiner be
+        /// admitted into a normal hosted lobby with no TCP anywhere on its link. Inbound segments
+        /// are accepted only from known route candidates AND only for endpoints with an open
+        /// stream, so an unadmitted stranger cannot open reliable-stream state on the host.
+        /// </summary>
+        public System.IO.Stream OpenControl(IPEndPoint peer)
+        {
+            if (peer == null) throw new ArgumentNullException(nameof(peer));
+            return _controlStreams.GetOrAdd(peer,
+                ep => new ReliableUdpStream(seg => SendFramed(Frame(TCtrlSeg, seg), ep)));
+        }
+
+        /// <summary>Close and forget one peer's control stream (refused admission, or link death).</summary>
+        public void CloseControl(IPEndPoint peer)
+        {
+            if (peer == null) return;
+            if (_controlStreams.TryRemove(peer, out var stream))
+            {
+                try { stream.Dispose(); } catch { /* teardown is best-effort */ }
+            }
+        }
+
         /// <summary>Forget the current path confirmations and make the punch loop probe every candidate
         /// immediately. Used when control traffic is healthy but input progress has gone quiet.</summary>
         public void RequestRepunch()
@@ -472,7 +504,20 @@ namespace BizHawkNetplay.Core.Net
                     continue; // liveness already recorded above
                 }
 
-                // TInput
+                if (type == TCtrlSeg)
+                {
+                    // Only endpoints someone explicitly opened a stream for get their segments
+                    // delivered; anything else is dropped before any state is allocated.
+                    if (_controlStreams.TryGetValue(known, out var stream))
+                    {
+                        var seg = new byte[n - HeaderSize];
+                        Buffer.BlockCopy(buffer, HeaderSize, seg, 0, seg.Length);
+                        stream.OnDatagram(seg);
+                    }
+                    continue;
+                }
+
+                if (type != TInput) continue; // unknown type from a future build — ignore
                 var payload = new byte[n - HeaderSize];
                 Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
                 _inbound.Enqueue(payload);
@@ -499,6 +544,11 @@ namespace BizHawkNetplay.Core.Net
         public void Dispose()
         {
             _running = false;
+            foreach (var stream in _controlStreams.Values)
+            {
+                try { stream.Dispose(); } catch { /* ignore */ }
+            }
+            _controlStreams.Clear();
             try { _socket.Dispose(); } catch { /* ignore */ }
             try { if (_rxThread.IsAlive) _rxThread.Join(500); } catch { /* ignore */ }
             try { if (_punchThread.IsAlive) _punchThread.Join(500); } catch { /* ignore */ }
