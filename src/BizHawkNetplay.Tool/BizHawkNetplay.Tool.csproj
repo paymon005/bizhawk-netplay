@@ -62,4 +62,15 @@
     <Message Importance="high" Text="Deployed $(TargetName) to $(BizHawkHome)\ExternalTools" />
   </Target>
 
+  <!-- Also stage the two shipping DLLs in the repo's dist\ folder (gitignored): one stable path
+       to grab artifacts from, whatever the configuration. Last build wins — a Debug build
+       overwrites Release DLLs and vice versa, so build -c Release right before attaching these
+       to a GitHub release. -->
+  <Target Name="DeployToDist" AfterTargets="Build">
+    <MakeDir Directories="$(MSBuildProjectDirectory)\..\..\dist" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(MSBuildProjectDirectory)\..\..\dist" />
+    <Copy SourceFiles="$(TargetDir)BizHawkNetplay.Core.dll" DestinationFolder="$(MSBuildProjectDirectory)\..\..\dist" />
+    <Message Importance="high" Text="Staged $(TargetName) + Core in dist\ ($(Configuration))" />
+  </Target>
+
 </Project>
