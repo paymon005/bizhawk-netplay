@@ -278,8 +278,6 @@ namespace BizHawkNetplay.Tool
         // take. Scaled by payload: a flat timeout would either hang on a dead peer or shoot a live one
         // mid-transfer (an N64 state is megabytes; on a weak uplink that is minutes, not seconds).
         // State-transfer deadline math lives in Core (StateTransferBudget) so its invariants are tested.
-        private const int MaxResyncStateBytes = 64 * 1024 * 1024 - 12; // ControlChannel cap minus generation
-        private const int MaxResyncAnnouncementWaitSeconds = 300;
         private volatile bool _simUnresponsive;         // diagnostic: act frozen (stop ping/pong) to test the watchdog
         private const double UdpRepunchAfterSeconds = 1.5;
         private const double UdpLostAfterSeconds = 8.0;
@@ -2061,7 +2059,7 @@ namespace BizHawkNetplay.Tool
             else if (_peers.Count > 0)
             {
                 QueueControl(_peers[0], ControlMessageType.Checksum,
-                    EncodeChecksum(generation, frame, hash));
+                    ControlMessageCodec.EncodeChecksum(generation, frame, hash));
             }
         }
 
@@ -2093,29 +2091,9 @@ namespace BizHawkNetplay.Tool
                     acknowledges = link.LastReceivedPacingSequence;
                 }
                 QueueControl(link, ControlMessageType.Pacing,
-                    EncodePacing(generation, sequence, acknowledges, frame, mine));
+                    ControlMessageCodec.EncodePacing(generation, sequence, acknowledges, frame, mine));
             }
         }
-
-        private static byte[] EncodePacing(SessionGeneration generation, int sequence,
-            int acknowledges, int frame, int localAdvantage)
-        {
-            var b = new byte[28];
-            WriteGeneration(b, 0, generation);
-            WriteInt32(b, 12, sequence);
-            WriteInt32(b, 16, acknowledges);
-            WriteInt32(b, 20, frame);
-            WriteInt32(b, 24, localAdvantage);
-            return b;
-        }
-
-        private static void WriteInt32(byte[] b, int o, int v)
-        {
-            b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v;
-        }
-
-        private static int ReadInt32(byte[] b, int o) =>
-            (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3];
 
         /// <summary>
         /// Watchdog: a link that hasn't sent us anything for <see cref="PingTimeoutSeconds"/> is presumed
@@ -2356,11 +2334,11 @@ namespace BizHawkNetplay.Tool
                 {
                     var (type, body) = link.Control.Receive();
                     Interlocked.Exchange(ref link.LastRecvTicks, MonotonicNow()); // liveness heartbeat
-                    if (type == ControlMessageType.Checksum && body.Length == 20)
+                    if (type == ControlMessageType.Checksum)
                     {
                         // Only the host aggregates; a joiner never receives checksums.
                         var generation = CurrentGeneration;
-                        if (_isHost && TryDecodeChecksum(body, generation, out int frame, out uint hash))
+                        if (_isHost && ControlMessageCodec.TryDecodeChecksum(body, generation, out int frame, out uint hash))
                             RecordChecksum(link.Attempt, generation, link.RemotePort, frame, hash);
                     }
                     else if (type == ControlMessageType.Ping && body.Length == 8)
@@ -2382,13 +2360,11 @@ namespace BizHawkNetplay.Tool
                             BeginInvokePeer(link, MaybeHintDelay);
                         }
                     }
-                    else if (type == ControlMessageType.Pacing && body.Length == 28)
+                    else if (type == ControlMessageType.Pacing)
                     {
-                        if (!TryReadGeneration(body, 0, out var generation)) continue;
-                        int sequence = ReadInt32(body, 12);
-                        int acknowledges = ReadInt32(body, 16);
-                        int theirFrame = ReadInt32(body, 20);
-                        int theirAdvantage = ReadInt32(body, 24);
+                        if (!ControlMessageCodec.TryDecodePacing(body, out var generation,
+                            out int sequence, out int acknowledges, out int theirFrame, out int theirAdvantage))
+                            continue;
                         if (sequence <= 0) continue;
                         lock (_generationLock)
                         {
@@ -2439,7 +2415,7 @@ namespace BizHawkNetplay.Tool
                     }
                     else if (type == ControlMessageType.ResyncBegin)
                     {
-                        if (!_isHost && TryDecodeResyncBegin(body, out var generation, out int stateBytes,
+                        if (!_isHost && ControlMessageCodec.TryDecodeResyncBegin(body, out var generation, out int stateBytes,
                             out int waitSeconds)
                             && generation == CurrentGeneration.Next())
                         {
@@ -2467,7 +2443,7 @@ namespace BizHawkNetplay.Tool
                             link.ReceivingResyncEpoch = 0;
                             link.ReceivingResyncBytes = 0;
                             Interlocked.Exchange(ref link.ResyncReceiveDeadlineTicks, 0);
-                            if (TryDecodeStatePayload(body, out var generation, out var state)
+                            if (ControlMessageCodec.TryDecodeStatePayload(body, out var generation, out var state)
                                 && generation.Epoch == expectedEpoch && generation == CurrentGeneration.Next()
                                 && state.Length == expectedBytes)
                                 BeginInvokePeer(link, () => ApplyResyncAsJoiner(generation, state));
@@ -2477,13 +2453,13 @@ namespace BizHawkNetplay.Tool
                     }
                     else if (type == ControlMessageType.ResyncApplied)
                     {
-                        if (_isHost && TryDecodeGeneration(body, out var generation)
+                        if (_isHost && ControlMessageCodec.TryDecodeGeneration(body, out var generation)
                             && generation == CurrentGeneration)
                             BeginInvokePeer(link, () => OnPeerResyncApplied(link, generation));
                     }
                     else if (type == ControlMessageType.ResyncResume)
                     {
-                        if (!_isHost && TryDecodeGeneration(body, out var generation)
+                        if (!_isHost && ControlMessageCodec.TryDecodeGeneration(body, out var generation)
                             && generation == CurrentGeneration)
                             BeginInvokePeer(link, () => ResumeResyncAsJoiner(generation));
                     }
@@ -2580,8 +2556,8 @@ namespace BizHawkNetplay.Tool
                 _resyncReleaseQueued = false;
                 RebuildDriver();
                 int peerCount = _peers.Count;
-                var generationBody = EncodeResyncBegin(generation, state.Length);
-                var stateBody = EncodeStatePayload(generation, state);
+                var generationBody = ControlMessageCodec.EncodeResyncBegin(generation, state.Length);
+                var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
                 Status($"resync #{_resyncCount}: sending epoch {generation.Epoch} " +
                     $"({state.Length / 1024}KiB) to {peerCount} peer(s)…", Color.DarkOrange);
                 Log($"resync #{_resyncCount}: captured {state.Length / 1024}KiB for epoch " +
@@ -2726,71 +2702,6 @@ namespace BizHawkNetplay.Tool
             {
                 if (IsConnectionAttemptCurrent(attempt) && _peers.Contains(link)) action();
             });
-        }
-
-        private static byte[] EncodeResyncBegin(
-            SessionGeneration generation, int stateBytes, int waitSeconds = 0)
-        {
-            if (stateBytes < 0 || stateBytes > MaxResyncStateBytes)
-                throw new ArgumentOutOfRangeException(nameof(stateBytes));
-            if (waitSeconds < 0 || waitSeconds > MaxResyncAnnouncementWaitSeconds)
-                throw new ArgumentOutOfRangeException(nameof(waitSeconds));
-            var body = new byte[20];
-            WriteGeneration(body, 0, generation);
-            WriteInt32(body, 12, stateBytes);
-            WriteInt32(body, 16, waitSeconds);
-            return body;
-        }
-
-        private static bool TryDecodeResyncBegin(byte[] body, out SessionGeneration generation,
-            out int stateBytes, out int waitSeconds)
-        {
-            generation = default;
-            stateBytes = 0;
-            waitSeconds = 0;
-            if (body == null || body.Length != 20 || !TryReadGeneration(body, 0, out generation)) return false;
-            stateBytes = ReadInt32(body, 12);
-            waitSeconds = ReadInt32(body, 16);
-            return stateBytes >= 0 && stateBytes <= MaxResyncStateBytes
-                && waitSeconds >= 0 && waitSeconds <= MaxResyncAnnouncementWaitSeconds;
-        }
-
-        private static byte[] EncodeStatePayload(SessionGeneration generation, byte[] state)
-        {
-            if (state == null) throw new ArgumentNullException(nameof(state));
-            if (state.Length > MaxResyncStateBytes) throw new ArgumentException("Resync state exceeds control-frame cap", nameof(state));
-            var generationBody = HandshakeCodec.EncodeGeneration(generation);
-            var body = new byte[generationBody.Length + state.Length];
-            Buffer.BlockCopy(generationBody, 0, body, 0, generationBody.Length);
-            Buffer.BlockCopy(state, 0, body, generationBody.Length, state.Length);
-            return body;
-        }
-
-        private static bool TryDecodeStatePayload(byte[] body, out SessionGeneration generation, out byte[] state)
-        {
-            generation = default;
-            state = Array.Empty<byte>();
-            if (body == null || body.Length < 12) return false;
-            var generationBody = new byte[12];
-            Buffer.BlockCopy(body, 0, generationBody, 0, generationBody.Length);
-            if (!TryDecodeGeneration(generationBody, out generation)) return false;
-            state = new byte[body.Length - generationBody.Length];
-            Buffer.BlockCopy(body, generationBody.Length, state, 0, state.Length);
-            return true;
-        }
-
-        private static bool TryDecodeGeneration(byte[] body, out SessionGeneration generation)
-        {
-            try
-            {
-                generation = HandshakeCodec.DecodeGeneration(body);
-                return true;
-            }
-            catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
-            {
-                generation = default;
-                return false;
-            }
         }
 
         /// <summary>
@@ -3096,7 +3007,7 @@ namespace BizHawkNetplay.Tool
                 RebuildDriver();
                 RedistributeMesh(); // remove the dead endpoint from host and survivor route tables
 
-                var begin = EncodeResyncBegin(generation, state.Length, (int)ReconnectTimeoutSeconds);
+                var begin = ControlMessageCodec.EncodeResyncBegin(generation, state.Length, (int)ReconnectTimeoutSeconds);
                 foreach (var survivor in _peers)
                 {
                     if (!QueueControl(survivor, ControlMessageType.ResyncBegin, begin))
@@ -3321,7 +3232,7 @@ namespace BizHawkNetplay.Tool
                 _pendingReconnectLink = link;
                 _pendingReconnectStateLength = state.Length;
                 _pendingReconnectGeneration = generation;
-                var stateBody = EncodeStatePayload(generation, state);
+                var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
                 if (survivors.Count == 0)
                 {
                     ReleaseReconnectedPeer(link, state.Length, generation);
@@ -3719,45 +3630,6 @@ namespace BizHawkNetplay.Tool
             if (vp != null && vp.VsyncNumerator > 0 && vp.VsyncDenominator > 0)
                 return 1000.0 * vp.VsyncDenominator / vp.VsyncNumerator;
             return 1000.0 / 60.0;
-        }
-
-        private static byte[] EncodeChecksum(SessionGeneration generation, int frame, uint hash)
-        {
-            var b = new byte[20];
-            WriteGeneration(b, 0, generation);
-            WriteInt32(b, 12, frame);
-            b[16] = (byte)(hash >> 24); b[17] = (byte)(hash >> 16);
-            b[18] = (byte)(hash >> 8); b[19] = (byte)hash;
-            return b;
-        }
-
-        private static bool TryDecodeChecksum(byte[] b, SessionGeneration expected, out int frame, out uint hash)
-        {
-            frame = 0; hash = 0;
-            if (b == null || b.Length != 20 || !TryReadGeneration(b, 0, out var generation)
-                || generation != expected) return false;
-            frame = ReadInt32(b, 12);
-            hash = ((uint)b[16] << 24) | ((uint)b[17] << 16) | ((uint)b[18] << 8) | b[19];
-            return true;
-        }
-
-        private static void WriteGeneration(byte[] b, int offset, SessionGeneration generation)
-        {
-            ulong id = generation.SessionId;
-            for (int i = 7; i >= 0; i--) { b[offset + i] = (byte)id; id >>= 8; }
-            WriteInt32(b, offset + 8, generation.Epoch);
-        }
-
-        private static bool TryReadGeneration(byte[] b, int offset, out SessionGeneration generation)
-        {
-            generation = SessionGeneration.Legacy;
-            if (b == null || offset < 0 || b.Length - offset < 12) return false;
-            ulong id = 0;
-            for (int i = 0; i < 8; i++) id = (id << 8) | b[offset + i];
-            int epoch = ReadInt32(b, offset + 8);
-            if (id == 0 || epoch < 0) return false;
-            generation = new SessionGeneration(id, epoch);
-            return true;
         }
 
         private void StartThread(Action body) =>
