@@ -160,3 +160,7 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
 - **The session password** is verified by a nonce challenge-response (`SessionAuth`): the password is never sent (not even hashed), a captured proof can't be replayed to another session, and role-tagging blocks a reflection attack. An empty password means an open session. A refused joiner (wrong password, wrong ROM/core, a HELLO that never arrives) only loses its own connection — the host logs it and keeps listening, so a typo doesn't cost you the lobby. Still not a fortress — it's a shared secret over a plaintext control channel with no forward secrecy — but it's a real gate, not an echo-able hash.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
 - **Symmetric NAT is untested** over a real internet path, as is rollback with more than 2 players (3–4P forces lockstep). 2P and 4P sessions are verified working; everything below the socket layer is unit-tested.
+
+## License
+
+[MIT](LICENSE).
