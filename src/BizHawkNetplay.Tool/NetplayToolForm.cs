@@ -598,17 +598,17 @@ namespace BizHawkNetplay.Tool
             // carries the full diagnostic firehose, which is the wrong place to learn that your password
             // was wrong — only connection-lifecycle events land here, color-coded (red = refused/failed,
             // green = connected). See ConnLog.
-            var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 200) };
+            var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 348) };
             _connLog = new RichTextBox
             {
-                Location = new Point(12, 218), Size = new Size(544, 92),
+                Location = new Point(12, 366), Size = new Size(544, 92),
                 ReadOnly = true, BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
                 ScrollBars = RichTextBoxScrollBars.Vertical, TabStop = false, DetectUrls = false,
             };
 
             _netcodeLabel = new Label
             {
-                Text = "Netcode in use: —", Location = new Point(12, 318), Width = 300, Height = 24,
+                Text = "Netcode in use: —", Location = new Point(12, 466), Width = 300, Height = 24,
                 BorderStyle = BorderStyle.FixedSingle, TextAlign = ContentAlignment.MiddleLeft,
                 Padding = new Padding(6, 0, 0, 0), ForeColor = Color.DimGray,
             };
@@ -635,7 +635,7 @@ namespace BizHawkNetplay.Tool
             _punchGroup = new GroupBox
             {
                 Text = "UDP Punch — play without port-forwarding",
-                Location = new Point(12, 350), Size = new Size(544, 140),
+                Location = new Point(12, 200), Size = new Size(544, 140),
             };
 
             // The group shows only what YOUR role needs (see UpdatePunchUiForRole): a joiner
