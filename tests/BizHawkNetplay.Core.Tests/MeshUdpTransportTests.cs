@@ -203,6 +203,31 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void BeforeAnyConfirmation_InputBroadcastsToEveryCandidate()
+        {
+            // Session start, punch still in flight: guessing one candidate can blackhole the whole
+            // opening toward a NAT'd peer (the first real-internet session lost ~300ms of input to
+            // the unreachable pre-NAT candidate this way). Until a path confirms, input must go to
+            // every candidate — whichever one is real receives from frame zero.
+            var sender = MeshUdpTransport.Bind(0);
+            var unreachableFirst = MeshUdpTransport.Bind(0);
+            var reachable = MeshUdpTransport.Bind(0);
+            try
+            {
+                var unreachableEndpoint = Loop(unreachableFirst.LocalPort);
+                var reachableEndpoint = Loop(reachable.LocalPort);
+                unreachableFirst.Dispose(); // the pre-NAT address: nothing there
+                sender.SetPeerRoutes(new[] { new PeerRoute(1, new[] { unreachableEndpoint, reachableEndpoint }) });
+                reachable.SetPeers(new[] { Loop(sender.LocalPort) });
+
+                // Send immediately — deliberately BEFORE waiting for any liveness confirmation.
+                sender.Send(new byte[] { 50 });
+                Assert.Equal(new byte[] { 50 }, WaitRecv(reachable));
+            }
+            finally { sender.Dispose(); unreachableFirst.Dispose(); reachable.Dispose(); }
+        }
+
+        [Fact]
         public void RepunchFallsBackToLastKnownGoodCandidate_NotFirstAdvertised()
         {
             // F8: RequestRepunch clears the liveness table while re-probing a silent peer. With

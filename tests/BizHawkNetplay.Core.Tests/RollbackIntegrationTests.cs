@@ -327,6 +327,50 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void EarlyOneWayLoss_WithTimeSync_RecoversInsteadOfMutualSoftCapFreeze()
+        {
+            // The first real-internet session (host log: "time-sync yield at frame 17" forever):
+            // the opening ~300ms of host→joiner input vanished into a pre-NAT candidate before the
+            // punch confirmed a path. The hole then slid out of the sender's resend window — but
+            // with time-sync active both peers stall at their SOFT caps (~latency+2 frames past the
+            // frontier), far shallower than the depth-based gap-request trigger, so neither side
+            // ever requested the missing frames and both froze forever, resends keeping the
+            // liveness watchdog quiet. The hole-beyond-window trigger must break this deadlock.
+            const int k = 3;
+            const double frameMs = 16.0;
+            var clock = new Clock();
+            bool burst = true; // A→B traffic lost from the very first datagram
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k, dropA: _ => burst);
+            var a = BuildRollback(ta, 0, frameMs);
+            var b = BuildRollback(tb, 1, frameMs);
+            // Lobby-measured RTT narrows both soft caps, exactly like the real session.
+            a.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
+            b.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
+
+            long tick = 0;
+            for (int i = 0; i < 15; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
+            burst = false; // the punch confirms; the path opens — but the early frames are gone
+
+            int targetA = a.Driver.CurrentFrame + 120;
+            int targetB = b.Driver.CurrentFrame + 120;
+            for (int i = 0; i < 5000 && (a.Driver.CurrentFrame < targetA || b.Driver.CurrentFrame < targetB); i++)
+            {
+                clock.Tick = ++tick;
+                a.Step();
+                b.Step();
+                System.Threading.Thread.Sleep(1); // gap requests are wall-clock throttled
+            }
+
+            Assert.True(a.Driver.CurrentFrame >= targetA && b.Driver.CurrentFrame >= targetB,
+                $"mutual soft-cap freeze after early one-way loss: A={a.Driver.CurrentFrame}/{targetA} " +
+                $"B={b.Driver.CurrentFrame}/{targetB} (A stalled={a.Driver.IsStalled}, B stalled={b.Driver.IsStalled})");
+
+            int upTo = Math.Min(a.Driver.CurrentFrame, b.Driver.CurrentFrame) - k - Redundancy - Delay - 6;
+            AssertFinalizedCorrect(a, upTo);
+            AssertFinalizedCorrect(b, upTo);
+        }
+
+        [Fact]
         public void ConfirmedChecksums_AlignAndAgreeAcrossPeers()
         {
             // Rollback can't checksum the live frame (it may be a prediction), so it checksums the

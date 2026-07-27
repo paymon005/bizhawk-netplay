@@ -183,7 +183,17 @@ namespace BizHawkNetplay.Core.Net
             foreach (var route in table.Routes)
             {
                 var endpoint = SelectSendCandidate(route, now);
-                if (endpoint != null) SendFramed(framed, endpoint);
+                if (endpoint != null)
+                {
+                    SendFramed(framed, endpoint);
+                    continue;
+                }
+                // No path to this peer has EVER been confirmed (fresh session, punch still in
+                // flight). Guessing one candidate can blackhole the whole opening of the session
+                // toward a NAT'd peer — the pre-NAT candidate silently ate the first ~300ms of
+                // input in the first real-internet test. Send to every candidate until the first
+                // ack picks a winner.
+                foreach (var candidate in route.Candidates) SendFramed(framed, candidate);
             }
         }
 
@@ -280,9 +290,9 @@ namespace BizHawkNetplay.Core.Net
             if (_lastSelected.TryGetValue(route.RemotePort, out var last) && route.Candidates.Contains(last))
                 return last;
 
-            // Before punching has ever confirmed anything, preserve deterministic forward progress
-            // through the first advertised candidate.
-            return route.Candidates.Count > 0 ? route.Candidates[0] : null;
+            // Nothing has ever worked for this peer — no single candidate is a safe guess. Return
+            // null so the caller broadcasts to every candidate until the punch confirms one.
+            return null;
         }
 
         private bool TryGetBestLiveRtt(PeerRoute route, long now, out double bestRtt)

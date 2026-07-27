@@ -62,6 +62,7 @@ namespace BizHawkNetplay.Core.Sync
         private readonly Dictionary<int, byte[]> _sentPayloads = new Dictionary<int, byte[]>();
         private int _oldestSentPayload = -1;
         private readonly long[] _lastGapRequestMs;
+        private readonly int[] _newestRemoteFrame; // highest frame ever decoded per port (-1 = none)
 
         /// <param name="strategyFactory">Builds the sync strategy over the shared pipeline (the swap point).</param>
         /// <param name="localPort">The controller port this instance owns and sources locally.</param>
@@ -128,7 +129,12 @@ namespace BizHawkNetplay.Core.Sync
             _serializers = new InputSerializer[ports];
             _lastRemoteInputStamp = new long[ports];
             _lastGapRequestMs = new long[ports];
-            for (int p = 0; p < ports; p++) _lastGapRequestMs[p] = -GapRequestIntervalMs;
+            _newestRemoteFrame = new int[ports];
+            for (int p = 0; p < ports; p++)
+            {
+                _lastGapRequestMs[p] = -GapRequestIntervalMs;
+                _newestRemoteFrame[p] = -1;
+            }
             var payloadSizes = new int[ports];
             for (int p = 0; p < ports; p++)
             {
@@ -317,6 +323,11 @@ namespace BizHawkNetplay.Core.Sync
                     // Any well-decoded frame from a remote port proves that port's UDP path is alive,
                     // including a redundant frame we already hold during a lockstep stall.
                     _lastRemoteInputStamp[inFrame.Port] = Stopwatch.GetTimestamp();
+                    // Track the newest frame the peer has SENT (even if we drop it below): the gap
+                    // between this and the confirmed frontier is what tells us a missing frame has
+                    // slid out of the peer's live resend window and must be requested.
+                    if (inFrame.Frame > _newestRemoteFrame[inFrame.Port])
+                        _newestRemoteFrame[inFrame.Port] = inFrame.Frame;
                     // Genuine redundancy: we already hold this exact (port, frame). This is also the
                     // ONLY way an earlier-than-current frame reaches lockstep — it can't have advanced
                     // past a frame it lacked — so with _rollbackWindow==0 this matches the old
@@ -388,7 +399,17 @@ namespace BizHawkNetplay.Core.Sync
             {
                 if (p == _localPort) continue;
                 int frontier = _pipeline.ConfirmedFrontier(p);
-                if (CurrentFrame - 1 - frontier < trigger) continue;
+                // Depth alone is NOT a sufficient trigger: with time-sync enabled the soft cap
+                // stalls us only ~(latency+2) frames past the frontier — far shallower than the
+                // window — so a hole burned in during a loss burst never reaches `trigger` and both
+                // peers freeze in a mutual "time-sync yield" forever (the first real-internet
+                // session deadlocked exactly like this at frame 17). The direct evidence of an
+                // unrecoverable hole is the peer's NEWEST frame sitting more than a whole resend
+                // window past our frontier: the frame we need has slid out of its live window and
+                // will never arrive on its own, no matter how shallow our own stall is.
+                bool deepGap = CurrentFrame - 1 - frontier >= trigger;
+                bool holeBeyondWindow = _newestRemoteFrame[p] > frontier + _redundancy;
+                if (!deepGap && !holeBeyondWindow) continue;
                 if (now - _lastGapRequestMs[p] < GapRequestIntervalMs) continue;
                 _lastGapRequestMs[p] = now;
                 _transport.Send(_codec.EncodeRequest((byte)p, frontier + 1));
