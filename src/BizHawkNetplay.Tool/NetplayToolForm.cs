@@ -1100,6 +1100,16 @@ namespace BizHawkNetplay.Tool
                     // Trade one reliable byte each way up front, before any ControlChannel framing, and
                     // refuse a same-role pair with a message that says exactly what to change.
                     var reliable = link.Control;
+                    // The punch handshake used to run with no deadline at all — a peer that kept the
+                    // reliable layer ACKed while withholding the application bytes we were blocked on
+                    // could hold this thread forever (KI-6). Bound every read: the host scales by the
+                    // state it is about to send (the joiner's import + READY legitimately trails a
+                    // big transfer), the joiner uses the ordinary handshake window (a transfer's
+                    // segments keep arriving, resetting the per-read clock).
+                    reliable.ReadTimeout = isHost
+                        ? StateTransferBudget.SocketTimeoutMs((state ?? Array.Empty<byte>()).Length,
+                            HandshakeReceiveTimeoutMs)
+                        : HandshakeReceiveTimeoutMs;
                     byte myRole = (byte)(isHost ? 1 : 0);
                     reliable.WriteByte(myRole);
                     reliable.Flush();
@@ -1152,6 +1162,12 @@ namespace BizHawkNetplay.Tool
                             });
                             initialStateApplied = true;
                         });
+                    // Handshake done: idle session reads go back to unbounded (pings keep the link
+                    // warm), but any frame that has started arriving stays bounded by its size —
+                    // the same started-frames-must-finish rule as the TCP join path.
+                    reliable.ReadTimeout = Timeout.Infinite;
+                    ch.BodyReadTimeoutMs = len =>
+                        StateTransferBudget.SocketTimeoutMs(len, HandshakeReceiveTimeoutMs);
                     BeginInvokeUi(() =>
                     {
                         if (IsConnectionAttemptCurrent(attempt))
@@ -2731,6 +2747,11 @@ namespace BizHawkNetplay.Tool
         {
             if (!_paceClock.IsRunning) _paceClock.Start();
             _nextFrameDueMs = _paceClock.Elapsed.TotalMilliseconds;
+            // The pause froze stepping but not the FPS sample clock — restart the sample so the
+            // first post-resume status line doesn't read ~0 fps and flash "CPU-bound" (KI-7).
+            _fpsClock.Restart();
+            _fpsCount = 0;
+            _actualFps = -1;
         }
 
         private SessionGeneration CurrentGeneration
@@ -2997,6 +3018,10 @@ namespace BizHawkNetplay.Tool
             _reconnectStartedStamp = MonotonicNow();
 
             _peers.Remove(link);
+            // The link leaves _peers here, so TeardownNetwork's reaping will never see it again —
+            // shut its writer down now or the thread spins on OutboundSignal forever (KI-4).
+            link.WriterRunning = false;
+            try { link.OutboundSignal.Set(); } catch { }
             try { link.Tcp?.Close(); } catch { }
             try
             {

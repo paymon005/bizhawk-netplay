@@ -68,6 +68,27 @@ namespace BizHawkNetplay.Core.Net
         public override bool CanRead => true;
         public override bool CanWrite => true;
         public override bool CanSeek => false;
+        public override bool CanTimeout => true;
+
+        private volatile int _readTimeoutMs = Timeout.Infinite;
+
+        /// <summary>
+        /// Bounds how long <see cref="Read"/> may wait for the FIRST available byte (milliseconds,
+        /// or <see cref="Timeout.Infinite"/>). Mirrors a NetworkStream: data trickling in resets
+        /// nothing — each Read call gets the full window — but total silence past the window throws
+        /// <see cref="IOException"/>. This is what lets the punch path put a deadline on a peer that
+        /// keeps the reliable layer ACKed while never sending the application bytes we're blocked on.
+        /// </summary>
+        public override int ReadTimeout
+        {
+            get => _readTimeoutMs;
+            set
+            {
+                if (value <= 0 && value != Timeout.Infinite)
+                    throw new ArgumentOutOfRangeException(nameof(value), "Timeout must be positive or Timeout.Infinite");
+                _readTimeoutMs = value;
+            }
+        }
         public override long Length => throw new NotSupportedException();
         public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
@@ -111,6 +132,8 @@ namespace BizHawkNetplay.Core.Net
         {
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (count == 0) return 0;
+            int timeoutMs = _readTimeoutMs; // snapshot: one window per Read call
+            long deadline = timeoutMs > 0 ? NowMs() + timeoutMs : long.MaxValue;
             lock (_gate)
             {
                 while (true)
@@ -123,7 +146,9 @@ namespace BizHawkNetplay.Core.Net
                     }
                     if (_finReceived && _rcvBase >= _rcvFinSeq) return 0; // clean EOF
                     ThrowIfBroken();
-                    Monitor.Wait(_gate, 1000);
+                    long remaining = deadline - NowMs();
+                    if (remaining <= 0) throw new IOException("reliable UDP read timed out");
+                    Monitor.Wait(_gate, (int)Math.Min(1000, remaining));
                 }
             }
         }

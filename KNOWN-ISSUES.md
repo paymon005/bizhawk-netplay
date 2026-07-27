@@ -6,27 +6,6 @@ what was addressed — and how — stays greppable.
 
 ## Open
 
-**KI-4 (was F3, low, pre-existing) — `OnPeerLinkLost` leaks the writer thread.**
-`_peers.Remove(link)` + `Tcp.Close()` without `link.WriterRunning = false`: the writer spins on
-`OutboundSignal.WaitOne(250)` forever and `TeardownNetwork` never reaps it (link left `_peers`).
-One background thread + event handle per dropped peer. Fix: clear `WriterRunning` before removal.
-
-**KI-5 (was F1/F2, low) — two weak tests.**
-`LobbyDelayPolicyTests.UsesActualConsoleFrameDuration` picks scenarios where 50 Hz and 60 Hz both
-expect 4 (use RTT 150 ms: 50 Hz → 5, 60 Hz → 6). `HandshakeTests` (~461) never isolates the
-rollback-depth conjunct — add a client with `wantRollback: true, depth: 2`.
-
-**KI-6 (hardening, low) — punch-path bring-up has unbounded waits (pre-existing at HEAD).**
-The rewrite's `AbsoluteSocketDeadline` anti-slow-byte defense covers only the TcpClient paths. The
-UDP-punch handshake runs over `ReliableUdpStream`, whose dead-link detector only fires on unacked
-*outbound* data — a peer that acks everything but withholds application messages can hold the
-handshake thread forever (recoverable via manual Disconnect). Extend the absolute deadline to the
-punch path.
-
-**KI-7 (cosmetic, pre-existing) — first FPS sample after a resync/reconnect freeze reads ~0.**
-`_fpsClock`/`_fpsCount` are not reset on the resume paths, so the status line can flash
-"CPU-bound" for ≤500 ms after a freeze. Fix: restart both (and `_actualFps = -1`) on resume.
-
 **KI-8 (validation) — lobby auto-delay is untested in real play.**
 `LobbyDelayPolicy` + host RTT probing are wired and unit-tested but have never been exercised in a
 real two-player internet session. Worth one session before trusting the automatic selection.
@@ -39,6 +18,28 @@ future change reintroduces an unfillable gap the watchdog will again sleep throu
 matters: track frontier progress per port instead of decode activity.
 
 ## Fixed (2026-07-26)
+
+**F3 / KI-4 (low, pre-existing) — `OnPeerLinkLost` leaked the writer thread.**
+The reconnect-wait drop path now clears `link.WriterRunning` and pulses `OutboundSignal` before
+removing the link from `_peers`, mirroring `TeardownNetwork` — no more one leaked background
+thread + event handle per dropped peer.
+
+**F1/F2 / KI-5 (low) — two weak tests strengthened.**
+`UsesActualConsoleFrameDuration` now uses RTT 150 ms, where 50 Hz (5) and 60 Hz (6) genuinely
+differ; the forced-rollback test gained the `wantRollback: true, depth: 2` scenario that isolates
+the depth conjunct.
+
+**KI-6 (low, pre-existing) — punch-path bring-up had unbounded waits.**
+`ReliableUdpStream` now supports `ReadTimeout` (NetworkStream semantics: one window per Read for
+the first byte; `IOException` on expiry). The punch handshake runs bounded — the host scaled by the
+state it is about to send, the joiner at the handshake window — and after GO the punch channel
+reverts to unbounded idle with the same started-frames-must-finish body bound as the TCP path. A
+peer that keeps the reliable layer ACKed while withholding application bytes can no longer hold
+the handshake thread forever.
+
+**KI-7 (cosmetic, pre-existing) — first FPS sample after a freeze read ~0.**
+`RebaseFrameSchedule` — the common resume point for resync, reconnect, and release paths — now
+restarts the FPS sample clock, so the status line no longer flashes "CPU-bound" after a pause.
 
 **P2 / KI-2 (medium) — initial join-state transfer was unbounded.**
 `ControlChannel` gained an optional per-frame progress bound (`BodyReadTimeoutMs`): the wait for a

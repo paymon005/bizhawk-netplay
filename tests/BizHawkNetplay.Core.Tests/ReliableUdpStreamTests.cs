@@ -127,6 +127,41 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void ReadTimeout_BoundsAPeerThatAcksButNeverSends()
+        {
+            // The KI-6 mechanism: with nothing of ours unacked, the dead-link detector never fires,
+            // so a peer that withholds application bytes used to hold a blocked Read forever. With a
+            // read timeout the silence surfaces as an IOException instead.
+            using var silent = new ReliableUdpStream(_ => { });
+            Assert.True(silent.CanTimeout);
+            Assert.Equal(Timeout.Infinite, silent.ReadTimeout); // default behavior unchanged
+            Assert.Throws<ArgumentOutOfRangeException>(() => silent.ReadTimeout = 0);
+
+            silent.ReadTimeout = 150;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Assert.Throws<System.IO.IOException>(() => silent.Read(new byte[8], 0, 8));
+            Assert.InRange(sw.ElapsedMilliseconds, 100, 10_000); // timed out, not instant, not hung
+        }
+
+        [Fact]
+        public void ReadTimeout_DataArrivingWithinTheWindow_ReadsNormally()
+        {
+            using var stream = new ReliableUdpStream(_ => { });
+            stream.ReadTimeout = 5000;
+
+            // Feed one in-order DATA segment ([type][seq:u32 BE][payload]) while a Read is blocked.
+            var seg = new byte[] { 0x01, 0, 0, 0, 0, 42, 43, 44 };
+            var feeder = Task.Run(() => { Thread.Sleep(50); stream.OnDatagram(seg); });
+
+            var buffer = new byte[8];
+            int n = stream.Read(buffer, 0, buffer.Length);
+            feeder.Wait(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(3, n);
+            Assert.Equal(new byte[] { 42, 43, 44 }, buffer[0..3]);
+        }
+
+        [Fact]
         public void RealHandshake_RunsOverThePunchStreams()
         {
             using var link = new LossyLink(seed: 555, drop: 0.15);

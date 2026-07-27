@@ -465,6 +465,24 @@ namespace BizHawkNetplay.Core.Tests
                 Assert.Equal(SyncMode.Lockstep, clientParams.Mode);
             }
             finally { dispose2(); }
+
+            // A client that WANTS rollback but reports too shallow a probed depth must still be
+            // held to lockstep — this isolates the depth conjunct, which the scenario above cannot
+            // (there the wantRollback=false conjunct already forces lockstep on its own) (KI-5).
+            var (hostCh3, clientCh3, dispose3) = TcpPair();
+            try
+            {
+                var hostTask = Task.Run(() => Handshake.RunHost(
+                    hostCh3, Id(depth: 2), new SessionPreferences(2, wantRollback: true),
+                    new byte[10], 47800, forceHostRollback: true));
+                var clientParams = Handshake.RunClient(
+                    clientCh3, Id(depth: 2), new SessionPreferences(2, wantRollback: true), 51000);
+                var hostParams = hostTask.GetAwaiter().GetResult();
+
+                Assert.Equal(SyncMode.Lockstep, hostParams.Mode);
+                Assert.Equal(SyncMode.Lockstep, clientParams.Mode);
+            }
+            finally { dispose3(); }
         }
     }
 }

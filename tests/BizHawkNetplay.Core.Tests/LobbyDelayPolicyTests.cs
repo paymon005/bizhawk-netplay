@@ -57,11 +57,13 @@ namespace BizHawkNetplay.Core.Tests
         [Fact]
         public void UsesActualConsoleFrameDuration()
         {
-            var fiftyHz = LobbyDelayPolicy.Choose(100, 20, SyncMode.Rollback, 1, 20);
-            var sixtyHz = LobbyDelayPolicy.Choose(100, Frame60, SyncMode.Rollback, 1, 20);
+            // RTT 150ms is chosen because the two frame rates land on DIFFERENT delays — at RTT
+            // 100ms both round to 4, so a regression to hard-coded 60Hz would have passed (KI-5).
+            var fiftyHz = LobbyDelayPolicy.Choose(150, 20, SyncMode.Rollback, 1, 20);
+            var sixtyHz = LobbyDelayPolicy.Choose(150, Frame60, SyncMode.Rollback, 1, 20);
 
-            Assert.Equal(4, fiftyHz.Frames); // ceil(50/20) + one frame
-            Assert.Equal(4, sixtyHz.Frames); // ceil(50/16.67) + one frame
+            Assert.Equal(5, fiftyHz.Frames); // ceil(75/20) + one frame = 4 + 1
+            Assert.Equal(6, sixtyHz.Frames); // ceil(75/16.67) + one frame = 5 + 1
         }
     }
 }
