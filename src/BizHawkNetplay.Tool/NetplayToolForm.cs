@@ -3670,7 +3670,8 @@ namespace BizHawkNetplay.Tool
             try
             {
                 var adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
-                restore = APIs.MemorySaveState.SaveCoreStateToMemory();
+                // MemorySaveState is nullable on the container but guaranteed by the _statable gate above.
+                restore = APIs.MemorySaveState!.SaveCoreStateToMemory();
                 double budget = FrameMs();
                 var probe = new CapabilityProbe(adapter, new StopwatchClock(), samples: 100);
                 var result = probe.Run(budget, budget * 0.25);
@@ -3681,7 +3682,7 @@ namespace BizHawkNetplay.Tool
             {
                 if (restore != null)
                 {
-                    try { APIs.MemorySaveState.LoadCoreStateFromMemory(restore); APIs.MemorySaveState.DeleteState(restore); }
+                    try { APIs.MemorySaveState!.LoadCoreStateFromMemory(restore); APIs.MemorySaveState!.DeleteState(restore); }
                     catch (Exception ex) { Log("(warning) could not restore pre-probe state: " + ex.Message); }
                 }
                 Log("=== done ===");
@@ -3749,7 +3750,8 @@ namespace BizHawkNetplay.Tool
             string? restore = null;
             try
             {
-                restore = APIs.MemorySaveState.SaveCoreStateToMemory();
+                // MemorySaveState is nullable on the container but this only runs for statable cores.
+                restore = APIs.MemorySaveState!.SaveCoreStateToMemory();
                 double budget = FrameMs();
                 var result = new CapabilityProbe(a, new StopwatchClock(), samples: 60).Run(budget, budget * 0.25);
                 _probeDepth = result.MaxRollbackDepth;
@@ -3760,7 +3762,7 @@ namespace BizHawkNetplay.Tool
             {
                 if (restore != null)
                 {
-                    try { APIs.MemorySaveState.LoadCoreStateFromMemory(restore); APIs.MemorySaveState.DeleteState(restore); }
+                    try { APIs.MemorySaveState!.LoadCoreStateFromMemory(restore); APIs.MemorySaveState!.DeleteState(restore); }
                     catch (Exception ex) { Log("(warning) could not restore pre-probe state: " + ex.Message); }
                 }
             }

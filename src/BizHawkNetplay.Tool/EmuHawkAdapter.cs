@@ -189,9 +189,9 @@ namespace BizHawkNetplay.Tool
                 // math so the captured value matches exactly what local play would feed the core. Same
                 // source-port remap as buttons, so a player assigned P2/P3/P4 uses their P1 stick.
                 int axSrc = (src >= 0 && src < _analogBinds.Length && _analogBinds[src].Length == axes.Length) ? src : port;
-                IReadOnlyDictionary<string, int> hostAxes;
+                IReadOnlyDictionary<string, int>? hostAxes;
                 try { hostAxes = _apis.Input.GetPressedAxes(); }
-                catch { hostAxes = null; }
+                catch { hostAxes = null; } // ResolveAxis treats null as "no live axes" (neutral)
                 for (int j = 0; j < axes.Length; j++)
                     axes[j] = ResolveAxis(_analogBinds[axSrc][j], layout.Axes[j], _axisReversed[port][j], hostAxes, pressed);
             }
@@ -545,7 +545,7 @@ namespace BizHawkNetplay.Tool
         /// EmuHawk analog config. Null entries are unbound axes (captured as neutral).</summary>
         private AnalogBind?[][] BuildAnalogBinds()
         {
-            Dictionary<string, AnalogBind> map = null;
+            Dictionary<string, AnalogBind>? map = null;
             try
             {
                 var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
@@ -587,7 +587,7 @@ namespace BizHawkNetplay.Tool
         /// shift to Neutral, clamp. Kept identical so a captured value equals what local play would inject.
         /// </summary>
         private static int ResolveAxis(AnalogBind? bindN, CoreAxisSpec spec, bool reversed,
-            IReadOnlyDictionary<string, int> hostAxes, HashSet<string> pressedButtons)
+            IReadOnlyDictionary<string, int>? hostAxes, HashSet<string> pressedButtons)
         {
             if (bindN == null) return spec.Neutral;
             var bind = bindN.Value;
@@ -621,18 +621,24 @@ namespace BizHawkNetplay.Tool
 
         // --- State --------------------------------------------------------------------
 
+        // Declared nullable on the ApiContainer, but the tool refuses cores without savestate
+        // support before this adapter is ever constructed — absence here would be a wiring bug,
+        // so fail with a message instead of a bare NullReferenceException.
+        private IMemorySaveStateApi MemorySave => _apis.MemorySaveState
+            ?? throw new InvalidOperationException("MemorySaveState API unavailable (non-statable core?)");
+
         public StateHandle SaveStateToMemory() =>
-            new StateHandle(_emulator.Frame, _apis.MemorySaveState.SaveCoreStateToMemory());
+            new StateHandle(_emulator.Frame, MemorySave.SaveCoreStateToMemory());
 
         public void LoadStateFromMemory(StateHandle handle) =>
-            _apis.MemorySaveState.LoadCoreStateFromMemory((string)handle.Token);
+            MemorySave.LoadCoreStateFromMemory((string)handle.Token);
 
         public void ReleaseState(StateHandle handle)
         {
             // The rollback ring evicts a state every frame; free the underlying GUID blob so it
             // doesn't accumulate. Tolerate an already-deleted/unknown id (DeleteState of a stale
             // GUID is a no-op or throws depending on build — swallow either way).
-            try { _apis.MemorySaveState.DeleteState((string)handle.Token); }
+            try { MemorySave.DeleteState((string)handle.Token); }
             catch { /* already gone / unknown token — nothing to free */ }
         }
 
