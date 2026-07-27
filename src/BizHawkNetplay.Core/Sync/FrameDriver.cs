@@ -63,6 +63,7 @@ namespace BizHawkNetplay.Core.Sync
         private int _oldestSentPayload = -1;
         private readonly long[] _lastGapRequestMs;
         private readonly int[] _newestRemoteFrame; // highest frame ever decoded per port (-1 = none)
+        private readonly long[] _holeFirstSeenMs;  // send-clock ms when a beyond-window hole appeared (-1 = none)
 
         /// <param name="strategyFactory">Builds the sync strategy over the shared pipeline (the swap point).</param>
         /// <param name="localPort">The controller port this instance owns and sources locally.</param>
@@ -130,10 +131,12 @@ namespace BizHawkNetplay.Core.Sync
             _lastRemoteInputStamp = new long[ports];
             _lastGapRequestMs = new long[ports];
             _newestRemoteFrame = new int[ports];
+            _holeFirstSeenMs = new long[ports];
             for (int p = 0; p < ports; p++)
             {
                 _lastGapRequestMs[p] = -GapRequestIntervalMs;
                 _newestRemoteFrame[p] = -1;
+                _holeFirstSeenMs[p] = -1;
             }
             var payloadSizes = new int[ports];
             for (int p = 0; p < ports; p++)
@@ -266,6 +269,31 @@ namespace BizHawkNetplay.Core.Sync
                 ProduceLocal(stamp, local);
                 SendWindow(force: true);
             }
+        }
+
+        /// <summary>
+        /// The last-resort freeze detector behind gap retransmission. True when some remote port's
+        /// input has a hole that provably slid out of the peer's live resend window (so only a
+        /// gap-request can fill it) and has stayed unfilled for <paramref name="stuck"/> despite
+        /// those requests. A healthy stall never sets this — the condition requires newer frames
+        /// from that peer beyond an unfillable gap. The caller escalates once the duration exceeds
+        /// its patience: at that point retransmission itself has failed (requests lost in both
+        /// directions, a peer on a build without the request type, or the frame aged out of the
+        /// peer's retransmit history) and the session should end with a clear error instead of
+        /// freezing while redundant resends keep the arrival-based watchdog quiet.
+        /// </summary>
+        public bool TryGetUnrepairedHole(out int port, out TimeSpan stuck)
+        {
+            port = -1;
+            stuck = TimeSpan.Zero;
+            long now = _sendClock.ElapsedMilliseconds;
+            for (int p = 0; p < _holeFirstSeenMs.Length; p++)
+            {
+                if (p == _localPort || _holeFirstSeenMs[p] < 0) continue;
+                var age = TimeSpan.FromMilliseconds(now - _holeFirstSeenMs[p]);
+                if (port < 0 || age > stuck) { port = p; stuck = age; }
+            }
+            return port >= 0;
         }
 
         /// <summary>Find the remote controller port whose valid input has been silent longest.</summary>
@@ -409,6 +437,13 @@ namespace BizHawkNetplay.Core.Sync
                 // will never arrive on its own, no matter how shallow our own stall is.
                 bool deepGap = CurrentFrame - 1 - frontier >= trigger;
                 bool holeBeyondWindow = _newestRemoteFrame[p] > frontier + _redundancy;
+                // KI-9 backstop bookkeeping: remember when a beyond-window hole appeared so the
+                // caller can escalate if retransmission never manages to fill it.
+                if (holeBeyondWindow)
+                {
+                    if (_holeFirstSeenMs[p] < 0) _holeFirstSeenMs[p] = now;
+                }
+                else _holeFirstSeenMs[p] = -1;
                 if (!deepGap && !holeBeyondWindow) continue;
                 if (now - _lastGapRequestMs[p] < GapRequestIntervalMs) continue;
                 _lastGapRequestMs[p] = now;

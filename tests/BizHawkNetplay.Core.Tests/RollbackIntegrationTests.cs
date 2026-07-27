@@ -371,6 +371,62 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void UnrepairableHole_IsReported_SoTheSessionCanEndInsteadOfFreezing()
+        {
+            // KI-9: when a hole slides out of the peer's resend window AND the gap requests that
+            // would repair it are lost too, nothing can ever unfreeze the session — but the frozen
+            // windows keep arriving, so the arrival-based watchdog stays quiet. The driver must
+            // surface the persisting hole so the tool can end with a clear error. When requests DO
+            // get through, the hole must clear and never be reported.
+            const int k = 3;
+            const double frameMs = 16.0;
+            var clock = new Clock();
+            bool burst = true;
+            bool suppressRequests = true; // B's 18-byte type-2 gap requests to A are lost
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k,
+                dropA: _ => burst,
+                dropB: d => suppressRequests && d.Length == 18 && d[0] == 2);
+            var a = BuildRollback(ta, 0, frameMs);
+            var b = BuildRollback(tb, 1, frameMs);
+            a.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
+            b.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
+
+            long tick = 0;
+            for (int i = 0; i < 15; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
+            burst = false; // path heals, but the hole is beyond A's window and requests are dead
+
+            // The hole must be reported with a growing age (wall-clock; hence the real sleeps).
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            TimeSpan stuck = TimeSpan.Zero;
+            int holePort = -1;
+            while (sw.ElapsedMilliseconds < 5000 && stuck.TotalMilliseconds < 300)
+            {
+                clock.Tick = ++tick;
+                a.Step();
+                b.Step();
+                b.Driver.TryGetUnrepairedHole(out holePort, out stuck);
+                System.Threading.Thread.Sleep(1);
+            }
+            Assert.True(stuck.TotalMilliseconds >= 300,
+                $"unrepaired hole never reported (port {holePort}, stuck {stuck.TotalMilliseconds:F0}ms)");
+            Assert.Equal(0, holePort); // the hole is in A's input, as seen by B
+            Assert.False(a.Driver.TryGetUnrepairedHole(out _, out _), "A has no hole — B->A traffic was clean");
+
+            // Let the requests through: retransmission repairs the hole and the report clears.
+            suppressRequests = false;
+            int targetB = b.Driver.CurrentFrame + 60;
+            for (int i = 0; i < 5000 && b.Driver.CurrentFrame < targetB; i++)
+            {
+                clock.Tick = ++tick;
+                a.Step();
+                b.Step();
+                System.Threading.Thread.Sleep(1);
+            }
+            Assert.True(b.Driver.CurrentFrame >= targetB, "session did not recover once requests flowed");
+            Assert.False(b.Driver.TryGetUnrepairedHole(out _, out _), "hole report must clear after repair");
+        }
+
+        [Fact]
         public void ConfirmedChecksums_AlignAndAgreeAcrossPeers()
         {
             // Rollback can't checksum the live frame (it may be a prediction), so it checksums the

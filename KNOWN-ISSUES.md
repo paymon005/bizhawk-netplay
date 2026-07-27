@@ -16,13 +16,17 @@ rejoin) before trusting them; rollback with 3+ players and symmetric NAT remain 
 punch, lobby RTT probe, and auto-delay (4) all worked; the session then hit the mutual soft-cap
 freeze fixed in v0.10.2 (see Fixed below). Retest on v0.10.2.
 
-**KI-9 (design note) — the UDP liveness watchdog measures datagram arrival, not progress.**
-`FrameDriver` stamps `_lastRemoteInputStamp` for every well-decoded frame, including redundant
-resends that can never advance the frontier, so `CheckUdpInputProgress` sees a "live" port even
-when input is useless — confirmed in the wild by the 2026-07-27 session, whose 10+ second freeze
-never tripped the 8s watchdog. The hole-evidence gap-request trigger (v0.10.2) removes the known
-permanent-freeze scenarios; nothing to do unless that path ever regresses. If it matters again:
-track per-port frontier progress instead of decode activity.
+## Fixed (2026-07-27, v0.11.3)
+
+**KI-9 — the arrival-based watchdog could sleep through an unrepairable freeze.**
+Redundant resends kept `CheckUdpInputProgress`'s silence measure near zero even when input could
+never advance (confirmed in the wild by the first hotspot session). Rather than the false-positive
+trap of watching frontier progress (a healthy peer stalled on a third player would be shot),
+`FrameDriver` now tracks how long a *beyond-window hole* — the precise condition that only gap
+retransmission can repair, which a healthy stall never produces — has persisted despite requests,
+and `TryGetUnrepairedHole` surfaces it. The tool ends the session with a clear error at the same
+8s the silence watchdog uses. Test drops the request datagrams so repair is impossible and asserts
+the hole is reported (and clears when requests flow again).
 
 ## Fixed (2026-07-27, v0.11.0)
 

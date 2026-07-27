@@ -2144,6 +2144,17 @@ namespace BizHawkNetplay.Tool
         private void CheckUdpInputProgress()
         {
             if (_driver == null || _awaitingReconnect || _resyncInProgress) return;
+            // KI-9 backstop, checked BEFORE the silence gate below: a frozen peer's redundant
+            // resends keep arrival-silence near zero, so an unrepairable input hole never trips the
+            // silence-based watchdog. If gap retransmission has failed to fill a beyond-window hole
+            // for this long, end with a clear error instead of freezing indefinitely.
+            if (_driver.TryGetUnrepairedHole(out int holePort, out var stuck)
+                && stuck.TotalSeconds >= UdpLostAfterSeconds)
+            {
+                EndSession($"P{holePort + 1}'s input has a gap retransmission could not repair " +
+                    $"({stuck.TotalSeconds:F0}s) — mismatched builds, or requests lost in both directions");
+                return;
+            }
             if (!_driver.TryGetMostSilentRemotePort(out int port, out var silence)) return;
             double seconds = silence.TotalSeconds;
             if (seconds < UdpRepunchAfterSeconds)
