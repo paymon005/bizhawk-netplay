@@ -78,7 +78,6 @@ namespace BizHawkNetplay.Tool
         private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
         private bool _loadingSettings;                  // suppress change-handler saves while applying loaded prefs
         private string? _pendingJoinIp;                 // regular-join IP awaiting a successful connect, then recorded
-        private int _connectionAttempt;                 // invalidates callbacks from canceled/replaced workers
 
         private int _simLatencyMs; // diagnostic: artificial one-way UDP delay for this session (0 = off)
         private bool _upnpEnabled;  // host: whether to attempt the UPnP auto-forward (captured from the checkbox)
@@ -202,9 +201,9 @@ namespace BizHawkNetplay.Tool
         private volatile TcpListener? _listener;
         private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
         private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
-        private readonly object _handshakeClientsLock = new object();
-        private readonly HashSet<TcpClient> _handshakeClients = new HashSet<TcpClient>();
-        private bool _rejectNewHandshakeClients; // guarded by _handshakeClientsLock; closes accept-vs-teardown race
+        // Attempt tokens + tracked handshake sockets live in Core (ConnectionLifecycle), which
+        // atomically closes the accept-vs-teardown registration race.
+        private readonly ConnectionLifecycle _lifecycle = new ConnectionLifecycle();
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
         private const int LobbyProbeSamples = 5;
         private const int LobbyProbeTimeoutMs = 5000;
@@ -3518,14 +3517,7 @@ namespace BizHawkNetplay.Tool
             try { _greetingTcp?.Close(); } catch { } // abort a joiner we're blocked greeting (Disconnect mid-handshake)
             _greetingTcp = null;
 
-            List<TcpClient> handshakes;
-            lock (_handshakeClientsLock)
-            {
-                _rejectNewHandshakeClients = true;
-                handshakes = new List<TcpClient>(_handshakeClients);
-                _handshakeClients.Clear();
-            }
-            foreach (var tcp in handshakes) { try { tcp.Close(); } catch { } }
+            _lifecycle.RejectAndCloseAll(); // refuse new handshake sockets, close all in-flight ones
 
             var peers = new List<PeerLink>(_peers);
             _peers.Clear();
@@ -3766,38 +3758,14 @@ namespace BizHawkNetplay.Tool
         private void StartThread(Action body) =>
             new Thread(() => body()) { IsBackground = true, Name = "BizHawkNetplay-connect" }.Start();
 
-        private int BeginConnectionAttempt() => Interlocked.Increment(ref _connectionAttempt);
-        private int CurrentConnectionAttempt => Volatile.Read(ref _connectionAttempt);
-        private bool IsConnectionAttemptCurrent(int attempt) =>
-            attempt == Volatile.Read(ref _connectionAttempt);
-        private void InvalidateConnectionAttempt() => Interlocked.Increment(ref _connectionAttempt);
-
-        private void AllowHandshakeClients()
-        {
-            lock (_handshakeClientsLock) _rejectNewHandshakeClients = false;
-        }
-
-        private bool TrackHandshakeClient(TcpClient? tcp, int attempt)
-        {
-            if (tcp == null) return false;
-            lock (_handshakeClientsLock)
-            {
-                if (_rejectNewHandshakeClients || !IsConnectionAttemptCurrent(attempt)) return false;
-                _handshakeClients.Add(tcp);
-                return true;
-            }
-        }
-
-        private void UntrackHandshakeClient(TcpClient? tcp)
-        {
-            if (tcp == null) return;
-            lock (_handshakeClientsLock) _handshakeClients.Remove(tcp);
-        }
-
-        private bool HasHandshakeClients()
-        {
-            lock (_handshakeClientsLock) return _handshakeClients.Count != 0;
-        }
+        private int BeginConnectionAttempt() => _lifecycle.Begin();
+        private int CurrentConnectionAttempt => _lifecycle.Current;
+        private bool IsConnectionAttemptCurrent(int attempt) => _lifecycle.IsCurrent(attempt);
+        private void InvalidateConnectionAttempt() => _lifecycle.Invalidate();
+        private void AllowHandshakeClients() => _lifecycle.AcceptNew();
+        private bool TrackHandshakeClient(TcpClient? tcp, int attempt) => _lifecycle.Track(tcp, attempt);
+        private void UntrackHandshakeClient(TcpClient? tcp) => _lifecycle.Untrack(tcp);
+        private bool HasHandshakeClients() => _lifecycle.HasTracked;
 
         private static long MonotonicNow() => System.Diagnostics.Stopwatch.GetTimestamp();
 
