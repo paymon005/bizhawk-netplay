@@ -270,6 +270,10 @@ namespace BizHawkNetplay.Tool
         private int _playerCount = 2;
         private int _localPort;    // our controller port, for rebuilding the driver on resync
         private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
+        // Tells "the emulation drifted once" apart from "these two machines were never comparing the
+        // same thing": a real drift agrees for a while first, a systematic mismatch never agrees at all.
+        private bool _agreedSinceResync;
+        private int _desyncsWithoutAgreement;
         private long _lastResyncStamp; // monotonic timestamp; debounces near-simultaneous resync triggers
         private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
         private const int MaxResyncs = 6;
@@ -1844,6 +1848,8 @@ namespace BizHawkNetplay.Tool
             APIs.EmuClient.Pause(); // we own the clock now
             _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
             _resyncCount = 0;
+            _agreedSinceResync = false;
+            _desyncsWithoutAgreement = 0;
             _resyncInProgress = false;
             _resyncReleaseQueued = false;
             _reconnectState = null;
@@ -2967,6 +2973,7 @@ namespace BizHawkNetplay.Tool
                 {
                     if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
                         Log($"checksum frame {frame}: all {_playerCount} agree");
+                        _agreedSinceResync = true;
                 });
         }
 
@@ -2975,6 +2982,22 @@ namespace BizHawkNetplay.Tool
             if (_resyncInProgress) return;
             if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // just resynced; give it time
             Log($"DESYNC at frame {frame} — peers disagree");
+            // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
+            // the emulation drifting — a real drift would sync fine for a while first. It means the two
+            // machines are comparing memory that was never going to match. On N64 the usual cause is
+            // above-native video resolution: the plugin resolves its framebuffer back into RDRAM, and
+            // those bytes come from the GPU rather than the emulated core, so they differ per machine
+            // and land inside the region the checksum reads. Resyncing cannot fix that, and will keep
+            // shipping a 16MiB state every interval until it gives up.
+            if (!_agreedSinceResync) _desyncsWithoutAgreement++;
+            _agreedSinceResync = false;
+            if (_desyncsWithoutAgreement == 2)
+                ConnLog("every checksum since this session began has disagreed, with none agreeing in " +
+                    "between — that is a systematic mismatch, not emulation drift, and resyncing will " +
+                    "not clear it. On N64 the usual cause is running the video plugin above native " +
+                    "resolution: it resolves the framebuffer back into RDRAM, and those bytes come from " +
+                    "your GPU rather than the emulated core, so they cannot match your opponent's. Drop " +
+                    "to native resolution on BOTH machines.", Color.Firebrick);
             PerformResyncAsHost();
         }
 

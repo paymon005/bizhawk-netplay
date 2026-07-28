@@ -144,6 +144,7 @@ N64 works (connects, plays, stays in sync, analog moves). BizHawk's N64 core is 
 - **RSP:** Hle (the default). Keep GLideN64, if used, at native (1x) resolution with enhancements off.
 - Both machines must use **identical** N64 settings (they're sync settings — a mismatch desyncs).
 - N64 reports non-deterministic. That is not treated as a refusal (it usually just means determinism wasn't requested) — the session runs and desync detection guards you. You'll see a warning in the log; in practice it stays in sync.
+- **Run the video plugin at native resolution.** Above it, N64 desyncs at *every* checksum — measured over a long two-machine session: at 800×600 every single checksum disagreed, in lockstep *and* in rollback; at native resolution the same pair ran 15,000+ frames with every checksum agreeing. The cause isn't the netcode. Rice and GLideN64 resolve their framebuffer back into RDRAM, and above native those bytes are produced by your GPU rather than the emulated core — so they differ between machines and land inside the region the desync checksum reads. Resyncing can't fix it; the tool now says so after the second consecutive disagreement.
 
 Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster settings or a second machine, not netcode). Check `stall%` before blaming the core, though — on a heavy console the two look identical from the picture, and only one of them is fixed by video-plugin settings.
 
