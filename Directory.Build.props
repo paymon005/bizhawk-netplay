@@ -7,6 +7,6 @@
 
     <!-- Location of the BizHawk install whose assemblies external tools compile against.
          Override on the command line with -p:BizHawkHome=... if your install lives elsewhere. -->
-    <BizHawkHome Condition="'$(BizHawkHome)' == ''">X:\Games\Emulators\BizHawk - Most Consoles</BizHawkHome>
+    <BizHawkHome Condition="'$(BizHawkHome)' == ''">X:\Games\Emulators\BizHawk</BizHawkHome>
   </PropertyGroup>
 </Project>
