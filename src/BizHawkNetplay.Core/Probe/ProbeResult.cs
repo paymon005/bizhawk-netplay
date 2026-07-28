@@ -15,9 +15,11 @@ namespace BizHawkNetplay.Core.Probe
             double frameBudgetMs,
             double headroomMs,
             int maxRollbackDepth,
-            double steadyStateMs = 0)
+            double steadyStateMs = 0,
+            bool replayDeterministic = true)
         {
             SteadyStateMs = steadyStateMs > 0 ? steadyStateMs : medianFrameMs + medianSaveMs;
+            ReplayDeterministic = replayDeterministic;
             CoreName = coreName;
             StateSizeBytes = stateSizeBytes;
             MedianSaveMs = medianSaveMs;
@@ -44,6 +46,17 @@ namespace BizHawkNetplay.Core.Probe
         public double SteadyStateMs { get; }
 
         /// <summary>
+        /// Whether replaying the same inputs from the same savestate reproduced the same memory.
+        ///
+        /// Rollback repair IS load-and-re-simulate, so a core that fails this desyncs the moment the
+        /// link makes it predict — and stays flawlessly in sync on a connection fast enough that it
+        /// never has to, which is what makes the failure so easy to miss in local testing. False is
+        /// conclusive; true is evidence rather than proof, since it covers only the frames the probe
+        /// happened to replay.
+        /// </summary>
+        public bool ReplayDeterministic { get; }
+
+        /// <summary>
         /// Deepest misprediction (in frames) whose repair — one load plus depth re-simulated
         /// frames each re-saved — still fits inside one frame budget.
         /// </summary>
@@ -65,12 +78,15 @@ namespace BizHawkNetplay.Core.Probe
         /// </summary>
         public const int RollbackDepthThreshold = 3;
 
-        public bool RollbackQualified => MaxRollbackDepth >= RollbackDepthThreshold;
+        /// <summary>Depth alone is not enough: a core that cannot replay is disqualified however much
+        /// budget it has, because the thing it would be spending that budget on is replaying.</summary>
+        public bool RollbackQualified => ReplayDeterministic && MaxRollbackDepth >= RollbackDepthThreshold;
 
         public override string ToString() =>
             $"{CoreName}: state={StateSizeBytes / 1024.0:F1}KiB " +
             $"save={MedianSaveMs:F3}ms load={MedianLoadMs:F3}ms frame={MedianFrameMs:F3}ms " +
             $"steady={SteadyStateMs:F3}ms budget={FrameBudgetMs:F3}ms -> maxDepth={MaxRollbackDepth} " +
+            $"replay={(ReplayDeterministic ? "ok" : "DIVERGED")} " +
             $"({(RollbackQualified ? "ROLLBACK OK" : "lockstep only")})";
     }
 }

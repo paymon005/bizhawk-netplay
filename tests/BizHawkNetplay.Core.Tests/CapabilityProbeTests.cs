@@ -93,6 +93,52 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void Run_DisqualifiesACoreThatDoesNotReproduceOnReplay()
+        {
+            // Timing says this core is fine. It still cannot do rollback, because rollback repair IS
+            // load-and-re-simulate — and a core that lands somewhere else when it does that desyncs
+            // only once the link makes it predict, which is why a timing-only probe waves it through
+            // and the failure shows up later against a distant opponent.
+            var emu = new FakeEmuAdapter(portCount: 2) { DriftsOnReplay = true };
+            var clock = new ManualClock(Enumerable.Repeat(0.05, 400));
+
+            var result = new CapabilityProbe(emu, clock, samples: 20).Run(16.639, 4.0);
+
+            Assert.False(result.ReplayDeterministic);
+            Assert.False(result.RollbackQualified);
+            Assert.True(result.MaxRollbackDepth > ProbeResult.RollbackDepthThreshold,
+                "the timing side must still say yes, or this proves nothing about the replay check");
+            Assert.Contains("DIVERGED", result.ToString());
+        }
+
+        [Fact]
+        public void Run_PassesTheReplayCheckOnAReproducibleCore()
+        {
+            var emu = new FakeEmuAdapter(portCount: 2);
+            var clock = new ManualClock(Enumerable.Repeat(0.05, 400));
+
+            var result = new CapabilityProbe(emu, clock, samples: 20).Run(16.639, 4.0);
+
+            Assert.True(result.ReplayDeterministic);
+            Assert.True(result.RollbackQualified);
+        }
+
+        [Fact]
+        public void Run_ReplayCheckLeavesThePositionWhereItFoundIt()
+        {
+            // The probe runs before a session against the user's live game. It advances 60 frames to
+            // answer this question and must hand every one of them back.
+            var emu = new FakeEmuAdapter(portCount: 2);
+            var clock = new ManualClock(Enumerable.Repeat(0.05, 400));
+            var before = emu.HashMainMemory();
+
+            new CapabilityProbe(emu, clock, samples: 20).Run(16.639, 4.0);
+
+            Assert.Equal(before, emu.HashMainMemory());
+            Assert.Empty(emu.LiveStates);
+        }
+
+        [Fact]
         public void Run_ComputesMediansAndDepthFromScriptedTimings()
         {
             var emu = new FakeEmuAdapter(portCount: 2);
@@ -115,9 +161,9 @@ namespace BizHawkNetplay.Core.Tests
             Assert.True(result.RollbackQualified);
 
             // Adapter was actually exercised the expected number of times.
-            Assert.Equal(101, emu.SaveCount);      // 1 reference + 100 samples
-            Assert.Equal(100, emu.LoadCount);
-            Assert.Equal(100, emu.InvisibleFrameCount);
+            Assert.Equal(102, emu.SaveCount);   // 1 reference + 100 samples + 1 replay-check anchor
+            Assert.Equal(103, emu.LoadCount);   // 100 samples + 2 in the replay check + 1 final restore
+            Assert.Equal(160, emu.InvisibleFrameCount); // 100 timed + 30 replayed twice
         }
     }
 }

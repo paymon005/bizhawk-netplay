@@ -118,6 +118,16 @@ namespace BizHawkNetplay.Core.Tests.Fakes
             }
         }
 
+        /// <summary>
+        /// Set to model a core that does not reproduce from a savestate — the property N64 appeared to
+        /// violate in real play. Each advance folds in a counter that savestates do NOT capture, so
+        /// replaying the same inputs from the same state lands somewhere else, exactly as a core with
+        /// hidden state outside its savestate would.
+        /// </summary>
+        public bool DriftsOnReplay { get; set; }
+
+        private int _hiddenDrift;
+
         private void Step(InputSet inputs)
         {
             // Record the inputs used to advance this frame (resim overwrites any earlier prediction).
@@ -127,6 +137,7 @@ namespace BizHawkNetplay.Core.Tests.Fakes
             foreach (var port in inputs.Ports)
                 foreach (var b in port.Buttons)
                     acc = acc * 31 + (b ? 1 : 0);
+            if (DriftsOnReplay) acc += ++_hiddenDrift;
             _memory[_frame % _memory.Length] ^= (byte)acc;
             _frame++;
         }

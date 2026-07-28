@@ -338,6 +338,9 @@ namespace BizHawkNetplay.Tool
         private NetcodeChoice _netcodeChoice; // captured from the dropdown at start (host decides the mode)
         private SyncMode _mode = SyncMode.Lockstep;   // negotiated; drives which strategy the driver builds
         private int _probeDepth = -1;                 // cached capability-probe depth (frames); -1 = not measured
+        // Whether the core reproduced the same memory on replay. Unlike depth this is a correctness
+        // result, not a performance one, so forcing Rollback does not get to override it.
+        private bool _replayDeterministic = true;
         private int _rollbackDepth;                   // this session's savestate-ring depth when in rollback
         private const int RollbackDepthCap = 16;      // clamp the ring so resim cost + memory stay bounded
 
@@ -1421,6 +1424,15 @@ namespace BizHawkNetplay.Tool
                 if (_netcodeChoice == NetcodeChoice.Lockstep)
                 {
                     mode = SyncMode.Lockstep;
+                }
+                else if (_netcodeChoice == NetcodeChoice.Rollback && !_replayDeterministic)
+                {
+                    // The Rollback pick overrides the probe's PERFORMANCE recommendation. It does not
+                    // override a core that provably cannot replay: that is not a matter of taste, and
+                    // honouring it would guarantee the desyncs rollback exists to avoid.
+                    mode = SyncMode.Lockstep;
+                    UiLog("rollback was forced, but this core failed the probe's replay check — using " +
+                          "lockstep, which never reloads state. Forcing it would desync on every correction.");
                 }
                 else if (_netcodeChoice == NetcodeChoice.Rollback)
                 {
@@ -4057,8 +4069,19 @@ namespace BizHawkNetplay.Tool
                 var result = new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
                     .Run(budget, budget * 0.25,
                         elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
-                _probeDepth = result.MaxRollbackDepth;
+                _replayDeterministic = result.ReplayDeterministic;
+                // A core that does not reproduce from a savestate has no usable depth at all: the work
+                // the depth budgets FOR is replaying. Reporting 0 keeps every peer's negotiation honest
+                // without needing a second field on the wire.
+                _probeDepth = result.ReplayDeterministic ? result.MaxRollbackDepth : 0;
                 Log($"rollback probe — {result}");
+                if (!result.ReplayDeterministic)
+                    ConnLog("this core did not reproduce the same memory when the probe replayed the " +
+                        "same inputs from the same savestate. Rollback repair is exactly that operation, " +
+                        "so it would desync whenever the link made it predict — and stay perfectly in " +
+                        "sync on a connection fast enough that it never had to, which is why this only " +
+                        "shows up against a distant opponent. Using lockstep, which never reloads state.",
+                        Color.Firebrick);
             }
             catch (Exception ex) { _probeDepth = 0; Log("rollback probe failed, will use lockstep: " + ex.Message); }
             finally

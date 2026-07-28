@@ -55,16 +55,25 @@ namespace BizHawkNetplay.Core.Probe
                 _emu.RunFramesInvisible(1, _ => neutral));
 
             foreach (var h in scratch) _emu.ReleaseState(h);
-            _emu.ReleaseState(reference);
 
             int depth = SolveMaxDepth(
                 frameBudgetMs, headroomMs, medianFrame, medianLoad, medianSave,
                 elideConfirmedSaves, repairBudgetMs);
 
+            bool replayDeterministic = VerifyReplayDeterminism(neutral, ReplayCheckFrames);
+
+            // Hand the position back. The timed passes advance the core and the replay check advances
+            // it further, and this runs against whatever the user currently has loaded — so the probe
+            // owes them the frame it started on. (The tool wraps this in its own save/restore as well;
+            // belt and braces, since a probe that quietly moves the game is a nasty surprise.)
+            try { _emu.LoadStateFromMemory(reference); } catch { }
+            _emu.ReleaseState(reference);
+
             return new ProbeResult(
                 _emu.CoreName, stateSize, medianSave, medianLoad, medianFrame,
                 frameBudgetMs, headroomMs, depth,
-                medianFrame + (elideConfirmedSaves ? 0 : medianSave));
+                medianFrame + (elideConfirmedSaves ? 0 : medianSave),
+                replayDeterministic);
         }
 
         /// <summary>
@@ -109,6 +118,62 @@ namespace BizHawkNetplay.Core.Probe
             if (perFrame <= 0) return 0;
             double depth = available / perFrame;
             return depth <= 0 ? 0 : (int)Math.Floor(depth);
+        }
+
+        /// <summary>Frames replayed on each side of the determinism check. Long enough for a divergence
+        /// to spread into main memory, short enough that the whole check is a fraction of a second.</summary>
+        private const int ReplayCheckFrames = 30;
+
+        /// <summary>Slices hashed per side. Covers a domain sampled with a stride of up to this much;
+        /// on a core that hashes everything the extra passes simply repeat the same answer.</summary>
+        private const int ReplayCheckSlices = 4;
+
+        /// <summary>
+        /// Does this core actually REPRODUCE from a savestate?
+        ///
+        /// Everything else here measures how fast save, load and advance are — never whether replaying
+        /// the same inputs from the same state lands in the same place. That is the one property
+        /// rollback cannot work without: repair is exactly load-and-re-simulate, so a core that drifts
+        /// across it desyncs whenever the link makes it predict, and stays perfectly in sync on a
+        /// connection fast enough that it never has to. A timing-only probe passes such a core happily
+        /// and the failure surfaces later as an unexplained desync mid-session.
+        ///
+        /// Save, run, hash; rewind, run the identical inputs, hash again; compare. A mismatch is
+        /// conclusive — rollback is unsafe on this core. A match is NOT proof of determinism, only
+        /// evidence over these frames from this position, so the result is reported as what it is.
+        /// </summary>
+        private bool VerifyReplayDeterminism(InputSet neutral, int frames)
+        {
+            StateHandle? anchor = null;
+            try
+            {
+                anchor = _emu.SaveStateToMemory();
+
+                _emu.RunFramesInvisible(frames, _ => neutral);
+                var first = new uint[ReplayCheckSlices];
+                for (int slice = 0; slice < ReplayCheckSlices; slice++)
+                    first[slice] = _emu.HashMainMemory(slice);
+
+                _emu.LoadStateFromMemory(anchor);
+                _emu.RunFramesInvisible(frames, _ => neutral);
+                for (int slice = 0; slice < ReplayCheckSlices; slice++)
+                    if (_emu.HashMainMemory(slice) != first[slice]) return false;
+
+                return true;
+            }
+            catch
+            {
+                // A core that cannot be driven through this at all is not one to trust with rollback.
+                return false;
+            }
+            finally
+            {
+                if (anchor != null)
+                {
+                    try { _emu.LoadStateFromMemory(anchor); } catch { }
+                    try { _emu.ReleaseState(anchor); } catch { }
+                }
+            }
         }
 
         private InputSet BuildNeutralInputs()
