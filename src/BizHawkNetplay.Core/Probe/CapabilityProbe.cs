@@ -65,6 +65,15 @@ namespace BizHawkNetplay.Core.Probe
 
             foreach (var h in scratch) _emu.ReleaseState(h);
 
+            // What a repair actually costs, timed whole rather than added up from the three figures
+            // above. Reported, not yet spent: the depth below is still solved from the isolated terms,
+            // because changing the verdict on the strength of a measurement nothing has corroborated
+            // would be the same mistake in the other direction. See RepairProfile for what it answers.
+            var repair = new RepairProfile(
+                RepairProbeShallow, MeasureRepair(RepairProbeShallow, resave: false, neutral),
+                RepairProbeDeep, MeasureRepair(RepairProbeDeep, resave: false, neutral),
+                MeasureRepair(RepairProbeDeep, resave: true, neutral));
+
             int depth = SolveMaxDepth(
                 frameBudgetMs, headroomMs, medianLiveFrame, medianFrame, medianLoad, medianSave,
                 elideConfirmedSaves, repairBudgetMs);
@@ -92,7 +101,78 @@ namespace BizHawkNetplay.Core.Probe
                 _emu.CoreName, stateSize, medianSave, medianLoad, medianFrame,
                 frameBudgetMs, headroomMs, depth,
                 medianLiveFrame + (elideConfirmedSaves ? 0 : medianSave),
-                replayDeterministic, depthAtWorst, highFrame, medianLiveFrame);
+                replayDeterministic, depthAtWorst, highFrame, medianLiveFrame, repair);
+        }
+
+        /// <summary>
+        /// Depths at which a whole repair is timed. One frame is nearly all load, so it fixes the
+        /// intercept; eight gives a seven-frame lever arm for the slope, long enough that the per-frame
+        /// cost clears the run-to-run scatter a single frame is lost in. Eight also brackets the range
+        /// worth arguing about — the qualifying threshold is 3, and the depths a heavy core could
+        /// plausibly be lifted to sit between the two.
+        /// </summary>
+        private const int RepairProbeShallow = 1;
+        private const int RepairProbeDeep = 8;
+
+        /// <summary>
+        /// Samples per repair pass. Each already averages over up to <see cref="RepairProbeDeep"/>
+        /// frames and is correspondingly steadier than a single-frame sample, so it needs fewer
+        /// repetitions; the full count would add seconds to a probe for resolution it does not need.
+        ///
+        /// The probe runs synchronously on the UI thread, so this is freeze length. Eight samples costs
+        /// an N64 at native resolution about 0.8s — most of it the pass that re-snapshots every frame,
+        /// which is 68ms a sample on its own. That roughly triples the probe's freeze, and is the price
+        /// of knowing what the snapshot in a repair really costs rather than assuming it costs what an
+        /// isolated one does.
+        /// </summary>
+        private int RepairSamples => Math.Max(8, _samples / 8);
+
+        /// <summary>
+        /// Times one whole repair shape: a load, then <paramref name="depth"/> frames re-simulated from
+        /// it, each optionally re-snapshotted the way a repair does today.
+        ///
+        /// The frames are advanced one call at a time whether or not they are being snapshotted, so the
+        /// two deep passes differ by the snapshot and by nothing else — which is what lets their
+        /// difference be read as the snapshot's cost.
+        /// </summary>
+        private double MeasureRepair(int depth, bool resave, InputSet neutral)
+        {
+            var anchor = _emu.SaveStateToMemory();
+            var taken = new List<StateHandle>(depth);
+            try
+            {
+                // Leave the core where every later sample will leave it, so the first timed sample
+                // loads across the same gap as the rest of them rather than across none.
+                for (int f = 0; f < depth; f++) _emu.RunFramesInvisible(1, _ => neutral);
+
+                return MeasureMedian(
+                    () =>
+                    {
+                        _emu.LoadStateFromMemory(anchor);
+                        for (int f = 0; f < depth; f++)
+                        {
+                            _emu.RunFramesInvisible(1, _ => neutral);
+                            if (resave) taken.Add(_emu.SaveStateToMemory());
+                        }
+                    },
+                    RepairSamples,
+                    out _,
+                    between: () =>
+                    {
+                        // Freed between samples rather than at the end: holding every sample's states
+                        // at once would peak at hundreds of MiB on exactly the cores this measures.
+                        // Outside the timed region, because a repair does not pay to free the ring's
+                        // evictions either.
+                        foreach (var h in taken) _emu.ReleaseState(h);
+                        taken.Clear();
+                    });
+            }
+            finally
+            {
+                foreach (var h in taken) _emu.ReleaseState(h);
+                try { _emu.LoadStateFromMemory(anchor); } catch { }
+                _emu.ReleaseState(anchor);
+            }
         }
 
         /// <summary>
@@ -217,7 +297,9 @@ namespace BizHawkNetplay.Core.Probe
             return InputSet.AllNeutral(0, layouts);
         }
 
-        private double MeasureMedian(Action op) => MeasureMedian(op, out _);
+        private double MeasureMedian(Action op) => MeasureMedian(op, _samples, out _);
+
+        private double MeasureMedian(Action op, out double highMs) => MeasureMedian(op, _samples, out highMs);
 
         /// <summary>
         /// Median cost of an operation, plus the 90th percentile so callers can see how much the
@@ -225,15 +307,19 @@ namespace BizHawkNetplay.Core.Probe
         /// and 2 at about 3.44ms, and N64 at 1400x1050 measures a median of 3.55ms — three consecutive
         /// probes of that one configuration returned depth 2, 3 and 3, with nothing in the output to
         /// say the answer had ever been close.
+        ///
+        /// <paramref name="between"/> runs after each sample and outside its timing, for bookkeeping a
+        /// caller must do per iteration but is not trying to measure.
         /// </summary>
-        private double MeasureMedian(Action op, out double highMs)
+        private double MeasureMedian(Action op, int sampleCount, out double highMs, Action? between = null)
         {
-            var samples = new double[_samples];
-            for (int i = 0; i < _samples; i++)
+            var samples = new double[sampleCount];
+            for (int i = 0; i < sampleCount; i++)
             {
                 double t0 = _clock.NowMs;
                 op();
                 samples[i] = _clock.NowMs - t0;
+                between?.Invoke();
             }
             Array.Sort(samples);
             int mid = samples.Length / 2;

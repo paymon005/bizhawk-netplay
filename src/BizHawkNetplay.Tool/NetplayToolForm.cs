@@ -4189,18 +4189,23 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// The probe result with the video settings it was measured under, on one line.
+        /// The probe result with the video settings it was measured under.
         ///
         /// A probe number means nothing without them. The verdict is decided by the frame cost, the
         /// frame cost is the video plugin's to spend, and the resolution behind it is not a sync
         /// setting — so it appeared nowhere near the probe: the session's video line prints later, only
         /// once a peer has joined, and the Diagnostics button never printed it at all. Anyone comparing
         /// a run of probes across settings was left matching numbers to a setting from memory.
+        ///
+        /// The measured repair goes on a second line. It answers a different question from the verdict
+        /// — whether the sum the verdict was solved from describes the thing it claims to — and this
+        /// output exists to be read a dozen runs at a time.
         /// </summary>
         private static string DescribeProbe(ProbeResult result, EmuHawkAdapter a)
         {
             string? video = a.VideoSettingsDiagnostic();
-            return video == null ? result.ToString() : $"{result} — video: {video}";
+            string head = video == null ? result.Summary : $"{result.Summary} — video: {video}";
+            return result.RepairDiagnostic.Length == 0 ? head : $"{head}{Environment.NewLine}    {result.RepairDiagnostic}";
         }
 
         private int MeasureRollbackDepth(EmuHawkAdapter a)

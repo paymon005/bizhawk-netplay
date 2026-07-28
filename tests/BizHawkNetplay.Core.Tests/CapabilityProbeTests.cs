@@ -183,12 +183,18 @@ namespace BizHawkNetplay.Core.Tests
             var emu = new FakeEmuAdapter(portCount: 2);
 
             // Probe order: 1 reference save (untimed), then samples of save x100, load x100,
-            // frame-without-render x100, frame-with-render x100. Feed constant per-op durations.
+            // frame-without-render x100, frame-with-render x100, then three whole-repair passes of 12
+            // (samples/8). Feed constant per-op durations. This is a perfectly linear core — the repair
+            // durations below are exactly load + depth*frame (+ depth*save on the last) — so every
+            // derived term must come back as the isolated figure it was built from.
             var durations = new List<double>();
             durations.AddRange(Enumerable.Repeat(0.10, 100)); // save
             durations.AddRange(Enumerable.Repeat(0.05, 100)); // load
             durations.AddRange(Enumerable.Repeat(0.20, 100)); // frame, rendering off — the repair term
             durations.AddRange(Enumerable.Repeat(0.50, 100)); // frame, rendering on — the live term
+            durations.AddRange(Enumerable.Repeat(0.25, 12));  // repair, 1 frame   = 0.05 + 1*0.20
+            durations.AddRange(Enumerable.Repeat(1.65, 12));  // repair, 8 frames  = 0.05 + 8*0.20
+            durations.AddRange(Enumerable.Repeat(2.45, 12));  // ...re-saving each = 1.65 + 8*0.10
             var clock = new ManualClock(durations);
 
             var probe = new CapabilityProbe(emu, clock, samples: 100);
@@ -203,10 +209,24 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0.50, result.LiveFrameMs, 3);
             Assert.True(result.RollbackQualified);
 
+            // The repair was timed whole, and taking it apart again recovers what it was made of.
+            var repair = Assert.IsType<RepairProfile>(result.Repair);
+            Assert.Equal(0.25, repair.ShallowMs, 3);
+            Assert.Equal(1.65, repair.DeepMs, 3);
+            Assert.Equal(2.45, repair.DeepResavedMs, 3);
+            Assert.Equal(result.MedianFrameMs, repair.MarginalFrameMs, 3);
+            Assert.Equal(result.MedianLoadMs, repair.ImpliedLoadMs, 3);
+            Assert.Equal(result.MedianSaveMs, repair.MarginalSaveMs, 3);
+            Assert.Equal(0.0, result.RepairModelError, 6);
+            Assert.False(result.RepairCostsMoreThanModelled);
+
             // Adapter was actually exercised the expected number of times.
-            Assert.Equal(102, emu.SaveCount);   // 1 reference + 100 samples + 1 replay-check anchor
-            Assert.Equal(103, emu.LoadCount);   // 100 samples + 2 in the replay check + 1 final restore
-            Assert.Equal(160, emu.InvisibleFrameCount); // 100 timed + 30 replayed twice
+            // 1 reference + 100 samples + 3 repair anchors + 12*8 repair re-saves + 1 replay anchor.
+            Assert.Equal(201, emu.SaveCount);
+            // 100 samples + 3 passes of (12 samples + 1 restore) + 2 in the replay check + 1 final.
+            Assert.Equal(142, emu.LoadCount);
+            // 100 timed + (1+12) + (8+96) + (8+96) across the repair passes + 30 replayed twice.
+            Assert.Equal(381, emu.InvisibleFrameCount);
             Assert.Equal(100, emu.RenderedFrameCount);
         }
 
@@ -236,6 +256,116 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0, CapabilityProbe.SolveMaxDepth(budget, headroom,
                 liveFrameMs: 13.0, repairFrameMs: repairFrame, loadMs: load, saveMs: save,
                 elideConfirmedSaves: true, repairBudgetMs: 2 * budget));
+        }
+
+        [Fact]
+        public void RepairProfile_ReadsTheSlopeAsTheFrameAndTheInterceptAsTheLoad()
+        {
+            // Measured N64 terms: load 1.4, frame 2.4, save 5.9. A core that behaves exactly as the
+            // depth model assumes produces these repair totals, and taking the line apart returns the
+            // three terms — which is the whole point: when the real core does NOT return them, the
+            // model is wrong about something and the difference says which term.
+            var linear = new RepairProfile(
+                shallowDepth: 1, shallowMs: 1.4 + 2.4,
+                deepDepth: 8, deepMs: 1.4 + 8 * 2.4,
+                deepResavedMs: 1.4 + 8 * 2.4 + 8 * 5.9);
+
+            Assert.Equal(2.4, linear.MarginalFrameMs, 3);
+            Assert.Equal(1.4, linear.ImpliedLoadMs, 3);
+            Assert.Equal(5.9, linear.MarginalSaveMs, 3);
+
+            // And a core where re-simulated frames cost half again as much as isolated ones — the
+            // cache-cold case this measurement exists to catch. The decomposition still holds: the
+            // slope reports the dearer frame and the load comes back unchanged.
+            var cacheCold = new RepairProfile(
+                shallowDepth: 1, shallowMs: 1.4 + 3.6,
+                deepDepth: 8, deepMs: 1.4 + 8 * 3.6,
+                deepResavedMs: 1.4 + 8 * 3.6 + 8 * 5.9);
+
+            Assert.Equal(3.6, cacheCold.MarginalFrameMs, 3);
+            Assert.Equal(1.4, cacheCold.ImpliedLoadMs, 3);
+            Assert.Equal(5.9, cacheCold.MarginalSaveMs, 3);
+        }
+
+        [Fact]
+        public void RepairProfile_DoesNotReportANegativeCostForAnythingPhysical()
+        {
+            // A slope steep enough to extrapolate back past zero means there is no load term to find,
+            // not that loading refunds time. The slope itself stays raw, though — a line that does
+            // this is telling you the measurement is off, and rounding it to something plausible
+            // would be hiding the only evidence of that.
+            var steep = new RepairProfile(shallowDepth: 1, shallowMs: 2.0, deepDepth: 8, deepMs: 30.0);
+
+            Assert.Equal(4.0, steep.MarginalFrameMs, 3);
+            Assert.Equal(0.0, steep.ImpliedLoadMs, 3);
+
+            var backwards = new RepairProfile(shallowDepth: 1, shallowMs: 20.0, deepDepth: 8, deepMs: 6.0);
+            Assert.True(backwards.MarginalFrameMs < 0, "a negative slope must stay visible");
+            Assert.Equal(0.0, backwards.MarginalSaveMs, 3);
+        }
+
+        [Fact]
+        public void RepairProfile_RefusesTwoDepthsWithNoLeverArmBetweenThem()
+        {
+            Assert.Throws<System.ArgumentOutOfRangeException>(() => new RepairProfile(4, 10.0, 4, 10.0));
+            Assert.Throws<System.ArgumentOutOfRangeException>(() => new RepairProfile(8, 20.0, 1, 4.0));
+            Assert.Throws<System.ArgumentOutOfRangeException>(() => new RepairProfile(0, 1.0, 8, 20.0));
+        }
+
+        [Fact]
+        public void Result_FlagsARepairThatCostsMoreThanTheTermsItWasSolvedFrom()
+        {
+            // Modelled: 1.4 + 8*(2.4 + 5.9) = 67.8ms. Only the optimistic direction is an alarm — a
+            // session that predicts as far as a 67.8ms repair allows, on a core where the repair
+            // actually takes 90, overruns its budget every time it corrects.
+            ProbeResult WithRepair(double measuredDeepResaved) => new ProbeResult(
+                "N64", 1024, medianSaveMs: 5.9, medianLoadMs: 1.4, medianFrameMs: 2.4,
+                frameBudgetMs: 16.683, headroomMs: 4.17, maxRollbackDepth: 3,
+                repair: new RepairProfile(1, 3.8, 8, 20.6, measuredDeepResaved));
+
+            Assert.Equal(67.8, WithRepair(67.8).ModelledRepairMs, 3);
+
+            var optimistic = WithRepair(90.0);
+            Assert.True(optimistic.RepairModelError > ProbeResult.RepairModelTolerance);
+            Assert.True(optimistic.RepairCostsMoreThanModelled);
+            Assert.Contains("REPAIR OVERRUNS MODEL", optimistic.ToString());
+
+            // Within tolerance, and cheaper than modelled, are both fine — and neither may raise it.
+            Assert.False(WithRepair(72.0).RepairCostsMoreThanModelled);
+            Assert.False(WithRepair(60.0).RepairCostsMoreThanModelled);
+            Assert.True(WithRepair(60.0).RepairModelError < 0);
+            Assert.DoesNotContain("REPAIR OVERRUNS MODEL", WithRepair(60.0).ToString());
+        }
+
+        [Fact]
+        public void Result_SaysNothingAboutRepairCostWhenItWasNeverMeasured()
+        {
+            // Every ProbeResult built before this existed, and any built by a caller that skips it.
+            var noRepair = new ProbeResult("NesHawk", 1024, 0.05, 0.05, 0.2, 16.639, 4.0, 49);
+
+            Assert.Null(noRepair.Repair);
+            Assert.False(noRepair.RepairCostsMoreThanModelled);
+            Assert.Equal(0, noRepair.RepairModelError);
+            Assert.DoesNotContain("repair", noRepair.ToString());
+        }
+
+        [Fact]
+        public void Run_HandsBackEveryStateAndEveryFrameTheRepairPassesBorrowed()
+        {
+            // The repair passes load, re-simulate and snapshot far more than anything else here, all
+            // against the position the user actually has loaded. They owe back every frame they moved
+            // and every state they took.
+            var emu = new FakeEmuAdapter(portCount: 2);
+            var clock = new ManualClock(Enumerable.Repeat(0.05, 400));
+            var before = emu.HashMainMemory();
+
+            var result = new CapabilityProbe(emu, clock, samples: 20).Run(16.639, 4.0);
+
+            Assert.NotNull(result.Repair);
+            Assert.Equal(before, emu.HashMainMemory());
+            Assert.Empty(emu.LiveStates);
+            Assert.True(emu.SaveCount > 20, $"the repair passes should dominate the saves, got {emu.SaveCount}");
+            Assert.Equal(emu.SaveCount, emu.ReleaseCount);
         }
 
         [Fact]

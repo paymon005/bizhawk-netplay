@@ -177,9 +177,25 @@ Each probe line also carries the video settings it was measured under, so a run 
 
 It also reports `MARGINAL` when the median frame cost qualifies for rollback and the slow end of the same run does not — a heavy core's frame cost moves enough between runs to flip the verdict, and re-rolling the probe until it says what you want is not a fix.
 
+### The repair line
+
+Everything above is a term timed on its own, and the depth verdict is those terms added up: `load + depth × (frame + save)`. The second line checks that sum against the thing it claims to describe, by timing a **whole repair** — a load, then N frames re-simulated from it — at two depths:
+
+```
+repair 1f=3.812ms 8f=20.640ms (+saves 67.910ms) -> per-frame 2.404ms +save 5.887ms, load 1.408ms | modelled 67.800ms (+0.2%)
+```
+
+Two depths give a line: its slope is what one more re-simulated frame really costs and its intercept is what the load really costs. Running the deep pass twice — once snapshotting every re-simulated frame, once not — isolates the snapshot, because those two passes differ by nothing else.
+
+That matters because none of the model's three assumptions is obvious on a recompiling core. A load from further back can invalidate the code cache, and the frames right after one run on caches the load has just cleared. Timing a load by itself would answer the narrower half of the question and miss exactly the effect most likely to bite. If the `per-frame`, `+save` and `load` figures come back matching `frame=`, `save=` and `load=` from the first line, the model describes the core; where they diverge, the difference says which term is wrong.
+
+`REPAIR OVERRUNS MODEL` appears when the measured repair costs more than 15% over the modelled one. That is the direction that desyncs a session: the depth was solved from a sum that a real repair cannot meet, so every correction overruns its budget. Cheaper-than-modelled is reported too, as a negative percentage, and is not an alarm.
+
+This is measured and reported, not yet spent — the depth is still solved from the isolated terms. It costs about 0.8 s of extra freeze on N64, most of it the pass that re-snapshots every frame.
+
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
-- **Rollback depth on heavy cores:** N64 now runs rollback, but only ~3 frames deep — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. Sparse keyframes during repair are the obvious next lever.
+- **Rollback depth on heavy cores:** N64 now runs rollback, but only ~3 frames deep — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. At native resolution the savestate is ~71% of the 8.3 ms a repaired frame costs, so snapshotting every *k*-th frame instead should take depth 3 to roughly 6 at *k*=3 — for at most *k*−1 extra re-simulated frames on a later rollback. The probe's [repair line](#the-repair-line) measures the three terms that arithmetic rests on; building it is the next step.
 - **Where N64's frame cost actually comes from:** mostly the render resolution — a controlled sweep puts it at 2.4 ms at 320×240 and 7.7 ms at 2880×2160 (see [Heavy cores](#heavy-cores-n64-and-friends)). An earlier uncontrolled sweep looked like noise and was read that way; it simply hadn't spanned enough of the range for the curve to clear the scatter. Whether resolution accounts for *all* of the 1.6–12 ms swing seen across one evening's sessions is still open — the top of that range is above anything measured here — but it is no longer an unexplained term.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 

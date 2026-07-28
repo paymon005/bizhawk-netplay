@@ -19,8 +19,10 @@ namespace BizHawkNetplay.Core.Probe
             bool replayDeterministic = true,
             int depthAtWorstFrame = -1,
             double highFrameMs = 0,
-            double liveFrameMs = 0)
+            double liveFrameMs = 0,
+            RepairProfile? repair = null)
         {
+            Repair = repair;
             LiveFrameMs = liveFrameMs > 0 ? liveFrameMs : medianFrameMs;
             SteadyStateMs = steadyStateMs > 0 ? steadyStateMs : medianFrameMs + medianSaveMs;
             ReplayDeterministic = replayDeterministic;
@@ -79,6 +81,42 @@ namespace BizHawkNetplay.Core.Probe
         public int DepthAtWorstFrame { get; }
 
         /// <summary>
+        /// A repair timed whole at two depths, or null if the probe did not measure one.
+        ///
+        /// Everything else here is a term measured on its own, and the depth is solved by adding those
+        /// terms up. This is the same repair measured as one operation, so the sum can be checked
+        /// against the thing it claims to describe.
+        /// </summary>
+        public RepairProfile? Repair { get; }
+
+        /// <summary>What the depth model predicts the deep repair costs, from terms timed in isolation
+        /// — the sum <see cref="CapabilityProbe.SolveMaxDepth(double,double,double,double,double)"/>
+        /// reasons with.</summary>
+        public double ModelledRepairMs =>
+            Repair == null ? 0 : MedianLoadMs + Repair.DeepDepth * (MedianFrameMs + MedianSaveMs);
+
+        /// <summary>
+        /// Signed fraction by which the measured repair overruns the modelled one. Positive means the
+        /// model is optimistic and the session predicts further ahead than it can actually repair;
+        /// negative means a repair is cheaper in one piece than as a sum, which is good news and no
+        /// cause for alarm.
+        /// </summary>
+        public double RepairModelError =>
+            Repair == null || ModelledRepairMs <= 0 ? 0 : (Repair.DeepResavedMs - ModelledRepairMs) / ModelledRepairMs;
+
+        /// <summary>
+        /// How far the measured repair may overrun the model before it is worth saying so. Each sample
+        /// already averages over several frames, so the figure is steadier than the single-frame ones —
+        /// steady enough that a few percent is noise and fifteen is roughly where the error starts to
+        /// move a depth verdict near the threshold.
+        /// </summary>
+        public const double RepairModelTolerance = 0.15;
+
+        /// <summary>True when a repair costs materially more than the terms it was solved from say it
+        /// should. One-sided on purpose: only the optimistic direction can desync a session.</summary>
+        public bool RepairCostsMoreThanModelled => Repair != null && RepairModelError > RepairModelTolerance;
+
+        /// <summary>
         /// True when the verdict depends on which run you happened to look at: the median qualifies and
         /// the slower end does not. Worth surfacing rather than silently returning whichever answer the
         /// dice gave, because the honest reading is "this machine is on the boundary" — the setting to
@@ -113,7 +151,8 @@ namespace BizHawkNetplay.Core.Probe
         /// budget it has, because the thing it would be spending that budget on is replaying.</summary>
         public bool RollbackQualified => ReplayDeterministic && MaxRollbackDepth >= RollbackDepthThreshold;
 
-        public override string ToString() =>
+        /// <summary>The verdict and the terms it was solved from, as one line.</summary>
+        public string Summary =>
             $"{CoreName}: state={StateSizeBytes / 1024.0:F1}KiB " +
             $"save={MedianSaveMs:F3}ms load={MedianLoadMs:F3}ms frame={MedianFrameMs:F3}ms " +
             $"live={LiveFrameMs:F3}ms " +
@@ -121,5 +160,19 @@ namespace BizHawkNetplay.Core.Probe
             $"replay={(ReplayDeterministic ? "ok" : "DIVERGED")} " +
             $"({(RollbackQualified ? "ROLLBACK OK" : "lockstep only")}" +
             $"{(DepthIsMarginal ? $"; MARGINAL — {DepthAtWorstFrame} on a {HighFrameMs:F3}ms frame" : "")})";
+
+        /// <summary>
+        /// The measured repair set against what the terms above predict for it, or "" if none was
+        /// measured. Kept apart from <see cref="Summary"/> so a caller comparing many probes can put it
+        /// on its own line — these two answer different questions and the combined line is a mouthful.
+        /// </summary>
+        public string RepairDiagnostic =>
+            Repair == null
+                ? ""
+                : $"{Repair} | modelled {ModelledRepairMs:F3}ms ({RepairModelError:+0.0%;-0.0%;0.0%})" +
+                  (RepairCostsMoreThanModelled ? " — REPAIR OVERRUNS MODEL" : "");
+
+        public override string ToString() =>
+            Repair == null ? Summary : $"{Summary} | {RepairDiagnostic}";
     }
 }
