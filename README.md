@@ -145,6 +145,17 @@ N64 works (connects, plays, stays in sync, analog moves). BizHawk's N64 core is 
 - Both machines must use **identical** N64 settings (they're sync settings — a mismatch desyncs).
 - N64 reports non-deterministic. That is not treated as a refusal (it usually just means determinism wasn't requested) — the session runs and desync detection guards you. You'll see a warning in the log; in practice it stays in sync.
 - **Run the video plugin at native resolution.** Above it, N64 desyncs at *every* checksum — measured over a long two-machine session: at 800×600 every single checksum disagreed, in lockstep *and* in rollback; at native resolution the same pair ran 15,000+ frames with every checksum agreeing. The cause isn't the netcode. Rice and GLideN64 resolve their framebuffer back into RDRAM, and above native those bytes are produced by your GPU rather than the emulated core — so they differ between machines and land inside the region the desync checksum reads. Resyncing can't fix it; the tool now says so after the second consecutive disagreement.
+- **Resolution is also the frame cost, and it decides whether rollback is available.** Twelve probes, three at each of four Rice resolutions, same machine and save:
+
+  | resolution | frame cost (median of 3) | verdict |
+  |---|---|---|
+  | 320×240 | 2.39 ms | rollback, depth 3 |
+  | 800×600 | 2.68 ms | rollback, depth 3 |
+  | 1400×1050 | 3.55 ms | depth 2–3, reported `MARGINAL` |
+  | 2880×2160 | 7.74 ms | depth 1, lockstep only |
+
+  Monotonic, with the spread within each resolution (±0.15 ms) far smaller than the steps between them. Savestate cost stays flat at ~5.9 ms throughout, as it should — state size doesn't depend on how you render. Since the desync boundary is *native* and the performance boundary is somewhere past 800×600, native is the setting that satisfies both.
+- **`render: false` saves nothing on this core.** The probe times a frame both ways, and across all twelve runs the rendered and unrendered figures agree within ~5%, with the rendered one sometimes *cheaper* — i.e. the difference is noise. Mupen64Plus/Rice does its video work regardless of the flag, so skipping the render on a discarded catch-up frame buys no time here (it may still on other cores).
 
 Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster settings or a second machine, not netcode). Check `stall%` before blaming the core, though — on a heavy console the two look identical from the picture, and only one of them is fixed by video-plugin settings.
 
@@ -158,14 +169,16 @@ See [Known limitations](#known-limitations) for the honest gaps (NAT scope, chec
 
 The M0 probe lives inside the netplay tool as the **Capability Probe** button (EmuHawk requires exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving and restoring your position so it doesn't disturb play.
 
-It reports **two** frame costs, because the two things a frame is used for cost differently: `frame=` is a frame advanced with rendering off — what a rollback repair re-simulates — and `live=` is one with video rendered, which is what the player's own frame costs. The difference is the video plugin. When they are far apart, the setting worth changing is the render one; when `live=` alone eats the frame budget, there is no rollback depth to have at any repair budget.
+It reports **two** frame costs, because the two things a frame is used for need not cost the same: `frame=` is a frame advanced with rendering off — what a rollback repair re-simulates — and `live=` is one with video rendered, which is what the player's own frame costs. When `live=` alone eats the frame budget there is no rollback depth to have at any repair budget. On Mupen64Plus/Rice the two match within noise, so the render flag saves nothing there; that is a fact about the core, and the point of printing both is that you can see it rather than assume it.
+
+Each probe line also carries the video settings it was measured under, so a run of them across resolutions is comparable by reading rather than by remembering.
 
 It also reports `MARGINAL` when the median frame cost qualifies for rollback and the slow end of the same run does not — a heavy core's frame cost moves enough between runs to flip the verdict, and re-rolling the probe until it says what you want is not a fix.
 
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
 - **Rollback depth on heavy cores:** N64 now runs rollback, but only ~3 frames deep — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. Sparse keyframes during repair are the obvious next lever.
-- **Where N64's frame cost actually comes from:** the same machine, game and settings measured frame costs from 1.6 ms to 12 ms across one evening, with the probe correctly predicting the live cost every time. Render resolution is *not* the variable — fourteen probes across every Rice setting landed in a 1.9–3.6 ms band, and a 1280×960 session ran cheaper than several lower ones. Depth, tick rate, picture rate and input feel are all downstream of this term, so it outranks every other performance lever until it is understood.
+- **Where N64's frame cost actually comes from:** mostly the render resolution — a controlled sweep puts it at 2.4 ms at 320×240 and 7.7 ms at 2880×2160 (see [Heavy cores](#heavy-cores-n64-and-friends)). An earlier uncontrolled sweep looked like noise and was read that way; it simply hadn't spanned enough of the range for the curve to clear the scatter. Whether resolution accounts for *all* of the 1.6–12 ms swing seen across one evening's sessions is still open — the top of that range is above anything measured here — but it is no longer an unexplained term.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 
 ## Known limitations

@@ -221,10 +221,10 @@ namespace BizHawkNetplay.Core.Probe
 
         /// <summary>
         /// Median cost of an operation, plus the 90th percentile so callers can see how much the
-        /// figure moves. On a heavy core the spread is not a detail: fourteen consecutive probes of one
-        /// N64 configuration produced frame costs from 1.86ms to 3.58ms, and the depth verdict flips
-        /// between 3 and 2 at about 3.44ms — so the same machine answers differently run to run, with
-        /// nothing in the output to say the answer was ever close.
+        /// figure moves. On a heavy core the spread is not a detail: the depth verdict flips between 3
+        /// and 2 at about 3.44ms, and N64 at 1400x1050 measures a median of 3.55ms — three consecutive
+        /// probes of that one configuration returned depth 2, 3 and 3, with nothing in the output to
+        /// say the answer had ever been close.
         /// </summary>
         private double MeasureMedian(Action op, out double highMs)
         {

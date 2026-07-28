@@ -141,10 +141,10 @@ namespace BizHawkNetplay.Core.Tests
         [Fact]
         public void SolveMaxDepth_N64FrameCostStraddlesTheVerdictBoundary()
         {
-            // Fourteen consecutive probes of one N64 configuration measured frame costs from 1.863ms to
-            // 3.582ms — noise, not a resolution curve, since the probe advances with rendering off. The
-            // verdict flips across that range, which is the whole reason it is now reported as marginal
-            // rather than as whichever answer the run happened to produce.
+            // The verdict flips at about 3.44ms, and N64 at 1400x1050 measures a median of 3.55ms —
+            // three consecutive probes of that configuration returned depth 2, 3 and 3. A machine can
+            // sit on the line, which is the whole reason the result is reported as marginal rather than
+            // as whichever answer the run happened to produce.
             const double budget = 16.683, headroom = 16.683 * 0.25;
             const double load = 1.6, save = 6.0;
 
@@ -216,7 +216,9 @@ namespace BizHawkNetplay.Core.Tests
             // A repair re-simulates with rendering off; the frame the player sees renders. The old
             // model measured only the first and charged it for both — which is optimistic twice over,
             // since the live cost appears in the steady-state check AND in what the repair has left to
-            // spend. Numbers below are the measured N64 save/load against three render costs.
+            // spend. Numbers below are the measured N64 save/load against three hypothetical render
+            // costs — on Mupen64Plus/Rice the two frame figures turn out to match, so this models the
+            // core that does not (a software rasteriser), which is the case the split exists for.
             const double budget = 16.683, headroom = 16.683 * 0.25;
             const double repairFrame = 4.25, load = 1.6, save = 6.0;
 

@@ -88,11 +88,14 @@ namespace BizHawkNetplay.Core.Emu
         /// costs.
         ///
         /// <see cref="RunFramesInvisible"/> is the right figure for repair, which genuinely does not
-        /// render — but the capability probe was charging that same figure for the live frame too. On a
-        /// core with an expensive video plugin the two differ by more than everything else the probe
-        /// measures put together, and the gap runs one way: the probe reports a machine as capable of
-        /// more rollback than it can actually afford, and barely responds to the resolution setting a
-        /// user tuning for performance is most likely to reach for.
+        /// render — but the capability probe was charging that same figure for the live frame too, and
+        /// nothing had ever established that the two were the same number.
+        ///
+        /// On Mupen64Plus with Rice they are: twelve probes across four resolutions put the rendered
+        /// and unrendered costs within ~5% of each other, the rendered one sometimes cheaper, so the
+        /// render flag saves nothing there and the old single figure was right by luck. That is a
+        /// property of the core, not of the model — a software rasteriser has no reason to honour it —
+        /// and the point of measuring both is that the answer is now read rather than assumed.
         /// </summary>
         void AdvanceRenderedFrame(InputSet inputs);
 
