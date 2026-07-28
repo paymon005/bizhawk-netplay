@@ -601,6 +601,85 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void ConfirmedChecksums_AreHashedWhereTheCoreAlreadyStands()
+        {
+            // The checksum reads the state entering an anchor — which is exactly where the core is
+            // standing when that anchor is saved. Hashing it there costs the hash and nothing else;
+            // coming back for it later costs a save, a load, the hash, and a load to return, measured
+            // on N64 as 18.4ms against the 7.2ms the hash alone costs. This pins the cheap route: one
+            // hash per boundary, no state traffic at all beyond the anchors themselves.
+            const int interval = 30;
+            const int iters = 320;
+
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: 0);
+            var a = BuildRollback(ta, 0, tuning: Eliding(interval));
+            var b = BuildRollback(tb, 1, tuning: Eliding(interval));
+
+            int boundaries = 0;
+            for (int i = 0; i < iters; i++)
+            {
+                clock.Tick = i;
+                a.Step();
+                b.Step();
+                if (a.Rollback.TryConfirmedChecksum(interval, out _, out _)) boundaries++;
+                b.Rollback.TryConfirmedChecksum(interval, out _, out _);
+            }
+
+            Assert.True(boundaries >= 5, $"only {boundaries} boundaries reported");
+            Assert.Equal(boundaries, a.Rollback.ChecksumsFromAnchor);
+            Assert.Equal(0, a.Rollback.ChecksumsByVisit);
+            // One hash per boundary and not one more, and — the part that was costing the hitch — no
+            // save or load anywhere except the anchor snapshots themselves.
+            Assert.Equal(boundaries, a.Emu.HashCount);
+            Assert.Equal(a.Rollback.SavesTaken, a.Emu.SaveCount);
+            Assert.Equal(0, a.Emu.LoadCount);
+        }
+
+        [Fact]
+        public void ConfirmedChecksums_StayCorrectWhenARepairRewritesTheAnchor()
+        {
+            // The cached hash describes a state a repair can destroy. When a correction re-simulates
+            // the anchor frame the cache is dropped rather than recomputed — recomputing would fold a
+            // full memory hash into the timed re-simulation and inflate the per-frame repair cost that
+            // governs how far we predict — so the checksum falls back to fetching that one itself.
+            // Both routes must produce the same number, which is what peer agreement here proves.
+            const int k = 4;
+            const int interval = 5; // short enough that ordinary rollbacks land on anchors constantly
+            const int iters = 400;
+
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k);
+            var a = BuildRollback(ta, 0, tuning: Eliding(interval));
+            var b = BuildRollback(tb, 1, tuning: Eliding(interval));
+
+            var ha = new Dictionary<int, uint>();
+            var hb = new Dictionary<int, uint>();
+            for (int i = 0; i < iters; i++)
+            {
+                clock.Tick = i;
+                a.Step();
+                b.Step();
+                if (a.Rollback.TryConfirmedChecksum(interval, out var fa, out var va)) ha[fa] = va;
+                if (b.Rollback.TryConfirmedChecksum(interval, out var fb, out var vb)) hb[fb] = vb;
+            }
+
+            Assert.True(a.Rollback.RollbackCount > 0, "no repairs ran, so nothing was exercised");
+            Assert.True(a.Rollback.ChecksumsByVisit > 0,
+                "the fallback never ran — this test would pass without ever leaving the fast path");
+            Assert.True(a.Rollback.ChecksumsFromAnchor > 0, "the fast path never ran either");
+
+            int shared = 0;
+            foreach (var kv in ha)
+                if (hb.TryGetValue(kv.Key, out var other))
+                {
+                    shared++;
+                    Assert.True(kv.Value == other, $"checksum disagreement at boundary {kv.Key}");
+                }
+            Assert.True(shared >= 10, $"only {shared} boundaries compared");
+        }
+
+        [Fact]
         public void TimeSync_BoundsRollbackDepthUnderClockSkew()
         {
             // Instance A's clock runs faster than B's (stepped twice per B step). Without time-sync A

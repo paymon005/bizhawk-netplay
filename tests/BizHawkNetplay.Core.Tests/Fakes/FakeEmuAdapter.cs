@@ -30,6 +30,7 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         public int LoadCount { get; private set; }
         public int ReleaseCount { get; private set; }
         public int InvisibleFrameCount { get; private set; }
+        public int HashCount { get; private set; }
         public List<InputSet> AppliedInputs { get; } = new List<InputSet>();
 
         /// <summary>Live in-memory states not yet released — models BizHawk's GUID-keyed store so
@@ -108,6 +109,16 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         public void SetPaused(bool paused) { }
         public void SetAudioMuted(bool muted) { }
 
+        /// <summary>Counted separately so a test can prove the probe times a rendered frame at all;
+        /// there is nothing to render here, so it costs whatever the scripted clock says.</summary>
+        public int RenderedFrameCount { get; private set; }
+
+        public void AdvanceRenderedFrame(InputSet inputs)
+        {
+            RenderedFrameCount++;
+            Step(inputs);
+        }
+
         public void RunFramesInvisible(int count, Func<int, InputSet> inputsFor)
         {
             for (int i = 0; i < count; i++)
@@ -145,6 +156,7 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         // Reads the whole (tiny) buffer, so the sampling salt is irrelevant here.
         public uint HashMainMemory(int salt = 0)
         {
+            HashCount++;
             uint h = 2166136261;
             foreach (var b in _memory) { h ^= b; h *= 16777619; }
             return h;

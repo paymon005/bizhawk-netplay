@@ -2201,6 +2201,16 @@ namespace BizHawkNetplay.Tool
                     else
                     {
                         double readyGateMs = phase.Elapsed.TotalMilliseconds; // includes rollback repair
+                        // Rollback hashes its checksum anchor inside the frame decision, where the core
+                        // is already standing on the state. That time is real but it isn't repair, so
+                        // move it into the hash column and keep the two disjoint. Nothing to drain on
+                        // the stall path above: a stall returns before the anchor is ever reached.
+                        double anchorHashMs = tickRollback?.TakeHashCostMs() ?? 0;
+                        if (anchorHashMs > 0)
+                        {
+                            readyGateMs = Math.Max(0, readyGateMs - anchorHashMs);
+                            _lastHashMs += anchorHashMs;
+                        }
                         gateMs += readyGateMs;
                         _pacing.AddGate(readyGateMs);
                         phase.Restart();
@@ -2548,9 +2558,12 @@ namespace BizHawkNetplay.Tool
                 // Under rollback the current frame may be a prediction that legitimately differs
                 // between peers — checksum the newest FINAL interval boundary instead. Both peers
                 // quantize to the same boundary, so their reports line up for the host to compare.
+                // Normally free: the hash was taken back when the anchor was saved, and its cost was
+                // already attributed on that tick. What this still times is the fallback — a repair
+                // rewrote the anchor, so the state has to be visited again to hash it.
                 var hashWatch = System.Diagnostics.Stopwatch.StartNew();
                 if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
-                _lastHashMs = hashWatch.Elapsed.TotalMilliseconds;
+                _lastHashMs += hashWatch.Elapsed.TotalMilliseconds;
             }
             else
             {
@@ -2558,7 +2571,7 @@ namespace BizHawkNetplay.Tool
                 if (frame % ChecksumInterval != 0) return;
                 var hashWatch = System.Diagnostics.Stopwatch.StartNew();
                 hash = _adapter!.HashMainMemory(frame);
-                _lastHashMs = hashWatch.Elapsed.TotalMilliseconds;
+                _lastHashMs += hashWatch.Elapsed.TotalMilliseconds;
             }
             // Which checksum path the core actually got, once per session. This is the only place the
             // cost is attributable — in a slow-tick line it just reads as an unexplained hitch.

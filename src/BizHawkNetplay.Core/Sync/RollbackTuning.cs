@@ -32,6 +32,11 @@ namespace BizHawkNetplay.Core.Sync
         /// <see cref="ElideConfirmedSaves"/> is on: the frame a checksum reads is by construction inside
         /// the finalized region, which is exactly what elision drops. Without this, desync detection
         /// stops silently — the checksum simply never finds its state and reports nothing.
+        ///
+        /// The anchor is also where the checksum's hash is taken, since the core is already standing on
+        /// the state there. A value that does not match the caller's interval therefore costs a hash
+        /// nobody consumes on top of losing detection — the checksum falls back to fetching its own
+        /// state, which is correct but is the expensive path this exists to avoid.
         /// </summary>
         public int ChecksumAnchorInterval { get; init; }
 

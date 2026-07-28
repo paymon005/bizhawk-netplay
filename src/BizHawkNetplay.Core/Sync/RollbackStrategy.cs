@@ -72,6 +72,15 @@ namespace BizHawkNetplay.Core.Sync
         private int _lastRunFrame = -1;         // highest frame actually simulated so far
         private int _lastChecksumFrame = -1;    // highest interval-boundary already checksummed (dedupe)
 
+        // Checksum of the state entering a checksum anchor, taken while the core was already standing
+        // there. -1 means nothing cached and TryConfirmedChecksum must go and fetch the state itself.
+        // One slot is enough: an anchor is only pending between the live frame reaching boundary+1 and
+        // the confirmed frontier reaching boundary, a gap bounded by the prediction cap — so two
+        // anchors could only overlap if the cap exceeded the checksum interval.
+        private int _anchorHashFrame = -1;
+        private uint _anchorHash;
+        private double _pendingHashMs;
+
         /// <param name="frameMs">
         /// Console frame period, used to turn a measured round-trip time (via <see cref="OnPacingReport"/>)
         /// into a target prediction horizon for time-sync. 0 (the default) disables time-sync entirely —
@@ -125,6 +134,25 @@ namespace BizHawkNetplay.Core.Sync
         public int CostCap => _costCap;
         /// <summary>Conservative rolling estimate of what one re-simulated frame costs, in ms.</summary>
         public double RepairPerFrameMs => _repairPerFrameMs;
+        /// <summary>Checksums answered from the anchor rather than by visiting the state again.</summary>
+        public int ChecksumsFromAnchor { get; private set; }
+        /// <summary>Checksums that had to save, load, hash and load back — the pre-anchor cost.</summary>
+        public int ChecksumsByVisit { get; private set; }
+
+        /// <summary>
+        /// Hash time accrued inside <see cref="BeginFrame"/> since the last call, and reset.
+        ///
+        /// The anchor hash runs while the core is mid-frame-decision, so left alone it would land in
+        /// whatever the caller measures around that call — where the checksum's cost is indistinguishable
+        /// from repair, which is the one thing that measurement exists to separate. Drain it once per
+        /// tick and the two stay disjoint.
+        /// </summary>
+        public double TakeHashCostMs()
+        {
+            double ms = _pendingHashMs;
+            _pendingHashMs = 0;
+            return ms;
+        }
         /// <summary>Live entries in the applied-input map; bounded by the ring window, not the session.</summary>
         public int AppliedCount => _applied.Count;
         /// <summary>Whether the next otherwise-runnable frame will be yielded for measured clock skew.</summary>
@@ -214,8 +242,14 @@ namespace BizHawkNetplay.Core.Sync
         /// (every port's real input has arrived through it, so both peers computed it identically) and
         /// the hash of the state right after it. Quantizing to interval boundaries is what keeps the two
         /// peers comparing the <em>same</em> frame despite running at slightly different confirmed
-        /// frontiers. The final state is visited via a temporary save/restore, leaving the live position
-        /// and the ring untouched. Returns false when no new boundary is final yet.
+        /// frontiers. Returns false when no new boundary is final yet.
+        ///
+        /// The hash itself is normally taken back when the anchor was saved, because the core was
+        /// already standing on exactly this state at that moment. Fetching it here instead costs a
+        /// save, a load, the hash and a load back to return — measured on N64 as 18.4ms against the
+        /// 7.2ms the hash alone costs, a hitch lockstep never pays for the same information. That path
+        /// remains as the fallback for the case the cache cannot cover: a repair that re-simulated the
+        /// anchor frame invalidates the cached hash, since the state it described no longer exists.
         /// </summary>
         public bool TryConfirmedChecksum(int interval, out int frame, out uint hash)
         {
@@ -229,6 +263,16 @@ namespace BizHawkNetplay.Core.Sync
 
             int boundary = (confirmed / interval) * interval;
             if (boundary <= _lastChecksumFrame) return false;   // already reported (cadence + dedupe)
+
+            if (_anchorHashFrame == boundary)
+            {
+                hash = _anchorHash;
+                _anchorHashFrame = -1;
+                ChecksumsFromAnchor++;
+                frame = boundary;
+                _lastChecksumFrame = boundary;
+                return true;
+            }
 
             int postFrame = boundary + 1;                        // entering postFrame == state right after `boundary`
             if (!_states.TryGetValue(postFrame, out var st)) return false; // just outside the ring; try again later
@@ -244,6 +288,7 @@ namespace BizHawkNetplay.Core.Sync
                 _adapter.LoadStateFromMemory(here);
                 _adapter.ReleaseState(here);
             }
+            ChecksumsByVisit++;
             frame = boundary;
             _lastChecksumFrame = boundary;
             return true;
@@ -325,7 +370,7 @@ namespace BizHawkNetplay.Core.Sync
                 // Re-snapshot the entering state (it may be corrected again later) on the same terms as
                 // the live path. Frames the arriving correction just confirmed are dropped rather than
                 // re-saved: any snapshot from the previous run of f is now stale, and nothing may find it.
-                AnchorOrDrop(f);
+                AnchorOrDrop(f, duringRepair: true);
                 var inputs = ResolveInputs(f);
                 _applied[f] = inputs;
                 return inputs;
@@ -431,12 +476,31 @@ namespace BizHawkNetplay.Core.Sync
         private bool IsUnconsumedChecksumAnchor(int frame) =>
             IsChecksumAnchor(frame) && frame - 1 > _lastChecksumFrame;
 
-        /// <summary>Take the snapshot, or make sure no stale one survives in its place.</summary>
-        private void AnchorOrDrop(int frame)
+        /// <summary>
+        /// Take the snapshot, or make sure no stale one survives in its place.
+        ///
+        /// A checksum anchor gets hashed here too, on the live path only. Standing on the state is the
+        /// whole cost of checksumming it — the alternative is to come back later and save, load, hash
+        /// and load again for the same bytes. Doing it during a repair instead would fold the hash into
+        /// the timed re-simulation and inflate the per-frame repair cost that governs how far we
+        /// predict, so a repair that rewrites an anchor invalidates the cached hash rather than
+        /// replacing it, and the checksum falls back to fetching that one itself.
+        /// </summary>
+        private void AnchorOrDrop(int frame, bool duringRepair = false)
         {
             if (ShouldAnchor(frame))
             {
                 SaveStateFor(frame);
+                if (!IsChecksumAnchor(frame)) return;
+                if (duringRepair)
+                {
+                    if (_anchorHashFrame == frame - 1) _anchorHashFrame = -1;
+                    return;
+                }
+                double startedMs = _clock?.NowMs ?? 0;
+                _anchorHash = _adapter.HashMainMemory(frame - 1);
+                if (_clock != null) _pendingHashMs += _clock.NowMs - startedMs;
+                _anchorHashFrame = frame - 1;
                 return;
             }
             if (_states.TryGetValue(frame, out var stale))
