@@ -195,6 +195,16 @@ The first thing it caught was the probe. Saving does not advance the core, so th
 
 Measured and reported, not spent: the depth is still solved from the isolated terms, which are now timed against state that actually changes. Costs about 0.8 s of extra freeze on N64, most of it the pass that re-snapshots every frame.
 
+### Sweeping the probe unattended
+
+`tools/probe-sweep.ps1` drives the whole thing — patch `config.ini`, launch EmuHawk, load a savestate, open the tool, click the probe, read the log, kill EmuHawk — once per configuration:
+
+```powershell
+.\tools\probe-sweep.ps1 -Config Rice:320x240,Rice:1280x960,GLideN64:320x240 -Runs 5
+```
+
+Each run is a **fresh EmuHawk**, so the core is always constructed with the plugin and resolution already in place rather than having them changed underneath it. The savestate slot follows the plugin (`-SlotByPlugin`), because the video plugin is a sync setting and a state saved under Rice is not the one to load under GLideN64. It loads a state rather than probing wherever the ROM boots to for a plain reason: the frame cost is whatever the game is doing, and at a title screen N64 measures ~0.7 ms a frame against ~2.5 ms in play.
+
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
 - **Rollback depth on heavy cores:** N64 runs rollback ~3 frames deep at native — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. The savestate is **~82%** of what a repaired frame costs there (7.3 ms of 8.9), so snapshotting every *k*-th frame instead is the one lever that raises depth — measured, it is worth **3 → 5 at *k*=4**. Less than it looks, because a repair must then walk back to the nearest keyframe (up to *k*−1 extra frames) *and* still leave keyframes behind as it goes, so the snapshots fall to ⌈(d+k−1)/k⌉ rather than to d/k. The deeper bound is that a 16.7 MiB state costs ~7 ms however it is scheduled; making it smaller or incremental would be the real win and needs core support BizHawk doesn't expose.
