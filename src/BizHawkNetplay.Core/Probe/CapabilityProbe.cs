@@ -51,13 +51,25 @@ namespace BizHawkNetplay.Core.Probe
 
             double medianLoad = MeasureMedian(() => _emu.LoadStateFromMemory(reference));
 
+            // NOTE: these advance with rendering OFF, which is what a repair does — but the depth
+            // formula also charges this figure for the live frame, which renders. On a core whose
+            // video plugin is expensive that understates the live cost, and the probe is correspondingly
+            // optimistic. It is also why changing resolution barely moves this number.
+            double highFrame;
             double medianFrame = MeasureMedian(() =>
-                _emu.RunFramesInvisible(1, _ => neutral));
+                _emu.RunFramesInvisible(1, _ => neutral), out highFrame);
 
             foreach (var h in scratch) _emu.ReleaseState(h);
 
             int depth = SolveMaxDepth(
                 frameBudgetMs, headroomMs, medianFrame, medianLoad, medianSave,
+                elideConfirmedSaves, repairBudgetMs);
+
+            // What the same machine would have concluded on a slower-than-typical frame. When this
+            // disagrees with the median verdict, the answer is a coin flip and the user deserves to
+            // know rather than re-rolling the probe until they like it.
+            int depthAtWorst = SolveMaxDepth(
+                frameBudgetMs, headroomMs, highFrame, medianLoad, medianSave,
                 elideConfirmedSaves, repairBudgetMs);
 
             bool replayDeterministic = VerifyReplayDeterminism(neutral, ReplayCheckFrames);
@@ -73,7 +85,7 @@ namespace BizHawkNetplay.Core.Probe
                 _emu.CoreName, stateSize, medianSave, medianLoad, medianFrame,
                 frameBudgetMs, headroomMs, depth,
                 medianFrame + (elideConfirmedSaves ? 0 : medianSave),
-                replayDeterministic);
+                replayDeterministic, depthAtWorst, highFrame);
         }
 
         /// <summary>
@@ -184,7 +196,16 @@ namespace BizHawkNetplay.Core.Probe
             return InputSet.AllNeutral(0, layouts);
         }
 
-        private double MeasureMedian(Action op)
+        private double MeasureMedian(Action op) => MeasureMedian(op, out _);
+
+        /// <summary>
+        /// Median cost of an operation, plus the 90th percentile so callers can see how much the
+        /// figure moves. On a heavy core the spread is not a detail: fourteen consecutive probes of one
+        /// N64 configuration produced frame costs from 1.86ms to 3.58ms, and the depth verdict flips
+        /// between 3 and 2 at about 3.44ms — so the same machine answers differently run to run, with
+        /// nothing in the output to say the answer was ever close.
+        /// </summary>
+        private double MeasureMedian(Action op, out double highMs)
         {
             var samples = new double[_samples];
             for (int i = 0; i < _samples; i++)
@@ -195,6 +216,10 @@ namespace BizHawkNetplay.Core.Probe
             }
             Array.Sort(samples);
             int mid = samples.Length / 2;
+            int rank = (int)Math.Ceiling(0.9 * samples.Length);
+            if (rank < 1) rank = 1;
+            if (rank > samples.Length) rank = samples.Length;
+            highMs = samples[rank - 1];
             return (samples.Length & 1) == 1
                 ? samples[mid]
                 : (samples[mid - 1] + samples[mid]) / 2.0;

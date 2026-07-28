@@ -4047,7 +4047,11 @@ namespace BizHawkNetplay.Tool
                 var handle = a.SaveStateToMemory();
                 double saveMs = timer.Elapsed.TotalMilliseconds;
                 a.ReleaseState(handle);
-                return saveMs > 1.0 ? 12 : 60;
+                // 24 rather than 12 on a heavy core: its frame cost swings enough between runs to move
+                // the verdict (measured 1.86ms to 3.58ms across consecutive N64 probes, either side of
+                // the ~3.44ms boundary), and a median over 12 noisy samples inherits that. Doubling it
+                // costs a couple of hundred milliseconds at session start against a 16MiB state export.
+                return saveMs > 1.0 ? 24 : 60;
             }
             catch { return 12; }
         }

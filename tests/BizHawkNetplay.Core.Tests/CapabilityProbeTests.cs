@@ -139,6 +139,45 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void SolveMaxDepth_N64FrameCostStraddlesTheVerdictBoundary()
+        {
+            // Fourteen consecutive probes of one N64 configuration measured frame costs from 1.863ms to
+            // 3.582ms — noise, not a resolution curve, since the probe advances with rendering off. The
+            // verdict flips across that range, which is the whole reason it is now reported as marginal
+            // rather than as whichever answer the run happened to produce.
+            const double budget = 16.683, headroom = 16.683 * 0.25;
+            const double load = 1.6, save = 6.0;
+
+            int fast = CapabilityProbe.SolveMaxDepth(budget, headroom, 1.863, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+            int slow = CapabilityProbe.SolveMaxDepth(budget, headroom, 3.582, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+
+            Assert.True(fast >= ProbeResult.RollbackDepthThreshold, $"fast end should qualify, got {fast}");
+            Assert.True(slow < ProbeResult.RollbackDepthThreshold, $"slow end should not, got {slow}");
+        }
+
+        [Fact]
+        public void Result_FlagsAVerdictThatDependsOnWhichRunYouLookedAt()
+        {
+            var marginal = new ProbeResult("N64", 1024, 6.0, 1.6, 2.0, 16.683, 4.17,
+                maxRollbackDepth: ProbeResult.RollbackDepthThreshold, steadyStateMs: 2.0,
+                replayDeterministic: true,
+                depthAtWorstFrame: ProbeResult.RollbackDepthThreshold - 1, highFrameMs: 3.58);
+
+            Assert.True(marginal.DepthIsMarginal);
+            Assert.True(marginal.RollbackQualified); // the median still decides; the flag informs
+            Assert.Contains("MARGINAL", marginal.ToString());
+
+            var solid = new ProbeResult("GPGX", 1024, 0.4, 0.2, 0.2, 16.688, 4.17,
+                maxRollbackDepth: 45, steadyStateMs: 0.2, replayDeterministic: true,
+                depthAtWorstFrame: 42, highFrameMs: 0.3);
+
+            Assert.False(solid.DepthIsMarginal);
+            Assert.DoesNotContain("MARGINAL", solid.ToString());
+        }
+
+        [Fact]
         public void Run_ComputesMediansAndDepthFromScriptedTimings()
         {
             var emu = new FakeEmuAdapter(portCount: 2);

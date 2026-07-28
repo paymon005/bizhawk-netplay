@@ -16,10 +16,14 @@ namespace BizHawkNetplay.Core.Probe
             double headroomMs,
             int maxRollbackDepth,
             double steadyStateMs = 0,
-            bool replayDeterministic = true)
+            bool replayDeterministic = true,
+            int depthAtWorstFrame = -1,
+            double highFrameMs = 0)
         {
             SteadyStateMs = steadyStateMs > 0 ? steadyStateMs : medianFrameMs + medianSaveMs;
             ReplayDeterministic = replayDeterministic;
+            DepthAtWorstFrame = depthAtWorstFrame < 0 ? maxRollbackDepth : depthAtWorstFrame;
+            HighFrameMs = highFrameMs > 0 ? highFrameMs : medianFrameMs;
             CoreName = coreName;
             StateSizeBytes = stateSizeBytes;
             MedianSaveMs = medianSaveMs;
@@ -56,6 +60,20 @@ namespace BizHawkNetplay.Core.Probe
         /// </summary>
         public bool ReplayDeterministic { get; }
 
+        /// <summary>90th-percentile frame cost, and the depth the same machine would have reported on
+        /// one. A heavy core's frame cost moves enough between runs to change the verdict.</summary>
+        public double HighFrameMs { get; }
+        public int DepthAtWorstFrame { get; }
+
+        /// <summary>
+        /// True when the verdict depends on which run you happened to look at: the median qualifies and
+        /// the slower end does not. Worth surfacing rather than silently returning whichever answer the
+        /// dice gave, because the honest reading is "this machine is on the boundary" — the setting to
+        /// change is the one making frames expensive, not the probe.
+        /// </summary>
+        public bool DepthIsMarginal =>
+            MaxRollbackDepth >= RollbackDepthThreshold && DepthAtWorstFrame < RollbackDepthThreshold;
+
         /// <summary>
         /// Deepest misprediction (in frames) whose repair — one load plus depth re-simulated
         /// frames each re-saved — still fits inside one frame budget.
@@ -87,6 +105,7 @@ namespace BizHawkNetplay.Core.Probe
             $"save={MedianSaveMs:F3}ms load={MedianLoadMs:F3}ms frame={MedianFrameMs:F3}ms " +
             $"steady={SteadyStateMs:F3}ms budget={FrameBudgetMs:F3}ms -> maxDepth={MaxRollbackDepth} " +
             $"replay={(ReplayDeterministic ? "ok" : "DIVERGED")} " +
-            $"({(RollbackQualified ? "ROLLBACK OK" : "lockstep only")})";
+            $"({(RollbackQualified ? "ROLLBACK OK" : "lockstep only")}" +
+            $"{(DepthIsMarginal ? $"; MARGINAL — {DepthAtWorstFrame} on a {HighFrameMs:F3}ms frame" : "")})";
     }
 }
