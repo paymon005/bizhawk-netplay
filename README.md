@@ -203,7 +203,9 @@ Measured and reported, not spent: the depth is still solved from the isolated te
 .\tools\probe-sweep.ps1 -Config Rice:320x240,Rice:1280x960,GLideN64:320x240 -Runs 5
 ```
 
-Each run is a **fresh EmuHawk**, so the core is always constructed with the plugin and resolution already in place rather than having them changed underneath it. The savestate slot follows the plugin (`-SlotByPlugin`), because the video plugin is a sync setting and a state saved under Rice is not the one to load under GLideN64. It loads a state rather than probing wherever the ROM boots to for a plain reason: the frame cost is whatever the game is doing, and at a title screen N64 measures ~0.7 ms a frame against ~2.5 ms in play.
+Each run is a **fresh EmuHawk**, so the core is always constructed with the plugin and resolution already in place rather than having them changed underneath it. The savestate slot follows the plugin (`-SlotByPlugin`), because the video plugin is a sync setting and a state saved under Rice is not the one to load under GLideN64. `-StateSlot 0` probes at boot instead, which is the only option for a game with no state.
+
+Loading a state is about keeping the workload *still*, not about it being dearer. Eight runs each way on Super Smash Bros. put the boot screen at 2.21 ms a frame against 2.32 ms in-game — the same, inside the spread. But the probe's passes run over several seconds, and a booting game moves through logos, an intro and an attract demo while they do; the repair decomposition assumes a stationary cost, and on some boot runs it misreads badly enough to put the derived load at zero.
 
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.

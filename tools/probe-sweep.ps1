@@ -29,9 +29,17 @@
        up in the tree. Cheap, and self-correcting across DPI and font differences, which a
        hard-coded offset would not be.
 
-    A savestate is loaded before probing because the frame cost is whatever the game is doing:
-    at a title screen N64 measures ~0.7ms a frame against ~1.6-2.1ms in play, which would make
-    every number here incomparable with one taken by hand.
+    A savestate is loaded before probing, but not for the reason it first appeared. Measured on
+    Super Smash Bros., eight runs each way, the boot screen and an in-game state agree: frame
+    2.21ms against 2.32ms, everything else inside the run-to-run spread. An earlier reading that
+    a title screen was three times cheaper came from GoldenEye, and was the *game* being lighter
+    rather than the screen -- the two had been changed together.
+
+    What loading a state does buy is a workload that holds still. The probe's passes run over
+    several seconds, and a booting game moves through logos, an intro and an attract demo while
+    they do; the repair decomposition assumes a stationary cost and misreads badly when that
+    fails, which is visible as the derived load collapsing to zero on some boot runs. Pass
+    -StateSlot 0 to probe at boot anyway, which is the only option for a game with no state.
 
     EmuHawk is killed rather than closed, deliberately: a clean exit rewrites config.ini and
     would undo the settings written for the next run.
@@ -49,12 +57,16 @@
 [CmdletBinding()]
 param(
     [string]   $BizHawkHome = 'X:\Games\Emulators\BizHawk',
-    [string]   $Rom = 'X:\Games\Emulators\BizHawk\zz_ROMS\Multiplayer\Super Smash Bros. (USA).z64',
+    [string[]] $Rom = @('X:\Games\Emulators\BizHawk\zz_ROMS\Multiplayer\Super Smash Bros. (USA).z64'),
     # A savestate carries the core configuration it was made under, and the video plugin is a
     # SYNC setting -- so a state saved on Rice is not the state to load while configured for
     # GLideN64. The slot therefore follows the plugin rather than being fixed for the sweep.
     [hashtable] $SlotByPlugin = @{ Rice = 1; GLideN64 = 2 },
-    [int]      $StateSlot = 0,
+    # -1 takes the slot from SlotByPlugin; 0 probes wherever the ROM boots to, with no state
+    # loaded; anything higher is that slot. 0 is the only way to compare a title screen against
+    # an in-game state for the SAME game, which is the only comparison that isolates the screen
+    # from the game.
+    [int]      $StateSlot = -1,
     [string[]] $Config = @('Rice:320x240'),
     [int]      $Runs = 1,
     [string]   $OutFile,
@@ -388,7 +400,7 @@ $exe     = Join-Path $BizHawkHome 'EmuHawk.exe'
 $cfg     = Join-Path $BizHawkHome 'config.ini'
 $toolDll = Join-Path $BizHawkHome 'ExternalTools\BizHawkNetplay.Tool.dll'
 
-foreach ($p in @($exe, $cfg, $toolDll, $Rom)) {
+foreach ($p in (@($exe, $cfg, $toolDll) + $Rom)) {
     if (-not (Test-Path $p)) { throw "not found: $p" }
 }
 if (Get-Process EmuHawk -ErrorAction SilentlyContinue) {
@@ -403,59 +415,74 @@ if (-not (Test-Path $backup)) {
 
 function Resolve-Slot {
     param([string] $Plugin)
-    if ($StateSlot -gt 0) { return $StateSlot }
+    if ($StateSlot -ge 0) { return $StateSlot }
     if ($SlotByPlugin -and $SlotByPlugin.ContainsKey($Plugin)) { return [int] $SlotByPlugin[$Plugin] }
     return 0
 }
 
-Write-Host "ROM:  $Rom" -ForegroundColor DarkGray
-Write-Host ("{0} config(s) x {1} run(s)" -f $Config.Count, $Runs) -ForegroundColor DarkGray
+Write-Host ("{0} rom(s) x {1} config(s) x {2} run(s)" -f $Rom.Count, $Config.Count, $Runs) -ForegroundColor DarkGray
 Write-Host ''
 
 $results = @()
 $transcript = New-Object System.Text.StringBuilder
 
-foreach ($spec in $Config) {
-    if ($spec -notmatch '^([A-Za-z0-9]+):(\d+)x(\d+)$') { throw "bad -Config spec '$spec' (want e.g. Rice:320x240)" }
-    $plugin = $Matches[1]; $w = [int] $Matches[2]; $h = [int] $Matches[3]
-    if (-not $PluginIds.ContainsKey($plugin)) { throw "unknown plugin '$plugin'; try $($PluginIds.Keys -join ', ')" }
+foreach ($romPath in $Rom) {
+    $game = [System.IO.Path]::GetFileNameWithoutExtension($romPath)
 
-    $slot = Resolve-Slot -Plugin $plugin
-    for ($run = 1; $run -le $Runs; $run++) {
-        Write-Host ("[{0} {1}x{2} slot {3}] run {4}/{5} ... " -f $plugin, $w, $h, $slot, $run, $Runs) -NoNewline
-        Set-N64Config -Path $cfg -PluginId $PluginIds[$plugin] -Width $w -Height $h -ToolDll $toolDll
+    foreach ($spec in $Config) {
+        if ($spec -notmatch '^([A-Za-z0-9]+):(\d+)x(\d+)$') { throw "bad -Config spec '$spec' (want e.g. Rice:320x240)" }
+        $plugin = $Matches[1]; $w = [int] $Matches[2]; $h = [int] $Matches[3]
+        if (-not $PluginIds.ContainsKey($plugin)) { throw "unknown plugin '$plugin'; try $($PluginIds.Keys -join ', ')" }
 
-        try {
-            $out = Invoke-OneProbe -Exe $exe -RomPath $Rom -Slot $slot -Seconds $TimeoutSec
-            Write-Host 'ok' -ForegroundColor Green
-        }
-        catch {
-            Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
-            try { Stop-Process -Name EmuHawk -Force -ErrorAction Stop } catch { }
-            Start-Sleep -Milliseconds 800
-            continue
-        }
+        $slot = Resolve-Slot -Plugin $plugin
+        $where = if ($slot -gt 0) { "slot $slot" } else { 'boot' }
 
-        Write-Host $out
-        Write-Host ''
-        [void] $transcript.AppendLine("--- $plugin ${w}x${h} run $run ---").AppendLine($out).AppendLine()
+        for ($run = 1; $run -le $Runs; $run++) {
+            Write-Host ("[{0} | {1} {2}x{3} {4}] run {5}/{6} ... " -f $game, $plugin, $w, $h, $where, $run, $Runs) -NoNewline
+            Set-N64Config -Path $cfg -PluginId $PluginIds[$plugin] -Width $w -Height $h -ToolDll $toolDll
 
-        # One "Config" column rather than plugin+resolution+live+verdict: the host console is
-        # about 80 wide and Format-Table drops the right-hand columns rather than wrapping, which
-        # silently hid the repair-derived figures this whole script exists to collect.
-        $row = [ordered] @{ Config = "$plugin ${w}x${h}"; Run = $run }
-        if ($out -match 'save=([\d.]+)ms load=([\d.]+)ms frame=([\d.]+)ms live=([\d.]+)ms') {
-            $row.Save = [double] $Matches[1]; $row.Load = [double] $Matches[2]
-            $row.Frame = [double] $Matches[3]; $row.Live = [double] $Matches[4]
+            try {
+                $out = Invoke-OneProbe -Exe $exe -RomPath $romPath -Slot $slot -Seconds $TimeoutSec
+                Write-Host 'ok' -ForegroundColor Green
+            }
+            catch {
+                Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                try { Stop-Process -Name EmuHawk -Force -ErrorAction Stop } catch { }
+                Start-Sleep -Milliseconds 800
+                continue
+            }
+
+            Write-Host $out
+            Write-Host ''
+            [void] $transcript.AppendLine("--- $game | $plugin ${w}x${h} $where run $run ---").AppendLine($out).AppendLine()
+
+            # Short column names, and plugin+resolution folded into one: the host console is about
+            # 80 wide and Format-Table drops the right-hand columns rather than wrapping, which
+            # silently hid the repair-derived figures this whole script exists to collect. The CSV
+            # written alongside carries everything at full precision.
+            $row = [ordered] @{
+                Game = $game; Config = "$plugin ${w}x${h}"; Where = $where; Run = $run
+            }
+            if ($out -match 'state=([\d.]+)KiB') { $row.StateKiB = [double] $Matches[1] }
+            if ($out -match 'save=([\d.]+)ms load=([\d.]+)ms frame=([\d.]+)ms live=([\d.]+)ms') {
+                $row.Save = [double] $Matches[1]; $row.Load = [double] $Matches[2]
+                $row.Frame = [double] $Matches[3]; $row.Live = [double] $Matches[4]
+            }
+            if ($out -match 'maxDepth=(\d+)') { $row.Depth = [int] $Matches[1] }
+            if ($out -match 'per-frame ([\d.]+)ms') { $row.RFrame = [double] $Matches[1] }
+            if ($out -match '\+save ([\d.]+)ms, load ([\d.]+)ms') {
+                $row.RSave = [double] $Matches[1]; $row.RLoad = [double] $Matches[2]
+            }
+            if ($out -match '1f=([\d.]+)ms (\d+)f=([\d.]+)ms \(\+saves ([\d.]+)ms\)') {
+                $row.R1f = [double] $Matches[1]; $row.R8f = [double] $Matches[3]; $row.R8fSaved = [double] $Matches[4]
+            }
+            if ($out -match 'modelled ([\d.]+)ms') { $row.Modelled = [double] $Matches[1] }
+            # The sign is optional: the probe formats a zero error as "0.0%" with no sign, so a
+            # pattern requiring one silently dropped exactly the runs where the model was right.
+            if ($out -match '\(([+-]?[\d.]+)%\)') { $row.ErrPct = [double] $Matches[1] }
+            if ($out -match 'ROLLBACK OK') { $row.Verdict = 'rollback' } else { $row.Verdict = 'lockstep' }
+            $results += [pscustomobject] $row
         }
-        if ($out -match 'maxDepth=(\d+)') { $row.Depth = [int] $Matches[1] }
-        if ($out -match 'per-frame ([\d.]+)ms')              { $row.RFrame = [double] $Matches[1] }
-        if ($out -match '\+save ([\d.]+)ms, load ([\d.]+)ms') {
-            $row.RSave = [double] $Matches[1]; $row.RLoad = [double] $Matches[2]
-        }
-        if ($out -match '\(([+-][\d.]+)%\)') { $row.ModelErr = $Matches[1] + '%' }
-        if ($out -match 'ROLLBACK OK') { $row.Verdict = 'rollback' } else { $row.Verdict = 'lockstep' }
-        $results += [pscustomobject] $row
     }
 }
 
@@ -468,5 +495,9 @@ if ($results.Count -gt 0) {
 if ($OutFile) {
     Set-Content -Path $OutFile -Value $transcript.ToString() -Encoding UTF8
     Write-Host "transcript written to $OutFile" -ForegroundColor DarkGray
+    # Full precision, every column, nothing dropped to fit a console.
+    $csv = [System.IO.Path]::ChangeExtension($OutFile, '.csv')
+    $results | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+    Write-Host "table written to $csv" -ForegroundColor DarkGray
 }
 Write-Host "config.ini was modified; restore with: Copy-Item '$backup' '$cfg'" -ForegroundColor DarkGray
