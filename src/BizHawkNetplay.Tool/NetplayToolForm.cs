@@ -4081,7 +4081,7 @@ namespace BizHawkNetplay.Tool
                 // MemorySaveState is nullable on the container but guaranteed by the _statable gate above.
                 restore = APIs.MemorySaveState!.SaveCoreStateToMemory();
                 double budget = FrameMs();
-                Log(RunCapabilityProbe(adapter).ToString());
+                Log(DescribeProbe(RunCapabilityProbe(adapter), adapter));
             }
             catch (Exception ex) { Log("probe failed: " + ex.Message); }
             finally
@@ -4188,6 +4188,21 @@ namespace BizHawkNetplay.Tool
                     elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
         }
 
+        /// <summary>
+        /// The probe result with the video settings it was measured under, on one line.
+        ///
+        /// A probe number means nothing without them. The verdict is decided by the frame cost, the
+        /// frame cost is the video plugin's to spend, and the resolution behind it is not a sync
+        /// setting — so it appeared nowhere near the probe: the session's video line prints later, only
+        /// once a peer has joined, and the Diagnostics button never printed it at all. Anyone comparing
+        /// a run of probes across settings was left matching numbers to a setting from memory.
+        /// </summary>
+        private static string DescribeProbe(ProbeResult result, EmuHawkAdapter a)
+        {
+            string? video = a.VideoSettingsDiagnostic();
+            return video == null ? result.ToString() : $"{result} — video: {video}";
+        }
+
         private int MeasureRollbackDepth(EmuHawkAdapter a)
         {
             if (_probeDepth >= 0) return _probeDepth;
@@ -4206,7 +4221,7 @@ namespace BizHawkNetplay.Tool
                 // the depth budgets FOR is replaying. Reporting 0 keeps every peer's negotiation honest
                 // without needing a second field on the wire.
                 _probeDepth = result.ReplayDeterministic ? result.MaxRollbackDepth : 0;
-                Log($"rollback probe — {result}");
+                Log($"rollback probe — {DescribeProbe(result, a)}");
                 if (!result.ReplayDeterministic)
                     ConnLog("this core did not reproduce the same memory when the probe replayed the " +
                         "same inputs from the same savestate. Rollback repair is exactly that operation, " +
