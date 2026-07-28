@@ -267,7 +267,15 @@ namespace BizHawkNetplay.Core.Session
         /// The client-side start loop echoes these probes while it waits. Median filtering keeps one
         /// scheduler/TCP spike from permanently adding another frame of input latency.
         /// </summary>
-        public static double MeasureLobbyRoundTrip(ControlChannel channel, int samples = 5)
+        public static double MeasureLobbyRoundTrip(ControlChannel channel, int samples = 5) =>
+            MeasureLobbyRtt(channel, samples).MedianMs;
+
+        /// <summary>
+        /// As <see cref="MeasureLobbyRoundTrip"/>, but also reports how far the link swings above its
+        /// settled cost. Delay has to cover the worst packet rather than the typical one, so the
+        /// median alone under-delays a jittery link — see <see cref="LobbyDelayPolicy"/>.
+        /// </summary>
+        public static LobbyRttSample MeasureLobbyRtt(ControlChannel channel, int samples = 9)
         {
             if (channel == null) throw new ArgumentNullException(nameof(channel));
             if (samples < 1 || samples > 20) throw new ArgumentOutOfRangeException(nameof(samples));
@@ -292,9 +300,18 @@ namespace BizHawkNetplay.Core.Session
 
             Array.Sort(measured);
             int middle = measured.Length / 2;
-            return measured.Length % 2 == 0
+            double median = measured.Length % 2 == 0
                 ? (measured[middle - 1] + measured[middle]) / 2.0
                 : measured[middle];
+
+            // Nearest-rank 85th percentile: at the default 9 samples that is the 8th smallest — the
+            // worst probe bar one. Taking the outright maximum would let a single scheduler or TCP
+            // hiccup permanently buy a frame of input latency, which is the very thing the median
+            // filter above exists to prevent.
+            int rank = (int)Math.Ceiling(0.85 * measured.Length);
+            if (rank < 1) rank = 1;
+            if (rank > measured.Length) rank = measured.Length;
+            return new LobbyRttSample(median, measured[rank - 1]);
         }
 
         /// <summary>

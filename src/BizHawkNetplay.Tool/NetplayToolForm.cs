@@ -28,7 +28,10 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        private const int Protocol = 6; // v6 adds pre-WELCOME lobby RTT probing + automatic delay selection
+        // v7 replaces the SHA-based main-memory checksum with a word-wise FNV-1a. The value is compared
+        // between peers, so a v6 build and a v7 build would report a phantom desync every interval —
+        // the version bump turns that into a clean refusal at the handshake instead.
+        private const int Protocol = 7;
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
@@ -214,7 +217,9 @@ namespace BizHawkNetplay.Tool
         // atomically closes the accept-vs-teardown registration race.
         private readonly ConnectionLifecycle _lifecycle = new ConnectionLifecycle();
         private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
-        private const int LobbyProbeSamples = 5;
+        // Odd count, and enough of them that the high-water figure means something: the delay estimate
+        // now needs the link's swing as well as its median (see LobbyDelayPolicy).
+        private const int LobbyProbeSamples = 9;
         private const int LobbyProbeTimeoutMs = 5000;
         // How long a started punch keeps knocking. Long on purpose: the asymmetric flow means one
         // side starts minutes before the other finishes reading a text message.
@@ -314,7 +319,7 @@ namespace BizHawkNetplay.Tool
         private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
         private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
         private const int MaxFramesPerTick = 2;  // WinForms callbacks can arrive ~25ms apart; one frame caps near 40fps
-        private const double FrameTickWorkBudgetMs = 8.0;
+        private const double FrameTickWorkBudgetMs = 8.0; // floor for fast cores; see TickBudgetMs
         private double _nextFrameDueMs;
         private double _recentCoreFrameMs; // conservative rolling cost used before committing a hidden first frame
         private bool _frameTickRunning;
@@ -329,6 +334,18 @@ namespace BizHawkNetplay.Tool
         private readonly System.Diagnostics.Stopwatch _fpsClock = new System.Diagnostics.Stopwatch();
         private int _fpsCount;
         private double _actualFps = -1;
+
+        // Advanced fps alone can't tell a slow core from a stalling link from pacing debt being
+        // discarded — all three read as "under 60". These carry the breakdown that separates them.
+        private readonly PacingStats _pacing = new PacingStats();
+        private PacingSummary _lastPacing;
+        private double _lastPacingLogMs = double.NegativeInfinity;
+        private double _stallHintSinceMs = double.NegativeInfinity;
+        private bool _stallHintShown; // one-time "your link is stalling" hint per session
+        private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
+        private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
+        private const double StallHintPct = 15.0;      // stalled share of ticks worth complaining about
+        private const double StallHintSustainMs = 5000; // ...but only once it persists, not on one burst
 
         // Raise the OS timer resolution to 1ms for the session so the WinForms frame timer fires
         // regularly (it's otherwise bound to the ~15ms system tick and jitters), which keeps audio
@@ -1388,14 +1405,19 @@ namespace BizHawkNetplay.Tool
                     UiConnLog($"measuring lobby ping ({LobbyProbeSamples} samples per player)…",
                         Color.DarkSlateBlue);
                     double worstRttMs = -1;
+                    double worstJitterMs = 0;
                     foreach (var link in links)
                     {
                         if (!IsConnectionAttemptCurrent(attempt)) return;
-                        double rtt = ProbeLobbyRtt(link);
-                        if (rtt > worstRttMs) worstRttMs = rtt;
+                        var sample = ProbeLobbyRtt(link);
+                        if (sample.MedianMs > worstRttMs) worstRttMs = sample.MedianMs;
+                        // Worst median and worst jitter are tracked independently: one session-wide
+                        // delay has to cover every link on both counts, so the safe figure is the
+                        // worst of each even when they come from different players.
+                        if (sample.JitterMs > worstJitterMs) worstJitterMs = sample.JitterMs;
                     }
                     finalDelay = SelectLobbyDelay(finalDelay, autoDelayMax, mode, worstRttMs,
-                        lobbyFrameMs, simulatedOneWayMs, players);
+                        lobbyFrameMs, simulatedOneWayMs, players, worstJitterMs);
                 }
 
                 // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
@@ -1494,7 +1516,7 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>Lobby RTT probe with the deadline on whichever pipe the link actually uses.</summary>
-        private static double ProbeLobbyRtt(PeerLink link)
+        private static LobbyRttSample ProbeLobbyRtt(PeerLink link)
         {
             if (link.Tcp != null)
             {
@@ -1505,7 +1527,7 @@ namespace BizHawkNetplay.Tool
                     oldSend = link.Tcp.SendTimeout;
                     link.Tcp.ReceiveTimeout = LobbyProbeTimeoutMs;
                     link.Tcp.SendTimeout = LobbyProbeTimeoutMs;
-                    return Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+                    return Handshake.MeasureLobbyRtt(link.Control, LobbyProbeSamples);
                 }
                 finally
                 {
@@ -1518,14 +1540,14 @@ namespace BizHawkNetplay.Tool
                 try
                 {
                     stream.ReadTimeout = LobbyProbeTimeoutMs;
-                    return Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+                    return Handshake.MeasureLobbyRtt(link.Control, LobbyProbeSamples);
                 }
                 finally
                 {
                     try { stream.ReadTimeout = old > 0 ? old : Timeout.Infinite; } catch { }
                 }
             }
-            return Handshake.MeasureLobbyRoundTrip(link.Control, LobbyProbeSamples);
+            return Handshake.MeasureLobbyRtt(link.Control, LobbyProbeSamples);
         }
 
         /// <summary>State-transfer deadline on whichever pipe the link uses (TCP socket timeouts, or
@@ -1775,6 +1797,10 @@ namespace BizHawkNetplay.Tool
             // Real-time pacing: tick often and advance however many frames wall-clock demands,
             // so irregular WinForms-timer firing doesn't run the game slow.
             _frameMs = FrameMs();
+            // Raise the OS timer resolution and measure what we actually got BEFORE the pacing clocks
+            // start, so the probe's own cost isn't charged to frame zero as debt.
+            try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
+            LogTimerGranularity();
             _delayHintShown = false;
             lock (_pingLock) { foreach (var link in _peers) { link.PingMs = -1; link.PingCount = 0; } }
             _pingClock.Restart();
@@ -1789,8 +1815,18 @@ namespace BizHawkNetplay.Tool
             _udpWarningActive = false;
             _pacingRebases = 0;
             _fpsClock.Restart(); _fpsCount = 0; _actualFps = -1;
-            try { if (!_timerResRaised) { timeBeginPeriod(1); _timerResRaised = true; } } catch { }
-            _frameTimer.Interval = 2;
+            _pacing.Reset(); _lastPacing = default;
+            _lastPacingLogMs = double.NegativeInfinity;
+            _stallHintSinceMs = double.NegativeInfinity;
+            _stallHintShown = false;
+            _hashDiagLogged = false;
+            _lastTickClockMs = -1;
+            // A WinForms timer is WM_TIMER, and SetTimer silently raises anything below
+            // USER_TIMER_MINIMUM to 10ms — asking for 2 never bought a 2ms cadence, it just hid the
+            // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
+            // comfortably under a frame period so long as we don't serialize on top of it (see
+            // FrameTick — the timer deliberately keeps running while a tick is in flight).
+            _frameTimer.Interval = 10;
             _frameTimer.Start();
 
             Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
@@ -1855,13 +1891,62 @@ namespace BizHawkNetplay.Tool
             RedistributeMesh();
         }
 
+        /// <summary>
+        /// How long one frame-tick callback may spend before it must return to the message loop.
+        ///
+        /// This has to scale with the console's frame period, not sit at a fixed 8ms. The second-frame
+        /// gate below requires <c>elapsed + 2·recentCoreFrameMs &lt; budget</c>, so a flat 8ms made
+        /// catch-up unreachable for any core costing more than ~4ms a frame — on N64 (~10-16ms) the
+        /// test could never pass. Lost wall-clock time was then never repaid: it accumulated until the
+        /// rebase above discarded roughly three frames in one lump, which reads as "CPU-bound" in the
+        /// status bar even when the core is comfortably inside budget.
+        ///
+        /// 1.7 frame periods (~28ms at 60Hz) lets exactly one catch-up frame through while staying
+        /// close enough to a frame period that the window never feels unresponsive. The hard
+        /// <see cref="MaxFramesPerTick"/> cap, the pessimistic <c>_recentCoreFrameMs</c> estimate and
+        /// the mid-burst audio pump are what keep that safe; this only stops the budget from
+        /// forbidding the burst outright.
+        /// </summary>
+        private double TickBudgetMs() => Math.Max(FrameTickWorkBudgetMs, 1.7 * _frameMs);
+
+        /// <summary>
+        /// Report what the OS actually gives us for a short sleep, once per session.
+        ///
+        /// The frame tick rides WM_TIMER, whose delivery is bound to the system clock tick, and on
+        /// Windows 11 <c>timeBeginPeriod</c> is per-process and may be ignored for a window that isn't
+        /// in the foreground — which is exactly our case when the second instance has focus. Since a
+        /// frame is presented at most once per tick, that granularity is a hard ceiling on presented
+        /// fps, so it's worth measuring rather than assuming. Near 1ms means a finer frame clock is
+        /// available; near 15ms means WM_TIMER can't do much better than one tick per frame.
+        /// </summary>
+        private void LogTimerGranularity()
+        {
+            try
+            {
+                const int probes = 5;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (int i = 0; i < probes; i++) Thread.Sleep(1);
+                double perSleep = sw.Elapsed.TotalMilliseconds / probes;
+                Log($"timer granularity: Sleep(1) averages {perSleep:F2}ms against a " +
+                    $"{_frameMs:F2}ms frame period — the frame tick cannot beat this.");
+            }
+            catch { }
+        }
+
         private void FrameTick()
         {
             if (!_sessionActive || _driver == null) return;
             if (_frameTickRunning) return;
 
+            // Deliberately NOT stopping the timer here. Stopping on entry and restarting in the finally
+            // made each period (interval + tick work + message-queue latency) instead of just the
+            // interval, because Start() re-arms SetTimer from zero. With ~10ms of enforced interval and
+            // a few ms of work that measured at ~26ms — about 38 callbacks a second. Since the frame is
+            // presented once per callback, the picture was capped near 38fps while the core happily
+            // emulated 60: the "60fps but choppy" report. Left free-running, WM_TIMER re-arms itself and
+            // coalesces (never more than one queued), and _frameTickRunning below is what actually keeps
+            // a nested message pump from reentering us.
             _frameTickRunning = true;
-            _frameTimer.Stop();
             var tickWatch = System.Diagnostics.Stopwatch.StartNew();
             double coreMs = 0, gateMs = 0, renderMs = 0;
             int packetsDrained = 0;
@@ -1929,9 +2014,12 @@ namespace BizHawkNetplay.Tool
                     // is what starves WinForms presentation on slow cores.
                     _nextFrameDueMs = nowMs;
                     _pacingRebases++;
+                    _pacing.AddRebase();
                 }
 
                 bool steppedThisTick = false;
+                bool stalledThisTick = false;
+                bool timeSyncThisTick = false;
                 int framesThisTick = 0;
                 bool committedSecondFrame = false;
                 while (framesThisTick < MaxFramesPerTick && nowMs + 0.25 >= _nextFrameDueMs)
@@ -1941,23 +2029,30 @@ namespace BizHawkNetplay.Tool
                     // that second frame after the callback has already consumed its UI work budget.
                     if (framesThisTick > 0)
                     {
-                        if (!committedSecondFrame && tickWatch.Elapsed.TotalMilliseconds >= FrameTickWorkBudgetMs) break;
+                        if (!committedSecondFrame && tickWatch.Elapsed.TotalMilliseconds >= TickBudgetMs()) break;
                         // A frame of core execution just happened, and packets that landed during it are
                         // already queued. Draining once per tick would judge this frame's readiness on
                         // network state captured before that work — turning an input that did arrive in
                         // time into a stall that costs the whole tick.
                         _driver.PumpNetwork();
                         packetsDrained += _driver.LastPacketsDrained;
+                        // A catch-up burst is the longest this callback ever goes without returning to
+                        // the message loop, so top the ring up mid-tick rather than only at tick start.
+                        _adapter?.PumpAudio();
                     }
 
                     _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
                     var phase = System.Diagnostics.Stopwatch.StartNew();
                     if (!_driver.CurrentFrameReady())
                     {
-                        gateMs += phase.Elapsed.TotalMilliseconds;
+                        double stallGateMs = phase.Elapsed.TotalMilliseconds;
+                        gateMs += stallGateMs;
+                        _pacing.AddGate(stallGateMs);
+                        stalledThisTick = true;
                         _driver.ResendLocalInputIfDue();
                         bool timeSync = _driver.Strategy is RollbackStrategy stalledRollback
                             && stalledRollback.LastStallWasTimeSync;
+                        timeSyncThisTick = timeSync;
                         if (timeSync)
                         {
                             // Advantage debt is denominated in emulated frames, not 2ms timer callbacks.
@@ -1974,7 +2069,9 @@ namespace BizHawkNetplay.Tool
                     }
                     else
                     {
-                        gateMs += phase.Elapsed.TotalMilliseconds; // includes rollback repair
+                        double readyGateMs = phase.Elapsed.TotalMilliseconds; // includes rollback repair
+                        gateMs += readyGateMs;
+                        _pacing.AddGate(readyGateMs);
                         phase.Restart();
                         // When wall-clock debt already makes a second frame due, the first picture is
                         // throwaway. Skip it only when frame two is input-safe and recent core cost says
@@ -1988,13 +2085,14 @@ namespace BizHawkNetplay.Tool
                             && nowMs + 0.25 >= _nextFrameDueMs + _frameMs
                             && _recentCoreFrameMs > 0
                             && tickWatch.Elapsed.TotalMilliseconds + 2.0 * _recentCoreFrameMs
-                                < FrameTickWorkBudgetMs
+                                < TickBudgetMs()
                             && secondGateSafe
                             && _driver.NextFrameFullyConfirmed;
                         if (anotherFrameDue) committedSecondFrame = true;
                         _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderVideo: !anotherFrameDue);
                         double frameCoreMs = phase.Elapsed.TotalMilliseconds;
                         coreMs += frameCoreMs;
+                        _pacing.AddFrame(frameCoreMs);
                         _recentCoreFrameMs = _recentCoreFrameMs <= 0
                             ? frameCoreMs
                             : Math.Max(frameCoreMs, _recentCoreFrameMs * 0.9);
@@ -2008,6 +2106,13 @@ namespace BizHawkNetplay.Tool
                     }
                 }
 
+                // Exactly one tick counted per callback, so the stall rate stays a share of ticks.
+                // Ticks that returned early above (frozen for a rejoin, mid-resync) are deliberately
+                // not counted: they aren't the frame loop, and folding them in would dilute the rate.
+                _pacing.AddTick(stalledThisTick, timeSyncThisTick);
+                if (_lastTickClockMs >= 0) _pacing.AddTickInterval(nowMs - _lastTickClockMs);
+                _lastTickClockMs = nowMs;
+
                 // We hold EmuHawk paused, so its own run loop never presents the frames we advance here —
                 // a paused window just keeps showing whatever its swapchain last held, which is why the
                 // host's picture froze while the core, audio and netplay all kept running. Present the
@@ -2017,6 +2122,7 @@ namespace BizHawkNetplay.Tool
                     var phase = System.Diagnostics.Stopwatch.StartNew();
                     _adapter!.PresentVideo();
                     renderMs = phase.Elapsed.TotalMilliseconds;
+                    _pacing.AddPresent(renderMs);
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
@@ -2067,7 +2173,8 @@ namespace BizHawkNetplay.Tool
                         $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}");
                 }
                 _frameTickRunning = false;
-                if (_sessionActive && _driver != null) _frameTimer.Start();
+                // No Start() here on purpose: the timer never stopped, and re-arming it would restore
+                // the serialization described above. EndSession/OnConnectFailed stop it explicitly.
             }
         }
 
@@ -2093,16 +2200,86 @@ namespace BizHawkNetplay.Tool
             {
                 _actualFps = _fpsCount * 1000.0 / _fpsClock.ElapsedMilliseconds;
                 _fpsCount = 0;
+                // Summarize before resetting: this is the only place the pacing window rolls over,
+                // so the log line below reads the same numbers the status bar just showed.
+                _lastPacing = _pacing.Summarize(_fpsClock.Elapsed.TotalMilliseconds);
+                _pacing.Reset();
                 _fpsClock.Restart();
             }
             double targetFps = _frameMs > 0 ? 1000.0 / _frameMs : 60.0;
             bool cpuBound = _actualFps >= 0 && _actualFps < targetFps * 0.95;
+            // Only worth the width when presentation actually fell behind the core — otherwise the two
+            // numbers are the same and repeating it just crowds the bar.
+            string presentStr = _lastPacing.PresentedFps < _lastPacing.AdvancedFps - 1
+                ? $", present {_lastPacing.PresentedFps:F0}"
+                : "";
             string speedStr = _actualFps < 0 ? ""
-                : $" — {_actualFps:F0}/{targetFps:F0} fps ({_actualFps / targetFps * 100:F0}%{(cpuBound ? ", CPU-bound" : "")})";
+                : $" — {_actualFps:F0}/{targetFps:F0} fps ({_actualFps / targetFps * 100:F0}%{(cpuBound ? ", CPU-bound" : "")}{presentStr})";
+            // The number that separates a slow core from a stalling link: high here means waiting on
+            // the network (raise input delay), low here with fps under target means CPU or pacing.
+            double stallPct = _lastPacing.StallTickPct;
+            string stallStr = stallPct >= 5 ? $" — stall {stallPct:F0}%" : "";
             string udpStr = _udpWarningActive ? " — UDP recovering" : "";
-            Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}{udpStr}",
-                _udpWarningActive || cpuBound ? Color.DarkOrange : Color.Green);
+            Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}{stallStr}{udpStr}",
+                _udpWarningActive || cpuBound || stallPct >= 25 ? Color.DarkOrange : Color.Green);
+            MaybeHintStalling(nowMs);
+            LogPacingSummary(nowMs);
             RefreshPlayersList();
+        }
+
+        /// <summary>
+        /// Say something once when lockstep is actually stalling, regardless of what the ping says.
+        /// <see cref="MaybeHintDelay"/> reasons from the worst measured round-trip, but what stalls a
+        /// lockstep session is the <em>late</em> packet, not the typical one — a link with a fine
+        /// median and a wide swing looks healthy by ping and still waits on remote input constantly.
+        /// The measured stall rate catches that case directly.
+        ///
+        /// It deliberately does NOT claim the delay is the cause. In lockstep, stalling is also how a
+        /// fast peer waits for a slow one, so a CPU-bound machine at the other end produces exactly
+        /// the same reading — and raising delay would do nothing for it. The message names both.
+        /// </summary>
+        private void MaybeHintStalling(double nowMs)
+        {
+            if (_stallHintShown || _mode != SyncMode.Lockstep || _lastPacing.Ticks == 0) return;
+            if (_lastPacing.StallTickPct <= StallHintPct)
+            {
+                _stallHintSinceMs = double.NegativeInfinity; // a single bad window isn't a problem
+                return;
+            }
+            if (double.IsNegativeInfinity(_stallHintSinceMs)) { _stallHintSinceMs = nowMs; return; }
+            if (nowMs - _stallHintSinceMs < StallHintSustainMs) return;
+
+            _stallHintShown = true;
+            ConnLog($"stalling {_lastPacing.StallTickPct:F0}% of the time waiting on remote input. " +
+                $"Either input delay ({_sessionDelay}) isn't covering the link's worst moments — a ping " +
+                "that looks fine on average still stalls if it swings — or the other machine can't hold " +
+                "full speed and you're waiting for it. Check whether their fps reads CPU-bound: if it " +
+                "does, only faster core settings help. If it doesn't, raise the host's Auto max or " +
+                "manual floor and reconnect (the running delay stays fixed).",
+                Color.DarkOrange);
+        }
+
+        /// <summary>
+        /// The full pacing breakdown, once a second under Verbose. The status bar has room for two
+        /// numbers; this has the rest — notably <c>rebases</c>, which counts how many times the pacing
+        /// clock gave up on accumulated debt and discarded frames outright. That is the difference
+        /// between a core that genuinely can't make budget (core mean at or above the frame period)
+        /// and a schedule that threw away frames the core could have run.
+        /// </summary>
+        private void LogPacingSummary(double nowMs)
+        {
+            if (!Verbose || nowMs - _lastPacingLogMs < 1000) return;
+            _lastPacingLogMs = nowMs;
+            var p = _lastPacing;
+            if (p.Ticks == 0) return;
+            Log($"pacing: adv {p.AdvancedFps:F0} fps, present {p.PresentedFps:F0}, " +
+                $"tick {p.TicksPerSecond:F0}/s (gap min {p.TickGapMinMs:F1} mean {p.TickGapMeanMs:F1} " +
+                $"max {p.TickGapMaxMs:F1}ms), " +
+                $"core mean {p.CoreMeanMs:F1} p95 {p.CoreP95Ms:F1} max {p.CoreMaxMs:F1}ms, " +
+                $"gate mean {p.GateMeanMs:F1} p95 {p.GateP95Ms:F1}ms, " +
+                $"present mean {p.PresentMeanMs:F1}ms, " +
+                $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
+                $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");
         }
 
         /// <summary>
@@ -2202,6 +2379,13 @@ namespace BizHawkNetplay.Tool
                 var hashWatch = System.Diagnostics.Stopwatch.StartNew();
                 hash = _adapter!.HashMainMemory();
                 _lastHashMs = hashWatch.Elapsed.TotalMilliseconds;
+            }
+            // Which checksum path the core actually got, once per session. This is the only place the
+            // cost is attributable — in a slow-tick line it just reads as an unexplained hitch.
+            if (!_hashDiagLogged && _adapter?.HashDiagnostic != null)
+            {
+                _hashDiagLogged = true;
+                Log(_adapter.HashDiagnostic);
             }
             if (_forceDesyncOnce)
             {
@@ -2335,15 +2519,17 @@ namespace BizHawkNetplay.Tool
 
         /// <summary>Apply the host's pre-WELCOME RTT estimate without ever lowering an explicit ask.</summary>
         private int SelectLobbyDelay(int manualFloor, int automaticMaximum, SyncMode mode,
-            double measuredRttMs, double frameMs, int simulatedOneWayMs, int players)
+            double measuredRttMs, double frameMs, int simulatedOneWayMs, int players,
+            double jitterMs = 0)
         {
             double effectiveRttMs = measuredRttMs + 2.0 * Math.Max(0, simulatedOneWayMs);
             var choice = LobbyDelayPolicy.Choose(effectiveRttMs, frameMs, mode,
-                manualFloor, automaticMaximum);
+                manualFloor, automaticMaximum, jitterMs);
 
             string simulated = simulatedOneWayMs > 0
                 ? $", including {2 * simulatedOneWayMs}ms simulated"
                 : "";
+            string jitter = jitterMs >= 1 ? $", jitter ±{jitterMs:F0}ms" : "";
             string capped = choice.WasCapped
                 ? $"; smooth target {choice.AutomaticFrames} was capped at {automaticMaximum}"
                 : "";
@@ -2354,7 +2540,7 @@ namespace BizHawkNetplay.Tool
                 ? " Host-to-player lobby links were measured; direct joiner-to-joiner paths can differ."
                 : "";
 
-            UiConnLog($"Auto delay: worst lobby RTT ~{effectiveRttMs:F0}ms{simulated} → " +
+            UiConnLog($"Auto delay: worst lobby RTT ~{effectiveRttMs:F0}ms{simulated}{jitter} → " +
                 $"{choice.Frames} frame(s) for {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}" +
                 floor + capped + "." + meshNote,
                 choice.WasCapped ? Color.DarkOrange : Color.DarkGreen);
@@ -2897,6 +3083,11 @@ namespace BizHawkNetplay.Tool
             _fpsClock.Restart();
             _fpsCount = 0;
             _actualFps = -1;
+            // Same reason for the pacing window: ticks that elapsed while frozen aren't frame ticks,
+            // and counting them would show a stall rate the running session never had.
+            _pacing.Reset();
+            _lastPacing = default;
+            _stallHintSinceMs = double.NegativeInfinity;
         }
 
         private SessionGeneration CurrentGeneration

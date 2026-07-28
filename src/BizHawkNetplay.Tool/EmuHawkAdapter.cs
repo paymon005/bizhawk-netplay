@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -7,6 +8,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using BizHawk.Client.Common;
+using BizHawk.Common;
 using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Input;
@@ -29,6 +31,11 @@ namespace BizHawkNetplay.Tool
         private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
         private readonly AnalogBind?[][] _analogBinds; // [port][axisIndex] -> host analog binding (null if unbound)
         private readonly bool[][] _axisReversed;      // [port][axisIndex] -> core axis IsReversed flag
+
+        // Raw main-memory access for the periodic desync checksum, resolved lazily (see HashMainMemory).
+        private IMemoryDomains? _memoryDomains;
+        private bool _memoryDomainsResolved;
+        private byte[] _hashScratch = Array.Empty<byte>();
 
         // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame / PumpAudio).
         private BizHawk.Client.EmuHawk.Sound? _sound;
@@ -678,15 +685,108 @@ namespace BizHawkNetplay.Tool
 
         // --- Integrity ----------------------------------------------------------------
 
+        /// <summary>
+        /// 32-bit checksum over main memory for periodic desync detection.
+        ///
+        /// The obvious implementation — <c>IMemoryApi.HashRegion</c> — runs SHA over the whole domain,
+        /// which on N64's 8MiB of RDRAM measured at ~38ms. That landed as a visible hitch every
+        /// <c>ChecksumInterval</c> frames (every ~5 seconds), on the UI thread, in the middle of play.
+        /// Nothing here needs a cryptographic digest: this only ever gets compared against the same
+        /// number computed by a peer, so a bulk copy plus a word-wise FNV-1a does the same job for a
+        /// fraction of the cost. The peer comparison is why the exact function is part of the wire
+        /// contract — changing it requires a Protocol bump so mismatched builds refuse rather than
+        /// reporting a phantom desync.
+        ///
+        /// Falls back to the portable API path if the domain service isn't reachable.
+        /// </summary>
         public uint HashMainMemory()
         {
+            var domain = MainMemoryDomain();
+            if (domain != null)
+            {
+                try
+                {
+                    long size = domain.Size;
+                    if (size > 0 && size <= int.MaxValue)
+                    {
+                        int length = (int)size;
+                        // BulkPeekByte wants an exactly-sized destination, and the domain never
+                        // changes size mid-session, so this allocates once per session.
+                        if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                        var timer = Stopwatch.StartNew();
+                        // Waterbox-backed domains (GPGX and friends) only expose their memory while
+                        // activated; Enter/Exit is a no-op for the plain native cores.
+                        domain.Enter();
+                        try { domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch); }
+                        finally { domain.Exit(); }
+                        double copyMs = timer.Elapsed.TotalMilliseconds;
+                        uint result = Fnv1a64(_hashScratch, length);
+                        // Split the cost the first time: BulkPeekByte is only a memcpy for domains
+                        // backed by a raw pointer — a delegate-backed domain falls back to a per-byte
+                        // loop, which would be slower than the SHA path this replaced. Recording both
+                        // halves is what tells the two apart instead of guessing from the total.
+                        if (HashDiagnostic == null)
+                            HashDiagnostic = $"checksum: bulk domain '{domain.Name}' {length / 1024}KiB — " +
+                                $"copy {copyMs:F1}ms + fnv {timer.Elapsed.TotalMilliseconds - copyMs:F1}ms";
+                        return result;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Any surprise from the domain service — fall through to the portable path rather
+                    // than losing desync detection entirely.
+                    _memoryDomains = null;
+                    HashDiagnostic = "checksum: bulk domain path failed (" + ex.GetType().Name +
+                        ": " + ex.Message + "), using the SHA fallback";
+                }
+            }
+
+            var shaTimer = Stopwatch.StartNew();
             var name = _apis.Memory.MainMemoryName;
-            var size = _apis.Memory.GetMemoryDomainSize(name);
-            var hex = _apis.Memory.HashRegion(0, (int)size, name);
+            var domainSize = _apis.Memory.GetMemoryDomainSize(name);
+            var hex = _apis.Memory.HashRegion(0, (int)domainSize, name);
             // Fold the leading bytes of the SHA hex string into a cheap 32-bit rolling checksum.
             uint h = 2166136261;
             foreach (var c in hex) { h ^= c; h *= 16777619; }
+            if (HashDiagnostic == null || HashDiagnostic.StartsWith("checksum: bulk domain path failed"))
+                HashDiagnostic = (HashDiagnostic ?? "checksum: no memory-domain service") +
+                    $" — SHA over '{name}' {domainSize / 1024}KiB took {shaTimer.Elapsed.TotalMilliseconds:F1}ms";
             return h;
+        }
+
+        /// <summary>Which checksum path ran and what it cost, filled in on the first hash of a session.
+        /// Null until then. Logged once so a regression here can't hide as a generic slow tick.</summary>
+        public string? HashDiagnostic { get; private set; }
+
+        /// <summary>Main memory as a raw domain, resolved once. Null if the service isn't offered.</summary>
+        private MemoryDomain? MainMemoryDomain()
+        {
+            if (!_memoryDomainsResolved)
+            {
+                _memoryDomainsResolved = true;
+                try { _memoryDomains = _emulator.ServiceProvider.GetService<IMemoryDomains>(); }
+                catch { _memoryDomains = null; }
+            }
+            try { return _memoryDomains?.MainMemory; }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// FNV-1a folded to 32 bits, consuming eight bytes per step. Both peers run the same arithmetic
+        /// on the same bytes, so the result is identical wherever it's computed — that, not collision
+        /// resistance, is the property desync detection needs.
+        /// </summary>
+        private static uint Fnv1a64(byte[] data, int length)
+        {
+            const ulong prime = 1099511628211UL;
+            ulong h = 14695981039346656037UL;
+            int i = 0;
+            for (int limit = length - 7; i < limit; i += 8)
+                h = (h ^ BitConverter.ToUInt64(data, i)) * prime;
+            for (; i < length; i++)
+                h = (h ^ data[i]) * prime;
+            // Fold the high half down so a divergence up there can't vanish in the truncation.
+            return (uint)(h ^ (h >> 32));
         }
 
         // --- Layout derivation --------------------------------------------------------

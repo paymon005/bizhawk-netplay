@@ -122,7 +122,16 @@ Settings worth knowing on the Connection tab:
 **Analog** sticks are networked (not just digital buttons), so N64/analog-pad games play with full stick control. During a session the status bar shows the emulation speed you're actually sustaining
 (e.g. `55/60 fps (92%)`) and flags **CPU-bound** in orange when your machine can't run the core fast enough — the true cause of "lag" on a heavy core, distinct from any netcode issue.
 
-On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason otherwise), transfers the host's savestate so both sims start identical, then runs. It trades memory-hash checksums every 60 frames and, on a mismatch, resyncs everyone from the host's authoritative state (saving the diverged state to quick-slot 10 for inspection) rather than ending.
+Two more numbers appear when they matter, because "choppy" has more than one cause and they need different fixes:
+
+- **`stall N%`** — the share of the time spent waiting on remote input. High means the network: either input delay isn't covering the link's worst moments, or the *other* machine can't hold full speed and you're waiting for it (check whether their fps reads CPU-bound — only faster core settings fix that one). The bar turns orange past 25%.
+- **`present N`** — frames actually drawn, shown only when it falls behind frames emulated. A gap means the catch-up path is skipping pictures to stay on schedule.
+
+So: high `stall%` is a network or peer-speed problem, low `stall%` with fps under target is your own CPU or frame pacing. Tick **Verbose log** on the Diagnostics tab for the full per-second breakdown — mean/p95/max core cost, gate, present, `rebases` (how often the scheduler gave up on accumulated debt and discarded frames outright), and **`tick N/s`**.
+
+That last one is a ceiling on everything else: a frame is presented at most once per timer callback, so if the tick rate falls below the console's frame rate the picture judders however fast the core runs. It should sit comfortably above 60.
+
+On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason otherwise), transfers the host's savestate so both sims start identical, then runs. It trades memory-hash checksums every 300 frames (~5s) and, on a mismatch, resyncs everyone from the host's authoritative state (saving the diverged state to quick-slot 10 for inspection) rather than ending.
 
 **Frame-driving model:** the tool pauses EmuHawk and steps the core exactly one confirmed frame per timer tick with only the merged network inputs — it *owns the clock* rather than fighting EmuHawk's own loop (which pausing would silence). This is what makes lockstep stalls safe, and it keeps input capture entirely out of the emulation path so both peers stay deterministic. Under load it renders only the last frame of a catch-up burst (Dolphin-style frame-skip) to keep heavy cores responsive.
 
@@ -136,7 +145,9 @@ N64 works (connects, plays, stays in sync, analog moves), but BizHawk's N64 core
 - Both machines must use **identical** N64 settings (they're sync settings — a mismatch desyncs).
 - N64 reports non-deterministic, so tick the **experimental override** on the Diagnostics tab on *both* ends. In practice it stays in sync; desync detection guards you.
 
-Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster settings or a second machine, not netcode).
+Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster settings or a second machine, not netcode). Check `stall%` before blaming the core, though — on a heavy console the two look identical from the picture, and only one of them is fixed by video-plugin settings.
+
+Also worth knowing: turning on **Verbose log** and reading the per-second `pacing:` line tells you whether the core is genuinely missing budget (`core mean` at or above the frame period) or whether the schedule discarded frames it could have run (`rebases` above zero).
 
 See [Known limitations](#known-limitations) for the honest gaps (NAT scope, checksum scope, etc.).
 
@@ -145,7 +156,8 @@ See [Known limitations](#known-limitations) for the honest gaps (NAT scope, chec
 The M0 probe lives inside the netplay tool as the **Capability Probe** button (EmuHawk requires exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving and restoring your position so it doesn't disturb play.
 
 # To Do
-- **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip and audio-under-load smoothing are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the real levers are core/plugin settings and a capable CPU.
+- **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
+- **Rollback on heavy cores:** N64 is still forced to lockstep. Making rollback affordable there means not taking a savestate on frames whose inputs are already confirmed (most of them, on a healthy link) and bounding repair by wall clock rather than a frame count. Even then a repaired N64 frame costs `load + frame` ≈ 24ms, so rollback would be free while the link is healthy and hitch on every misprediction — a real trade, not a free win.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 
 ## Known limitations
