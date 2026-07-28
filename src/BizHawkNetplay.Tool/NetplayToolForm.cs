@@ -2075,6 +2075,13 @@ namespace BizHawkNetplay.Tool
             int packetsDrained = 0;
             int frameForTelemetry = _driver.CurrentFrame;
             _lastHashMs = 0;
+            // Snapshot the repair counters so a slow tick can report what this tick actually did rather
+            // than a session total. "rollback/gate" covers both repair and the savestate work around it,
+            // and those need opposite fixes — a 190ms gate that turns out to have run no repair at all
+            // is a different bug from one that resimulated forty frames.
+            var tickRollback = _driver.Strategy as RollbackStrategy;
+            int repairsBefore = tickRollback?.RollbackCount ?? 0;
+            long resimBefore = tickRollback?.FramesResimulated ?? 0;
             try
             {
                 // Keep the audio device fed every tick, independent of how many frames we step this
@@ -2292,9 +2299,19 @@ namespace BizHawkNetplay.Tool
                     && clockMs - _lastSlowTickLogMs >= 1000)
                 {
                     _lastSlowTickLogMs = clockMs;
+                    string repairStr = "";
+                    if (tickRollback != null && gateMs >= 1.0)
+                    {
+                        int repairs = tickRollback.RollbackCount - repairsBefore;
+                        long resim = tickRollback.FramesResimulated - resimBefore;
+                        repairStr = repairs == 0
+                            ? ", no repair ran"
+                            : $", {repairs} repair(s) (last d{tickRollback.LastRollbackDepth}, " +
+                              $"{resim} frame(s) resimulated)";
+                    }
                     Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
                         $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
-                        $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}");
+                        $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}{repairStr}");
                 }
                 _frameTickRunning = false;
                 // No Start() here on purpose: the timer never stopped, and re-arming it would restore
