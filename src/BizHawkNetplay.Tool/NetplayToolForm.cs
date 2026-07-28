@@ -55,6 +55,10 @@ namespace BizHawkNetplay.Tool
         /// so once, since the user chose a mode whose whole point is hiding latency.</summary>
         private const int ShallowRollbackDepth = 4;
 
+        /// <summary>Shallowest ring worth building. Below this rollback predicts nothing useful, but a
+        /// ring of 1 would leave no room for the correction that is already in flight.</summary>
+        private const int MinRollbackRing = 2;
+
         // Window size at 96 DPI, in client pixels. The Connection tab is the widest: its connection log
         // spans x=12..556 inside an 8px page padding, so anything under ~572 clips it horizontally. The
         // old minimum was 520 — narrower than the content it was meant to protect — which let the window
@@ -1784,9 +1788,20 @@ namespace BizHawkNetplay.Tool
             {
                 // Ring depth = this peer's probe depth, clamped so resim cost + memory stay bounded.
                 // Each peer bounds its own ring independently; correctness never needs them equal.
-                int d = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
-                _rollbackDepth = Math.Max(ProbeResult.RollbackDepthThreshold, Math.Min(d, RollbackDepthCap));
-                if (_rollbackDepth <= ShallowRollbackDepth)
+                // Floored at MinRollbackRing, NOT at the qualifying threshold. Flooring at the threshold
+                // meant a core the probe measured at 2 silently ran a ring of 3 — booking repair work
+                // the machine had just been told it could not afford, and then reporting the inflated
+                // number back to the user as if it had been measured.
+                int measured = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
+                _rollbackDepth = Math.Max(MinRollbackRing, Math.Min(measured, RollbackDepthCap));
+                if (_probeDepth >= 0 && _probeDepth < ProbeResult.RollbackDepthThreshold)
+                    ConnLog($"rollback is overriding this machine's own measurement: the probe found a " +
+                        $"usable depth of {_probeDepth}, below the {ProbeResult.RollbackDepthThreshold} it " +
+                        "considers worthwhile, so every correction will cost more than a frame and the " +
+                        "picture will stutter whenever the link makes it predict. Netcode is on forced " +
+                        "Rollback — switch it to Automatic to let the probe decide, or Lockstep to stop " +
+                        "predicting entirely.", Color.Firebrick);
+                else if (_rollbackDepth <= ShallowRollbackDepth)
                     ConnLog($"rollback on a heavy core: this machine measured a usable depth of " +
                         $"{_rollbackDepth} frames, so it can hide about {_rollbackDepth} frames of one-way " +
                         "latency and no more — good for a nearby opponent, not a distant one. Corrections " +
