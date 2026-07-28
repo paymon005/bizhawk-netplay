@@ -55,6 +55,15 @@ namespace BizHawkNetplay.Tool
         /// so once, since the user chose a mode whose whole point is hiding latency.</summary>
         private const int ShallowRollbackDepth = 4;
 
+        // Window size at 96 DPI, in client pixels. The Connection tab is the widest: its connection log
+        // spans x=12..556 inside an 8px page padding, so anything under ~572 clips it horizontally. The
+        // old minimum was 520 — narrower than the content it was meant to protect — which let the window
+        // be dragged (or restored by BizHawk at a remembered size) into clipping the boxes on the right.
+        private const int DesignClientWidth = 600;
+        private const int DesignClientHeight = 620;
+        private const int MinClientWidth = 580;
+        private const int MinClientHeight = 560;
+
         public ApiContainer? _apiContainer { get; set; }
         private ApiContainer APIs => _apiContainer!;
 
@@ -81,7 +90,6 @@ namespace BizHawkNetplay.Tool
         private CheckBox _forceDesyncCheck = null!;
         private ComboBox _netcodeCombo = null!;
         private ComboBox _inputSourceCombo = null!;
-        private CheckBox _allowNonDetCheck = null!;
         private Label _netcodeLabel = null!;
         private RichTextBox _connLog = null!;
         private CheckBox _simUnresponsiveCheck = null!;
@@ -379,8 +387,18 @@ namespace BizHawkNetplay.Tool
         public NetplayToolForm()
         {
             SuspendLayout();
-            ClientSize = new Size(580, 600);
-            MinimumSize = new Size(520, 600); // the Connection tab's content ends at y=526 — don't clip the punch group
+            // Every control on every tab is positioned in hardcoded pixels, laid out against a 96-DPI
+            // screen. Without an auto-scale mode WinForms leaves those coordinates alone while the OS
+            // hands the process a larger font, so at 125% and up the labels grow into their neighbours
+            // and the right-hand controls run off the edge — text and boxes visibly clipped.
+            //
+            // Dpi mode rather than Font mode on purpose: it scales purely by the DPI ratio, so at 100%
+            // the factor is exactly 1 and the layout is untouched. Font mode would need the design-time
+            // font metrics declared correctly, and getting that guess wrong would shift the layout for
+            // everyone currently seeing it render fine.
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            ClientSize = new Size(DesignClientWidth, DesignClientHeight);
 
             var tabs = new TabControl { Dock = DockStyle.Fill };
             tabs.TabPages.Add(BuildConnectionTab());
@@ -413,6 +431,29 @@ namespace BizHawkNetplay.Tool
         /// disconnected or rearranged leaves the window stranded offscreen. If little of it is on any
         /// screen, re-center on the primary display; an already-visible position is left untouched.
         /// </summary>
+        /// <summary>
+        /// Apply the window's minimum size once the real DPI is known.
+        ///
+        /// <see cref="Form.MinimumSize"/> is one of the few properties WinForms deliberately does NOT
+        /// auto-scale, so setting it in the constructor would pin a 96-DPI number onto a 144-DPI window
+        /// and let it be dragged down to two-thirds of the size its content needs. The handle is the
+        /// first point <see cref="Control.DeviceDpi"/> is meaningful, and it accounts for the border and
+        /// title bar so the figures above can stay in client pixels like every other coordinate here.
+        /// </summary>
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            float scale = DeviceDpi / 96f;
+            if (scale <= 0) scale = 1f;
+            // Border + title bar, already in device pixels. Guarded because a minimum that came out
+            // under the content would reintroduce exactly the clipping this exists to prevent.
+            int chromeW = Math.Max(0, Size.Width - ClientSize.Width);
+            int chromeH = Math.Max(0, Size.Height - ClientSize.Height);
+            MinimumSize = new Size(
+                (int)Math.Ceiling(MinClientWidth * scale) + chromeW,
+                (int)Math.Ceiling(MinClientHeight * scale) + chromeH);
+        }
+
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             // Closing the tool is also a Disconnect, including the pre-session lobby/state-transfer
@@ -768,22 +809,10 @@ namespace BizHawkNetplay.Tool
                         : "resumed responding to pings");
             };
 
-            _allowNonDetCheck = new CheckBox
-            {
-                Text = "Allow non-deterministic core (experimental — may desync)",
-                AutoSize = true, Location = new Point(12, 192), Checked = true,
-            };
-
-            var nonDetHint = new Label
-            {
-                Text = "For cores that report non-deterministic but often sync anyway (e.g. N64 with no movie).\nBoth players must enable it. Desync detection still guards you.",
-                AutoSize = true, Location = new Point(30, 214), ForeColor = Color.DimGray,
-            };
-
             page.Controls.AddRange(new Control[]
             {
                 _probeButton, _testInputButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
-                simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _allowNonDetCheck, nonDetHint,
+                simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
             });
             return page;
         }
@@ -963,8 +992,8 @@ namespace BizHawkNetplay.Tool
                 // forces it; Lockstep forces lockstep. We "want" rollback unless Lockstep is chosen, and
                 // probe accordingly. The host's choice is authoritative for the session's mode.
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
-                bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
-                var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
+                var prefs = LocalPreferences(_hostRadio.Checked);
+                bool wantRollback = prefs.WantRollback;
                 var id = BuildIdentity(_adapter, wantRollback);
                 int port = (int)_portBox.Value;
                 bool autoDelay = _hostRadio.Checked && _autoDelayCheck.Checked;
@@ -1060,9 +1089,8 @@ namespace BizHawkNetplay.Tool
                 APIs.EmuClient.Pause(); // freeze now so the resume frame is fixed before the state arrives
 
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
-                bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
-                _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
-                _punchId = BuildIdentity(_adapter, wantRollback);
+                _punchPrefs = LocalPreferences(isHost: false); // punching is always the joining side
+                _punchId = BuildIdentity(_adapter, _punchPrefs.WantRollback);
                 _simLatencyMs = (int)_simLatencyBox.Value;
 
                 StartPunchJoin(new IPEndPoint(hostIp, hostPort));
@@ -3956,17 +3984,13 @@ namespace BizHawkNetplay.Tool
             // so the negotiator (which needs both peers to opt in) settles on lockstep for free.
             int depth = wantRollback ? MeasureRollbackDepth(a) : 0;
 
-            // Determinism gate: normally the core's own report. The experimental override lets a peer
-            // assert a core that reports non-deterministic (often just "not requested", e.g. N64 with no
-            // movie) is fine to net-play. Both peers must opt in — the negotiator checks both flags — and
-            // desync detection still catches a genuine divergence.
-            bool deterministic = a.VerifyDeterministicMode();
-            if (!deterministic && _allowNonDetCheck.Checked)
-            {
-                deterministic = true;
-                Log("WARNING: overriding the non-deterministic core check (experimental) — both players must " +
-                    "enable this, and a truly non-deterministic core will desync and give up.");
-            }
+            // Determinism: a core reporting non-deterministic usually means "determinism was not
+            // requested" rather than "this will diverge" — N64 with no movie loaded says it and syncs
+            // fine in practice. That report is therefore not treated as a refusal; the session runs and
+            // the periodic checksum catches a genuine divergence, which is the check that actually
+            // proves anything. Formerly a Diagnostics opt-in that defaulted to on, so this is the same
+            // behaviour with one less box to tick.
+            const bool deterministic = true;
             return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
                 a.SyncSettingsDigest, layouts, deterministic, maxRollbackDepth: depth);
         }
@@ -4136,9 +4160,35 @@ namespace BizHawkNetplay.Tool
             _playersBox.Enabled = host; // only the host chooses the player count
             _autoDelayCheck.Enabled = host;
             _autoDelayMaxBox.Enabled = host && _autoDelayCheck.Checked;
+            // The host settles netcode and delay for the whole session, and UPnP forwards the host's
+            // own port. Greyed out rather than hidden so a joiner can still read what they mean —
+            // and see the value they'll be joining under is not theirs to set. LocalPreferences is
+            // what makes that true rather than merely implied.
+            _netcodeCombo.Enabled = host;
+            _delayBox.Enabled = host;
+            _upnpCheck.Enabled = host;
             _goButton.Text = host ? "Start Hosting" : "Join";
             UpdatePunchUiForRole();
         }
+
+        /// <summary>
+        /// What this peer asks the session for.
+        ///
+        /// A host asks for what its own controls say. A joiner asks for nothing it could impose:
+        /// rollback is opted into unconditionally so a stale local dropdown cannot veto the host's
+        /// choice, and the delay ask is the floor so a stale local number cannot raise the session's
+        /// — the negotiator honours the LARGEST ask, so anything else would let a disabled control go
+        /// on quietly deciding things.
+        ///
+        /// What a joiner still decides is nothing to do with preference: the rollback depth it
+        /// advertises is measured on its own machine, and the host refuses rollback outright if any
+        /// joiner's is too shallow. Capability is not up for negotiation; taste is the host's.
+        /// </summary>
+        private SessionPreferences LocalPreferences(bool isHost) =>
+            isHost
+                ? new SessionPreferences((int)_delayBox.Value,
+                    _netcodeChoice != NetcodeChoice.Lockstep, _passwordBox.Text)
+                : new SessionPreferences(1, true, _passwordBox.Text);
 
         private void SetBusy(bool busy)
         {
