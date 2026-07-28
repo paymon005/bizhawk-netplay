@@ -3967,9 +3967,7 @@ namespace BizHawkNetplay.Tool
                 // MemorySaveState is nullable on the container but guaranteed by the _statable gate above.
                 restore = APIs.MemorySaveState!.SaveCoreStateToMemory();
                 double budget = FrameMs();
-                var probe = new CapabilityProbe(adapter, new StopwatchClock(), samples: 100);
-                var result = probe.Run(budget, budget * 0.25);
-                Log(result.ToString());
+                Log(RunCapabilityProbe(adapter).ToString());
             }
             catch (Exception ex) { Log("probe failed: " + ex.Message); }
             finally
@@ -4054,6 +4052,24 @@ namespace BizHawkNetplay.Tool
             catch { return 12; }
         }
 
+        /// <summary>
+        /// Run the probe against the model the SESSION actually uses.
+        ///
+        /// Both the Diagnostics button and the pre-session measurement come through here, because they
+        /// drifted apart once and it mattered: the button still asked for the original cost model, so
+        /// it reported a heavy core as steady 11.5ms / maxDepth 0 while a session — eliding snapshots
+        /// on confirmed frames and allowing a repair two frame periods — computed steady 5.5ms and a
+        /// workable depth for the very same machine. A diagnostic that answers a question nothing asks
+        /// is worse than no diagnostic.
+        /// </summary>
+        private ProbeResult RunCapabilityProbe(EmuHawkAdapter a)
+        {
+            double budget = FrameMs();
+            return new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
+                .Run(budget, budget * 0.25,
+                    elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
+        }
+
         private int MeasureRollbackDepth(EmuHawkAdapter a)
         {
             if (_probeDepth >= 0) return _probeDepth;
@@ -4066,9 +4082,7 @@ namespace BizHawkNetplay.Tool
                 // Probe the model the session will actually run: snapshots elided on confirmed frames,
                 // and a repair allowed more than one frame period. Measuring the old model and then
                 // running a different one is how you get a depth that has nothing to do with the cost.
-                var result = new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
-                    .Run(budget, budget * 0.25,
-                        elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
+                var result = RunCapabilityProbe(a);
                 _replayDeterministic = result.ReplayDeterministic;
                 // A core that does not reproduce from a savestate has no usable depth at all: the work
                 // the depth budgets FOR is replaying. Reporting 0 keeps every peer's negotiation honest
