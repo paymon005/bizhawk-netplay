@@ -440,7 +440,10 @@ foreach ($spec in $Config) {
         Write-Host ''
         [void] $transcript.AppendLine("--- $plugin ${w}x${h} run $run ---").AppendLine($out).AppendLine()
 
-        $row = [ordered] @{ Plugin = $plugin; Res = "${w}x${h}"; Run = $run }
+        # One "Config" column rather than plugin+resolution+live+verdict: the host console is
+        # about 80 wide and Format-Table drops the right-hand columns rather than wrapping, which
+        # silently hid the repair-derived figures this whole script exists to collect.
+        $row = [ordered] @{ Config = "$plugin ${w}x${h}"; Run = $run }
         if ($out -match 'save=([\d.]+)ms load=([\d.]+)ms frame=([\d.]+)ms live=([\d.]+)ms') {
             $row.Save = [double] $Matches[1]; $row.Load = [double] $Matches[2]
             $row.Frame = [double] $Matches[3]; $row.Live = [double] $Matches[4]
