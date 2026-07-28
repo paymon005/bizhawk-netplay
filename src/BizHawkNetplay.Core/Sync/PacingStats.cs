@@ -12,8 +12,10 @@ namespace BizHawkNetplay.Core.Sync
         public PacingSummary(int ticks, int frames, int presents, int stalledTicks, int timeSyncTicks,
             int rebases, double ticksPerSecond, double advancedFps, double presentedFps,
             double coreMeanMs, double coreP95Ms, double coreMaxMs, double gateMeanMs, double gateP95Ms,
-            double presentMeanMs, double tickGapMeanMs, double tickGapMinMs, double tickGapMaxMs)
+            double presentMeanMs, double tickGapMeanMs, double tickGapMinMs, double tickGapMaxMs,
+            int renderedFrames = 0)
         {
+            RenderedFrames = renderedFrames;
             CoreMaxMs = coreMaxMs;
             TicksPerSecond = ticksPerSecond;
             TickGapMeanMs = tickGapMeanMs;
@@ -64,6 +66,30 @@ namespace BizHawkNetplay.Core.Sync
         /// whenever the catch-up path renders only the last frame of a burst.</summary>
         public double PresentedFps { get; }
 
+        /// <summary>Frames the core was asked to draw a picture for. Compare with
+        /// <see cref="Presents"/>: the difference is work paid for and thrown away.</summary>
+        public int RenderedFrames { get; }
+
+        /// <summary>
+        /// Pictures rendered but never shown. A frame is presented at most once per tick, so every
+        /// frame beyond the first in a tick costs a full render that nothing ever displays — unless
+        /// the catch-up path saw it coming and asked the core to skip drawing. On a light core that
+        /// skip always fires and this stays at zero; on a heavy one, where the render is the expensive
+        /// part, this is how much of it is being burned for nothing.
+        /// </summary>
+        public int UndrawnRenders => RenderedFrames > Presents ? RenderedFrames - Presents : 0;
+
+        /// <summary>
+        /// Share of emulated frames that reached the screen, 0..1.
+        ///
+        /// This is the one reading that separates "the session is slow" from "the session is fine and
+        /// the picture is coarse". Everything else — fps, CPU-bound, stall rate — is computed from
+        /// frames advanced, which stay at the console's rate precisely because the pacing code is doing
+        /// its job. A session can therefore read 60/60 fps at 100% while the window updates half that
+        /// often, and from the chair that looks like dropped inputs rather than a display problem.
+        /// </summary>
+        public double PresentedShare => AdvancedFps <= 0 ? 1 : Math.Min(1, PresentedFps / AdvancedFps);
+
         public double CoreMeanMs { get; }
         public double CoreP95Ms { get; }
 
@@ -112,6 +138,7 @@ namespace BizHawkNetplay.Core.Sync
         private double _gateSum;
         private double _presentSum;
         private int _frames;
+        private int _renderedFrames;
         private int _presents;
         private int _ticks;
         private int _stalledTicks;
@@ -122,10 +149,15 @@ namespace BizHawkNetplay.Core.Sync
         private double _intervalMax;
         private double _intervalMin = double.MaxValue;
 
-        /// <summary>One frame stepped through the core, with the wall-clock cost of that step.</summary>
-        public void AddFrame(double coreMs)
+        /// <summary>
+        /// One frame stepped through the core, with the wall-clock cost of that step.
+        /// <paramref name="rendered"/> is whether the core was asked to draw a picture for it — false
+        /// only for a frame the catch-up path already knew would be superseded before the next present.
+        /// </summary>
+        public void AddFrame(double coreMs, bool rendered = true)
         {
             _frames++;
+            if (rendered) _renderedFrames++;
             _coreSum += coreMs;
             if (coreMs > _coreMax) _coreMax = coreMs;
             _coreSamples[_coreWrites++ & (SampleCapacity - 1)] = coreMs;
@@ -196,7 +228,8 @@ namespace BizHawkNetplay.Core.Sync
                 presentMeanMs: Mean(_presentSum, _presents),
                 tickGapMeanMs: Mean(_intervalSum, _intervalCount),
                 tickGapMinMs: _intervalCount == 0 ? 0 : _intervalMin,
-                tickGapMaxMs: _intervalMax);
+                tickGapMaxMs: _intervalMax,
+                renderedFrames: _renderedFrames);
         }
 
         public void Reset()
@@ -208,6 +241,7 @@ namespace BizHawkNetplay.Core.Sync
             _gateSum = 0;
             _presentSum = 0;
             _frames = 0;
+            _renderedFrames = 0;
             _presents = 0;
             _ticks = 0;
             _stalledTicks = 0;

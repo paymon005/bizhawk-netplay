@@ -81,6 +81,71 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void PresentedShareSeparatesACoarsePictureFromASlowSession()
+        {
+            // Both windows from the same N64 game on the same machine. The only reading that tells them
+            // apart is this one: frames advanced is 60 in both, so fps, CPU-bound and the stall rate all
+            // say the session is healthy, and only the presented share notices that at max resolution
+            // the window is updating barely half as often as the core is emulating.
+            var coarse = new PacingStats();
+            for (int i = 0; i < 60; i++) coarse.AddFrame(13.7);
+            for (int i = 0; i < 32; i++) coarse.AddPresent(2.2);
+
+            var fine = new PacingStats();
+            for (int i = 0; i < 60; i++) fine.AddFrame(4.7);
+            for (int i = 0; i < 56; i++) fine.AddPresent(0.9);
+
+            var a = coarse.Summarize(1000);
+            var b = fine.Summarize(1000);
+
+            Assert.Equal(a.AdvancedFps, b.AdvancedFps, 3);
+            Assert.True(a.PresentedShare < 0.6, $"coarse window read {a.PresentedShare:F2}");
+            Assert.True(b.PresentedShare > 0.9, $"fine window read {b.PresentedShare:F2}");
+        }
+
+        [Fact]
+        public void PresentedShareIsOneWhenNothingWasEmulated()
+        {
+            // A window that stalled end to end presents nothing and advances nothing. That is a link
+            // problem the stall rate already reports; it must not also read as a display problem.
+            var stats = new PacingStats();
+            for (int i = 0; i < 30; i++) stats.AddTick(stalled: true, timeSyncYield: false);
+
+            Assert.Equal(1, stats.Summarize(1000).PresentedShare, 6);
+        }
+
+        [Fact]
+        public void UndrawnRendersCountsThePicturesPaidForAndThrownAway()
+        {
+            var stats = new PacingStats();
+            // Ten ticks of two frames each. The catch-up path saw the second frame coming on four of
+            // them and skipped drawing the first; on the other six it did not, so those six pictures
+            // were rendered in full and then immediately superseded by the tick's single present.
+            for (int i = 0; i < 10; i++)
+            {
+                stats.AddTick(false, false);
+                stats.AddFrame(13.7, rendered: i >= 4);
+                stats.AddFrame(13.7);
+                stats.AddPresent(2.2);
+            }
+
+            var summary = stats.Summarize(1000);
+            Assert.Equal(20, summary.Frames);
+            Assert.Equal(16, summary.RenderedFrames);
+            Assert.Equal(10, summary.Presents);
+            Assert.Equal(6, summary.UndrawnRenders);
+        }
+
+        [Fact]
+        public void UndrawnRendersIsZeroRatherThanNegativeWhenEveryRenderWasShown()
+        {
+            var stats = new PacingStats();
+            for (int i = 0; i < 10; i++) { stats.AddFrame(4, rendered: false); stats.AddPresent(1); }
+
+            Assert.Equal(0, stats.Summarize(1000).UndrawnRenders);
+        }
+
+        [Fact]
         public void TickGapsSeparateASteadyCadenceFromAJitteryOne()
         {
             var steady = new PacingStats();
@@ -212,6 +277,7 @@ namespace BizHawkNetplay.Core.Tests
 
             Assert.Equal(0, summary.Ticks);
             Assert.Equal(0, summary.Frames);
+            Assert.Equal(0, summary.RenderedFrames);
             Assert.Equal(0, summary.Presents);
             Assert.Equal(0, summary.Rebases);
             Assert.Equal(0, summary.CoreP95Ms);

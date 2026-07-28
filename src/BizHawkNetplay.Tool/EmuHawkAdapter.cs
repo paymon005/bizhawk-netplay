@@ -146,8 +146,8 @@ namespace BizHawkNetplay.Tool
         ///
         /// Reported rather than enforced: this reads whatever the loaded core happens to expose, and
         /// what counts as "too high" is a property of the game and plugin, not something worth guessing
-        /// at from here. Returns a bare summary like "800x600, plugin Rice" so callers can quote it in
-        /// their own wording. Null when the core has no such setting.
+        /// at from here. Returns a bare summary like "800x600, plugin Rice (InN64Resolution=False)" so
+        /// callers can quote it in their own wording. Null when the core has no such setting.
         /// </summary>
         public string? VideoSettingsDiagnostic()
         {
@@ -158,15 +158,43 @@ namespace BizHawkNetplay.Tool
                 var settings = settable?.GetMethod("GetSettings")?.Invoke(_emulator, null);
                 if (settings == null) return null;
 
-                var x = settings.GetType().GetProperty("VideoSizeX")?.GetValue(settings);
-                var y = settings.GetType().GetProperty("VideoSizeY")?.GetValue(settings);
+                var x = MemberValue(settings, "VideoSizeX");
+                var y = MemberValue(settings, "VideoSizeY");
                 if (x == null || y == null) return null;
 
                 var sync = settable!.GetMethod("GetSyncSettings")?.Invoke(_emulator, null);
-                var plugin = sync?.GetType().GetProperty("VideoPlugin")?.GetValue(sync);
-                return plugin != null ? $"{x}x{y}, plugin {plugin}" : $"{x}x{y}";
+                var plugin = sync == null ? null : MemberValue(sync, "VideoPlugin");
+                if (plugin == null) return $"{x}x{y}";
+
+                // Whether the plugin renders at the console's own resolution is the setting that decides
+                // whether those framebuffer bytes came off the GPU at all, so it belongs next to the size.
+                // It lives on the selected plugin's own settings object, which each plugin names for
+                // itself; the two that have one disagree even on what to call it. Absent for the rest.
+                var pluginSettings = MemberValue(sync!, plugin + "Plugin");
+                if (pluginSettings != null)
+                    foreach (var flag in new[] { "InN64Resolution", "UseNativeResolutionFactor" })
+                    {
+                        var value = MemberValue(pluginSettings, flag);
+                        if (value != null) return $"{x}x{y}, plugin {plugin} ({flag}={value})";
+                    }
+                return $"{x}x{y}, plugin {plugin}";
             }
             catch { return null; } // a settings read must never disturb starting a session
+        }
+
+        /// <summary>
+        /// Read a public instance member by name, whether it is a property or a field.
+        ///
+        /// BizHawk's settings objects mix the two freely — N64Settings exposes UseMupenStyleLag as a
+        /// property and VideoSizeX/VideoSizeY as bare fields — so a property-only lookup returns null
+        /// for exactly the values worth reporting, and does it silently.
+        /// </summary>
+        private static object? MemberValue(object target, string name)
+        {
+            var type = target.GetType();
+            var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+            if (property != null) return property.GetValue(target);
+            return type.GetField(name, BindingFlags.Public | BindingFlags.Instance)?.GetValue(target);
         }
 
         private string SyncSettingsBlob()

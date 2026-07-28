@@ -382,10 +382,16 @@ namespace BizHawkNetplay.Tool
         private double _lastPacingLogMs = double.NegativeInfinity;
         private double _stallHintSinceMs = double.NegativeInfinity;
         private bool _stallHintShown; // one-time "your link is stalling" hint per session
+        private double _presentHintSinceMs = double.NegativeInfinity;
+        private bool _presentHintShown; // one-time "the picture is coarser than the emulation" hint
         private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
         private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
         private const double StallHintPct = 15.0;      // stalled share of ticks worth complaining about
         private const double StallHintSustainMs = 5000; // ...but only once it persists, not on one burst
+        // Presented-vs-advanced share below which the picture is coarse enough to be worth naming. A
+        // healthy heavy-core session measured 0.87-0.97 and the max-resolution one 0.53-0.63, so this
+        // sits in the gap rather than at either edge of it.
+        private const double PresentShareHintFloor = 0.70;
 
         // Raise the OS timer resolution to 1ms for the session so the WinForms frame timer fires
         // regularly (it's otherwise bound to the ~15ms system tick and jitters), which keeps audio
@@ -1916,6 +1922,8 @@ namespace BizHawkNetplay.Tool
             _lastPacingLogMs = double.NegativeInfinity;
             _stallHintSinceMs = double.NegativeInfinity;
             _stallHintShown = false;
+            _presentHintSinceMs = double.NegativeInfinity;
+            _presentHintShown = false;
             _hashDiagLogged = false;
             _lastTickClockMs = -1;
             // A WinForms timer is WM_TIMER, and SetTimer silently raises anything below
@@ -2208,7 +2216,7 @@ namespace BizHawkNetplay.Tool
                         _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderVideo: !anotherFrameDue);
                         double frameCoreMs = phase.Elapsed.TotalMilliseconds;
                         coreMs += frameCoreMs;
-                        _pacing.AddFrame(frameCoreMs);
+                        _pacing.AddFrame(frameCoreMs, rendered: !anotherFrameDue);
                         _recentCoreFrameMs = _recentCoreFrameMs <= 0
                             ? frameCoreMs
                             : Math.Max(frameCoreMs, _recentCoreFrameMs * 0.9);
@@ -2339,6 +2347,7 @@ namespace BizHawkNetplay.Tool
             Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}{stallStr}{udpStr}",
                 _udpWarningActive || cpuBound || stallPct >= 25 ? Color.DarkOrange : Color.Green);
             MaybeHintStalling(nowMs);
+            MaybeHintPresentation(nowMs);
             LogPacingSummary(nowMs);
             RefreshPlayersList();
         }
@@ -2376,6 +2385,44 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
+        /// Say once when the core is keeping up but the picture isn't.
+        ///
+        /// A frame is presented once per timer callback, so when a callback emulates more than one frame
+        /// only the last of them is ever shown. On a light core that costs nothing — the whole burst
+        /// fits inside a single display refresh, so the skipped pictures were never going to be seen.
+        /// On a heavy core the frames of a burst are ten-plus milliseconds apart and every one of them
+        /// was a real, showable picture.
+        ///
+        /// Nothing else in the session reports this, and it isn't an oversight: fps, the CPU-bound
+        /// reading and the stall rate are all computed from frames advanced, which hold at the console's
+        /// rate exactly because the pacing code is succeeding. So the session reads 60/60 fps at 100%,
+        /// in sync, no stalls — while the window updates half that often and the game feels like it is
+        /// dropping inputs. Naming it is the whole point; there is no lever here but a cheaper frame.
+        /// </summary>
+        private void MaybeHintPresentation(double nowMs)
+        {
+            if (_presentHintShown || _lastPacing.Ticks == 0 || _lastPacing.AdvancedFps <= 0) return;
+            if (_lastPacing.PresentedShare >= PresentShareHintFloor)
+            {
+                _presentHintSinceMs = double.NegativeInfinity; // a single bad window isn't a problem
+                return;
+            }
+            if (double.IsNegativeInfinity(_presentHintSinceMs)) { _presentHintSinceMs = nowMs; return; }
+            if (nowMs - _presentHintSinceMs < StallHintSustainMs) return;
+
+            _presentHintShown = true;
+            var p = _lastPacing;
+            ConnLog($"emulating {p.AdvancedFps:F0} fps but only drawing the picture {p.PresentedFps:F0} " +
+                $"times a second. A frame is drawn once per timer callback, and callbacks are landing " +
+                $"{p.TickGapMeanMs:F0}ms apart against a {_frameMs:F0}ms frame period, so each one has to " +
+                "emulate more than one frame and only the last of them is shown. The session is at full " +
+                "speed and in sync — it is the display that is coarse, which feels like dropped inputs. " +
+                $"Core frames cost {p.CoreMeanMs:F1}ms each here; nothing but making them cheaper helps, " +
+                "so lower the render resolution or pick a lighter video plugin.",
+                Color.DarkOrange);
+        }
+
+        /// <summary>
         /// The full pacing breakdown, once a second under Verbose. The status bar has room for two
         /// numbers; this has the rest — notably <c>rebases</c>, which counts how many times the pacing
         /// clock gave up on accumulated debt and discarded frames outright. That is the difference
@@ -2393,7 +2440,7 @@ namespace BizHawkNetplay.Tool
                 $"max {p.TickGapMaxMs:F1}ms), " +
                 $"core mean {p.CoreMeanMs:F1} p95 {p.CoreP95Ms:F1} max {p.CoreMaxMs:F1}ms, " +
                 $"gate mean {p.GateMeanMs:F1} p95 {p.GateP95Ms:F1}ms, " +
-                $"present mean {p.PresentMeanMs:F1}ms, " +
+                $"present mean {p.PresentMeanMs:F1}ms, undrawn {p.UndrawnRenders}, " +
                 $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
                 $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");
         }
@@ -3223,6 +3270,7 @@ namespace BizHawkNetplay.Tool
             _pacing.Reset();
             _lastPacing = default;
             _stallHintSinceMs = double.NegativeInfinity;
+            _presentHintSinceMs = double.NegativeInfinity;
         }
 
         private SessionGeneration CurrentGeneration
