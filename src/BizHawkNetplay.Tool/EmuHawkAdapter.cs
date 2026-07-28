@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using BizHawk.Client.Common;
@@ -36,6 +37,8 @@ namespace BizHawkNetplay.Tool
         private IMemoryDomains? _memoryDomains;
         private bool _memoryDomainsResolved;
         private byte[] _hashScratch = Array.Empty<byte>();
+        private PropertyInfo? _domainDataProp;
+        private bool _domainDataResolved;
 
         // Audio: we drive EmuHawk's Sound output ourselves (see EnableAudio / AdvanceFrame / PumpAudio).
         private BizHawk.Client.EmuHawk.Sound? _sound;
@@ -692,14 +695,17 @@ namespace BizHawkNetplay.Tool
         /// which on N64's 8MiB of RDRAM measured at ~38ms. That landed as a visible hitch every
         /// <c>ChecksumInterval</c> frames (every ~5 seconds), on the UI thread, in the middle of play.
         /// Nothing here needs a cryptographic digest: this only ever gets compared against the same
-        /// number computed by a peer, so a bulk copy plus a word-wise FNV-1a does the same job for a
+        /// number computed by a peer, so an FNV-1a over the same bytes does the same job for a
         /// fraction of the cost. The peer comparison is why the exact function is part of the wire
         /// contract — changing it requires a Protocol bump so mismatched builds refuse rather than
         /// reporting a phantom desync.
         ///
-        /// Falls back to the portable API path if the domain service isn't reachable.
+        /// Two ways in, because domains differ in what they expose: a raw block gets memcpy'd, anything
+        /// else is read a word at a time (see HashByWord). They need not agree with each other — both
+        /// peers run the same core, so both take the same path. Falls back to the portable API path if
+        /// the domain service isn't reachable at all.
         /// </summary>
-        public uint HashMainMemory()
+        public uint HashMainMemory(int salt = 0)
         {
             var domain = MainMemoryDomain();
             if (domain != null)
@@ -710,24 +716,37 @@ namespace BizHawkNetplay.Tool
                     if (size > 0 && size <= int.MaxValue)
                     {
                         int length = (int)size;
-                        // BulkPeekByte wants an exactly-sized destination, and the domain never
-                        // changes size mid-session, so this allocates once per session.
-                        if (_hashScratch.Length != length) _hashScratch = new byte[length];
                         var timer = Stopwatch.StartNew();
+                        string how;
+                        uint result;
                         // Waterbox-backed domains (GPGX and friends) only expose their memory while
-                        // activated; Enter/Exit is a no-op for the plain native cores.
+                        // activated, and the Monitor variants guard it with a lock; Enter/Exit is a
+                        // no-op for the plain native cores.
                         domain.Enter();
-                        try { domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch); }
+                        try
+                        {
+                            var data = DomainDataPointer(domain);
+                            if (data != IntPtr.Zero)
+                            {
+                                // Pointer-backed domain: a straight memcpy, then hash the buffer. The
+                                // domain never changes size mid-session, so this allocates once.
+                                if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                                Marshal.Copy(data, _hashScratch, 0, length);
+                                result = Fnv1a64(_hashScratch, length);
+                                how = "ptr";
+                            }
+                            else
+                            {
+                                result = HashByWord(domain, size, salt, out int stride);
+                                how = stride > 1 ? $"word/{stride}" : "word";
+                            }
+                        }
                         finally { domain.Exit(); }
-                        double copyMs = timer.Elapsed.TotalMilliseconds;
-                        uint result = Fnv1a64(_hashScratch, length);
-                        // Split the cost the first time: BulkPeekByte is only a memcpy for domains
-                        // backed by a raw pointer — a delegate-backed domain falls back to a per-byte
-                        // loop, which would be slower than the SHA path this replaced. Recording both
-                        // halves is what tells the two apart instead of guessing from the total.
+                        // Report the cost the first time so a regression here is attributable rather
+                        // than showing up as an unexplained slow tick.
                         if (HashDiagnostic == null)
-                            HashDiagnostic = $"checksum: bulk domain '{domain.Name}' {length / 1024}KiB — " +
-                                $"copy {copyMs:F1}ms + fnv {timer.Elapsed.TotalMilliseconds - copyMs:F1}ms";
+                            HashDiagnostic = $"checksum: {how} domain '{domain.Name}' {length / 1024}KiB " +
+                                $"in {timer.Elapsed.TotalMilliseconds:F1}ms";
                         return result;
                     }
                 }
@@ -758,6 +777,35 @@ namespace BizHawkNetplay.Tool
         /// Null until then. Logged once so a regression here can't hide as a generic slow tick.</summary>
         public string? HashDiagnostic { get; private set; }
 
+        /// <summary>
+        /// The domain's backing block as a raw pointer, or Zero if it doesn't have one. Every
+        /// MemoryDomainIntPtr* variant exposes it as a public <c>Data</c> property; delegate- and
+        /// array-backed domains do not, and fall back to BulkPeekByte. Resolved by reflection once
+        /// because the concrete domain type lives in the emulation cores, which this project has no
+        /// compile-time reference to.
+        ///
+        /// Note the Swap16 variants hold their bytes in a different order than PeekByte reports. That
+        /// is fine here and only here: this value is never interpreted, only compared against the same
+        /// computation on a peer running the same build.
+        /// </summary>
+        private IntPtr DomainDataPointer(MemoryDomain domain)
+        {
+            if (!_domainDataResolved)
+            {
+                _domainDataResolved = true;
+                try
+                {
+                    var prop = domain.GetType().GetProperty("Data", BindingFlags.Public | BindingFlags.Instance);
+                    if (prop != null && prop.PropertyType == typeof(IntPtr) && prop.CanRead)
+                        _domainDataProp = prop;
+                }
+                catch { _domainDataProp = null; }
+            }
+            if (_domainDataProp == null) return IntPtr.Zero;
+            try { return (IntPtr)(_domainDataProp.GetValue(domain) ?? IntPtr.Zero); }
+            catch { return IntPtr.Zero; }
+        }
+
         /// <summary>Main memory as a raw domain, resolved once. Null if the service isn't offered.</summary>
         private MemoryDomain? MainMemoryDomain()
         {
@@ -769,6 +817,58 @@ namespace BizHawkNetplay.Tool
             }
             try { return _memoryDomains?.MainMemory; }
             catch { return null; }
+        }
+
+        /// <summary>
+        /// How many 32-bit words one checksum may read. N64's RDRAM measured ~13.5ns per word read, so
+        /// this budget is roughly 7ms — under half a frame, where reading all 2M words took 28ms.
+        /// Domains at or under this size (everything up to a 2MiB main RAM) are still read in full.
+        /// </summary>
+        private const int HashWordBudget = 512 * 1024;
+
+        /// <summary>
+        /// Hash a domain that has no raw backing block, reading a 32-bit word at a time.
+        ///
+        /// N64's RDRAM is a <c>MemoryDomainDelegate</c>: there is no pointer to copy, and every read —
+        /// byte or word — goes through a delegate. <c>BulkPeekByte</c> is one such call PER BYTE (8
+        /// million of them, 34ms for 8MiB); reading words measured 28ms, because PeekUint on this
+        /// domain is itself composed from byte reads. There is no fast path, so the only remaining
+        /// lever is reading less.
+        ///
+        /// Above <see cref="HashWordBudget"/> the domain is therefore sampled with a stride. To avoid
+        /// permanently ignoring the unsampled words, the starting offset rotates with the frame the
+        /// checksum describes: over <c>stride</c> consecutive checksums every word is covered. Both
+        /// peers derive the offset from the same frame number, so they always read the same slice.
+        ///
+        /// The trade this makes, stated plainly: a divergence spanning at least <c>stride</c> words is
+        /// still caught immediately, and anything narrower is caught within <c>stride</c> intervals
+        /// instead of at the next one. Emulation divergence spreads across memory within a few frames,
+        /// so in practice this costs detection latency rather than detection.
+        /// </summary>
+        private static uint HashByWord(MemoryDomain domain, long size, int salt, out int stride)
+        {
+            long words = size / 4;
+            stride = words <= HashWordBudget
+                ? 1
+                : (int)Math.Min(int.MaxValue, (words + HashWordBudget - 1) / HashWordBudget);
+            long offset = stride <= 1 ? 0 : (uint)salt % (uint)stride;
+
+            const ulong prime = 1099511628211UL;
+            ulong h = 14695981039346656037UL;
+            // Fold the sampling parameters in, so a value can never be compared as though it described
+            // a slice it didn't. A peer reading a different slice produces an obviously different hash
+            // rather than a plausible one.
+            h = (h ^ (((ulong)(uint)stride << 32) | (uint)offset)) * prime;
+
+            for (long w = offset; w < words; w += stride)
+                h = (h ^ domain.PeekUint(w * 4, false)) * prime;
+
+            // Trailing bytes past the last whole word, only when reading everything anyway.
+            if (stride == 1)
+                for (long a = words * 4; a < size; a++)
+                    h = (h ^ domain.PeekByte(a)) * prime;
+
+            return (uint)(h ^ (h >> 32));
         }
 
         /// <summary>

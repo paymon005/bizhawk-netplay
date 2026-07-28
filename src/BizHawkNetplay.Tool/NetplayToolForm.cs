@@ -28,10 +28,11 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        // v7 replaces the SHA-based main-memory checksum with a word-wise FNV-1a. The value is compared
-        // between peers, so a v6 build and a v7 build would report a phantom desync every interval —
+        // v10 hashes main memory with FNV-1a over 32-bit words — sampled with a rotating stride on
+        // domains too large to read whole — replacing the SHA over the entire domain. The value is
+        // compared between peers, so a build mismatch would report a phantom desync every interval —
         // the version bump turns that into a clean refusal at the handshake instead.
-        private const int Protocol = 7;
+        private const int Protocol = 10;
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
@@ -1910,6 +1911,24 @@ namespace BizHawkNetplay.Tool
         private double TickBudgetMs() => Math.Max(FrameTickWorkBudgetMs, 1.7 * _frameMs);
 
         /// <summary>
+        /// How early the FIRST frame of a tick may run.
+        ///
+        /// Callbacks do not arrive on a clean 16.7ms cadence — measured gaps run 3ms to 35ms around a
+        /// 16.7ms mean, because our WM_TIMER is only delivered when the host pumps its message queue.
+        /// Against a strict due-time that pattern is worst-case: the tick that lands early runs no
+        /// frame at all, so the one after it finds two due, runs both, and shows only the second. One
+        /// picture is lost per pair, which is why presented frames sat near 50 while the core emulated
+        /// a steady 60.
+        ///
+        /// Letting the first frame run up to half a period early lets an early tick take the frame it
+        /// nearly earned, turning "none then two" into "one then one". Long-run rate is untouched —
+        /// _nextFrameDueMs still advances by exactly one period per frame — so the emulation can never
+        /// lead the wall clock by more than this tolerance. Frames two and later stay strict, so a
+        /// catch-up burst still requires genuinely accumulated debt.
+        /// </summary>
+        private double EarlyFrameToleranceMs => _frameMs * 0.5;
+
+        /// <summary>
         /// Report what the OS actually gives us for a short sleep, once per session.
         ///
         /// The frame tick rides WM_TIMER, whose delivery is bound to the system clock tick, and on
@@ -2022,7 +2041,8 @@ namespace BizHawkNetplay.Tool
                 bool timeSyncThisTick = false;
                 int framesThisTick = 0;
                 bool committedSecondFrame = false;
-                while (framesThisTick < MaxFramesPerTick && nowMs + 0.25 >= _nextFrameDueMs)
+                while (framesThisTick < MaxFramesPerTick
+                    && nowMs + (framesThisTick == 0 ? EarlyFrameToleranceMs : 0.25) >= _nextFrameDueMs)
                 {
                     // Normally this loop runs once. A second frame compensates for an irregular ~25ms
                     // WinForms callback without reviving the old eight-frame catch-up bursts. Never start
@@ -2377,7 +2397,7 @@ namespace BizHawkNetplay.Tool
                 frame = _driver.CurrentFrame;
                 if (frame % ChecksumInterval != 0) return;
                 var hashWatch = System.Diagnostics.Stopwatch.StartNew();
-                hash = _adapter!.HashMainMemory();
+                hash = _adapter!.HashMainMemory(frame);
                 _lastHashMs = hashWatch.Elapsed.TotalMilliseconds;
             }
             // Which checksum path the core actually got, once per session. This is the only place the

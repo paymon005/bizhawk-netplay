@@ -87,7 +87,15 @@ namespace BizHawkNetplay.Core.Emu
 
         // --- Integrity ----------------------------------------------------------------
 
-        /// <summary>Cheap rolling checksum over main memory for periodic desync detection.</summary>
-        uint HashMainMemory();
+        /// <summary>
+        /// Cheap rolling checksum over main memory for periodic desync detection.
+        ///
+        /// <paramref name="salt"/> is the frame the checksum describes. An adapter that cannot read
+        /// the whole domain cheaply may sample it, and uses this to rotate which slice it reads so
+        /// consecutive checksums cover different ground. Peers derive it from the same frame number,
+        /// so they always sample identically and stay comparable; an adapter that reads everything
+        /// ignores it.
+        /// </summary>
+        uint HashMainMemory(int salt = 0);
     }
 }

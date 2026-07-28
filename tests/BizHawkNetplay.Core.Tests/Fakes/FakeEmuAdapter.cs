@@ -131,7 +131,8 @@ namespace BizHawkNetplay.Core.Tests.Fakes
             _frame++;
         }
 
-        public uint HashMainMemory()
+        // Reads the whole (tiny) buffer, so the sampling salt is irrelevant here.
+        public uint HashMainMemory(int salt = 0)
         {
             uint h = 2166136261;
             foreach (var b in _memory) { h ^= b; h *= 16777619; }

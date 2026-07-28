@@ -201,7 +201,7 @@ namespace BizHawkNetplay.Core.Sync
             try
             {
                 _adapter.LoadStateFromMemory(st);
-                hash = _adapter.HashMainMemory();
+                hash = _adapter.HashMainMemory(boundary);
             }
             finally
             {
