@@ -225,8 +225,9 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(201, emu.SaveCount);
             // 100 samples + 3 passes of (12 samples + 1 restore) + 2 in the replay check + 1 final.
             Assert.Equal(142, emu.LoadCount);
-            // 100 timed + (1+12) + (8+96) + (8+96) across the repair passes + 30 replayed twice.
-            Assert.Equal(381, emu.InvisibleFrameCount);
+            // 100 timed + 100 between the save samples + 100 between the load samples
+            // + (1+12) + (8+96) + (8+96) across the repair passes + 30 replayed twice.
+            Assert.Equal(581, emu.InvisibleFrameCount);
             Assert.Equal(100, emu.RenderedFrameCount);
         }
 
@@ -256,6 +257,30 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0, CapabilityProbe.SolveMaxDepth(budget, headroom,
                 liveFrameMs: 13.0, repairFrameMs: repairFrame, loadMs: load, saveMs: save,
                 elideConfirmedSaves: true, repairBudgetMs: 2 * budget));
+        }
+
+        [Fact]
+        public void Run_TimesSavesAndLoadsAgainstStateThatIsActuallyChanging()
+        {
+            // Both of these used to be timed in place, and both were cheap for the wrong reason.
+            //
+            // Saving does not advance the core, so the save pass snapshotted memory nothing had touched
+            // since the previous sample, and the load pass then restored the state the core was already
+            // standing on — 16.7MiB written back over identical bytes. Measured on N64: 5.6-6.7ms for a
+            // save that should be ~7.0, and ~1.4ms for a load that should be ~3.0. Both understate, and
+            // both feed the depth verdict, which flipped 4 -> 3 at the recommended settings once the
+            // real figures were used.
+            var emu = new FakeEmuAdapter(portCount: 2);
+            var clock = new ManualClock(Enumerable.Repeat(0.05, 400));
+
+            new CapabilityProbe(emu, clock, samples: 20).Run(16.639, 4.0);
+
+            // The 20 timed saves each captured a frame the one before it had not seen. (Index 0 is the
+            // untimed reference save, taken before the pass begins.)
+            Assert.Equal(Enumerable.Range(0, 20), emu.SavedAtFrames.Skip(1).Take(20));
+
+            // And nothing anywhere in the probe loads the state it already stands on.
+            Assert.DoesNotContain(emu.LoadJumps, j => j.From == j.To);
         }
 
         [Fact]

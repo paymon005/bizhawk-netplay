@@ -46,10 +46,31 @@ namespace BizHawkNetplay.Core.Probe
 
             // Retain the timed save handles so we can free them afterwards — otherwise every probe
             // leaks ~samples whole-core states into the emulator's in-memory store (~hundreds of MiB).
+            //
+            // A frame runs between samples, outside the timing. Saving does not advance the core, so
+            // without it every sample after the first snapshots memory nothing has touched since the
+            // last one — and a snapshot of unchanged memory is measurably cheaper than the real thing.
+            // Across six N64 configurations this pass reported 5.6-6.7ms with no pattern, against a
+            // steady ~7.0ms (±5%) for the same operation timed inside a repair. A session snapshots
+            // after a frame that has just dirtied RAM, so that is what gets timed.
             var scratch = new List<StateHandle>(_samples);
-            double medianSave = MeasureMedian(() => scratch.Add(_emu.SaveStateToMemory()));
+            double medianSave = MeasureMedian(
+                () => scratch.Add(_emu.SaveStateToMemory()),
+                _samples, out _,
+                between: () => _emu.RunFramesInvisible(1, _ => neutral));
 
-            double medianLoad = MeasureMedian(() => _emu.LoadStateFromMemory(reference));
+            // Same treatment, so each sample loads a state the core is not already standing on. This
+            // pass used to restore the reference from the reference position, over and over: 16.7MiB
+            // written back over identical bytes, which measured ~1.4ms against ~3.0ms for a load that
+            // genuinely moves the core. That one understated the term the repair budget spends first.
+            //
+            // The core arrives here already displaced by the pass above, so every sample crosses a real
+            // gap. How wide does not matter: the repair passes below measure loads across 1 and 8
+            // frames and find them the same to within half a percent.
+            double medianLoad = MeasureMedian(
+                () => _emu.LoadStateFromMemory(reference),
+                _samples, out _,
+                between: () => _emu.RunFramesInvisible(1, _ => neutral));
 
             // These advance with rendering OFF, which is exactly what a repair does — so this is the
             // repair term, and the right figure for it.
