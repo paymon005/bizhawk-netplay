@@ -274,6 +274,7 @@ namespace BizHawkNetplay.Tool
         // same thing": a real drift agrees for a while first, a systematic mismatch never agrees at all.
         private bool _agreedSinceResync;
         private int _desyncsWithoutAgreement;
+        private string? _videoDiagnostic; // resolution/plugin line, quoted back if desyncs turn systematic
         private long _lastResyncStamp; // monotonic timestamp; debounces near-simultaneous resync triggers
         private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
         private const int MaxResyncs = 6;
@@ -1872,6 +1873,16 @@ namespace BizHawkNetplay.Tool
             Log(_adapter.AudioReady ? "audio enabled — " + _adapter.AudioDiagnostic
                                     : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
 
+            // Render resolution isn't a sync setting, so nothing else in the session will ever mention
+            // it — and on N64 it is the single most likely reason two peers disagree. Put it in the log
+            // where it can be correlated after the fact, not only in a warning after it has gone wrong.
+            _videoDiagnostic = _adapter.VideoSettingsDiagnostic();
+            if (_videoDiagnostic != null)
+                Log($"video: {_videoDiagnostic} — resolution is NOT a sync setting, so it is not checked " +
+                    "at connect. Above native the plugin resolves its framebuffer back into main RAM, " +
+                    "and those bytes come from the GPU — which disagrees between machines even when both " +
+                    "players have identical settings, and shows up as a desync at every checksum.");
+
             // One reader and one serialized outbound writer per control link. The writer is what keeps
             // checksums, pings, and especially whole-state resync transfers off EmuHawk's UI thread.
             foreach (var link in _peers)
@@ -2997,7 +3008,9 @@ namespace BizHawkNetplay.Tool
                     "not clear it. On N64 the usual cause is running the video plugin above native " +
                     "resolution: it resolves the framebuffer back into RDRAM, and those bytes come from " +
                     "your GPU rather than the emulated core, so they cannot match your opponent's. Drop " +
-                    "to native resolution on BOTH machines.", Color.Firebrick);
+                    "to native resolution on BOTH machines." +
+                    (_videoDiagnostic != null ? $" This session is running {_videoDiagnostic}." : ""),
+                    Color.Firebrick);
             PerformResyncAsHost();
         }
 

@@ -133,6 +133,42 @@ namespace BizHawkNetplay.Tool
         /// both-peers-symmetric source) rather than the config dict, so a value the user just changed and a
         /// value loaded from disk can't serialize differently for the same logical settings.
         /// </summary>
+        /// <summary>
+        /// The video settings that change what ends up in main RAM without being part of the sync
+        /// settings — so the handshake never compares them and a desync is the first anyone hears.
+        ///
+        /// On N64 the render resolution lives in <c>N64Settings.VideoSizeX/Y</c>, which is the ordinary
+        /// settings object, while the plugin choice and its framebuffer options live in
+        /// <c>N64SyncSettings</c> and ARE compared. Above native resolution the plugin resolves its
+        /// framebuffer back into RDRAM and those bytes come from the GPU, so two machines disagree even
+        /// with byte-identical settings on both — measured as a desync at every single checksum at
+        /// 800x600, and none at all at native, in lockstep and rollback alike.
+        ///
+        /// Reported rather than enforced: this reads whatever the loaded core happens to expose, and
+        /// what counts as "too high" is a property of the game and plugin, not something worth guessing
+        /// at from here. Returns a bare summary like "800x600, plugin Rice" so callers can quote it in
+        /// their own wording. Null when the core has no such setting.
+        /// </summary>
+        public string? VideoSettingsDiagnostic()
+        {
+            try
+            {
+                var settable = _emulator.GetType().GetInterfaces().FirstOrDefault(i =>
+                    i.IsGenericType && i.GetGenericTypeDefinition().FullName == "BizHawk.Emulation.Common.ISettable`2");
+                var settings = settable?.GetMethod("GetSettings")?.Invoke(_emulator, null);
+                if (settings == null) return null;
+
+                var x = settings.GetType().GetProperty("VideoSizeX")?.GetValue(settings);
+                var y = settings.GetType().GetProperty("VideoSizeY")?.GetValue(settings);
+                if (x == null || y == null) return null;
+
+                var sync = settable!.GetMethod("GetSyncSettings")?.Invoke(_emulator, null);
+                var plugin = sync?.GetType().GetProperty("VideoPlugin")?.GetValue(sync);
+                return plugin != null ? $"{x}x{y}, plugin {plugin}" : $"{x}x{y}";
+            }
+            catch { return null; } // a settings read must never disturb starting a session
+        }
+
         private string SyncSettingsBlob()
         {
             try
