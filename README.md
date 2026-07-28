@@ -140,21 +140,23 @@ On connect the tool verifies ROM/core/version/sync-settings/layout match (refusi
 N64 works (connects, plays, stays in sync, analog moves). BizHawk's N64 core is **interpreter-only (no dynamic recompiler)**, so it's often described as CPU-heavy — but measure before believing it: on a modern machine this core runs a frame in ~2-4ms against a 16.7ms budget, and what's expensive is its **savestate** (~6ms for a 16MiB state), which is a rollback cost rather than an emulation one. Two instances sharing one machine is still the worst case. To get it to full speed:
 
 - **Core:** Mupen64Plus (not Ares64 — Ares is accurate but slower).
-- **Video plugin:** **Rice** (or Glide64mk2), *not* the default GLideN64, and never Angrylion (software renderer). The plugin is the biggest adjustable cost.
+- **Video plugin:** **Rice** (or Glide64mk2), *not* the default GLideN64, and never Angrylion (software renderer). Worth 5–23% of the frame against GLideN64 — real, but an order of magnitude less than the resolution below it.
 - **RSP:** Hle (the default). Keep GLideN64, if used, at native (1x) resolution with enhancements off.
 - Both machines must use **identical** N64 settings (they're sync settings — a mismatch desyncs).
 - N64 reports non-deterministic. That is not treated as a refusal (it usually just means determinism wasn't requested) — the session runs and desync detection guards you. You'll see a warning in the log; in practice it stays in sync.
 - **Run the video plugin at native resolution.** Above it, N64 desyncs at *every* checksum — measured over a long two-machine session: at 800×600 every single checksum disagreed, in lockstep *and* in rollback; at native resolution the same pair ran 15,000+ frames with every checksum agreeing. The cause isn't the netcode. Rice and GLideN64 resolve their framebuffer back into RDRAM, and above native those bytes are produced by your GPU rather than the emulated core — so they differ between machines and land inside the region the desync checksum reads. Resyncing can't fix it; the tool now says so after the second consecutive disagreement.
-- **Resolution is also the frame cost, and it decides whether rollback is available.** Twelve probes, three at each of four Rice resolutions, same machine and save:
+- **Resolution is the frame cost, and it decides whether rollback is available.** Forty probes, five at each of four resolutions on each of two plugins, same machine and save (median frame cost, and the verdict across those five runs):
 
-  | resolution | frame cost (median of 3) | verdict |
+  | resolution | Rice | GLideN64 |
   |---|---|---|
-  | 320×240 | 2.39 ms | rollback, depth 3 |
-  | 800×600 | 2.68 ms | rollback, depth 3 |
-  | 1400×1050 | 3.55 ms | depth 2–3, reported `MARGINAL` |
-  | 2880×2160 | 7.74 ms | depth 1, lockstep only |
+  | 320×240 | 2.42 ms — rollback, depth 3 | 2.62 ms — rollback, depth 3 |
+  | 800×600 | 2.64 ms — rollback, depth 3 | 3.26 ms — rollback, depth 3 |
+  | 1400×1050 | 3.52 ms — depth 3, `MARGINAL` | 4.33 ms — depth 2, **lockstep only** |
+  | 2880×2160 | 8.14 ms — depth 1, lockstep only | 8.57 ms — depth 1, lockstep only |
 
-  Monotonic, with the spread within each resolution (±0.15 ms) far smaller than the steps between them. Savestate cost stays flat at ~5.9 ms throughout, as it should — state size doesn't depend on how you render. Since the desync boundary is *native* and the performance boundary is somewhere past 800×600, native is the setting that satisfies both.
+  Resolution is worth ~3.4× across that range; the plugin is worth 5–23% at a fixed resolution. Both matter, but not equally — and the plugin gap is what costs GLideN64 rollback at 1400×1050, one step earlier than Rice. Savestate cost stays flat at ~5.9 ms throughout, as it should: state size doesn't depend on how you render. An earlier independent sweep of the Rice column landed within 0.05 ms at three of the four points, so this is a replication rather than a single run.
+
+  Since the desync boundary is *native* and the performance boundary is somewhere past 800×600, native is the setting that satisfies both.
 - **`render: false` saves nothing on this core.** The probe times a frame both ways, and across all twelve runs the rendered and unrendered figures agree within ~5%, with the rendered one sometimes *cheaper* — i.e. the difference is noise. Mupen64Plus/Rice does its video work regardless of the flag, so skipping the render on a discarded catch-up frame buys no time here (it may still on other cores).
 
 Watch the fps readout while you tune: at ~100% you're good; well under means CPU-bound (faster settings or a second machine, not netcode). Check `stall%` before blaming the core, though — on a heavy console the two look identical from the picture, and only one of them is fixed by video-plugin settings.

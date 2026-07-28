@@ -279,14 +279,26 @@ namespace BizHawkNetplay.Tool
         /// <summary>
         /// One frame with video rendered, for the capability probe's live-frame measurement.
         ///
-        /// Deliberately not <see cref="AdvanceFrame"/>: that also drains the core's samples into the
-        /// audio ring, and the probe runs outside the session's audio lifecycle. The samples this
-        /// produces are simply discarded when the probe restores its reference state.
+        /// Deliberately not <see cref="AdvanceFrame"/>: that drains the core's samples into the session
+        /// audio ring, and the probe runs outside the session's audio lifecycle entirely.
+        ///
+        /// Sound is still rendered, because a live frame renders it and the whole point is to time a
+        /// live frame — but then the samples must go somewhere. Left in the core they pile up and reach
+        /// EmuHawk's own output as a backlog, which it drains by playing faster: the music jumps in
+        /// pitch after every probe and slides back down as it catches up, and stacks higher if you probe
+        /// again before it has. Discarding is both the fix and the more faithful measurement, since the
+        /// session empties the core after every frame too.
         /// </summary>
         public void AdvanceRenderedFrame(InputSet inputs)
         {
             var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
             _emulator.FrameAdvance(controller, render: true, renderSound: true);
+            try
+            {
+                _coreSound ??= _emulator.ServiceProvider.GetService<ISoundProvider>();
+                _coreSound?.DiscardSamples();
+            }
+            catch { /* a probe must never be the thing that breaks audio */ }
         }
 
         /// <summary>
