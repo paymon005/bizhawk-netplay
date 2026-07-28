@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Input;
 using BizHawkNetplay.Core.Net;
+using BizHawkNetplay.Core.Probe;
 
 namespace BizHawkNetplay.Core.Sync
 {
@@ -37,6 +38,9 @@ namespace BizHawkNetplay.Core.Sync
         // yielding the whole surplus at once overshoots and sets up an oscillation with the peer.
         private const int AdvantageStallThreshold = 2;
         private const int MaxAdvantageStall = 3;
+        // Never let the measured cost ceiling collapse rollback into lockstep-with-extra-steps; below
+        // this it isn't hiding any latency and the peer would be better off choosing lockstep outright.
+        private const int MinCostCap = 2;
 
         private readonly InputPipeline _pipeline;
         private readonly IEmuAdapter _adapter;
@@ -46,6 +50,14 @@ namespace BizHawkNetplay.Core.Sync
         private readonly double _frameMs;   // console frame period; 0 disables time-sync
         private readonly PortInput[] _neutral;
         private int _softCap;               // horizon at which time-sync trims (<= _maxRollback)
+
+        // --- tuning (see RollbackTuning; none of it is negotiated) ---------------------
+        private readonly bool _elideConfirmedSaves;
+        private readonly int _checksumAnchorInterval;
+        private readonly double _repairBudgetMs;
+        private readonly IMonotonicClock? _clock;
+        private double _repairPerFrameMs;   // conservative rolling estimate of resim cost
+        private int _costCap;               // horizon the measured repair budget affords (<= _maxRollback)
 
         // state[N] = whole-core state captured entering frame N (i.e. the result of frames 0..N-1).
         private readonly Dictionary<int, StateHandle> _states = new Dictionary<int, StateHandle>();
@@ -65,7 +77,8 @@ namespace BizHawkNetplay.Core.Sync
         /// into a target prediction horizon for time-sync. 0 (the default) disables time-sync entirely —
         /// the strategy then only ever stalls at the hard ring cap.
         /// </param>
-        public RollbackStrategy(InputPipeline pipeline, IEmuAdapter adapter, int localPort, int maxRollback, double frameMs = 0)
+        public RollbackStrategy(InputPipeline pipeline, IEmuAdapter adapter, int localPort, int maxRollback,
+            double frameMs = 0, RollbackTuning? tuning = null)
         {
             _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
             _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
@@ -76,6 +89,13 @@ namespace BizHawkNetplay.Core.Sync
             _maxRollback = maxRollback;
             _frameMs = frameMs;
             _softCap = maxRollback; // no trimming until a pacing report narrows it
+
+            var t = tuning ?? RollbackTuning.Legacy;
+            _elideConfirmedSaves = t.ElideConfirmedSaves;
+            _checksumAnchorInterval = t.ChecksumAnchorInterval;
+            _clock = t.Clock;
+            _repairBudgetMs = _clock != null ? t.RepairBudgetMs : 0; // a budget with no clock is unmeasurable
+            _costCap = maxRollback; // no trimming until a repair has actually been timed
 
             _neutral = new PortInput[_portCount];
             for (int p = 0; p < _portCount; p++)
@@ -95,7 +115,18 @@ namespace BizHawkNetplay.Core.Sync
         public long FramesResimulated { get; private set; }
         public int PredictionStalls { get; private set; }
         public int TimeSyncStalls { get; private set; }
+        /// <summary>Frames yielded because the measured repair cost, not the clock skew, said to.</summary>
+        public int CostStalls { get; private set; }
+        public int SavesTaken { get; private set; }
+        /// <summary>Snapshots skipped because the frame was already fully confirmed (see RollbackTuning).</summary>
+        public int SavesElided { get; private set; }
         public int SoftCap => _softCap;
+        /// <summary>Prediction horizon the measured repair budget currently affords.</summary>
+        public int CostCap => _costCap;
+        /// <summary>Conservative rolling estimate of what one re-simulated frame costs, in ms.</summary>
+        public double RepairPerFrameMs => _repairPerFrameMs;
+        /// <summary>Live entries in the applied-input map; bounded by the ring window, not the session.</summary>
+        public int AppliedCount => _applied.Count;
         /// <summary>Whether the next otherwise-runnable frame will be yielded for measured clock skew.</summary>
         public bool HasPendingTimeSyncDebt => _advantageStallFrames > 0;
 
@@ -127,13 +158,17 @@ namespace BizHawkNetplay.Core.Sync
             //     rollbacks shallow instead of letting depth grow toward the hard cap. Disabled (soft cap
             //     == hard cap) until a pacing report narrows it, so it never trims the latency we mean to
             //     hide. This is rollback's only routine backpressure and is rare on a sane link.
-            if (horizon > _softCap)
+            //     The cost cap rides alongside it: where the soft cap trims skew the link doesn't
+            //     justify, the cost cap trims depth this MACHINE can't repair inside its budget. Both
+            //     only ever narrow how far we predict — neither touches the ring depth or the driver's
+            //     accept window, which govern which late datagrams are still usable.
+            if (horizon > _softCap || horizon > _costCap)
             {
                 // A soft-cap stall already gives the faster peer one frame back. If measured-advantage
                 // debt is outstanding, pay it here too so the two time-sync mechanisms do not charge
                 // twice for the same skew.
                 if (_advantageStallFrames > 0) _advantageStallFrames--;
-                TimeSyncStalls++;
+                if (horizon > _softCap) TimeSyncStalls++; else CostStalls++;
                 IsStalled = true;
                 LastStallWasTimeSync = true;
                 return FrameDecision.StallDecision;
@@ -152,10 +187,11 @@ namespace BizHawkNetplay.Core.Sync
             }
             IsStalled = false;
 
-            // 3) Snapshot the state entering this frame so a future correction can return here.
+            // 3) Snapshot the state entering this frame so a future correction can return here — unless
+            //    this frame provably cannot BE a correction target (see ShouldAnchor).
             if (_savedFrame != frame)
             {
-                SaveStateFor(frame);
+                AnchorOrDrop(frame);
                 _savedFrame = frame;
             }
 
@@ -282,16 +318,21 @@ namespace BizHawkNetplay.Core.Sync
 
             _adapter.LoadStateFromMemory(baseState); // core now sits entering frame r
             int count = frame - r;                   // re-simulate r .. frame-1
+            double startedMs = _clock?.NowMs ?? 0;
             _adapter.RunFramesInvisible(count, i =>
             {
                 int f = r + i;
-                SaveStateFor(f);           // re-snapshot entering-state (it may be corrected again later)
+                // Re-snapshot the entering state (it may be corrected again later) on the same terms as
+                // the live path. Frames the arriving correction just confirmed are dropped rather than
+                // re-saved: any snapshot from the previous run of f is now stale, and nothing may find it.
+                AnchorOrDrop(f);
                 var inputs = ResolveInputs(f);
                 _applied[f] = inputs;
                 return inputs;
             });
             // Core is back at `frame`; the snapshot previously taken for it is now stale.
             _savedFrame = -1;
+            if (_clock != null && count > 0) RecordRepairCost((_clock.NowMs - startedMs) / count);
 
             RollbackCount++;
             LastRollbackDepth = count;
@@ -340,6 +381,91 @@ namespace BizHawkNetplay.Core.Sync
             if (_states.TryGetValue(frame, out var old))
                 _adapter.ReleaseState(old);
             _states[frame] = _adapter.SaveStateToMemory();
+            SavesTaken++;
+        }
+
+        /// <summary>
+        /// Whether the state entering <paramref name="frame"/> is worth keeping.
+        ///
+        /// A frame whose every port was already confirmed when it ran can never become a rollback
+        /// target, so its state is dead weight. The argument is short and rests entirely on code that
+        /// already exists:
+        ///
+        ///   * <c>ResolveInputs</c> takes the real input for every port that has one, so a frame run
+        ///     while <c>AllConfirmed</c> holds applied real input on every port — nothing predicted.
+        ///   * <c>OnRemoteInput</c> only ever sets <c>_rollbackTo</c> when an arriving input DIFFERS
+        ///     from what was applied. It cannot differ from itself.
+        ///   * A stored (port, frame) input is never overwritten — <c>InputPipeline.Add</c> ignores a
+        ///     repeat, and <c>FrameDriver</c> drops a datagram it already holds before this is reached.
+        ///   * <c>AllConfirmed</c> reads the contiguous frontier, which only ever advances, so the
+        ///     property is monotonic: once true for a frame it stays true for the rest of the session.
+        ///
+        /// So the elided frames are exactly the ones no correction can reach. Frames still carrying a
+        /// prediction are anchored as before, which is what keeps repair possible at all.
+        ///
+        /// The one exception is the checksum: it reads the state entering an interval boundary + 1,
+        /// which is by construction deep inside the confirmed region and would otherwise be the first
+        /// thing dropped. Those frames are anchored unconditionally — without that, desync detection
+        /// goes quiet and nothing says so.
+        /// </summary>
+        private bool ShouldAnchor(int frame) =>
+            !_elideConfirmedSaves
+            || IsChecksumAnchor(frame)
+            || !_pipeline.AllConfirmed(frame);
+
+        private bool IsChecksumAnchor(int frame) =>
+            _checksumAnchorInterval > 0 && frame >= 1 && (frame - 1) % _checksumAnchorInterval == 0;
+
+        /// <summary>
+        /// An anchor whose boundary has not been checksummed yet, and which therefore outranks the
+        /// prune window.
+        ///
+        /// Insurance, not a fix for a live bug: at present the arithmetic already works out. The
+        /// confirmed frontier can only lag the live frame by the prediction cap, and the prune window
+        /// is the ring depth plus a margin, so an anchor is still resident when its boundary becomes
+        /// checksummable — verified by removing this clause and watching the shallow-ring test still
+        /// pass. What it buys is that the property stops depending on that coincidence surviving every
+        /// future change to ring depth, prune margin or cap. The cost is one extra state, and the
+        /// failure it guards against is silent — checksums merely stop being produced.
+        /// </summary>
+        private bool IsUnconsumedChecksumAnchor(int frame) =>
+            IsChecksumAnchor(frame) && frame - 1 > _lastChecksumFrame;
+
+        /// <summary>Take the snapshot, or make sure no stale one survives in its place.</summary>
+        private void AnchorOrDrop(int frame)
+        {
+            if (ShouldAnchor(frame))
+            {
+                SaveStateFor(frame);
+                return;
+            }
+            if (_states.TryGetValue(frame, out var stale))
+            {
+                _adapter.ReleaseState(stale);
+                _states.Remove(frame);
+            }
+            SavesElided++;
+        }
+
+        /// <summary>
+        /// Fold a measured per-frame repair cost into the ceiling on how far we predict.
+        ///
+        /// The estimate decays toward the truth but jumps straight to any worse sample (the same
+        /// conservative shape the tool uses for core frame cost), so one expensive repair immediately
+        /// tightens the cap while a run of cheap ones only loosens it gradually.
+        /// </summary>
+        private void RecordRepairCost(double perFrameMs)
+        {
+            if (perFrameMs <= 0) return;
+            _repairPerFrameMs = _repairPerFrameMs <= 0
+                ? perFrameMs
+                : Math.Max(perFrameMs, _repairPerFrameMs * 0.9);
+
+            if (_repairBudgetMs <= 0) return;
+            int cap = (int)Math.Floor(_repairBudgetMs / _repairPerFrameMs);
+            if (cap < MinCostCap) cap = MinCostCap;
+            if (cap > _maxRollback) cap = _maxRollback;
+            _costCap = cap;
         }
 
         /// <summary>
@@ -359,15 +485,25 @@ namespace BizHawkNetplay.Core.Sync
         {
             int keepFrom = frame + 1 - _maxRollback - PruneMargin;
             if (keepFrom <= 0) return;
+
             _pruneScratch.Clear();
             foreach (var key in _states.Keys)
-                if (key < keepFrom) _pruneScratch.Add(key);
+                if (key < keepFrom && !IsUnconsumedChecksumAnchor(key)) _pruneScratch.Add(key);
             foreach (var key in _pruneScratch)
             {
                 _adapter.ReleaseState(_states[key]);
                 _states.Remove(key);
-                _applied.Remove(key);
             }
+
+            // _applied is pruned on its own keys, not as a passenger of _states. It used to be dropped
+            // alongside the matching state, which was only correct while every frame had one — with
+            // elision most frames have an applied input and no state, and riding along would have left
+            // them to accumulate for the whole session.
+            _pruneScratch.Clear();
+            foreach (var key in _applied.Keys)
+                if (key < keepFrom) _pruneScratch.Add(key);
+            foreach (var key in _pruneScratch)
+                _applied.Remove(key);
         }
     }
 }

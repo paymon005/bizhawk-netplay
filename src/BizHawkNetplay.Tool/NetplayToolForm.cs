@@ -28,13 +28,32 @@ namespace BizHawkNetplay.Tool
         Description = "2-player lockstep netplay over direct IP.")]
     public sealed class NetplayToolForm : ToolFormBase, IExternalToolForm
     {
-        // v10 hashes main memory with FNV-1a over 32-bit words — sampled with a rotating stride on
-        // domains too large to read whole — replacing the SHA over the entire domain. The value is
-        // compared between peers, so a build mismatch would report a phantom desync every interval —
-        // the version bump turns that into a clean refusal at the handshake instead.
-        private const int Protocol = 10;
+        // v11 changes what the advertised rollback depth MEANS (measured against the model the session
+        // actually runs — snapshots elided on confirmed frames, a repair allowed two frame periods) and
+        // the threshold peers compare it against. Both ends must agree on both, or one could negotiate
+        // rollback while the other negotiated lockstep.
+        //
+        // v10 hashed main memory with FNV-1a over 32-bit words, sampled with a rotating stride on
+        // domains too large to read whole. That value also crosses the wire, so the same rule applies:
+        // a version bump turns a build mismatch into a clean refusal at the handshake instead of a
+        // phantom desync every interval.
+        private const int Protocol = 11;
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
+
+        /// <summary>
+        /// How many frame periods one rollback repair may spend. Requiring it to fit inside a single
+        /// period is stricter than the frame tick now needs — the catch-up path absorbs a short overrun
+        /// — and on a heavy core that strictness is the difference between a usable prediction horizon
+        /// and none. Two periods buys N64 depth 3 where one period allows 1. Repaired frames emit no
+        /// audio, but they never did: the sample for a frame is produced by its original (predicted)
+        /// run, so a deeper repair costs wall clock, not sound.
+        /// </summary>
+        private const double RepairBudgetFrames = 2.0;
+
+        /// <summary>At or below this ring depth, rollback is working but has little room — worth saying
+        /// so once, since the user chose a mode whose whole point is hiding latency.</summary>
+        private const int ShallowRollbackDepth = 4;
 
         public ApiContainer? _apiContainer { get; set; }
         private ApiContainer APIs => _apiContainer!;
@@ -944,7 +963,6 @@ namespace BizHawkNetplay.Tool
                 // forces it; Lockstep forces lockstep. We "want" rollback unless Lockstep is chosen, and
                 // probe accordingly. The host's choice is authoritative for the session's mode.
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
-                ApplyHeavyCoreNetcodeDefault();
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
                 var prefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
                 var id = BuildIdentity(_adapter, wantRollback);
@@ -1042,7 +1060,6 @@ namespace BizHawkNetplay.Tool
                 APIs.EmuClient.Pause(); // freeze now so the resume frame is fixed before the state arrives
 
                 _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
-                ApplyHeavyCoreNetcodeDefault();
                 bool wantRollback = _netcodeChoice != NetcodeChoice.Lockstep;
                 _punchPrefs = new SessionPreferences((int)_delayBox.Value, wantRollback, _passwordBox.Text);
                 _punchId = BuildIdentity(_adapter, wantRollback);
@@ -1741,6 +1758,13 @@ namespace BizHawkNetplay.Tool
                 // Each peer bounds its own ring independently; correctness never needs them equal.
                 int d = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
                 _rollbackDepth = Math.Max(ProbeResult.RollbackDepthThreshold, Math.Min(d, RollbackDepthCap));
+                if (_rollbackDepth <= ShallowRollbackDepth)
+                    ConnLog($"rollback on a heavy core: this machine measured a usable depth of " +
+                        $"{_rollbackDepth} frames, so it can hide about {_rollbackDepth} frames of one-way " +
+                        "latency and no more — good for a nearby opponent, not a distant one. Corrections " +
+                        "cost a brief hitch here rather than the stall lockstep would have taken. Switch " +
+                        "Netcode to Lockstep if you prefer the steadier frame time.",
+                        Color.DarkSlateBlue);
                 if (_playerCount > 2)
                     ConnLog($"rollback with {_playerCount} players: every peer predicts the other " +
                         $"{_playerCount - 1} ports, so a correction from any of them rolls everyone back — " +
@@ -3155,7 +3179,8 @@ namespace BizHawkNetplay.Tool
         {
             if (_mode == SyncMode.Rollback)
                 return new FrameDriver(_adapter!, _transport!,
-                    p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth, FrameMs()),
+                    p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth, FrameMs(),
+                        RollbackTuningForSession()),
                     _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth,
                     portCount: _playerCount, generation: CurrentGeneration);
 
@@ -3164,16 +3189,19 @@ namespace BizHawkNetplay.Tool
                 generation: CurrentGeneration);
         }
 
-        /// <summary>N64 rollback repair can synchronously resimulate a deep state ring on EmuHawk's UI
-        /// thread. Until that work is incrementally budgeted, favor responsiveness and reliability by
-        /// forcing this heavy system to lockstep even if Rollback was selected explicitly.</summary>
-        private void ApplyHeavyCoreNetcodeDefault()
+        /// <summary>
+        /// How this peer spends its savestate budget. Purely local — see <see cref="RollbackTuning"/>
+        /// for why none of it is negotiated. The anchor interval MUST track
+        /// <see cref="ChecksumInterval"/>, since eliding snapshots would otherwise take the checksum's
+        /// own state with them and stop desync detection without saying so.
+        /// </summary>
+        private RollbackTuning RollbackTuningForSession() => new RollbackTuning
         {
-            if (_adapter == null || !string.Equals(_adapter.SystemId, "N64", StringComparison.OrdinalIgnoreCase)) return;
-            if (_netcodeChoice != NetcodeChoice.Lockstep)
-                Log("N64 uses lockstep for stability — deep rollback can freeze presentation on this core.");
-            _netcodeChoice = NetcodeChoice.Lockstep;
-        }
+            ElideConfirmedSaves = true,
+            ChecksumAnchorInterval = ChecksumInterval,
+            RepairBudgetMs = RepairBudgetFrames * FrameMs(),
+            Clock = new StopwatchClock(),
+        };
 
         // Reflection flags for reaching EmuHawk internals (Tools/LuaConsole members aren't all public).
         private const System.Reflection.BindingFlags AnyInstance =
@@ -3955,6 +3983,26 @@ namespace BizHawkNetplay.Tool
         /// inside one frame budget. Saves and restores the core state so the pre-session position is
         /// untouched. Requires the emulator to already be paused (we advance frames invisibly here).
         /// </summary>
+        /// <summary>
+        /// How many samples the probe should take. This runs synchronously on the UI thread, so the
+        /// count is the freeze length: 60 samples is nothing on a light core and most of a second on
+        /// N64, where one save alone is 6ms. One timed save tells the two apart, and a median of 12 is
+        /// ample for sizing a prediction horizon. Nothing used to reach here on a heavy core, because
+        /// the old N64 override short-circuited the probe before it ran.
+        /// </summary>
+        private static int ProbeSamplesFor(EmuHawkAdapter a)
+        {
+            try
+            {
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                var handle = a.SaveStateToMemory();
+                double saveMs = timer.Elapsed.TotalMilliseconds;
+                a.ReleaseState(handle);
+                return saveMs > 1.0 ? 12 : 60;
+            }
+            catch { return 12; }
+        }
+
         private int MeasureRollbackDepth(EmuHawkAdapter a)
         {
             if (_probeDepth >= 0) return _probeDepth;
@@ -3964,7 +4012,12 @@ namespace BizHawkNetplay.Tool
                 // MemorySaveState is nullable on the container but this only runs for statable cores.
                 restore = APIs.MemorySaveState!.SaveCoreStateToMemory();
                 double budget = FrameMs();
-                var result = new CapabilityProbe(a, new StopwatchClock(), samples: 60).Run(budget, budget * 0.25);
+                // Probe the model the session will actually run: snapshots elided on confirmed frames,
+                // and a repair allowed more than one frame period. Measuring the old model and then
+                // running a different one is how you get a depth that has nothing to do with the cost.
+                var result = new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
+                    .Run(budget, budget * 0.25,
+                        elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
                 _probeDepth = result.MaxRollbackDepth;
                 Log($"rollback probe — {result}");
             }

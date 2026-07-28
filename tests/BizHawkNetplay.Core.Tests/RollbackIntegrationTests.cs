@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using BizHawkNetplay.Core.Input;
 using BizHawkNetplay.Core.Net;
+using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Sync;
 using BizHawkNetplay.Core.Tests.Fakes;
 using Xunit;
@@ -108,16 +110,24 @@ namespace BizHawkNetplay.Core.Tests
             }
         }
 
-        private static Instance BuildRollback(ITransport t, int localPort, double frameMs = 0)
+        private static Instance BuildRollback(ITransport t, int localPort, double frameMs = 0,
+            RollbackTuning? tuning = null, int maxRollback = MaxRollback)
         {
             var emu = new FakeEmuAdapter(portCount: 2) { LocalInputScript = Scripts[localPort] };
             var driver = new FrameDriver(emu, t,
-                p => new RollbackStrategy(p, emu, localPort, MaxRollback, frameMs),
-                localPort: localPort, delay: Delay, redundancy: Redundancy, rollbackWindow: MaxRollback);
+                p => new RollbackStrategy(p, emu, localPort, maxRollback, frameMs, tuning),
+                localPort: localPort, delay: Delay, redundancy: Redundancy, rollbackWindow: maxRollback);
             var inst = new Instance { Emu = emu, Driver = driver, Rollback = (RollbackStrategy)driver.Strategy };
             driver.Start();
             return inst;
         }
+
+        /// <summary>Elision on, with checksum anchors at the interval the test polls.</summary>
+        private static RollbackTuning Eliding(int checksumInterval = 0) => new RollbackTuning
+        {
+            ElideConfirmedSaves = true,
+            ChecksumAnchorInterval = checksumInterval,
+        };
 
         private static Instance BuildLockstep(ITransport t, int localPort)
         {
@@ -177,6 +187,86 @@ namespace BizHawkNetplay.Core.Tests
             AssertFinalizedCorrect(a, a.Driver.CurrentFrame - 2);
             AssertFinalizedCorrect(b, b.Driver.CurrentFrame - 2);
             Assert.Equal(a.Emu.HashMainMemory(), b.Emu.HashMainMemory());
+        }
+
+        [Fact]
+        public void ZeroLatency_ConfirmedFramesTakeNoSavestates()
+        {
+            // The point of elision: with every input present before its frame runs, no frame can ever
+            // be a rollback target, so the ring should cost nothing at all. This is the steady state on
+            // any link whose input delay covers its latency — i.e. the case rollback normally runs in.
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: 0);
+            var a = BuildRollback(ta, 0, tuning: Eliding());
+            var b = BuildRollback(tb, 1, tuning: Eliding());
+
+            Run(clock, a, b, 320);
+
+            Assert.True(a.Driver.CurrentFrame >= 300, $"reached only {a.Driver.CurrentFrame}");
+            Assert.Equal(0, a.Rollback.RollbackCount);
+            // Frames before the first inputs land are genuinely unconfirmed and are still anchored;
+            // everything after must be free. Without elision this run takes a save every single frame.
+            Assert.True(a.Rollback.SavesTaken <= Delay + 2,
+                $"expected the ring to go quiet, took {a.Rollback.SavesTaken} saves");
+            Assert.True(a.Rollback.SavesElided > 300 - Delay - 2,
+                $"expected nearly every frame elided, got {a.Rollback.SavesElided}");
+            AssertFinalizedCorrect(a, a.Driver.CurrentFrame - 2);
+            Assert.Equal(a.Emu.HashMainMemory(), b.Emu.HashMainMemory());
+        }
+
+        [Fact]
+        public void Elision_IsUnobservable_UnderLatencyAndLoss()
+        {
+            // The real proof: elision may not change a single applied input or the resulting state,
+            // however much correction traffic is flying around. Same seed, same scripts, same link —
+            // only the savestate policy differs, and the two runs must be indistinguishable.
+            const int k = 5;
+            const int iters = 500;
+
+            (Dictionary<int, InputSet> inputs, uint hash, int rollbacks) RunWith(RollbackTuning? tuning)
+            {
+                var clock = new Clock();
+                var (ta, tb) = LatencyLink.Pair(clock, latency: k,
+                    dropA: d => d.Length % 7 == 3, dropB: d => d.Length % 11 == 5);
+                var a = BuildRollback(ta, 0, tuning: tuning);
+                var b = BuildRollback(tb, 1, tuning: tuning);
+                Run(clock, a, b, iters);
+                return (a.Emu.LastInputByFrame, a.Emu.HashMainMemory(), a.Rollback.RollbackCount);
+            }
+
+            var plain = RunWith(null);
+            var elided = RunWith(Eliding());
+
+            Assert.True(plain.rollbacks > 0, "the scenario must actually exercise corrections");
+            Assert.Equal(plain.rollbacks, elided.rollbacks);
+            Assert.Equal(plain.hash, elided.hash);
+            Assert.Equal(plain.inputs.Count, elided.inputs.Count);
+            foreach (var kv in plain.inputs)
+            {
+                Assert.True(elided.inputs.TryGetValue(kv.Key, out var other), $"frame {kv.Key} missing");
+                for (int p = 0; p < Scripts.Length; p++)
+                    Assert.True(kv.Value.Ports[p].ValueEquals(other!.Ports[p]),
+                        $"elision changed the input applied at frame {kv.Key} port {p}");
+            }
+        }
+
+        [Fact]
+        public void Elision_DoesNotStrandAppliedInputs()
+        {
+            // _applied used to be pruned as a passenger of the state ring. With most frames no longer
+            // having a state, riding along would leak an InputSet per frame for the whole session.
+            const int iters = 600;
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: 5);
+            var a = BuildRollback(ta, 0, tuning: Eliding());
+            var b = BuildRollback(tb, 1, tuning: Eliding());
+
+            Run(clock, a, b, iters);
+
+            Assert.True(a.Emu.LiveStates.Count <= MaxRollback + 6,
+                $"ring leaked: {a.Emu.LiveStates.Count} live states");
+            Assert.True(a.Rollback.AppliedCount <= MaxRollback + 8,
+                $"applied-input map leaked: {a.Rollback.AppliedCount} entries after {iters} frames");
         }
 
         [Fact]
@@ -426,20 +516,27 @@ namespace BizHawkNetplay.Core.Tests
             Assert.False(b.Driver.TryGetUnrepairedHole(out _, out _), "hole report must clear after repair");
         }
 
-        [Fact]
-        public void ConfirmedChecksums_AlignAndAgreeAcrossPeers()
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ConfirmedChecksums_AlignAndAgreeAcrossPeers(bool elide)
         {
             // Rollback can't checksum the live frame (it may be a prediction), so it checksums the
             // newest *final* interval boundary. Both peers must (a) produce checksums for the same
             // boundary frames despite predicting independently, and (b) agree on every shared one —
             // that is exactly what lets the host catch a real desync.
+            //
+            // The elide:true case is the regression guard for the trap in that arrangement: the state a
+            // checksum reads sits inside the finalized region, which is precisely what elision drops.
+            // Get the anchor wrong and this test goes to zero shared checksums — silently, which is how
+            // it would fail in the wild too.
             const int k = 4;
             const int iters = 500;
             const int interval = 30;
             var clock = new Clock();
             var (ta, tb) = LatencyLink.Pair(clock, latency: k);
-            var a = BuildRollback(ta, 0);
-            var b = BuildRollback(tb, 1);
+            var a = BuildRollback(ta, 0, tuning: elide ? Eliding(interval) : null);
+            var b = BuildRollback(tb, 1, tuning: elide ? Eliding(interval) : null);
 
             var ha = new Dictionary<int, uint>();
             var hb = new Dictionary<int, uint>();
@@ -460,6 +557,47 @@ namespace BizHawkNetplay.Core.Tests
                     Assert.True(kv.Value == other, $"checksum disagreement at boundary {kv.Key}");
                 }
             Assert.True(shared >= 10, $"expected many aligned confirmed checksums, got {shared}");
+        }
+
+        [Fact]
+        public void ConfirmedChecksums_SurviveAShallowRing()
+        {
+            // A heavy core qualifies at the minimum depth, which is a ring far shallower than anything
+            // that could exist before rollback was opened up to such cores — and a shallow ring means a
+            // narrow prune window, which is what the checksum's anchor has to survive. Covering the
+            // configuration rather than a specific bug: the anchor does currently survive on the
+            // arithmetic alone, so this passes with or without the retention clause in Prune. What it
+            // catches is the whole arrangement breaking, and it would do so silently otherwise —
+            // checksums just stop being produced.
+            const int k = 4;
+            const int iters = 500;
+            const int interval = 30;
+            int shallowRing = ProbeResult.RollbackDepthThreshold; // the shallowest ring that can qualify
+
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k);
+            var a = BuildRollback(ta, 0, tuning: Eliding(interval), maxRollback: shallowRing);
+            var b = BuildRollback(tb, 1, tuning: Eliding(interval), maxRollback: shallowRing);
+
+            var ha = new Dictionary<int, uint>();
+            var hb = new Dictionary<int, uint>();
+            for (int i = 0; i < iters; i++)
+            {
+                clock.Tick = i;
+                a.Step();
+                b.Step();
+                if (a.Rollback.TryConfirmedChecksum(interval, out var fa, out var va)) ha[fa] = va;
+                if (b.Rollback.TryConfirmedChecksum(interval, out var fb, out var vb)) hb[fb] = vb;
+            }
+
+            int shared = 0;
+            foreach (var kv in ha)
+                if (hb.TryGetValue(kv.Key, out var other))
+                {
+                    shared++;
+                    Assert.True(kv.Value == other, $"checksum disagreement at boundary {kv.Key}");
+                }
+            Assert.True(shared >= 5, $"shallow ring lost its checksum anchors: only {shared} shared");
         }
 
         [Fact]
@@ -502,6 +640,56 @@ namespace BizHawkNetplay.Core.Tests
                 $"time-sync should reduce peak rollback depth (with={withSync.maxDepth}, without={without.maxDepth})");
             Assert.True(withSync.maxDepth <= k + 3,
                 $"time-sync should bound depth near the soft cap, got {withSync.maxDepth}");
+        }
+
+        [Fact]
+        public void CostCap_TrimsPredictionWhenRepairsMeasureExpensive()
+        {
+            // A depth in frames can't bound a freeze when a frame's cost varies — which on a heavy core
+            // it does. Here every repair is scripted to cost far more than the budget allows, so the
+            // strategy must notice and stop predicting as far ahead, rather than keep booking work it
+            // cannot afford. Correctness is not negotiable while it does that.
+            const int k = 8;
+            const int iters = 600;
+
+            (RollbackStrategy strategy, Instance a, Instance b) RunWith(bool budgeted)
+            {
+                RollbackTuning Tune() => new RollbackTuning
+                {
+                    ElideConfirmedSaves = true,
+                    // Every repair is scripted to "take" 100ms against a 5ms allowance.
+                    RepairBudgetMs = budgeted ? 5.0 : 0,
+                    Clock = new ManualClock(Enumerable.Repeat(100.0, 20000)),
+                };
+                var clock = new Clock();
+                var (ta, tb) = LatencyLink.Pair(clock, latency: k);
+                var a = BuildRollback(ta, 0, tuning: Tune());
+                var b = BuildRollback(tb, 1, tuning: Tune());
+                Run(clock, a, b, iters);
+                return (a.Rollback, a, b);
+            }
+
+            var free = RunWith(budgeted: false);
+            var capped = RunWith(budgeted: true);
+
+            Assert.True(free.strategy.RollbackCount > 0, "the scenario must actually exercise repairs");
+            Assert.True(capped.strategy.CostStalls > 0, "expected the cost ceiling to yield frames");
+            Assert.True(capped.strategy.CostCap < MaxRollback,
+                $"cost cap should have tightened below the ring depth, stayed at {capped.strategy.CostCap}");
+            // Peak depth can't be the signal here: the cap is learned FROM the first repair, so both
+            // runs share that one and reach the same high-water mark. Total re-simulated frames is the
+            // aggregate over everything after it, which is exactly the work the cap exists to bound.
+            Assert.True(capped.strategy.FramesResimulated < free.strategy.FramesResimulated,
+                $"cost cap should reduce total re-simulation (capped={capped.strategy.FramesResimulated}, " +
+                $"free={free.strategy.FramesResimulated})");
+            Assert.True(capped.strategy.LastRollbackDepth <= capped.strategy.CostCap + 1,
+                $"a settled repair ran {capped.strategy.LastRollbackDepth} deep against a cap of " +
+                $"{capped.strategy.CostCap}");
+            // The cap may only ever narrow prediction — never the ring, and never correctness.
+            Assert.Equal(MaxRollback, capped.strategy.MaxRollback);
+            int upTo = Math.Min(capped.a.Driver.CurrentFrame, capped.b.Driver.CurrentFrame) - k - Delay - 4;
+            AssertFinalizedCorrect(capped.a, upTo);
+            AssertFinalizedCorrect(capped.b, upTo);
         }
 
         [Fact]

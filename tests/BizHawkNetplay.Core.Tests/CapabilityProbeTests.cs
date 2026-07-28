@@ -40,6 +40,59 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void SolveMaxDepth_LegacyOverload_MatchesTheExplicitModel()
+        {
+            // The five-argument form must stay exactly what it always was: no elision, one frame period
+            // of repair budget. Every existing caller depends on that.
+            foreach (var (frame, load, save) in new[] { (0.2, 0.05, 0.05), (2.0, 1.5, 6.0), (8.0, 6.0, 6.0) })
+                Assert.Equal(
+                    CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save),
+                    CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save,
+                        elideConfirmedSaves: false, repairBudgetMs: 0));
+        }
+
+        [Fact]
+        public void SolveMaxDepth_SteadyStateGateStopsARepairBudgetPaperingOverAnUnaffordableCore()
+        {
+            // frame+save is 14ms against 12.639ms of usable budget: this core cannot afford a snapshot
+            // every frame, full stop. A generous repair budget must not be able to hide that — the
+            // repair sum alone would happily report a workable depth. Eliding the recurring save is
+            // what actually makes the core viable, not a bigger allowance for the occasional repair.
+            const double frame = 6.0, load = 0.5, save = 8.0;
+            const double generousRepair = 2 * 16.639;
+
+            Assert.Equal(0, CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save,
+                elideConfirmedSaves: false, repairBudgetMs: generousRepair));
+            Assert.True(CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: generousRepair) > 0);
+
+            // With no repair budget the gate is redundant — the repair sum already returns 0 — so it
+            // can never change an answer the original five-argument form gave.
+            Assert.Equal(0, CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save));
+        }
+
+        [Fact]
+        public void SolveMaxDepth_RealN64Timings_ReachTheThresholdOnlyWithBothChanges()
+        {
+            // Measured on the N64 core this was built for: save 6.084, load 1.505, frame 1.966,
+            // against a 16.683ms budget. The original model says 1 — too shallow to be worth running.
+            const double budget = 16.683, headroom = 16.683 * 0.25;
+            const double frame = 1.966, load = 1.505, save = 6.084;
+
+            Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom, frame, load, save));
+
+            // Elision alone doesn't move the repair sum — it removes the recurring tax, not the cost of
+            // re-simulating. Allowing a repair two frame periods is what buys the depth.
+            Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom, frame, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: 0));
+
+            int depth = CapabilityProbe.SolveMaxDepth(budget, headroom, frame, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+            Assert.Equal(3, depth);
+            Assert.True(depth >= ProbeResult.RollbackDepthThreshold);
+        }
+
+        [Fact]
         public void Run_ComputesMediansAndDepthFromScriptedTimings()
         {
             var emu = new FakeEmuAdapter(portCount: 2);

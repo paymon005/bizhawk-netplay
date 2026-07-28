@@ -27,7 +27,13 @@ namespace BizHawkNetplay.Core.Probe
 
         /// <param name="frameBudgetMs">Console's exact frame period (e.g. 16.639 ms NTSC, 16.743 ms GBA).</param>
         /// <param name="headroomMs">Slack reserved for the rest of the per-frame work (render, transport, GC).</param>
-        public ProbeResult Run(double frameBudgetMs, double headroomMs)
+        /// <param name="elideConfirmedSaves">Whether the session will skip snapshots on confirmed frames
+        /// (see <see cref="Sync.RollbackTuning"/>). Changes what rollback costs when nothing is being
+        /// repaired, which is the common case and the one that decides whether a core can run it at all.</param>
+        /// <param name="repairBudgetMs">Wall clock one repair may take, if the session is willing to spend
+        /// more than a single frame period on it. 0 keeps the original one-frame ceiling.</param>
+        public ProbeResult Run(double frameBudgetMs, double headroomMs,
+            bool elideConfirmedSaves = false, double repairBudgetMs = 0)
         {
             var neutral = BuildNeutralInputs();
 
@@ -52,23 +58,53 @@ namespace BizHawkNetplay.Core.Probe
             _emu.ReleaseState(reference);
 
             int depth = SolveMaxDepth(
-                frameBudgetMs, headroomMs, medianFrame, medianLoad, medianSave);
+                frameBudgetMs, headroomMs, medianFrame, medianLoad, medianSave,
+                elideConfirmedSaves, repairBudgetMs);
 
             return new ProbeResult(
                 _emu.CoreName, stateSize, medianSave, medianLoad, medianFrame,
-                frameBudgetMs, headroomMs, depth);
+                frameBudgetMs, headroomMs, depth,
+                medianFrame + (elideConfirmedSaves ? 0 : medianSave));
         }
 
         /// <summary>
         /// Largest depth d such that: normalFrame + load + d*(sim + save) &lt;= budget - headroom.
         /// A repair reloads once, then re-simulates and re-saves d frames. Returns 0 if even a
-        /// single-frame repair overruns.
+        /// single-frame repair overruns. Original signature, preserved exactly.
         /// </summary>
         internal static int SolveMaxDepth(
             double frameBudgetMs, double headroomMs,
-            double normalFrameMs, double loadMs, double saveMs)
+            double normalFrameMs, double loadMs, double saveMs) =>
+            SolveMaxDepth(frameBudgetMs, headroomMs, normalFrameMs, loadMs, saveMs,
+                elideConfirmedSaves: false, repairBudgetMs: 0);
+
+        /// <summary>
+        /// As above, but modelling the two things the original formula left out.
+        ///
+        /// <b>Steady state.</b> The old arithmetic only ever charged for savestates taken during a
+        /// repair, and silently ignored that rollback also takes one every ordinary frame whether or
+        /// not anything is ever corrected. On a light core that omission is noise; on a heavy one it is
+        /// the whole story — N64 measures save 6.1ms against a 2.0ms frame, so nearly half the frame
+        /// budget was going on insurance the formula never counted. A core that cannot afford that
+        /// recurring cost has no usable depth however the repair sum works out, so it is checked first.
+        /// Elision removes the cost rather than accounting for it.
+        ///
+        /// <b>Repair budget.</b> Requiring a repair to fit inside a single frame period is stricter than
+        /// it needs to be now that the frame tick can absorb a short overrun. Passing an explicit budget
+        /// buys real depth on a heavy core; the frames re-simulated are still charged at the full
+        /// sim+save rate, because a correction generally confirms only the frames near its own and
+        /// leaves the rest of the window predicted — and therefore still worth anchoring.
+        /// </summary>
+        internal static int SolveMaxDepth(
+            double frameBudgetMs, double headroomMs,
+            double normalFrameMs, double loadMs, double saveMs,
+            bool elideConfirmedSaves, double repairBudgetMs)
         {
-            double available = frameBudgetMs - headroomMs - normalFrameMs - loadMs;
+            double steadyMs = normalFrameMs + (elideConfirmedSaves ? 0 : saveMs);
+            if (steadyMs > frameBudgetMs - headroomMs) return 0;
+
+            double budget = repairBudgetMs > 0 ? repairBudgetMs : frameBudgetMs - headroomMs;
+            double available = budget - normalFrameMs - loadMs;
             double perFrame = saveMs + normalFrameMs; // re-sim + re-save one repaired frame
             if (perFrame <= 0) return 0;
             double depth = available / perFrame;

@@ -137,7 +137,7 @@ On connect the tool verifies ROM/core/version/sync-settings/layout match (refusi
 
 ### Heavy cores (N64 and friends)
 
-N64 works (connects, plays, stays in sync, analog moves), but BizHawk's N64 core is **interpreter-only (no dynamic recompiler)**, so it's CPU-heavy — worst when two instances share one machine. To get it to full speed:
+N64 works (connects, plays, stays in sync, analog moves). BizHawk's N64 core is **interpreter-only (no dynamic recompiler)**, so it's often described as CPU-heavy — but measure before believing it: on a modern machine this core runs a frame in ~2-4ms against a 16.7ms budget, and what's expensive is its **savestate** (~6ms for a 16MiB state), which is a rollback cost rather than an emulation one. Two instances sharing one machine is still the worst case. To get it to full speed:
 
 - **Core:** Mupen64Plus (not Ares64 — Ares is accurate but slower).
 - **Video plugin:** **Rice** (or Glide64mk2), *not* the default GLideN64, and never Angrylion (software renderer). The plugin is the biggest adjustable cost.
@@ -149,6 +149,8 @@ Watch the fps readout while you tune: at ~100% you're good; well under means CPU
 
 Also worth knowing: turning on **Verbose log** and reading the per-second `pacing:` line tells you whether the core is genuinely missing budget (`core mean` at or above the frame period) or whether the schedule discarded frames it could have run (`rebases` above zero).
 
+**Rollback on N64 is available**, and no longer overridden to lockstep. The capability probe decides, using the model the session actually runs: a snapshot is skipped on any frame whose inputs are all already confirmed — most of them on a healthy link — so rollback's steady cost is the frame itself rather than a whole-core savestate every frame. The catch is depth. N64 measures a usable prediction horizon of about **3 frames**, so it hides roughly 3 frames of one-way latency and no more: worth it against someone nearby, not against someone far away, and lockstep remains a click away on the Netcode dropdown. When a misprediction does land, you pay a brief hitch where lockstep would have paid a stall. The session log tells you the depth it measured.
+
 See [Known limitations](#known-limitations) for the honest gaps (NAT scope, checksum scope, etc.).
 
 ## Capability probe
@@ -157,7 +159,7 @@ The M0 probe lives inside the netplay tool as the **Capability Probe** button (E
 
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
-- **Rollback on heavy cores:** N64 is still forced to lockstep. Making rollback affordable there means not taking a savestate on frames whose inputs are already confirmed (most of them, on a healthy link) and bounding repair by wall clock rather than a frame count. Even then a repaired N64 frame costs `load + frame` ≈ 24ms, so rollback would be free while the link is healthy and hitch on every misprediction — a real trade, not a free win.
+- **Rollback depth on heavy cores:** N64 now runs rollback, but only ~3 frames deep — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. Sparse keyframes during repair are the obvious next lever.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 
 ## Known limitations

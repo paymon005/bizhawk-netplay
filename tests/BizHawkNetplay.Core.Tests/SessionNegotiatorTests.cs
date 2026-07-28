@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using Xunit;
 
@@ -101,10 +102,18 @@ namespace BizHawkNetplay.Core.Tests
                 Pref(rollback: true), Pref(rollback: true));
             Assert.Equal(SyncMode.Rollback, r1.Mode);
 
-            // Both want it, but the worst peer is too shallow -> lockstep.
-            var r2 = SessionNegotiator.Negotiate(Id(depth: 20), Id(depth: 3),
+            // Both want it, but the worst peer is too shallow -> lockstep. Written against the
+            // threshold rather than a literal, so moving it can't silently reclassify this case.
+            var r2 = SessionNegotiator.Negotiate(
+                Id(depth: 20), Id(depth: ProbeResult.RollbackDepthThreshold - 1),
                 Pref(rollback: true), Pref(rollback: true));
             Assert.Equal(SyncMode.Lockstep, r2.Mode);
+
+            // ...and the peer exactly at the threshold is on the qualifying side of it.
+            var r2b = SessionNegotiator.Negotiate(
+                Id(depth: 20), Id(depth: ProbeResult.RollbackDepthThreshold),
+                Pref(rollback: true), Pref(rollback: true));
+            Assert.Equal(SyncMode.Rollback, r2b.Mode);
 
             // One peer didn't opt in -> lockstep even though both qualify.
             var r3 = SessionNegotiator.Negotiate(Id(depth: 20), Id(depth: 20),
