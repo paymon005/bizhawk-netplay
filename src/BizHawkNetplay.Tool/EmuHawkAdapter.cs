@@ -277,6 +277,19 @@ namespace BizHawkNetplay.Tool
         public void SetInputs(InputSet inputs) { }
 
         /// <summary>
+        /// One frame with video rendered, for the capability probe's live-frame measurement.
+        ///
+        /// Deliberately not <see cref="AdvanceFrame"/>: that also drains the core's samples into the
+        /// audio ring, and the probe runs outside the session's audio lifecycle. The samples this
+        /// produces are simply discarded when the probe restores its reference state.
+        /// </summary>
+        public void AdvanceRenderedFrame(InputSet inputs)
+        {
+            var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
+            _emulator.FrameAdvance(controller, render: true, renderSound: true);
+        }
+
+        /// <summary>
         /// Step the core exactly one frame using <paramref name="inputs"/> as the ONLY input source
         /// (bypasses EmuHawk's input chain and hotkeys). Identical inputs on both peers therefore
         /// produce identical state — the proven-deterministic stepping path.

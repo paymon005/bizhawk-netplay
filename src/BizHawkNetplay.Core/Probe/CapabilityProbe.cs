@@ -51,25 +51,32 @@ namespace BizHawkNetplay.Core.Probe
 
             double medianLoad = MeasureMedian(() => _emu.LoadStateFromMemory(reference));
 
-            // NOTE: these advance with rendering OFF, which is what a repair does — but the depth
-            // formula also charges this figure for the live frame, which renders. On a core whose
-            // video plugin is expensive that understates the live cost, and the probe is correspondingly
-            // optimistic. It is also why changing resolution barely moves this number.
+            // These advance with rendering OFF, which is exactly what a repair does — so this is the
+            // repair term, and the right figure for it.
             double highFrame;
             double medianFrame = MeasureMedian(() =>
                 _emu.RunFramesInvisible(1, _ => neutral), out highFrame);
 
+            // ...and this is the live frame, which renders. The two used to be the same number, which
+            // made the probe optimistic on precisely the cores where the verdict is close, and left it
+            // almost blind to the resolution setting — the one knob a user tuning for performance
+            // reaches for first. Measured separately now, and each charged where it belongs.
+            double medianLiveFrame = MeasureMedian(() => _emu.AdvanceRenderedFrame(neutral));
+
             foreach (var h in scratch) _emu.ReleaseState(h);
 
             int depth = SolveMaxDepth(
-                frameBudgetMs, headroomMs, medianFrame, medianLoad, medianSave,
+                frameBudgetMs, headroomMs, medianLiveFrame, medianFrame, medianLoad, medianSave,
                 elideConfirmedSaves, repairBudgetMs);
 
             // What the same machine would have concluded on a slower-than-typical frame. When this
             // disagrees with the median verdict, the answer is a coin flip and the user deserves to
-            // know rather than re-rolling the probe until they like it.
+            // know rather than re-rolling the probe until they like it. The high end is measured on the
+            // repair term, so scale the live term by the same ratio rather than pretending only one of
+            // them has a bad run.
+            double liveRatio = medianFrame > 0 ? highFrame / medianFrame : 1.0;
             int depthAtWorst = SolveMaxDepth(
-                frameBudgetMs, headroomMs, highFrame, medianLoad, medianSave,
+                frameBudgetMs, headroomMs, medianLiveFrame * liveRatio, highFrame, medianLoad, medianSave,
                 elideConfirmedSaves, repairBudgetMs);
 
             bool replayDeterministic = VerifyReplayDeterminism(neutral, ReplayCheckFrames);
@@ -84,8 +91,8 @@ namespace BizHawkNetplay.Core.Probe
             return new ProbeResult(
                 _emu.CoreName, stateSize, medianSave, medianLoad, medianFrame,
                 frameBudgetMs, headroomMs, depth,
-                medianFrame + (elideConfirmedSaves ? 0 : medianSave),
-                replayDeterministic, depthAtWorst, highFrame);
+                medianLiveFrame + (elideConfirmedSaves ? 0 : medianSave),
+                replayDeterministic, depthAtWorst, highFrame, medianLiveFrame);
         }
 
         /// <summary>
@@ -98,6 +105,15 @@ namespace BizHawkNetplay.Core.Probe
             double normalFrameMs, double loadMs, double saveMs) =>
             SolveMaxDepth(frameBudgetMs, headroomMs, normalFrameMs, loadMs, saveMs,
                 elideConfirmedSaves: false, repairBudgetMs: 0);
+
+        /// <summary>As the six-argument form, charging one frame cost for both roles. Kept because most
+        /// callers and every test written before the live frame was measured separately pass one.</summary>
+        internal static int SolveMaxDepth(
+            double frameBudgetMs, double headroomMs,
+            double normalFrameMs, double loadMs, double saveMs,
+            bool elideConfirmedSaves, double repairBudgetMs) =>
+            SolveMaxDepth(frameBudgetMs, headroomMs, normalFrameMs, normalFrameMs, loadMs, saveMs,
+                elideConfirmedSaves, repairBudgetMs);
 
         /// <summary>
         /// As above, but modelling the two things the original formula left out.
@@ -115,18 +131,23 @@ namespace BizHawkNetplay.Core.Probe
         /// buys real depth on a heavy core; the frames re-simulated are still charged at the full
         /// sim+save rate, because a correction generally confirms only the frames near its own and
         /// leaves the rest of the window predicted — and therefore still worth anchoring.
+        ///
+        /// <b>Two frame costs.</b> A repair re-simulates with rendering off; the live frame renders.
+        /// Charging one figure for both was wrong in the direction that matters — the live frame is the
+        /// dearer of the two, and it appears in the steady-state check and in what the repair has left
+        /// to spend, so a single cheap number inflated the answer twice.
         /// </summary>
         internal static int SolveMaxDepth(
             double frameBudgetMs, double headroomMs,
-            double normalFrameMs, double loadMs, double saveMs,
+            double liveFrameMs, double repairFrameMs, double loadMs, double saveMs,
             bool elideConfirmedSaves, double repairBudgetMs)
         {
-            double steadyMs = normalFrameMs + (elideConfirmedSaves ? 0 : saveMs);
+            double steadyMs = liveFrameMs + (elideConfirmedSaves ? 0 : saveMs);
             if (steadyMs > frameBudgetMs - headroomMs) return 0;
 
             double budget = repairBudgetMs > 0 ? repairBudgetMs : frameBudgetMs - headroomMs;
-            double available = budget - normalFrameMs - loadMs;
-            double perFrame = saveMs + normalFrameMs; // re-sim + re-save one repaired frame
+            double available = budget - liveFrameMs - loadMs;
+            double perFrame = saveMs + repairFrameMs; // re-sim + re-save one repaired frame
             if (perFrame <= 0) return 0;
             double depth = available / perFrame;
             return depth <= 0 ? 0 : (int)Math.Floor(depth);

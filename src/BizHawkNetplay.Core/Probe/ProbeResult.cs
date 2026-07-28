@@ -18,8 +18,10 @@ namespace BizHawkNetplay.Core.Probe
             double steadyStateMs = 0,
             bool replayDeterministic = true,
             int depthAtWorstFrame = -1,
-            double highFrameMs = 0)
+            double highFrameMs = 0,
+            double liveFrameMs = 0)
         {
+            LiveFrameMs = liveFrameMs > 0 ? liveFrameMs : medianFrameMs;
             SteadyStateMs = steadyStateMs > 0 ? steadyStateMs : medianFrameMs + medianSaveMs;
             ReplayDeterministic = replayDeterministic;
             DepthAtWorstFrame = depthAtWorstFrame < 0 ? maxRollbackDepth : depthAtWorstFrame;
@@ -38,7 +40,18 @@ namespace BizHawkNetplay.Core.Probe
         public int StateSizeBytes { get; }
         public double MedianSaveMs { get; }
         public double MedianLoadMs { get; }
+        /// <summary>Median cost of a frame advanced with rendering OFF — what a repair re-simulates.</summary>
         public double MedianFrameMs { get; }
+
+        /// <summary>
+        /// Median cost of a frame with video rendered — what the player's own frame costs.
+        ///
+        /// Separate from <see cref="MedianFrameMs"/> because the difference is the video plugin, which on
+        /// a heavy core is the largest single term the probe measures and the one a user actually
+        /// controls. When these two are far apart, the setting worth changing is the render one.
+        /// </summary>
+        public double LiveFrameMs { get; }
+
         public double FrameBudgetMs { get; }
         public double HeadroomMs { get; }
 
@@ -103,6 +116,7 @@ namespace BizHawkNetplay.Core.Probe
         public override string ToString() =>
             $"{CoreName}: state={StateSizeBytes / 1024.0:F1}KiB " +
             $"save={MedianSaveMs:F3}ms load={MedianLoadMs:F3}ms frame={MedianFrameMs:F3}ms " +
+            $"live={LiveFrameMs:F3}ms " +
             $"steady={SteadyStateMs:F3}ms budget={FrameBudgetMs:F3}ms -> maxDepth={MaxRollbackDepth} " +
             $"replay={(ReplayDeterministic ? "ok" : "DIVERGED")} " +
             $"({(RollbackQualified ? "ROLLBACK OK" : "lockstep only")}" +

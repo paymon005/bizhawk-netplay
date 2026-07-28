@@ -83,6 +83,19 @@ namespace BizHawkNetplay.Core.Emu
         /// </summary>
         void RunFramesInvisible(int count, Func<int, InputSet> inputsFor);
 
+        /// <summary>
+        /// Advance one frame with video rendered, for measuring what a frame the player actually sees
+        /// costs.
+        ///
+        /// <see cref="RunFramesInvisible"/> is the right figure for repair, which genuinely does not
+        /// render — but the capability probe was charging that same figure for the live frame too. On a
+        /// core with an expensive video plugin the two differ by more than everything else the probe
+        /// measures put together, and the gap runs one way: the probe reports a machine as capable of
+        /// more rollback than it can actually afford, and barely responds to the resolution setting a
+        /// user tuning for performance is most likely to reach for.
+        /// </summary>
+        void AdvanceRenderedFrame(InputSet inputs);
+
         void SetAudioMuted(bool muted);
 
         // --- Integrity ----------------------------------------------------------------

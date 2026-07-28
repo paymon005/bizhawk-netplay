@@ -158,9 +158,14 @@ See [Known limitations](#known-limitations) for the honest gaps (NAT scope, chec
 
 The M0 probe lives inside the netplay tool as the **Capability Probe** button (EmuHawk requires exactly one external-tool entry point per DLL, so it's folded in rather than a separate tool). It times save/load/frame-advance on the loaded core and prints the per-core rollback verdict, saving and restoring your position so it doesn't disturb play.
 
+It reports **two** frame costs, because the two things a frame is used for cost differently: `frame=` is a frame advanced with rendering off — what a rollback repair re-simulates — and `live=` is one with video rendered, which is what the player's own frame costs. The difference is the video plugin. When they are far apart, the setting worth changing is the render one; when `live=` alone eats the frame budget, there is no rollback depth to have at any repair budget.
+
+It also reports `MARGINAL` when the median frame cost qualifies for rollback and the slow end of the same run does not — a heavy core's frame cost moves enough between runs to flip the verdict, and re-rolling the probe until it says what you want is not a fix.
+
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
 - **Rollback depth on heavy cores:** N64 now runs rollback, but only ~3 frames deep — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. Sparse keyframes during repair are the obvious next lever.
+- **Where N64's frame cost actually comes from:** the same machine, game and settings measured frame costs from 1.6 ms to 12 ms across one evening, with the probe correctly predicting the live cost every time. Render resolution is *not* the variable — fourteen probes across every Rice setting landed in a 1.9–3.6 ms band, and a 1280×960 session ran cheaper than several lower ones. Depth, tick rate, picture rate and input feel are all downstream of this term, so it outranks every other performance lever until it is understood.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 
 ## Known limitations

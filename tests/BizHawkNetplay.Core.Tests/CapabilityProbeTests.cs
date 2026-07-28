@@ -182,12 +182,13 @@ namespace BizHawkNetplay.Core.Tests
         {
             var emu = new FakeEmuAdapter(portCount: 2);
 
-            // Probe order: 1 reference save (untimed), then samples of
-            // save x100, load x100, frame x100. Feed constant per-op durations.
+            // Probe order: 1 reference save (untimed), then samples of save x100, load x100,
+            // frame-without-render x100, frame-with-render x100. Feed constant per-op durations.
             var durations = new List<double>();
             durations.AddRange(Enumerable.Repeat(0.10, 100)); // save
             durations.AddRange(Enumerable.Repeat(0.05, 100)); // load
-            durations.AddRange(Enumerable.Repeat(0.20, 100)); // frame
+            durations.AddRange(Enumerable.Repeat(0.20, 100)); // frame, rendering off — the repair term
+            durations.AddRange(Enumerable.Repeat(0.50, 100)); // frame, rendering on — the live term
             var clock = new ManualClock(durations);
 
             var probe = new CapabilityProbe(emu, clock, samples: 100);
@@ -197,12 +198,54 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0.10, result.MedianSaveMs, 3);
             Assert.Equal(0.05, result.MedianLoadMs, 3);
             Assert.Equal(0.20, result.MedianFrameMs, 3);
+            // The two frame costs are kept apart. Scripted differently on purpose: a clock that runs
+            // out returns zero-length ops, so a probe that never rendered would pass this silently.
+            Assert.Equal(0.50, result.LiveFrameMs, 3);
             Assert.True(result.RollbackQualified);
 
             // Adapter was actually exercised the expected number of times.
             Assert.Equal(102, emu.SaveCount);   // 1 reference + 100 samples + 1 replay-check anchor
             Assert.Equal(103, emu.LoadCount);   // 100 samples + 2 in the replay check + 1 final restore
             Assert.Equal(160, emu.InvisibleFrameCount); // 100 timed + 30 replayed twice
+            Assert.Equal(100, emu.RenderedFrameCount);
+        }
+
+        [Fact]
+        public void SolveMaxDepth_ChargesTheRenderedFrameToTheLiveTermAndTheBareOneToRepair()
+        {
+            // A repair re-simulates with rendering off; the frame the player sees renders. The old
+            // model measured only the first and charged it for both — which is optimistic twice over,
+            // since the live cost appears in the steady-state check AND in what the repair has left to
+            // spend. Numbers below are the measured N64 save/load against three render costs.
+            const double budget = 16.683, headroom = 16.683 * 0.25;
+            const double repairFrame = 4.25, load = 1.6, save = 6.0;
+
+            int asIfRenderWereFree = CapabilityProbe.SolveMaxDepth(budget, headroom, repairFrame, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+            Assert.Equal(2, asIfRenderWereFree);
+
+            // A dearer video plugin buys fewer repaired frames with the same repair budget...
+            Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom,
+                liveFrameMs: 12.0, repairFrameMs: repairFrame, loadMs: load, saveMs: save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget));
+
+            // ...and past the point where the live frame no longer fits the budget at all, there is no
+            // depth to have. The old figure would still have reported 2 here.
+            Assert.Equal(0, CapabilityProbe.SolveMaxDepth(budget, headroom,
+                liveFrameMs: 13.0, repairFrameMs: repairFrame, loadMs: load, saveMs: save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget));
+        }
+
+        [Fact]
+        public void SolveMaxDepth_OneFrameCostIsExactlyTheSameCostTwice()
+        {
+            // The shorter overloads must stay a special case of the long one, not an approximation:
+            // every caller and test written before the live frame was measured separately relies on it.
+            foreach (var (frame, load, save) in new[] { (0.2, 0.05, 0.05), (2.0, 1.5, 6.0), (8.0, 6.0, 6.0) })
+                foreach (bool elide in new[] { false, true })
+                    Assert.Equal(
+                        CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save, elide, 33.0),
+                        CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save, elide, 33.0));
         }
     }
 }
