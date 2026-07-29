@@ -402,6 +402,7 @@ namespace BizHawkNetplay.Tool
         private bool _presentHintShown; // one-time "the picture is coarser than the emulation" hint
         private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
         private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
+        private double _lastPresentClockMs = -1; // ...and of the previous present, for judder stats
         private const double StallHintPct = 15.0;      // stalled share of ticks worth complaining about
         private const double StallHintSustainMs = 5000; // ...but only once it persists, not on one burst
         // Presented-vs-advanced share below which the picture is coarse enough to be worth naming. A
@@ -1943,6 +1944,7 @@ namespace BizHawkNetplay.Tool
             _presentHintShown = false;
             _hashDiagLogged = false;
             _lastTickClockMs = -1;
+            _lastPresentClockMs = -1;
             // A WinForms timer is WM_TIMER, and SetTimer silently raises anything below
             // USER_TIMER_MINIMUM to 10ms — asking for 2 never bought a 2ms cadence, it just hid the
             // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
@@ -2312,6 +2314,9 @@ namespace BizHawkNetplay.Tool
                     _adapter!.PresentVideo();
                     renderMs = phase.Elapsed.TotalMilliseconds;
                     _pacing.AddPresent(renderMs);
+                    if (_lastPresentClockMs >= 0)
+                        _pacing.AddPresentInterval(nowMs - _lastPresentClockMs, _frameMs);
+                    _lastPresentClockMs = nowMs;
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
@@ -2601,6 +2606,8 @@ namespace BizHawkNetplay.Tool
                 $"core mean {p.CoreMeanMs:F1} p95 {p.CoreP95Ms:F1} max {p.CoreMaxMs:F1}ms, " +
                 $"gate mean {p.GateMeanMs:F1} p95 {p.GateP95Ms:F1}ms, " +
                 $"present mean {p.PresentMeanMs:F1}ms, undrawn {p.UndrawnRenders}, " +
+                $"judder {p.JudderPct:F0}% (gap {p.PresentGapMeanMs:F1}ms ±{p.PresentJitterMs:F1} " +
+                $"max {p.PresentGapMaxMs:F1} vs {_frameMs:F1} target), " +
                 $"{rbStr}" +
                 $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
                 $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");

@@ -284,5 +284,70 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0, summary.CoreMaxMs);
             Assert.Equal(0, summary.CoreMeanMs);
         }
+
+        /// <summary>
+        /// The reading this metric exists for. Both streams below present exactly 60 frames in exactly
+        /// one second, so every rate on the pacing line — adv, present, tick — is identical between
+        /// them. One is a perfect cadence and the other alternates 8ms/25ms, which is visibly uneven
+        /// motion. If the summary cannot tell them apart it is not measuring smoothness.
+        /// </summary>
+        [Fact]
+        public void SeparatesAnEvenCadenceFromABurstyOneAtTheSameFrameRate()
+        {
+            const double target = 16.688;
+
+            var even = new PacingStats();
+            for (int i = 0; i < 60; i++) even.AddPresentInterval(target, target);
+
+            // Straddles the target so the two streams average to exactly the same pace.
+            var bursty = new PacingStats();
+            for (int i = 0; i < 60; i++) bursty.AddPresentInterval(i % 2 == 0 ? target / 2 : target * 1.5, target);
+
+            var e = even.Summarize(1000);
+            var b = bursty.Summarize(1000);
+
+            // Same average pace, so no rate-based reading could distinguish them.
+            Assert.Equal(e.PresentGapMeanMs, b.PresentGapMeanMs, 1);
+
+            Assert.Equal(0, e.PresentJitterMs, 3);
+            Assert.Equal(0, e.JudderPct);
+            Assert.True(b.PresentJitterMs > 8, $"bursty jitter {b.PresentJitterMs:F1}ms should be large");
+            Assert.Equal(100, b.JudderPct);
+        }
+
+        [Fact]
+        public void CountsOnlyTheGapsThatMissTheFramePeriodByMoreThanTheTolerance()
+        {
+            const double target = 16.0;
+            var stats = new PacingStats();
+
+            // Inside +-25%: 12.0 and 20.0 both sit exactly on the boundary, which is not "more than".
+            stats.AddPresentInterval(16.0, target);
+            stats.AddPresentInterval(12.0, target);
+            stats.AddPresentInterval(20.0, target);
+            // Outside it, in both directions.
+            stats.AddPresentInterval(33.0, target);
+            stats.AddPresentInterval(2.0, target);
+
+            var summary = stats.Summarize(1000);
+
+            Assert.Equal(40, summary.JudderPct);
+            Assert.Equal(33.0, summary.PresentGapMaxMs, 3);
+        }
+
+        [Fact]
+        public void JudderStatsResetWithTheWindow()
+        {
+            var stats = new PacingStats();
+            stats.AddPresentInterval(50, 16.688);
+            stats.Reset();
+
+            var summary = stats.Summarize(1000);
+
+            Assert.Equal(0, summary.JudderPct);
+            Assert.Equal(0, summary.PresentJitterMs);
+            Assert.Equal(0, summary.PresentGapMaxMs);
+            Assert.Equal(0, summary.PresentGapMeanMs);
+        }
     }
 }

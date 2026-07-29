@@ -13,8 +13,14 @@ namespace BizHawkNetplay.Core.Sync
             int rebases, double ticksPerSecond, double advancedFps, double presentedFps,
             double coreMeanMs, double coreP95Ms, double coreMaxMs, double gateMeanMs, double gateP95Ms,
             double presentMeanMs, double tickGapMeanMs, double tickGapMinMs, double tickGapMaxMs,
-            int renderedFrames = 0)
+            int renderedFrames = 0,
+            double presentGapMeanMs = 0, double presentJitterMs = 0, double judderPct = 0,
+            double presentGapMaxMs = 0)
         {
+            PresentGapMeanMs = presentGapMeanMs;
+            PresentJitterMs = presentJitterMs;
+            JudderPct = judderPct;
+            PresentGapMaxMs = presentGapMaxMs;
             RenderedFrames = renderedFrames;
             CoreMaxMs = coreMaxMs;
             TicksPerSecond = ticksPerSecond;
@@ -90,6 +96,37 @@ namespace BizHawkNetplay.Core.Sync
         /// </summary>
         public double PresentedShare => AdvancedFps <= 0 ? 1 : Math.Min(1, PresentedFps / AdvancedFps);
 
+        /// <summary>
+        /// Wall-clock gap between consecutive presents — the interval the eye actually sees, as opposed
+        /// to <see cref="TickGapMeanMs"/>, which counts callbacks whether or not one put a new picture
+        /// on the screen.
+        ///
+        /// Added after a player reported the game "runs faster and smoother without netplay" while every
+        /// rate on this line read a healthy 60. Both statements were true. Smoothness is not a rate: a
+        /// stream of frames at a perfect 16.7ms apart and one alternating 8ms/25ms have identical
+        /// averages, and only the second one judders. Nothing here measured the spacing, so the pacing
+        /// line kept answering "60fps, fine" to a question about evenness.
+        /// </summary>
+        public double PresentGapMeanMs { get; }
+
+        /// <summary>
+        /// Standard deviation of the present gaps. This is the smoothness number. Zero is a perfect
+        /// cadence; anything approaching the frame period itself means frames are arriving in bursts
+        /// and the average rate is telling you nothing about what the display is doing.
+        /// </summary>
+        public double PresentJitterMs { get; }
+
+        /// <summary>Worst single gap between presents in the window — the longest the picture stood still.</summary>
+        public double PresentGapMaxMs { get; }
+
+        /// <summary>
+        /// Share of presents landing more than <see cref="PacingStats.JudderTolerance"/> away from the
+        /// console's frame period, 0..100. A percentage rather than a deviation because it answers the
+        /// question a player is actually asking — how often does the motion break — and because it stays
+        /// comparable between a 60Hz console and a 50Hz one.
+        /// </summary>
+        public double JudderPct { get; }
+
         public double CoreMeanMs { get; }
         public double CoreP95Ms { get; }
 
@@ -148,6 +185,19 @@ namespace BizHawkNetplay.Core.Sync
         private double _intervalSum;
         private double _intervalMax;
         private double _intervalMin = double.MaxValue;
+        private int _presentGapCount;
+        private double _presentGapSum;
+        private double _presentGapSumSq;
+        private double _presentGapMax;
+        private int _judderGaps;
+
+        /// <summary>
+        /// How far a present may land from the console's frame period before it counts as judder, as a
+        /// fraction of that period. A quarter of a frame is a little over 4ms at 60Hz — comfortably
+        /// above the sub-millisecond noise of a Stopwatch read, and comfortably below the half-frame
+        /// error that shows up as visibly uneven motion.
+        /// </summary>
+        public const double JudderTolerance = 0.25;
 
         /// <summary>
         /// One frame stepped through the core, with the wall-clock cost of that step.
@@ -200,6 +250,22 @@ namespace BizHawkNetplay.Core.Sync
             if (intervalMs < _intervalMin) _intervalMin = intervalMs;
         }
 
+        /// <summary>
+        /// Wall-clock gap since the previous present, against the console's frame period.
+        ///
+        /// Distinct from <see cref="AddTickInterval"/> on purpose: a tick that steps no frame presents
+        /// nothing, so the tick cadence can be perfectly even while the picture updates in bursts. This
+        /// measures the picture.
+        /// </summary>
+        public void AddPresentInterval(double intervalMs, double targetMs)
+        {
+            _presentGapCount++;
+            _presentGapSum += intervalMs;
+            _presentGapSumSq += intervalMs * intervalMs;
+            if (intervalMs > _presentGapMax) _presentGapMax = intervalMs;
+            if (targetMs > 0 && Math.Abs(intervalMs - targetMs) > targetMs * JudderTolerance) _judderGaps++;
+        }
+
         /// <summary>The pacing clock gave up on accumulated debt and jumped to now, discarding frames.</summary>
         public void AddRebase() => _rebases++;
 
@@ -229,7 +295,26 @@ namespace BizHawkNetplay.Core.Sync
                 tickGapMeanMs: Mean(_intervalSum, _intervalCount),
                 tickGapMinMs: _intervalCount == 0 ? 0 : _intervalMin,
                 tickGapMaxMs: _intervalMax,
-                renderedFrames: _renderedFrames);
+                renderedFrames: _renderedFrames,
+                presentGapMeanMs: Mean(_presentGapSum, _presentGapCount),
+                presentJitterMs: StdDev(_presentGapSum, _presentGapSumSq, _presentGapCount),
+                judderPct: _presentGapCount <= 0 ? 0 : _judderGaps * 100.0 / _presentGapCount,
+                presentGapMaxMs: _presentGapMax);
+        }
+
+        /// <summary>
+        /// Population standard deviation from running sums, clamped at zero. The naive sum-of-squares
+        /// form is fine at this scale — gaps are tens of milliseconds over a window of tens of samples,
+        /// nowhere near where catastrophic cancellation bites — and it keeps the per-present cost to two
+        /// adds and a multiply. The clamp only ever catches float error on a window where every gap was
+        /// identical, where the true answer is zero anyway.
+        /// </summary>
+        private static double StdDev(double sum, double sumSq, int count)
+        {
+            if (count <= 1) return 0;
+            double mean = sum / count;
+            double variance = sumSq / count - mean * mean;
+            return variance <= 0 ? 0 : Math.Sqrt(variance);
         }
 
         public void Reset()
@@ -251,6 +336,11 @@ namespace BizHawkNetplay.Core.Sync
             _intervalSum = 0;
             _intervalMax = 0;
             _intervalMin = double.MaxValue;
+            _presentGapCount = 0;
+            _presentGapSum = 0;
+            _presentGapSumSq = 0;
+            _presentGapMax = 0;
+            _judderGaps = 0;
         }
 
         private static double Mean(double sum, int count) => count <= 0 ? 0 : sum / count;
