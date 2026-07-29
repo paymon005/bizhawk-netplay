@@ -2344,7 +2344,11 @@ namespace BizHawkNetplay.Tool
                 : $" — ping {effRttMs:F0}ms{(udpMeasured ? " udp" : "")}" +
                   $"{(_simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "")}{(_peers.Count > 1 ? " (worst)" : "")}";
             string rbStr = _driver.Strategy is RollbackStrategy rbs
-                ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
+                // Walk-back only appears once it has happened: it is the price sparse keyframes pays,
+                // and the first thing to look at if a repair costs more than its depth accounts for.
+                ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}" +
+                  $"{(rbs.LastRollbackWalkback > 0 ? $"+{rbs.LastRollbackWalkback}wb" : "")}" +
+                  $", max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
                 : "";
 
             if (_fpsClock.ElapsedMilliseconds >= 500)
@@ -3368,9 +3372,28 @@ namespace BizHawkNetplay.Tool
         {
             ElideConfirmedSaves = true,
             ChecksumAnchorInterval = ChecksumInterval,
+            KeyframeInterval = RepairKeyframeInterval,
             RepairBudgetMs = RepairBudgetFrames * FrameMs(),
             Clock = new StopwatchClock(),
         };
+
+        /// <summary>
+        /// Snapshot every other predicted frame rather than every one.
+        ///
+        /// The snapshot is what a repair spends its budget on: measured on N64 over eight stationary
+        /// runs, a repaired frame costs 9.24ms of which 6.82ms is the snapshot and 2.41ms is the frame.
+        /// Halving the snapshots costs at most one extra re-simulated frame per correction, and buys a
+        /// frame of prediction depth — worth about 17ms of hideable one-way latency.
+        ///
+        /// The second effect is the one that shows up as feel rather than as a number. A worst-case
+        /// repair at this depth costs ~27ms against ~31.5ms before, which is the first time it fits
+        /// inside <see cref="TickBudgetMs"/> (~28.4ms at 60Hz). Until now every max-depth correction
+        /// overran its own tick and landed as a hitch.
+        ///
+        /// Not raised further on purpose: past 3 the walk-back to the nearest keyframe costs more
+        /// frames than the snapshots it avoids, and the measured depth goes back down.
+        /// </summary>
+        private const int RepairKeyframeInterval = 2;
 
         // Reflection flags for reaching EmuHawk internals (Tools/LuaConsole members aren't all public).
         private const System.Reflection.BindingFlags AnyInstance =
