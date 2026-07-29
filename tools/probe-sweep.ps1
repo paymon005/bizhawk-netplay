@@ -71,6 +71,15 @@ param(
     [int]      $Runs = 1,
     [string]   $OutFile,
     [int]      $TimeoutSec = 180,
+    # How long the core runs before it is probed. This is the one wait here that is part of the
+    # experiment rather than overhead: everything else -- menus, tab clicks, window and log polling --
+    # is the harness sitting around, and is driven by conditions instead of by a duration.
+    #
+    # Kept at a second and a half rather than trimmed with the rest, on the general principle that a
+    # measurement taken of a just-started process is not obviously the measurement wanted. That is a
+    # precaution, not a finding: cutting it to 250ms and restoring it made no difference to any figure
+    # the probe reports, so nothing here is known to depend on it.
+    [int]      $SettleMs = 1500,
     [switch]   $KeepOpen
 )
 
@@ -128,8 +137,14 @@ function Set-Foreground {
     [void][ProbeSweep.Win]::BringWindowToTop($Handle)
     [void][ProbeSweep.Win]::SetForegroundWindow($Handle)
     [void][ProbeSweep.Win]::AttachThreadInput($me, $fgThread, $false)
-    Start-Sleep -Milliseconds 300
-    return ([ProbeSweep.Win]::GetForegroundWindow() -eq $Handle)
+    # Poll briefly for the switch rather than assuming a duration for it: it is usually immediate,
+    # and when it does not happen there is nothing to gain by waiting -- the clicks below use screen
+    # coordinates and land whether or not the window took focus.
+    for ($i = 0; $i -lt 6; $i++) {
+        if ([ProbeSweep.Win]::GetForegroundWindow() -eq $Handle) { return $true }
+        Start-Sleep -Milliseconds 20
+    }
+    return $false
 }
 
 <#
@@ -143,7 +158,7 @@ function Show-WindowMaximized {
     [void][ProbeSweep.Win]::SetWindowPos($Handle, [System.IntPtr]::Zero, 0, 0, 0, 0, 0x0005) # NOSIZE|NOZORDER
     [void][ProbeSweep.Win]::ShowWindow($Handle, 3)                                        # SW_MAXIMIZE
     [void](Set-Foreground -Handle $Handle)
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Milliseconds 60
 }
 
 $script:ScanPid = 0
@@ -175,7 +190,7 @@ function Wait-WindowByTitle {
     while ((Get-Date) -lt $deadline) {
         $h = Get-WindowByTitle -ProcId $ProcId -Title $Title
         if ($h -ne [System.IntPtr]::Zero) { return $h }
-        Start-Sleep -Milliseconds 300
+        Start-Sleep -Milliseconds 75
     }
     throw "window '$Title' did not appear within ${Seconds}s"
 }
@@ -183,10 +198,10 @@ function Wait-WindowByTitle {
 function Invoke-Click {
     param([int] $X, [int] $Y)
     [void][ProbeSweep.Win]::SetCursorPos($X, $Y)
-    Start-Sleep -Milliseconds 120
+    Start-Sleep -Milliseconds 30
     [ProbeSweep.Win]::mouse_event(0x0002, 0, 0, 0, [System.IntPtr]::Zero)  # LEFTDOWN
     [ProbeSweep.Win]::mouse_event(0x0004, 0, 0, 0, [System.IntPtr]::Zero)  # LEFTUP
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 60
 }
 
 # ------------------------------------------------------------------ EmuHawk's own menus
@@ -204,6 +219,10 @@ function Invoke-MenuItem {
     $cond = New-Object System.Windows.Automation.AndCondition(
         (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $Name)),
         (New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::MenuItem)))
+    # No settle after expanding or invoking: the caller's next step already polls for whatever this
+    # produced -- the following menu item, a window, or a log marker -- so sleeping here just adds a
+    # fixed cost to every step of every run. The retry loop below covers a dropdown that is slow to
+    # appear, at 60ms rather than by guessing a duration up front.
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
         try {
@@ -212,13 +231,13 @@ function Invoke-MenuItem {
                 if (-not $hit) { continue }
                 if ($Expand) {
                     $ec = Get-Pattern $hit ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-                    if ($ec) { $ec.Expand(); Start-Sleep -Milliseconds 500; return }
+                    if ($ec) { $ec.Expand(); return }
                 }
                 $inv = Get-Pattern $hit ([System.Windows.Automation.InvokePattern]::Pattern)
-                if ($inv) { $inv.Invoke(); Start-Sleep -Milliseconds 300; return }
+                if ($inv) { $inv.Invoke(); return }
             }
         } catch { }
-        Start-Sleep -Milliseconds 250
+        Start-Sleep -Milliseconds 60
     }
     throw "menu item '$Name' not found"
 }
@@ -232,14 +251,48 @@ function Get-Descendants {
     return $out
 }
 
+<#
+    One filtered cross-process call, not a walk.
+
+    This used to enumerate every descendant and compare names here. The tool's tree arrives over the
+    MSAA bridge, where a full walk is hundreds of milliseconds and each property read is its own
+    round trip -- and the tab search pays for one of these after every click. Handing the condition
+    to UI Automation lets it filter on its side and return the one element.
+#>
 function Find-ByName {
     param($Window, [string] $Name, [switch] $OnScreenOnly)
-    foreach ($e in (Get-Descendants -Window $Window)) {
-        if ($e.Current.Name -ne $Name) { continue }
-        if ($OnScreenOnly -and $e.Current.IsOffscreen) { continue }
-        return $e
+    $cond = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $Name)
+    if ($OnScreenOnly) {
+        $cond = New-Object System.Windows.Automation.AndCondition(
+            $cond,
+            (New-Object System.Windows.Automation.PropertyCondition($AE::IsOffscreenProperty, $false)))
     }
-    return $null
+    return $Window.FindFirst($Tree::Descendants, $cond)
+}
+
+<#
+    The tab control, reached with one walker step instead of enumerating the window's descendants.
+#>
+function Get-TabControl {
+    param($Window)
+    return [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetFirstChild($Window)
+}
+
+<#
+    Is this tab page the selected one? Scoped to the tab control's immediate CHILDREN, which is the
+    difference between a fast answer and a slow one.
+
+    A descendant search has to walk the whole subtree before it can conclude "not here", and during
+    the strip scan that negative is the answer after every click but the last -- so the search was
+    costing a full tree walk per click, over the MSAA bridge, several times per run. The realized
+    tab pages are direct children of the tab control, so asking there looks at four elements.
+#>
+function Find-TabPage {
+    param($TabControl, [string] $Name)
+    $cond = New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $Name)),
+        (New-Object System.Windows.Automation.PropertyCondition($AE::IsOffscreenProperty, $false)))
+    return $TabControl.FindFirst($Tree::Children, $cond)
 }
 
 <#
@@ -247,29 +300,49 @@ function Find-ByName {
     between the tab control's top and the selected page's top, so its position is measured
     rather than assumed -- the form is DPI-scaled and the tab widths follow the font.
 #>
+# Where each tab's label was found, remembered across runs. Every run maximizes the tool window to
+# the same place, so the strip lands at the same coordinates and a sweep only pays for the search
+# once instead of once per run -- which was the single biggest fixed cost in a run.
+$script:TabHit = @{}
+$script:StripY = $null
+$script:StripLeft = $null
+
 function Select-ToolTab {
     param($Window, [string] $Name)
-    if (Find-ByName -Window $Window -Name $Name -OnScreenOnly) { return }
+    $tabCtl = Get-TabControl -Window $Window
+    if (-not $tabCtl) { throw 'the tool window exposes no tab control' }
+    if (Find-TabPage -TabControl $tabCtl -Name $Name) { return }
 
-    $kids = Get-Descendants -Window $Window
-    if ($kids.Count -eq 0) { throw 'the tool window exposes no children' }
-    $tabCtl = $kids[0]
-    $page = $null
-    foreach ($n in @('Connection', 'Players', 'Diagnostics', 'Log')) {
-        $candidate = Find-ByName -Window $Window -Name $n -OnScreenOnly
-        if ($candidate) { $page = $candidate; break }
+    # The strip sits between the tab control's top and the selected page's, so finding it needs two
+    # rectangles -- measured once and reused, since every run maximizes to the same geometry.
+    if ($null -eq $script:StripY) {
+        $page = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetFirstChild($tabCtl)
+        if (-not $page) { throw 'no tab page is visible; cannot locate the tab strip' }
+        $tr = $tabCtl.Current.BoundingRectangle
+        $pr = $page.Current.BoundingRectangle
+        $script:StripY = [int](($tr.Y + $pr.Y) / 2)
+        $script:StripLeft = [int] $tr.X
     }
-    if (-not $page) { throw 'no tab page is visible; cannot locate the tab strip' }
+    $stripY = $script:StripY
+    $left = $script:StripLeft
 
-    $tr = $tabCtl.Current.BoundingRectangle
-    $pr = $page.Current.BoundingRectangle
-    $stripY = [int](($tr.Y + $pr.Y) / 2)
-    $left = [int] $tr.X
+    if ($script:TabHit.ContainsKey($Name)) {
+        Invoke-Click -X $script:TabHit[$Name] -Y $stripY
+        if (Find-TabPage -TabControl $tabCtl -Name $Name) { return }
+        # Geometry moved, so nothing cached about it is trustworthy any more.
+        $script:TabHit.Remove($Name)
+        $script:StripY = $null
+        $script:StripLeft = $null
+    }
 
-    for ($x = $left + 10; $x -lt $left + 1200; $x += 30) {
+    # 50px steps: the observed labels are ~120px apart at this DPI, so this cannot step over one,
+    # and it halves the clicks of the original 30px sweep. Each miss is now four elements to check
+    # rather than a whole tree, so the scan costs about what the clicks themselves do.
+    for ($x = $left + 10; $x -lt $left + 1200; $x += 50) {
         Invoke-Click -X $x -Y $stripY
-        if (Find-ByName -Window $Window -Name $Name -OnScreenOnly) {
+        if (Find-TabPage -TabControl $tabCtl -Name $Name) {
             Write-Verbose "selected tab '$Name' at x=$x"
+            $script:TabHit[$Name] = $x
             return
         }
     }
@@ -280,13 +353,13 @@ function Select-ToolTab {
     The log's text arrives as the Name of its element -- the bridge offers no TextPattern or
     ValuePattern here. It is the only multi-line name in the window, which is what identifies it.
 #>
-function Get-LogText {
+function Find-LogElement {
     param($Window)
-    $best = ''
+    $best = $null; $bestLen = -1
     foreach ($e in (Get-Descendants -Window $Window)) {
         $n = $e.Current.Name
         if (-not $n -or $n -notmatch "`n") { continue }
-        if ($n.Length -gt $best.Length) { $best = $n }
+        if ($n.Length -gt $bestLen) { $bestLen = $n.Length; $best = $e }
     }
     return $best
 }
@@ -337,18 +410,33 @@ function Invoke-OneProbe {
             $proc.Refresh()
             if ($proc.HasExited) { throw "EmuHawk exited during startup (code $($proc.ExitCode))" }
             if ($proc.MainWindowHandle -ne [System.IntPtr]::Zero) { break }
-            Start-Sleep -Milliseconds 250
+            Start-Sleep -Milliseconds 100
         }
         if ($proc.MainWindowHandle -eq [System.IntPtr]::Zero) { throw 'EmuHawk main window never appeared' }
         Show-WindowMaximized -Handle $proc.MainWindowHandle
-        Start-Sleep -Seconds 4   # let the core finish loading the ROM
+
+        # The core is loaded when the caption says so: EmuHawk titles itself
+        # "<game> [<system>] - BizHawk" once a ROM is up, and plain "BizHawk" before. Waiting on that
+        # beats a fixed settle in both directions -- it returns as soon as the ROM is up on a fast
+        # start, and still waits on a slow one instead of racing ahead into an empty core.
+        $romDeadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $romDeadline) {
+            $proc.Refresh()
+            if ($proc.MainWindowTitle -match '\[.+\] - BizHawk') { break }
+            Start-Sleep -Milliseconds 100
+        }
+        $proc.Refresh()
+        if ($proc.MainWindowTitle -notmatch '\[.+\] - BizHawk') { throw 'the ROM never finished loading' }
+        Start-Sleep -Milliseconds 200   # the caption lands a touch before the menu is usable
 
         if ($Slot -gt 0) {
             Invoke-MenuItem -ProcId $proc.Id -Name 'File'       -Expand $true
             Invoke-MenuItem -ProcId $proc.Id -Name 'Load State' -Expand $true
             Invoke-MenuItem -ProcId $proc.Id -Name "$Slot"      -Expand $false
-            Start-Sleep -Seconds 2
         }
+        # Let the core run before measuring it -- see -SettleMs. Opening the tool below happens on
+        # top of this, so the effective warm-up is a little longer than the number.
+        Start-Sleep -Milliseconds $SettleMs
 
         Invoke-MenuItem -ProcId $proc.Id -Name 'Tools'           -Expand $true
         Invoke-MenuItem -ProcId $proc.Id -Name 'External Tool'   -Expand $true
@@ -368,12 +456,16 @@ function Invoke-OneProbe {
 
         # The probe runs synchronously on the UI thread and freezes it for seconds at a time,
         # so poll for its own end marker (and tolerate reads failing meanwhile).
+        # Locate the log element once, then poll only its own text. Re-finding it each time meant a
+        # full descendant walk every poll, against a UI thread the probe has frozen anyway.
         $deadline = (Get-Date).AddSeconds($Seconds)
         $text = ''
+        $log = $null
         while ((Get-Date) -lt $deadline) {
-            try { $text = Get-LogText -Window $tool } catch { }
+            if (-not $log) { try { $log = Find-LogElement -Window $tool } catch { } }
+            if ($log) { try { $text = $log.Current.Name } catch { $log = $null } }
             if ($text -match '=== done ===') { break }
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds 150
         }
         if ($text -notmatch '=== done ===') { throw "the probe did not finish within ${Seconds}s" }
 
@@ -388,8 +480,10 @@ function Invoke-OneProbe {
     }
     finally {
         if (-not $KeepOpen) {
+            # Wait for the process to actually go, rather than for a duration guessed to outlast it:
+            # the next run refuses to start while an EmuHawk is up.
             try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
-            Start-Sleep -Milliseconds 800
+            try { [void] $proc.WaitForExit(5000) } catch { }
         }
     }
 }
