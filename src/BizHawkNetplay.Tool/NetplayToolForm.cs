@@ -418,61 +418,40 @@ namespace BizHawkNetplay.Tool
         private bool _timerResRaised;
 
         /// <summary>
-        /// Whether anything is waiting in this thread's message queue. The idle pacing loop below runs
-        /// only while this is false, so input, painting and every other message still get served
-        /// promptly — the loop is using time the message pump would otherwise have spent blocked.
+        /// How close to the frame boundary the fine clock stops waiting and runs the tick. Half a
+        /// millisecond is about a sixth of an unthrottled loop iteration, so it costs nothing to ask
+        /// for and keeps a frame from being deferred a whole iteration by rounding.
         /// </summary>
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
-        private static extern bool PeekMessage(out NativeMsg msg, IntPtr hWnd, uint min, uint max, uint remove);
-
-        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-        private struct NativeMsg
-        {
-            public IntPtr HWnd; public uint Message; public IntPtr WParam; public IntPtr LParam;
-            public uint Time; public int X; public int Y;
-        }
-
-        private const uint PmNoRemove = 0;
-        private static bool MessagePending() => PeekMessage(out _, IntPtr.Zero, 0, 0, PmNoRemove);
+        private const double FineClockWakeMarginMs = 0.5;
 
         /// <summary>
-        /// How close to the frame boundary the idle loop stops sleeping and runs the tick. Sleep(1)
-        /// measures ~1.1ms on a machine with the timer resolution raised, so waking within half a
-        /// millisecond of the boundary is about as fine as this mechanism goes.
-        /// </summary>
-        private const double IdleWakeMarginMs = 0.5;
-
-        /// <summary>
-        /// Floor on how often the idle loop may enter the tick. Normally irrelevant — the tick advances
+        /// Floor on how often the fine clock may enter the tick. Normally irrelevant — the tick advances
         /// the due time a whole period per frame, so it naturally runs about sixty times a second. It
-        /// matters when the tick runs no frame at all (lockstep waiting on remote input): without a
-        /// floor the loop would re-enter as fast as the CPU allows and turn a stall into a spin.
+        /// matters when the tick runs no frame at all (lockstep waiting on remote input): at 3200 loop
+        /// iterations a second, without a floor a stall would become a spin through the whole tick body.
         /// </summary>
-        private const double IdleMinTickSpacingMs = 1.0;
+        private const double FineClockMinSpacingMs = 1.0;
 
         /// <summary>
-        /// How long the idle clock may go quiet before <see cref="_frameTimer"/> resumes driving frames.
+        /// How long the fine clock may go quiet before <see cref="_frameTimer"/> resumes driving frames.
         /// Two frame periods: long enough that it never fires during normal play, short enough that a
         /// session which loses its idle time skips rather than stops.
         /// </summary>
-        private const double IdlePacingFallbackMs = 34;
+        private const double FineClockFallbackMs = 34;
 
-        private bool _idlePacingHooked;
-        private double _lastIdleTickMs = double.NegativeInfinity;
+        private double _lastFineTickMs = double.NegativeInfinity;
 
         /// <summary>
         /// Which clock is actually driving frames, counted per pacing window.
         ///
-        /// Moving the frame clock to <see cref="Application.Idle"/> changed the measured judder by
-        /// nothing at all — same tick rate, same gaps, same 15%. A fix that produces byte-identical
-        /// telemetry has almost certainly not run, and there are two ways for that to be true here:
-        /// the event never fires (EmuHawk drives its own loop rather than Application.Run, and
-        /// Application.DoEvents does not raise Idle), or it fires but the loop exits immediately
-        /// because a message is always pending. These three counters tell those apart instead of
-        /// leaving it to argument: entries with no ticks means the second, no entries at all the first.
+        /// Worth keeping because the first attempt at this — moving the clock to Application.Idle —
+        /// changed the measured judder by nothing at all, and it took counters to establish that the
+        /// handler had never once run. EmuHawk drives its own loop rather than Application.Run, and
+        /// Application.DoEvents does not raise Idle. `timer` staying at zero is now the evidence that
+        /// the fine clock is doing its job; a session where it climbs is one where UpdateValues has
+        /// stopped arriving and the heartbeat has taken over.
         /// </summary>
-        private int _idleEntriesWindow;
-        private int _idleTicksWindow;
+        private int _emuLoopTicksWindow;
         private int _timerTicksWindow;
 
         /// <summary>
@@ -524,13 +503,13 @@ namespace BizHawkNetplay.Tool
             ResumeLayout(false);
 
             _frameTimer = new System.Windows.Forms.Timer();
-            // Fallback only. While OnIdlePace is running frames this does nothing, so the tick count
-            // stays one-per-frame and `stall%` keeps meaning what it did. If idle time dries up — a
-            // message storm, a nested pump that never yields — this takes back over within a frame or
-            // two rather than leaving the session with no clock at all.
+            // Fallback only. While UpdateValues is running frames this does nothing, so the tick count
+            // stays one-per-frame and `stall%` keeps meaning what it did. If EmuHawk stops calling in —
+            // a modal dialog, a core swap, anything that takes over its loop — this resumes within a
+            // frame or two rather than leaving the session with no clock at all.
             _frameTimer.Tick += (_, __) =>
             {
-                if (_paceClock.Elapsed.TotalMilliseconds - _lastIdleTickMs < IdlePacingFallbackMs) return;
+                if (_paceClock.Elapsed.TotalMilliseconds - _lastFineTickMs < FineClockFallbackMs) return;
                 _timerTicksWindow++;
                 FrameTick();
             };
@@ -2029,16 +2008,26 @@ namespace BizHawkNetplay.Tool
             // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
             // comfortably under a frame period so long as we don't serialize on top of it (see
             // FrameTick — the timer deliberately keeps running while a tick is in flight).
+            // EmuHawk's own loop rate is a hard ceiling on our frame clock — see
+            // EmuHawkAdapter.SuppressLoopThrottle. Do this before starting the clock so the first
+            // window is already measuring the unthrottled loop.
+            if (_adapter != null)
+            {
+                bool ok = _adapter.SuppressLoopThrottle(true);
+                ConnLog(ok
+                    ? "EmuHawk loop throttle suppressed for this session — frame pacing is bounded by " +
+                      "that loop's rate, and throttled it runs barely faster than the console itself. " +
+                      "Costs a busy core until you disconnect; watch `emuloop` in the pacing line."
+                    : "could not reach EmuHawk's throttle settings — frame pacing stays bounded by its " +
+                      "loop rate (~64/s against a 59.92Hz console), so expect judder.",
+                    ok ? Color.DarkGreen : Color.DarkOrange);
+            }
+
             _frameTimer.Interval = 10;
             _frameTimer.Start();
-            // The timer above is now only a heartbeat; OnIdlePace is what paces frames. See its remarks
-            // for why WM_TIMER cannot do this job however short its interval is set.
-            if (!_idlePacingHooked)
-            {
-                _lastIdleTickMs = double.NegativeInfinity;
-                Application.Idle += OnIdlePace;
-                _idlePacingHooked = true;
-            }
+            // The timer above is only a heartbeat now; UpdateValues is what paces frames. See its
+            // remarks for why WM_TIMER cannot do this job however short its interval is set.
+            _lastFineTickMs = double.NegativeInfinity;
 
             Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
                    $"you are P{_localPort + 1}/{_playerCount}, delay {_sessionDelay}", Color.Green);
@@ -2193,34 +2182,28 @@ namespace BizHawkNetplay.Tool
         {
             _emuLoopCallsWindow++;
             base.UpdateValues(type);
+
+            // This is the frame clock. EmuHawk calls it once per iteration of the loop that owns the UI
+            // thread, which makes it the finest clock available to us by definition — nothing we could
+            // install can fire between two iterations of the loop we are running inside. Unthrottled
+            // that is ~3200/s against a 16.688ms frame, so a frame lands within about 0.3ms of when it
+            // is due. WM_TIMER, by contrast, is capped near 100/s by its 10ms floor no matter how fast
+            // the loop spins, and measured 64.
+            if (!_sessionActive || _driver == null) return;
+            double nowMs = _paceClock.Elapsed.TotalMilliseconds;
+            if (nowMs < _nextFrameDueMs - FineClockWakeMarginMs) return;
+            if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
+            _lastFineTickMs = nowMs;
+            _emuLoopTicksWindow++;
+            FrameTick();
         }
 
         private void StopFramePacing()
         {
             _frameTimer.Stop();
-            if (!_idlePacingHooked) return;
-            Application.Idle -= OnIdlePace;
-            _idlePacingHooked = false;
-        }
-
-        private void OnIdlePace(object? sender, EventArgs e)
-        {
-            _idleEntriesWindow++;
-            while (_sessionActive && _driver != null && !MessagePending())
-            {
-                double nowMs = _paceClock.Elapsed.TotalMilliseconds;
-                if (nowMs < _nextFrameDueMs - IdleWakeMarginMs ||
-                    nowMs - _lastIdleTickMs < IdleMinTickSpacingMs)
-                {
-                    // Sleep rather than spin: this loop must cost a parked thread, not a busy core.
-                    Thread.Sleep(1);
-                    continue;
-                }
-
-                _lastIdleTickMs = nowMs;
-                _idleTicksWindow++;
-                FrameTick();
-            }
+            // Give the user's throttle settings back. Runs on every exit path, including a failed
+            // connect, so a session that never started cannot leave a core spinning.
+            try { _adapter?.SuppressLoopThrottle(false); } catch { }
         }
 
         private void FrameTick()
@@ -2738,12 +2721,11 @@ namespace BizHawkNetplay.Tool
             var p = _lastPacing;
             if (p.Ticks == 0) return;
 
-            string clockStr = $"clock idle {_idleTicksWindow}/{_idleEntriesWindow} " +
-                              $"timer {_timerTicksWindow} emuloop {_emuLoopCallsWindow}, ";
-            _idleEntriesWindow = 0;
-            _idleTicksWindow = 0;
+            string clockStr = $"clock emuloop {_emuLoopTicksWindow}/{_emuLoopCallsWindow} " +
+                              $"timer {_timerTicksWindow}, ";
             _timerTicksWindow = 0;
             _emuLoopCallsWindow = 0;
+            _emuLoopTicksWindow = 0;
 
             string rbStr = "";
             if (_driver?.Strategy is RollbackStrategy rb)

@@ -844,6 +844,69 @@ namespace BizHawkNetplay.Tool
             else _apis.EmuClient.Unpause();
         }
 
+        /// <summary>Whether the session is currently suppressing EmuHawk's loop throttle.</summary>
+        public bool LoopThrottleSuppressed { get; private set; }
+
+        /// <summary>What the throttle read before we touched it, so disconnect restores the user's own
+        /// settings rather than whatever we happened to prefer.</summary>
+        private bool _savedUnthrottled, _savedClockThrottle, _savedVSyncThrottle, _savedSoundThrottle;
+
+        /// <summary>
+        /// Stops EmuHawk throttling its own run loop for the duration of a session, and restores the
+        /// user's settings afterwards.
+        ///
+        /// The tool pauses EmuHawk and owns the frame clock, but it can only run a frame when EmuHawk's
+        /// ProgramRunLoop hands over the UI thread — so that loop's rate is a hard ceiling on ours. A
+        /// session measured it at 64 calls a second against a 59.92Hz console. Placing frames evenly on
+        /// a boundary needs a clock materially finer than the boundary itself; a clock 7% faster than
+        /// it cannot, and the phase drifts continuously. Most ticks run one frame, some run none, the
+        /// next runs two. That beat was 15% of presents landing off-cadence, and no timer on our side
+        /// could have fixed it because our timer was never the binding constraint.
+        ///
+        /// The same telemetry showed the loop running at 3202/s before the session settled, so the
+        /// throttle is the only thing holding it down. Suppressed, it spins near a 0.3ms period and
+        /// frame placement becomes a matter of arithmetic rather than luck.
+        ///
+        /// The cost is a core spinning for as long as the session lasts, which is why this is scoped to
+        /// exactly that and reverted on the way out.
+        /// </summary>
+        public bool SuppressLoopThrottle(bool suppress)
+        {
+            try
+            {
+                var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                if (config == null) return false;
+
+                if (suppress)
+                {
+                    if (LoopThrottleSuppressed) return true;
+                    _savedUnthrottled = config.Unthrottled;
+                    _savedClockThrottle = config.ClockThrottle;
+                    _savedVSyncThrottle = config.VSyncThrottle;
+                    _savedSoundThrottle = config.SoundThrottle;
+
+                    // Exactly one of these three is what BizHawk consults, so all three go: clock and
+                    // vsync throttling off, unthrottled on. Sound throttle is already off in a session
+                    // (we drive the device ourselves) but is saved and forced for the same reason.
+                    config.Unthrottled = true;
+                    config.ClockThrottle = false;
+                    config.VSyncThrottle = false;
+                    config.SoundThrottle = false;
+                    LoopThrottleSuppressed = true;
+                    return true;
+                }
+
+                if (!LoopThrottleSuppressed) return true;
+                config.Unthrottled = _savedUnthrottled;
+                config.ClockThrottle = _savedClockThrottle;
+                config.VSyncThrottle = _savedVSyncThrottle;
+                config.SoundThrottle = _savedSoundThrottle;
+                LoopThrottleSuppressed = false;
+                return true;
+            }
+            catch { return false; }
+        }
+
         public void SetAudioMuted(bool muted) => _apis.EmuClient.SetSoundOn(!muted);
 
         public void RunFramesInvisible(int count, Func<int, InputSet> inputsFor)
