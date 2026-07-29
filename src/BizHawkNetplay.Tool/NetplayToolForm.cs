@@ -460,6 +460,33 @@ namespace BizHawkNetplay.Tool
         private bool _idlePacingHooked;
         private double _lastIdleTickMs = double.NegativeInfinity;
 
+        /// <summary>
+        /// Which clock is actually driving frames, counted per pacing window.
+        ///
+        /// Moving the frame clock to <see cref="Application.Idle"/> changed the measured judder by
+        /// nothing at all — same tick rate, same gaps, same 15%. A fix that produces byte-identical
+        /// telemetry has almost certainly not run, and there are two ways for that to be true here:
+        /// the event never fires (EmuHawk drives its own loop rather than Application.Run, and
+        /// Application.DoEvents does not raise Idle), or it fires but the loop exits immediately
+        /// because a message is always pending. These three counters tell those apart instead of
+        /// leaving it to argument: entries with no ticks means the second, no entries at all the first.
+        /// </summary>
+        private int _idleEntriesWindow;
+        private int _idleTicksWindow;
+        private int _timerTicksWindow;
+
+        /// <summary>
+        /// How often EmuHawk calls into this tool from its own run loop, per pacing window.
+        ///
+        /// This is the number that decides whether frame pacing is fixable at all. Our tick can only
+        /// run when EmuHawk's ProgramRunLoop hands the UI thread over, so that loop's rate is a hard
+        /// ceiling on ours. If this reads in the hundreds, WM_TIMER's coalescing is what has been
+        /// limiting us to sixty jittery ticks a second and moving the clock here fixes it. If it reads
+        /// about sixty, we are inheriting EmuHawk's own cadence and no clock of ours can beat it —
+        /// which would be worth saying plainly rather than attempting a fourth mechanism.
+        /// </summary>
+        private int _emuLoopCallsWindow;
+
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
         public NetplayToolForm()
@@ -504,6 +531,7 @@ namespace BizHawkNetplay.Tool
             _frameTimer.Tick += (_, __) =>
             {
                 if (_paceClock.Elapsed.TotalMilliseconds - _lastIdleTickMs < IdlePacingFallbackMs) return;
+                _timerTicksWindow++;
                 FrameTick();
             };
 
@@ -2157,6 +2185,16 @@ namespace BizHawkNetplay.Tool
         /// left attached it would keep being raised for the lifetime of EmuHawk, and the session flags
         /// it tests are the only thing standing between that and a permanent sleep loop.
         /// </summary>
+        /// <summary>
+        /// EmuHawk's own per-loop-iteration callback into external tools. Counted only — see
+        /// <see cref="_emuLoopCallsWindow"/> for why its rate is the question that matters.
+        /// </summary>
+        public override void UpdateValues(ToolFormUpdateType type)
+        {
+            _emuLoopCallsWindow++;
+            base.UpdateValues(type);
+        }
+
         private void StopFramePacing()
         {
             _frameTimer.Stop();
@@ -2167,6 +2205,7 @@ namespace BizHawkNetplay.Tool
 
         private void OnIdlePace(object? sender, EventArgs e)
         {
+            _idleEntriesWindow++;
             while (_sessionActive && _driver != null && !MessagePending())
             {
                 double nowMs = _paceClock.Elapsed.TotalMilliseconds;
@@ -2179,6 +2218,7 @@ namespace BizHawkNetplay.Tool
                 }
 
                 _lastIdleTickMs = nowMs;
+                _idleTicksWindow++;
                 FrameTick();
             }
         }
@@ -2698,6 +2738,13 @@ namespace BizHawkNetplay.Tool
             var p = _lastPacing;
             if (p.Ticks == 0) return;
 
+            string clockStr = $"clock idle {_idleTicksWindow}/{_idleEntriesWindow} " +
+                              $"timer {_timerTicksWindow} emuloop {_emuLoopCallsWindow}, ";
+            _idleEntriesWindow = 0;
+            _idleTicksWindow = 0;
+            _timerTicksWindow = 0;
+            _emuLoopCallsWindow = 0;
+
             string rbStr = "";
             if (_driver?.Strategy is RollbackStrategy rb)
             {
@@ -2716,7 +2763,7 @@ namespace BizHawkNetplay.Tool
                 $"present mean {p.PresentMeanMs:F1}ms, undrawn {p.UndrawnRenders}, " +
                 $"judder {p.JudderPct:F0}% (gap {p.PresentGapMeanMs:F1}ms ±{p.PresentJitterMs:F1} " +
                 $"max {p.PresentGapMaxMs:F1} vs {_frameMs:F1} target), " +
-                $"{rbStr}" +
+                $"{clockStr}{rbStr}" +
                 $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
                 $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");
         }
