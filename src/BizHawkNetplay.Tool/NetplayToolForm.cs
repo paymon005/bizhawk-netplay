@@ -2196,6 +2196,9 @@ namespace BizHawkNetplay.Tool
         private void StopFramePacing()
         {
             _frameTimer.Stop();
+            // The ring's worth of savestate buffers is real memory; hand it back rather than holding
+            // it across a long idle between sessions.
+            try { _adapter?.ClearStatePool(); } catch { }
         }
 
         /// <summary>
@@ -2835,8 +2838,12 @@ namespace BizHawkNetplay.Tool
                 _pacingResimAtWindowStart = rb.FramesResimulated;
                 _pacingSavesTakenAtWindowStart = rb.SavesTaken;
                 _pacingSavesElidedAtWindowStart = rb.SavesElided;
+                // buffers=N is the acceptance test for the state pool: it should climb to the ring's
+                // size in the first second or two and then stop. Still climbing means the pool is
+                // being outrun and savestates are still being allocated per frame.
                 rbStr = $"rollbacks {rollbacks} ({resim} frame(s) resimulated, last d{rb.LastRollbackDepth}, " +
-                        $"max d{rb.MaxRollbackDepthSeen}), saves {taken} taken/{elided} elided, ";
+                        $"max d{rb.MaxRollbackDepthSeen}), saves {taken} taken/{elided} elided" +
+                        $"{(_adapter != null ? $" (pool {_adapter.StatePoolSize}, buffers {_adapter.StateBuffersAllocated})" : "")}, ";
             }
 
             // Worst frame decision since this line last printed, not since the window opened — see

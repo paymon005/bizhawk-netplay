@@ -79,12 +79,33 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         public List<int> SavedAtFrames { get; } = new List<int>();
         public List<(int From, int To)> LoadJumps { get; } = new List<(int, int)>();
 
+        /// <summary>
+        /// Buffers handed back by <see cref="ReleaseState"/>, reused by the next save — and
+        /// deliberately scribbled over first.
+        ///
+        /// The real adapter pools these, because allocating a fresh whole-core state per snapshot was
+        /// putting 26.5MB/s onto the Large Object Heap and the resulting gen2 collections were landing
+        /// inside the frame decision as multi-tens-of-millisecond hitches. Pooling admits exactly one
+        /// new failure mode: reading a state after releasing it. Mirroring it here means every rollback
+        /// test in the suite — loss, latency, sparse keyframes, checksums, ring bounds — doubles as a
+        /// use-after-release detector, and the poison below turns a silent wrong answer into a loud one.
+        /// </summary>
+        private readonly Stack<byte[]> _statePool = new Stack<byte[]>();
+
+        /// <summary>Buffers this adapter had to create. Below <see cref="SaveCount"/> exactly to the
+        /// extent the pool is doing its job — and the guard against the reuse coverage above being
+        /// vacuous, since a pool that never hands a buffer back tests nothing.</summary>
+        public int StateBuffersAllocated { get; private set; }
+
         public StateHandle SaveStateToMemory()
         {
             SaveCount++;
             SavedAtFrames.Add(_frame);
-            var copy = (byte[])_memory.Clone();
-            var handle = new StateHandle(_frame, copy);
+            byte[] buffer;
+            if (_statePool.Count > 0 && _statePool.Peek().Length == _memory.Length) buffer = _statePool.Pop();
+            else { buffer = new byte[_memory.Length]; StateBuffersAllocated++; }
+            Buffer.BlockCopy(_memory, 0, buffer, 0, _memory.Length);
+            var handle = new StateHandle(_frame, buffer);
             LiveStates.Add(handle);
             return handle;
         }
@@ -99,7 +120,14 @@ namespace BizHawkNetplay.Core.Tests.Fakes
 
         public void ReleaseState(StateHandle handle)
         {
-            if (LiveStates.Remove(handle)) ReleaseCount++;
+            if (!LiveStates.Remove(handle)) return;
+            ReleaseCount++;
+            if (!(handle.Token is byte[] buffer)) return;
+            // Poison before retiring. A released buffer holds no meaningful state, so anything that
+            // reads one is already wrong; filling it makes that wrongness fail a checksum immediately
+            // instead of surviving as whatever the bytes happened to still be.
+            for (int i = 0; i < buffer.Length; i++) buffer[i] = 0xDD;
+            _statePool.Push(buffer);
         }
 
         public byte[] ExportState()

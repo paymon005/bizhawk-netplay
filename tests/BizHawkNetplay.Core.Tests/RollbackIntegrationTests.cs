@@ -274,7 +274,8 @@ namespace BizHawkNetplay.Core.Tests
             // Peer hashes are deliberately NOT compared: under latency the two sit at different frames
             // with different predicted tails, so they agree on finalized frames and nowhere else.
             // AssertFinalizedCorrect is the oracle for that; this compares one peer across policies.
-            (Dictionary<int, InputSet> inputs, uint hash, int rollbacks, int saves, long resim, long walked) RunWith(RollbackTuning t)
+            (Dictionary<int, InputSet> inputs, uint hash, int rollbacks, int saves, long resim, long walked,
+             FakeEmuAdapter adapter) RunWith(RollbackTuning t)
             {
                 var clock = new Clock();
                 var (ta, tb) = LatencyLink.Pair(clock, latency: k,
@@ -283,7 +284,8 @@ namespace BizHawkNetplay.Core.Tests
                 var b = BuildRollback(tb, 1, tuning: t);
                 Run(clock, a, b, iters);
                 return (a.Emu.LastInputByFrame, a.Emu.HashMainMemory(), a.Rollback.RollbackCount,
-                        a.Rollback.SavesTaken, a.Rollback.FramesResimulated, a.Rollback.FramesWalkedBack);
+                        a.Rollback.SavesTaken, a.Rollback.FramesResimulated, a.Rollback.FramesWalkedBack,
+                        a.Emu);
             }
 
             var dense = RunWith(Eliding());
@@ -293,6 +295,14 @@ namespace BizHawkNetplay.Core.Tests
             // measure, not walk-back: at N=2 this scenario's corrections happen to land on keyframes
             // every time and walk back zero frames, which is a property of where the drops fall rather
             // than of the policy. Frames re-simulated may therefore stay equal, never fall.
+            // The whole suite runs against an adapter that reuses released state buffers and poisons
+            // them on the way back, mirroring what the real one now does to keep 26.5MB/s of whole-core
+            // snapshots off the Large Object Heap. That coverage is only worth anything if buffers are
+            // genuinely being handed back and rewritten, so assert it where snapshot churn is highest.
+            Assert.True(dense.adapter.SaveCount > dense.adapter.StateBuffersAllocated,
+                $"the pool never recycled: {dense.adapter.SaveCount} saves from " +
+                $"{dense.adapter.StateBuffersAllocated} buffers — reuse is untested");
+
             Assert.True(dense.rollbacks > 0, "the scenario must actually exercise corrections");
             Assert.Equal(0, dense.walked);   // every predicted frame is its own base
             Assert.True(sparse.saves < dense.saves,
