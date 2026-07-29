@@ -2565,18 +2565,43 @@ namespace BizHawkNetplay.Tool
         /// between a core that genuinely can't make budget (core mean at or above the frame period)
         /// and a schedule that threw away frames the core could have run.
         /// </summary>
+        /// <summary>
+        /// Rollback activity over the last pacing window, as a rate rather than a running total.
+        ///
+        /// Missing from this line until a player reported the game "slowing down when a lot is going
+        /// on" while `adv` sat at a solid 60fps the whole time. Under rollback those are not in
+        /// conflict: a contradicted prediction re-simulates frames the player has already been shown,
+        /// so the advance rate stays exactly 60 while what is on screen gets rewritten. The rewrites
+        /// are what a player sees, and nothing here counted them — `gate` reports what a repair COST,
+        /// which on a core with a 0.4ms savestate stays near zero however many are happening.
+        /// </summary>
+        private int _pacingRollbacksAtWindowStart;
+        private long _pacingResimAtWindowStart;
+
         private void LogPacingSummary(double nowMs)
         {
             if (!Verbose || nowMs - _lastPacingLogMs < 1000) return;
             _lastPacingLogMs = nowMs;
             var p = _lastPacing;
             if (p.Ticks == 0) return;
+
+            string rbStr = "";
+            if (_driver?.Strategy is RollbackStrategy rb)
+            {
+                int rollbacks = rb.RollbackCount - _pacingRollbacksAtWindowStart;
+                long resim = rb.FramesResimulated - _pacingResimAtWindowStart;
+                _pacingRollbacksAtWindowStart = rb.RollbackCount;
+                _pacingResimAtWindowStart = rb.FramesResimulated;
+                rbStr = $"rollbacks {rollbacks} ({resim} frame(s) resimulated, last d{rb.LastRollbackDepth}, " +
+                        $"max d{rb.MaxRollbackDepthSeen}), ";
+            }
             Log($"pacing: adv {p.AdvancedFps:F0} fps, present {p.PresentedFps:F0}, " +
                 $"tick {p.TicksPerSecond:F0}/s (gap min {p.TickGapMinMs:F1} mean {p.TickGapMeanMs:F1} " +
                 $"max {p.TickGapMaxMs:F1}ms), " +
                 $"core mean {p.CoreMeanMs:F1} p95 {p.CoreP95Ms:F1} max {p.CoreMaxMs:F1}ms, " +
                 $"gate mean {p.GateMeanMs:F1} p95 {p.GateP95Ms:F1}ms, " +
                 $"present mean {p.PresentMeanMs:F1}ms, undrawn {p.UndrawnRenders}, " +
+                $"{rbStr}" +
                 $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
                 $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");
         }
