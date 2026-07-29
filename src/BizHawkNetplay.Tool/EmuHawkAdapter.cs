@@ -401,6 +401,36 @@ namespace BizHawkNetplay.Tool
         /// <summary>Human-readable note on why audio was/wasn't wired up (for the UI log).</summary>
         public string AudioDiagnostic { get; private set; } = "";
 
+        /// <summary>
+        /// Whether EmuHawk's sound device is currently running, and how full our ring is.
+        ///
+        /// Cheap enough to read on a slow tick, and between them they identify a failure the
+        /// per-second audio line only shows in hindsight: EmuHawk stops its device across a window
+        /// minimize/restore, <see cref="PumpAudio"/> early-returns while it is stopped, and since the
+        /// pump is what drains the ring, the ring climbs to full and stays there. Observed once in
+        /// real play — 300 frames with the pump counter frozen and the ring pegged at capacity,
+        /// immediately followed by the frame tick collapsing to 9/s.
+        /// </summary>
+        public bool AudioDeviceStarted
+        {
+            get { try { return _audioReady && _sound != null && _sound.IsStarted; } catch { return false; } }
+        }
+
+        /// <summary>Ring occupancy as a fraction, or -1 if there is no ring to report on.</summary>
+        public double AudioRingFullness
+        {
+            get
+            {
+                try
+                {
+                    if (_soundBuffer == null) return -1;
+                    int cap = _soundBuffer.Capacity;
+                    return cap <= 0 ? -1 : (double)_soundBuffer.Count / cap;
+                }
+                catch { return -1; }
+            }
+        }
+
         /// <summary>Pipeline counters for diagnosing silence: samples produced vs pumped vs buffered.</summary>
         public string AudioStats()
         {

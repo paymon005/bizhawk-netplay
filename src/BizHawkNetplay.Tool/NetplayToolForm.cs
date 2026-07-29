@@ -2351,9 +2351,20 @@ namespace BizHawkNetplay.Tool
                     // cheapest things the tick does.
                     double other = elapsed - (coreMs + gateMs + _lastHashMs + renderMs
                         + audioMs + emuApiMs + uiMs);
+                    // Audio device state, because a stopped one is silent in every other column: the
+                    // pump early-returns, the ring it drains fills up, and the tick collapses a few
+                    // seconds later with core, gate and stall all reading perfectly healthy.
+                    string audioState = "";
+                    if (_adapter != null)
+                    {
+                        double ring = _adapter.AudioRingFullness;
+                        audioState = $", audiodev {(_adapter.AudioDeviceStarted ? "on" : "STOPPED")}" +
+                            (ring >= 0 ? $", ring {ring:P0}" : "");
+                    }
                     Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
                         $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
-                        $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}, other {other:F1}, " +
+                        $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}, other {other:F1}" +
+                        $"{audioState}, " +
                         $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}{repairStr}");
                 }
                 _frameTickRunning = false;
