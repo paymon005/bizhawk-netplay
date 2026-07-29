@@ -508,6 +508,36 @@ namespace BizHawkNetplay.Core.Tests
             Assert.DoesNotContain("REPAIR OVERRUNS MODEL", WithRepair(60.0).ToString());
         }
 
+        /// <summary>
+        /// The warning above is about the verdict, not about the arithmetic. A load timed on its own is
+        /// systematically faster than the same load inside a real repair — nothing has evicted the state
+        /// from cache in between — so a repair always overruns a model built from isolated terms. On
+        /// GPGX that fired +18% on literally every run while the depth was already being solved from the
+        /// repair's own terms, where the optimism cannot reach it. A warning that cannot distinguish
+        /// "your verdict is unsafe" from "measurement works the way we documented" is worse than none.
+        /// </summary>
+        [Fact]
+        public void Result_StaysQuietAboutAnOverrunThatCannotReachTheVerdict()
+        {
+            ProbeResult WithSolveSource(bool solvedFromRepairTerms) => new ProbeResult(
+                "GPGX", 806000, medianSaveMs: 0.401, medianLoadMs: 0.237, medianFrameMs: 0.243,
+                frameBudgetMs: 16.688, headroomMs: 16.0, maxRollbackDepth: 73,
+                repair: new RepairProfile(1, 0.767, 8, 2.459, 2, 1.796),
+                solvedFromRepairTerms: solvedFromRepairTerms);
+
+            // Same measurement either way, and it really is over tolerance — this is not a rescaling.
+            foreach (var r in new[] { WithSolveSource(true), WithSolveSource(false) })
+                Assert.True(r.RepairModelError > ProbeResult.RepairModelTolerance);
+
+            // Solved from the repair's own terms: the isolated optimism never touched the depth.
+            Assert.False(WithSolveSource(true).RepairCostsMoreThanModelled);
+            Assert.DoesNotContain("REPAIR OVERRUNS MODEL", WithSolveSource(true).ToString());
+
+            // Solved from the isolated terms: the depth rests on figures the repair just contradicted.
+            Assert.True(WithSolveSource(false).RepairCostsMoreThanModelled);
+            Assert.Contains("REPAIR OVERRUNS MODEL", WithSolveSource(false).ToString());
+        }
+
         [Fact]
         public void Result_SaysNothingAboutRepairCostWhenItWasNeverMeasured()
         {

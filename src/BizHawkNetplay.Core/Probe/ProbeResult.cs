@@ -129,9 +129,25 @@ namespace BizHawkNetplay.Core.Probe
         /// </summary>
         public const double RepairModelTolerance = 0.15;
 
-        /// <summary>True when a repair costs materially more than the terms it was solved from say it
-        /// should. One-sided on purpose: only the optimistic direction can desync a session.</summary>
-        public bool RepairCostsMoreThanModelled => Repair != null && RepairModelError > RepairModelTolerance;
+        /// <summary>
+        /// True when a repair costs materially more than the terms the depth was ACTUALLY solved from
+        /// say it should. One-sided on purpose: only the optimistic direction can desync a session.
+        ///
+        /// The <see cref="SolvedFromRepairTerms"/> condition is what stops this crying wolf. The model
+        /// it compares against is built from the isolated figures, and those are known to be optimistic
+        /// — a load timed on its own runs about twice as fast as the same load inside a real repair,
+        /// because nothing has evicted the state from cache in between. On GPGX that gap alone is 0.29ms
+        /// against a 1.53ms model, so the comparison reported +18% on every single run and named a
+        /// discrepancy that had already been measured, understood, and designed around.
+        ///
+        /// When the depth is solved from the repair's own terms that optimism cannot reach the verdict,
+        /// so there is nothing to warn about. When it is not — the decomposition was rejected, usually
+        /// because the game was still booting — the verdict does rest on the isolated figures, and then
+        /// an overrun means the session may predict further ahead than it can repair. That is the only
+        /// case worth a warning, and it is now the only case that produces one.
+        /// </summary>
+        public bool RepairCostsMoreThanModelled =>
+            Repair != null && !SolvedFromRepairTerms && RepairModelError > RepairModelTolerance;
 
         /// <summary>
         /// True when the verdict depends on which run you happened to look at: the median qualifies and
