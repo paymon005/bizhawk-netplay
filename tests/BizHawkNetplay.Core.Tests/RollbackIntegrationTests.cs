@@ -959,9 +959,18 @@ namespace BizHawkNetplay.Core.Tests
             Assert.True(capped.strategy.FramesResimulated < free.strategy.FramesResimulated,
                 $"cost cap should reduce total re-simulation (capped={capped.strategy.FramesResimulated}, " +
                 $"free={free.strategy.FramesResimulated})");
+            // The +1 is the cap's own boundary, not the keyframe walkback. Splitting depth from
+            // replayed frames made that testable: with the walkback removed from the depth this still
+            // measured 3 against a cap of 2, so the slack is in how the cap is enforced — it bounds
+            // how far prediction may RUN, and the correction that arrives for the frame just past the
+            // horizon is one deeper than the horizon itself.
             Assert.True(capped.strategy.LastRollbackDepth <= capped.strategy.CostCap + 1,
                 $"a settled repair ran {capped.strategy.LastRollbackDepth} deep against a cap of " +
                 $"{capped.strategy.CostCap}");
+            // Depth and walkback are disjoint and together account for every frame replayed. This is
+            // the invariant the status line broke by reporting a d3+1wb correction as "d4+1wb".
+            Assert.Equal(capped.strategy.LastRollbackDepth + capped.strategy.LastRollbackWalkback,
+                capped.strategy.LastReplayedFrames);
             // The cap may only ever narrow prediction — never the ring, and never correctness.
             Assert.Equal(MaxRollback, capped.strategy.MaxRollback);
             int upTo = Math.Min(capped.a.Driver.CurrentFrame, capped.b.Driver.CurrentFrame) - k - Delay - 4;

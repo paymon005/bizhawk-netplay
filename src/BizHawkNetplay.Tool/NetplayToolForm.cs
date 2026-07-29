@@ -2495,12 +2495,34 @@ namespace BizHawkNetplay.Tool
                 if (steppedThisTick)
                 {
                     var phase = System.Diagnostics.Stopwatch.StartNew();
-                    _adapter!.PresentVideo();
+                    bool presented = _adapter!.PresentVideo();
                     renderMs = phase.Elapsed.TotalMilliseconds;
-                    _pacing.AddPresent(renderMs);
-                    if (_lastPresentClockMs >= 0)
-                        _pacing.AddPresentInterval(nowMs - _lastPresentClockMs, _frameMs);
-                    _lastPresentClockMs = nowMs;
+
+                    // Stamp AFTER the picture is on screen, not from the tick's entry timestamp.
+                    //
+                    // This measured `nowMs`, read before the frame decision and the core step ran. The
+                    // whole point of the metric is spacing between pictures, and everything variable
+                    // about that spacing — the repair, the core, the render — happens between those two
+                    // instants. It was therefore reporting how regularly the CLOCK fired, which is very
+                    // regular, and was structurally blind to the case it was built to catch: a tick
+                    // whose frame decision cost 55.8ms presented 55.8ms late and still recorded a
+                    // textbook 16.7ms gap. That is a large part of why judder read 0-3% through
+                    // sessions the player described as hitching.
+                    double presentedAtMs = _paceClock.Elapsed.TotalMilliseconds;
+                    if (presented)
+                    {
+                        _pacing.AddPresent(renderMs);
+                        if (_lastPresentClockMs >= 0)
+                            _pacing.AddPresentInterval(presentedAtMs - _lastPresentClockMs, _frameMs);
+                        _lastPresentClockMs = presentedAtMs;
+                    }
+                    else if (_adapter.PresentFailuresInARow == 1)
+                    {
+                        // Once, on the first failure: a persistent one now shows as presented-fps
+                        // falling rather than as a healthy number over a frozen window.
+                        ConnLog("video present failed — the picture may be frozen while emulation " +
+                                $"continues: {_adapter.LastPresentError ?? "no detail"}", Color.Firebrick);
+                    }
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
@@ -2617,6 +2639,8 @@ namespace BizHawkNetplay.Tool
             string rbStr = _driver.Strategy is RollbackStrategy rbs
                 // Walk-back only appears once it has happened: it is the price sparse keyframes pays,
                 // and the first thing to look at if a repair costs more than its depth accounts for.
+                // d and wb are disjoint now: d is how far the correction reached, wb the extra frames
+                // replayed to get to a keyframe. Their sum is what the repair actually re-simulated.
                 ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}" +
                   $"{(rbs.LastRollbackWalkback > 0 ? $"+{rbs.LastRollbackWalkback}wb" : "")}" +
                   $", max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"

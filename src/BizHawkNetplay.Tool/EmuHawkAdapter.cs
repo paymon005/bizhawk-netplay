@@ -437,12 +437,36 @@ namespace BizHawkNetplay.Tool
         /// (audio, netplay) kept running. MainForm.Render() re-presents the current video provider; we
         /// call it once per tick after stepping, the video twin of <see cref="PumpAudio"/>. Best-effort.
         /// </summary>
-        public void PresentVideo()
+        /// <returns>
+        /// True if a picture actually reached the window. This returned void and swallowed every
+        /// failure, while the caller counted a present regardless — so a window that had stopped
+        /// rendering entirely still reported a healthy presented-fps, which is precisely the symptom
+        /// this method exists to detect. Consecutive failures are counted so a persistent one is
+        /// distinguishable from the transient hiccup the catch was written for.
+        /// </returns>
+        public bool PresentVideo()
         {
             var form = _mainForm;
-            if (form == null || form.IsDisposed) return;
-            try { form.Render(); } catch { /* transient present hiccup — next tick tries again */ }
+            if (form == null || form.IsDisposed) { PresentFailuresInARow++; return false; }
+            try
+            {
+                form.Render();
+                PresentFailuresInARow = 0;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                PresentFailuresInARow++;
+                if (LastPresentError == null) LastPresentError = ex.Message;
+                return false;
+            }
         }
+
+        /// <summary>Presents that failed back to back; zero once one succeeds.</summary>
+        public int PresentFailuresInARow { get; private set; }
+
+        /// <summary>The first present failure of the session, kept so it can be reported once.</summary>
+        public string? LastPresentError { get; private set; }
 
         /// <summary>True once <see cref="EnableAudio"/> has wired up the sound output for the session.</summary>
         public bool AudioReady => _audioReady;
