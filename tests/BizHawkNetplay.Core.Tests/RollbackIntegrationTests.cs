@@ -250,6 +250,204 @@ namespace BizHawkNetplay.Core.Tests
             }
         }
 
+        /// <summary>Elision on, plus snapshots only every <paramref name="every"/>th predicted frame.</summary>
+        private static RollbackTuning Keyframed(int every, int checksumInterval = 0) => new RollbackTuning
+        {
+            ElideConfirmedSaves = true,
+            ChecksumAnchorInterval = checksumInterval,
+            KeyframeInterval = every,
+        };
+
+        [Theory]
+        [InlineData(2)]
+        [InlineData(3)]
+        [InlineData(4)]
+        public void SparseKeyframes_AreUnobservable_UnderLatencyAndLoss(int every)
+        {
+            // The load-bearing test. Snapshotting one predicted frame in N means a repair restarts from
+            // further back and replays more frames than it strictly needs — which must land in exactly
+            // the same place, or the whole idea is a desync generator. Same seed, same scripts, same
+            // link, same drops; only the snapshot policy differs.
+            const int k = 5;
+            const int iters = 500;
+
+            // Peer hashes are deliberately NOT compared: under latency the two sit at different frames
+            // with different predicted tails, so they agree on finalized frames and nowhere else.
+            // AssertFinalizedCorrect is the oracle for that; this compares one peer across policies.
+            (Dictionary<int, InputSet> inputs, uint hash, int rollbacks, int saves, long resim, long walked) RunWith(RollbackTuning t)
+            {
+                var clock = new Clock();
+                var (ta, tb) = LatencyLink.Pair(clock, latency: k,
+                    dropA: d => d.Length % 7 == 3, dropB: d => d.Length % 11 == 5);
+                var a = BuildRollback(ta, 0, tuning: t);
+                var b = BuildRollback(tb, 1, tuning: t);
+                Run(clock, a, b, iters);
+                return (a.Emu.LastInputByFrame, a.Emu.HashMainMemory(), a.Rollback.RollbackCount,
+                        a.Rollback.SavesTaken, a.Rollback.FramesResimulated, a.Rollback.FramesWalkedBack);
+            }
+
+            var dense = RunWith(Eliding());
+            var sparse = RunWith(Keyframed(every));
+
+            // Guards that the run actually exercised the new path. Skipped snapshots is the right
+            // measure, not walk-back: at N=2 this scenario's corrections happen to land on keyframes
+            // every time and walk back zero frames, which is a property of where the drops fall rather
+            // than of the policy. Frames re-simulated may therefore stay equal, never fall.
+            Assert.True(dense.rollbacks > 0, "the scenario must actually exercise corrections");
+            Assert.Equal(0, dense.walked);   // every predicted frame is its own base
+            Assert.True(sparse.saves < dense.saves,
+                $"keyframes every {every} skipped no snapshots ({sparse.saves} against {dense.saves})");
+            Assert.True(sparse.resim >= dense.resim, "walking back can never re-simulate fewer frames");
+
+            Assert.Equal(dense.rollbacks, sparse.rollbacks);
+            Assert.Equal(dense.hash, sparse.hash);
+            Assert.Equal(dense.inputs.Count, sparse.inputs.Count);
+            foreach (var kv in dense.inputs)
+            {
+                Assert.True(sparse.inputs.TryGetValue(kv.Key, out var other), $"frame {kv.Key} missing");
+                for (int p = 0; p < Scripts.Length; p++)
+                    Assert.True(kv.Value.Ports[p].ValueEquals(other!.Ports[p]),
+                        $"keyframing changed the input applied at frame {kv.Key} port {p}");
+            }
+        }
+
+        [Fact]
+        public void SparseKeyframes_TradeSnapshotsForReSimulatedFrames()
+        {
+            // The trade the whole change exists to make, in the units it is made in: snapshots down,
+            // re-simulated frames up. On N64 a snapshot is 6.82ms against a 2.41ms frame, so paying
+            // fewer than three frames per snapshot avoided is the win.
+            const int iters = 500;
+
+            (int saves, long resim) RunWith(RollbackTuning t)
+            {
+                var clock = new Clock();
+                var (ta, tb) = LatencyLink.Pair(clock, latency: 5,
+                    dropA: d => d.Length % 7 == 3, dropB: d => d.Length % 11 == 5);
+                var a = BuildRollback(ta, 0, tuning: t);
+                var b = BuildRollback(tb, 1, tuning: t);
+                Run(clock, a, b, iters);
+                return (a.Rollback.SavesTaken, a.Rollback.FramesResimulated);
+            }
+
+            var dense = RunWith(Eliding());
+            var sparse = RunWith(Keyframed(2));
+
+            Assert.True(sparse.saves < dense.saves,
+                $"expected fewer snapshots, got {sparse.saves} against {dense.saves}");
+            long framesPaid = sparse.resim - dense.resim;
+            int savesAvoided = dense.saves - sparse.saves;
+            Assert.True(framesPaid < savesAvoided * 3,
+                $"paid {framesPaid} extra frames to avoid {savesAvoided} snapshots — worse than N64's ratio");
+        }
+
+        [Fact]
+        public void SparseKeyframes_KeepABaseReachableAcrossRunsOfConfirmedFrames()
+        {
+            // Anchoring on `frame % N == 0` would be wrong, and this is the case that catches it: only
+            // frames still carrying a prediction are candidates, so confirmed runs punch holes in the
+            // sequence and a modulo rule can skip its own keyframe. Every predicted frame must have a
+            // base within N-1 frames of it regardless. Bursty loss produces exactly that alternation of
+            // confirmed and predicted stretches; a miss surfaces as the ring exception, not a bad hash.
+            // Loss is counted rather than derived from datagram contents: a content-based predicate
+            // drops every retransmission of the same datagram too, which redundancy cannot recover
+            // from, and the session stalls instead of exercising the alternation this is about.
+            const int k = 6;
+            const int iters = 700;
+            int ca = 0, cb = 0;
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k,
+                dropA: _ => (++ca % 4) == 0, dropB: _ => (++cb % 4) == 0);
+            var a = BuildRollback(ta, 0, tuning: Keyframed(3, checksumInterval: 0));
+            var b = BuildRollback(tb, 1, tuning: Keyframed(3, checksumInterval: 0));
+
+            Run(clock, a, b, iters);
+
+            Assert.True(a.Rollback.RollbackCount > 0, "no corrections ran, so nothing was proved");
+            Assert.True(a.Rollback.FramesWalkedBack > 0, "no walk-back happened, so nothing was proved");
+            int upTo = Math.Min(a.Driver.CurrentFrame, b.Driver.CurrentFrame) - k - Redundancy - Delay - 6;
+            AssertFinalizedCorrect(a, upTo);
+            AssertFinalizedCorrect(b, upTo);
+        }
+
+        [Fact]
+        public void SparseKeyframes_SurviveACorrectionAtTheEdgeOfTheRing()
+        {
+            // A correction landing at the prediction horizon restarts from a snapshot up to N-1 frames
+            // older still. If the prune window is not widened to match, that base has already been
+            // released and ExecutePendingRollback throws. A shallow ring puts the horizon and the prune
+            // floor close enough together for the difference to bite.
+            const int k = 4;
+            const int iters = 600;
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: k);
+            var a = BuildRollback(ta, 0, tuning: Keyframed(4), maxRollback: 5);
+            var b = BuildRollback(tb, 1, tuning: Keyframed(4), maxRollback: 5);
+
+            Run(clock, a, b, iters);
+
+            Assert.True(a.Rollback.RollbackCount > 0, "no corrections ran, so nothing was proved");
+            int upTo = Math.Min(a.Driver.CurrentFrame, b.Driver.CurrentFrame) - k - Delay - 4;
+            AssertFinalizedCorrect(a, upTo);
+            AssertFinalizedCorrect(b, upTo);
+        }
+
+        [Fact]
+        public void SparseKeyframes_DefaultToTheOriginalEveryFrameBehaviour()
+        {
+            // An omitted or nonsensical interval must be exactly the old behaviour, not an approximation
+            // of it -- every existing caller and test depends on that.
+            const int iters = 400;
+
+            (uint hash, int saves, long walked) RunWith(RollbackTuning t)
+            {
+                var clock = new Clock();
+                var (ta, tb) = LatencyLink.Pair(clock, latency: 5, dropA: d => d.Length % 7 == 3);
+                var a = BuildRollback(ta, 0, tuning: t);
+                var b = BuildRollback(tb, 1, tuning: t);
+                Run(clock, a, b, iters);
+                return (a.Emu.HashMainMemory(), a.Rollback.SavesTaken, a.Rollback.FramesWalkedBack);
+            }
+
+            var baseline = RunWith(Eliding());
+            foreach (var interval in new[] { 0, 1 })
+            {
+                var same = RunWith(Keyframed(interval));
+                Assert.Equal(baseline.hash, same.hash);
+                Assert.Equal(baseline.saves, same.saves);
+                Assert.Equal(0L, same.walked);
+            }
+        }
+
+        [Fact]
+        public void SparseKeyframes_StillAnchorEveryChecksumBoundary()
+        {
+            // Checksum anchors outrank the keyframe spacing: they are forced regardless of where the
+            // interval happens to fall, or desync detection goes quiet on exactly the frames it needs.
+            const int interval = 20;
+            const int iters = 600;
+            var clock = new Clock();
+            var (ta, tb) = LatencyLink.Pair(clock, latency: 5);
+            var a = BuildRollback(ta, 0, tuning: Keyframed(3, checksumInterval: interval));
+            var b = BuildRollback(tb, 1, tuning: Keyframed(3, checksumInterval: interval));
+
+            int checksums = 0;
+            for (int i = 0; i < iters; i++)
+            {
+                clock.Tick = i;
+                a.Step(); b.Step();
+                if (a.Rollback.TryConfirmedChecksum(interval, out var fa, out var ha)
+                    && b.Rollback.TryConfirmedChecksum(interval, out var fb, out var hb))
+                {
+                    Assert.Equal(fa, fb);
+                    Assert.Equal(ha, hb);
+                    checksums++;
+                }
+            }
+
+            Assert.True(checksums > 10, $"expected checksums to keep flowing, got {checksums}");
+        }
+
         [Fact]
         public void Elision_DoesNotStrandAppliedInputs()
         {

@@ -165,6 +165,8 @@ Also worth knowing: turning on **Verbose log** and reading the per-second `pacin
 
 **Rollback on N64 is available**, and no longer overridden to lockstep. The capability probe decides, using the model the session actually runs: a snapshot is skipped on any frame whose inputs are all already confirmed — most of them on a healthy link — so rollback's steady cost is the frame itself rather than a whole-core savestate every frame. The catch is depth. N64 measures a usable prediction horizon of about **3 frames**, so it hides roughly 3 frames of one-way latency and no more: worth it against someone nearby, not against someone far away, and lockstep remains a click away on the Netcode dropdown. When a misprediction does land, you pay a brief hitch where lockstep would have paid a stall. The session log tells you the depth it measured.
 
+Frames that *are* still predicted get a snapshot every other one rather than every one, because the snapshot is where a repair's budget goes: 6.82 ms of the 9.24 ms a repaired frame costs, against 2.41 ms for the frame itself. A correction then restarts from the nearest keyframe at or before its target and replays at most one extra frame to reach it — cheap, at that ratio. It buys a frame of depth, and it brings a worst-case repair from ~31.5 ms down to ~27 ms, which is the first time one fits inside the frame tick's own ~28.4 ms budget instead of overrunning it as a hitch. The status line shows the price when it is paid: `last d3+1wb` is a depth-3 correction that walked back one frame. Going sparser is not better — past every third frame the walk-back costs more than the snapshots it saves.
+
 See [Known limitations](#known-limitations) for the honest gaps (NAT scope, checksum scope, etc.).
 
 ## Capability probe
@@ -177,9 +179,41 @@ Each probe line also carries the video settings it was measured under, so a run 
 
 It also reports `MARGINAL` when the median frame cost qualifies for rollback and the slow end of the same run does not — a heavy core's frame cost moves enough between runs to flip the verdict, and re-rolling the probe until it says what you want is not a fix.
 
+### The repair line
+
+Everything above is a term timed on its own, and the depth verdict is those terms added up: `load + depth × (frame + save)`. The second line checks that sum against the thing it claims to describe, by timing a **whole repair** — a load, then N frames re-simulated from it — at two depths:
+
+```
+repair 1f=3.812ms 8f=20.640ms (+saves 67.910ms) -> per-frame 2.404ms +save 5.887ms, load 1.408ms | modelled 67.800ms (+0.2%)
+```
+
+Two depths give a line: its slope is what one more re-simulated frame really costs and its intercept is what the load really costs. Running the deep pass twice — once snapshotting every re-simulated frame, once not — isolates the snapshot, because those two passes differ by nothing else.
+
+That matters because none of the model's three assumptions is obvious on a recompiling core. A load from further back can invalidate the code cache, and the frames right after one run on caches the load has just cleared. Timing a load by itself would answer the narrower half of the question and miss exactly the effect most likely to bite. If the `per-frame`, `+save` and `load` figures come back matching `frame=`, `save=` and `load=` from the first line, the model describes the core; where they diverge, the difference says which term is wrong.
+
+`REPAIR OVERRUNS MODEL` appears when the measured repair costs more than 15% over the modelled one. That is the direction that desyncs a session: the depth was solved from a sum that a real repair cannot meet, so every correction overruns its budget. Cheaper-than-modelled is reported too, as a negative percentage, and is not an alarm.
+
+The first thing it caught was the probe. Saving does not advance the core, so the save pass was snapshotting memory nothing had touched since the previous sample, and the load pass was then restoring the state the core was already standing on — 16.7 MiB written back over identical bytes. Both are cheaper than the real operation: across six N64 configurations `save=` wandered between 5.6 and 6.7 ms with no pattern while the same snapshot timed inside a repair held steady at ~7.0 ms (±5%), and `load=` read ~1.4 ms against ~3.0. Understating both inflated the depth verdict, by enough to report 4 where the answer was 3. Those passes now advance a frame between samples, and the repair line stands as the standing cross-check.
+
+Measured and reported, not spent: the depth is still solved from the isolated terms, which are now timed against state that actually changes. Costs about 0.7 s of extra freeze on N64. The pass that re-snapshots every frame runs only two frames deep: it is the dearest thing here, the probe sits on the connect path where it lands as a hitch on joining, and the snapshot is a per-frame cost that reads the same off any depth.
+
+### Sweeping the probe unattended
+
+`tools/probe-sweep.ps1` drives the whole thing — patch `config.ini`, launch EmuHawk, load a savestate, open the tool, click the probe, read the log, kill EmuHawk — once per configuration:
+
+```powershell
+.\tools\probe-sweep.ps1 -Config Rice:320x240,Rice:1280x960,GLideN64:320x240 -Runs 5
+```
+
+Each run is a **fresh EmuHawk**, so the core is always constructed with the plugin and resolution already in place rather than having them changed underneath it. The savestate slot follows the plugin (`-SlotByPlugin`), because the video plugin is a sync setting and a state saved under Rice is not the one to load under GLideN64. `-StateSlot 0` probes at boot instead, which is the only option for a game with no state.
+
+Loading a state is about keeping the workload *still*, not about it being dearer. Eight runs each way on Super Smash Bros. put the boot screen at 2.21 ms a frame against 2.32 ms in-game — the same, inside the spread. But the probe's passes run over several seconds, and a booting game moves through logos, an intro and an attract demo while they do; the repair decomposition assumes a stationary cost, and on some boot runs it misreads badly enough to put the derived load at zero.
+
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
-- **Rollback depth on heavy cores:** N64 now runs rollback, but only ~3 frames deep — enough for a nearby opponent, not a distant one. Going deeper means making the *repair* cheaper, not the steady state (that part is done): re-simulated frames still carry a savestate each, because a correction generally confirms only the frames near its own and leaves the rest of the window predicted. Sparse keyframes during repair are the obvious next lever.
+- **Rollback depth on heavy cores:** N64 runs rollback ~3 frames deep at native — enough for a nearby opponent, not a distant one. Sparse keyframes (snapshotting every *other* predicted frame; see below) is in and buys a frame of that. Beyond it the wall is arithmetic: the savestate is **74%** of what a repaired frame costs, and a 16.7 MiB state moves at memory bandwidth — 2.9 GB/s written, measured identically across ten games, both plugins and every resolution. Making the state smaller or incremental would be the real win and needs core support BizHawk doesn't expose.
+- **The depth verdict is ~15% optimistic.** The probe's [repair line](#the-repair-line) says so on every stationary run, and the cause is known: `load=` is timed in isolation and the load defers work onto the frame that follows it, so the once-per-repair cost is nearer 3.8 ms than the 1.6 ms reported. Feeding the repair-derived terms to the solver is the fix; it moves the reported depth at native from 3 to what sparse keyframes now earns honestly.
+- **A repair spends up to `MaxFramesPerTick` frame periods, and the catch-up path can run exactly that many back per tick.** The two are now tied rather than chosen alongside each other, so raising either alone can no longer leave repairs running up arrears the pacing rebase quietly discards.
 - **Where N64's frame cost actually comes from:** mostly the render resolution — a controlled sweep puts it at 2.4 ms at 320×240 and 7.7 ms at 2880×2160 (see [Heavy cores](#heavy-cores-n64-and-friends)). An earlier uncontrolled sweep looked like noise and was read that way; it simply hadn't spanned enough of the range for the curve to clear the scatter. Whether resolution accounts for *all* of the 1.6–12 ms swing seen across one evening's sessions is still open — the top of that range is above anything measured here — but it is no longer an unexplained term.
 - **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
 

@@ -54,6 +54,7 @@ namespace BizHawkNetplay.Core.Sync
         // --- tuning (see RollbackTuning; none of it is negotiated) ---------------------
         private readonly bool _elideConfirmedSaves;
         private readonly int _checksumAnchorInterval;
+        private readonly int _keyframeInterval;  // 1 = snapshot every predicted frame
         private readonly double _repairBudgetMs;
         private readonly IMonotonicClock? _clock;
         private double _repairPerFrameMs;   // conservative rolling estimate of resim cost
@@ -102,6 +103,7 @@ namespace BizHawkNetplay.Core.Sync
             var t = tuning ?? RollbackTuning.Legacy;
             _elideConfirmedSaves = t.ElideConfirmedSaves;
             _checksumAnchorInterval = t.ChecksumAnchorInterval;
+            _keyframeInterval = t.KeyframeInterval < 1 ? 1 : t.KeyframeInterval;
             _clock = t.Clock;
             _repairBudgetMs = _clock != null ? t.RepairBudgetMs : 0; // a budget with no clock is unmeasurable
             _costCap = maxRollback; // no trimming until a repair has actually been timed
@@ -129,6 +131,10 @@ namespace BizHawkNetplay.Core.Sync
         public int SavesTaken { get; private set; }
         /// <summary>Snapshots skipped because the frame was already fully confirmed (see RollbackTuning).</summary>
         public int SavesElided { get; private set; }
+        /// <summary>Frames a repair had to re-simulate BEFORE its target, because the nearest keyframe
+        /// sat behind it. Zero unless <see cref="RollbackTuning.KeyframeInterval"/> is above 1.</summary>
+        public int LastRollbackWalkback { get; private set; }
+        public long FramesWalkedBack { get; private set; }
         public int SoftCap => _softCap;
         /// <summary>Prediction horizon the measured repair budget currently affords.</summary>
         public int CostCap => _costCap;
@@ -356,17 +362,24 @@ namespace BizHawkNetplay.Core.Sync
             _rollbackTo = int.MaxValue;
             if (r >= frame) return; // nothing simulated beyond it to correct
 
-            if (!_states.TryGetValue(r, out var baseState))
+            // The target itself is only guaranteed to be snapshotted when every predicted frame is.
+            // With sparse keyframes the repair restarts from the newest one at or before it and
+            // re-simulates the extra frames back up to it: correct because ResolveInputs recomputes
+            // each frame from the pipeline, so replaying from further back lands in the same place.
+            int b = NearestBaseAtOrBefore(r);
+            if (b < 0 || !_states.TryGetValue(b, out var baseState))
                 throw new InvalidOperationException(
-                    $"Rollback target frame {r} is not in the ring (depth {frame - r} > cap {_maxRollback}); " +
-                    "the prediction cap should have prevented running this far ahead.");
+                    $"Rollback target frame {r} has no base in the ring within {_keyframeInterval} frame(s) " +
+                    $"(depth {frame - r} > cap {_maxRollback}); the prediction cap and the prune window " +
+                    "should together have prevented running this far ahead.");
 
-            _adapter.LoadStateFromMemory(baseState); // core now sits entering frame r
-            int count = frame - r;                   // re-simulate r .. frame-1
+            _adapter.LoadStateFromMemory(baseState); // core now sits entering frame b
+            int walkback = r - b;
+            int count = frame - b;                   // re-simulate b .. frame-1
             double startedMs = _clock?.NowMs ?? 0;
             _adapter.RunFramesInvisible(count, i =>
             {
-                int f = r + i;
+                int f = b + i;
                 // Re-snapshot the entering state (it may be corrected again later) on the same terms as
                 // the live path. Frames the arriving correction just confirmed are dropped rather than
                 // re-saved: any snapshot from the previous run of f is now stale, and nothing may find it.
@@ -383,6 +396,10 @@ namespace BizHawkNetplay.Core.Sync
             LastRollbackDepth = count;
             if (count > MaxRollbackDepthSeen) MaxRollbackDepthSeen = count;
             FramesResimulated += count;
+            // Reported apart from the depth, because it is the price of sparse keyframes and the thing
+            // to look at if a repair costs more than the depth alone says it should.
+            LastRollbackWalkback = walkback;
+            FramesWalkedBack += walkback;
         }
 
         private InputSet ResolveInputs(int frame)
@@ -453,10 +470,46 @@ namespace BizHawkNetplay.Core.Sync
         /// thing dropped. Those frames are anchored unconditionally — without that, desync detection
         /// goes quiet and nothing says so.
         /// </summary>
-        private bool ShouldAnchor(int frame) =>
-            !_elideConfirmedSaves
-            || IsChecksumAnchor(frame)
-            || !_pipeline.AllConfirmed(frame);
+        /// ...and with <see cref="RollbackTuning.KeyframeInterval"/> above 1, a frame that still carries
+        /// a prediction is only snapshotted when nothing within reach already is. A repair then starts
+        /// from the newest keyframe at or before its target — see <see cref="NearestBaseAtOrBefore"/>.
+        private bool ShouldAnchor(int frame)
+        {
+            if (IsChecksumAnchor(frame)) return true;
+            if (_elideConfirmedSaves && _pipeline.AllConfirmed(frame)) return false;
+            return !HasBaseWithinReach(frame);
+        }
+
+        /// <summary>
+        /// Is there already a snapshot a repair could start from, close enough behind
+        /// <paramref name="frame"/> to be worth walking back to?
+        ///
+        /// Stated as a reachability question against the live ring rather than as
+        /// <c>frame % interval == 0</c>, because the modulo version is quietly wrong. Frames are only
+        /// considered for anchoring while they carry a prediction, so a run of confirmed frames leaves
+        /// gaps in the sequence; a modulo rule can then skip its own keyframe and leave a later
+        /// predicted frame with nothing behind it to roll back to. Asking the ring keeps the invariant
+        /// true by construction: every predicted frame either has a base within N-1 frames, or becomes
+        /// one itself. The scan is at most N-1 dictionary probes, with N small by design.
+        /// </summary>
+        private bool HasBaseWithinReach(int frame)
+        {
+            for (int b = frame - 1; b >= 0 && frame - b < _keyframeInterval; b--)
+                if (_states.ContainsKey(b)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// The frame a repair aiming at <paramref name="target"/> must actually load and restart from:
+        /// the newest snapshot at or before it. Returns -1 if the ring holds nothing in reach, which is
+        /// a bug in the caps or the prune window rather than a condition to recover from.
+        /// </summary>
+        private int NearestBaseAtOrBefore(int target)
+        {
+            for (int b = target; b >= 0 && target - b < _keyframeInterval; b--)
+                if (_states.ContainsKey(b)) return b;
+            return -1;
+        }
 
         private bool IsChecksumAnchor(int frame) =>
             _checksumAnchorInterval > 0 && frame >= 1 && (frame - 1) % _checksumAnchorInterval == 0;
@@ -526,7 +579,11 @@ namespace BizHawkNetplay.Core.Sync
                 : Math.Max(perFrameMs, _repairPerFrameMs * 0.9);
 
             if (_repairBudgetMs <= 0) return;
-            int cap = (int)Math.Floor(_repairBudgetMs / _repairPerFrameMs);
+            // The budget buys a number of re-simulated FRAMES; the cap governs prediction DEPTH. Sparse
+            // keyframes drives a wedge between the two, since a repair at depth d re-simulates up to
+            // d + N-1 frames. Charging the walk-back here is what stops the cheaper per-frame cost from
+            // being read as more depth than the budget can actually pay for.
+            int cap = (int)Math.Floor(_repairBudgetMs / _repairPerFrameMs) - (_keyframeInterval - 1);
             if (cap < MinCostCap) cap = MinCostCap;
             if (cap > _maxRollback) cap = _maxRollback;
             _costCap = cap;
@@ -547,7 +604,12 @@ namespace BizHawkNetplay.Core.Sync
 
         private void Prune(int frame)
         {
-            int keepFrom = frame + 1 - _maxRollback - PruneMargin;
+            // The keyframe term is not decoration: a correction landing at the very edge of the
+            // prediction horizon restarts from a snapshot up to N-1 frames older still, and pruning to
+            // the old window would throw that base away and turn a legal rollback into the exception in
+            // ExecutePendingRollback. The applied inputs are held to the same line, since those frames
+            // have to be re-resolved on the way back up.
+            int keepFrom = frame + 1 - _maxRollback - PruneMargin - (_keyframeInterval - 1);
             if (keepFrom <= 0) return;
 
             _pruneScratch.Clear();

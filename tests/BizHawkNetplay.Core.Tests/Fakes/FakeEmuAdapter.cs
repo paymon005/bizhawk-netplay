@@ -70,9 +70,19 @@ namespace BizHawkNetplay.Core.Tests.Fakes
             Step(AppliedInputs[AppliedInputs.Count - 1]);
         }
 
+        /// <summary>
+        /// The frame each save captured, and (from, to) for each load. Costs on a real core depend on
+        /// whether the operation is against state that actually changed — a snapshot of untouched
+        /// memory and a load of the state the core already stands on are both measurably cheaper than
+        /// the real thing — so a test needs to be able to prove the probe times the real thing.
+        /// </summary>
+        public List<int> SavedAtFrames { get; } = new List<int>();
+        public List<(int From, int To)> LoadJumps { get; } = new List<(int, int)>();
+
         public StateHandle SaveStateToMemory()
         {
             SaveCount++;
+            SavedAtFrames.Add(_frame);
             var copy = (byte[])_memory.Clone();
             var handle = new StateHandle(_frame, copy);
             LiveStates.Add(handle);
@@ -82,6 +92,7 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         public void LoadStateFromMemory(StateHandle handle)
         {
             LoadCount++;
+            LoadJumps.Add((_frame, handle.Frame));
             _memory = (byte[])((byte[])handle.Token).Clone();
             _frame = handle.Frame;
         }

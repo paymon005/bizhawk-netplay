@@ -48,8 +48,21 @@ namespace BizHawkNetplay.Tool
         /// and none. Two periods buys N64 depth 3 where one period allows 1. Repaired frames emit no
         /// audio, but they never did: the sample for a frame is produced by its original (predicted)
         /// run, so a deeper repair costs wall clock, not sound.
+        ///
+        /// Tied to <see cref="MaxFramesPerTick"/> rather than chosen alongside it, because "the
+        /// catch-up path absorbs it" is only true up to that many frames. A repair spending N frame
+        /// periods leaves N frames due when it returns, and a tick may run at most
+        /// <see cref="MaxFramesPerTick"/> of them — so at equality the next tick clears the debt
+        /// exactly, and above it the arrears grow until the pacing rebase discards them, which reads
+        /// as "CPU-bound" in the status bar for a core comfortably inside its budget.
+        ///
+        /// Both were 2, which made the invariant hold by coincidence. It is worth noting what this is
+        /// NOT tied to: <see cref="TickBudgetMs"/> is smaller (~28ms against ~33ms here) but governs a
+        /// different decision — whether to START another frame in this tick — and a repair already
+        /// running is not gated by it. Clamping this to that would cost N64 rollback entirely, for a
+        /// conflict that does not exist.
         /// </summary>
-        private const double RepairBudgetFrames = 2.0;
+        private const double RepairBudgetFrames = MaxFramesPerTick;
 
         /// <summary>At or below this ring depth, rollback is working but has little room — worth saying
         /// so once, since the user chose a mode whose whole point is hiding latency.</summary>
@@ -363,6 +376,9 @@ namespace BizHawkNetplay.Tool
         private double _nextFrameDueMs;
         private double _recentCoreFrameMs; // conservative rolling cost used before committing a hidden first frame
         private bool _frameTickRunning;
+        // Last seen state of EmuHawk's sound device, so the tick can report the transition rather
+        // than the aftermath. Starts true: a session that never stops it should say nothing.
+        private bool _audioDevWasUp = true;
         private double _lastUiRefreshMs = double.NegativeInfinity;
         private double _lastSlowTickLogMs = double.NegativeInfinity;
         private int _lastVerboseAudioFrame = -1;
@@ -386,6 +402,7 @@ namespace BizHawkNetplay.Tool
         private bool _presentHintShown; // one-time "the picture is coarser than the emulation" hint
         private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
         private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
+        private double _lastPresentClockMs = -1; // ...and of the previous present, for judder stats
         private const double StallHintPct = 15.0;      // stalled share of ticks worth complaining about
         private const double StallHintSustainMs = 5000; // ...but only once it persists, not on one burst
         // Presented-vs-advanced share below which the picture is coarse enough to be worth naming. A
@@ -399,6 +416,55 @@ namespace BizHawkNetplay.Tool
         [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeBeginPeriod(uint uMilliseconds);
         [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint uMilliseconds);
         private bool _timerResRaised;
+
+        /// <summary>
+        /// How close to the frame boundary the fine clock stops waiting and runs the tick. Half a
+        /// millisecond is about a sixth of an unthrottled loop iteration, so it costs nothing to ask
+        /// for and keeps a frame from being deferred a whole iteration by rounding.
+        /// </summary>
+        private const double FineClockWakeMarginMs = 0.5;
+
+        /// <summary>
+        /// Floor on how often the fine clock may enter the tick. Normally irrelevant — the tick advances
+        /// the due time a whole period per frame, so it naturally runs about sixty times a second. It
+        /// matters when the tick runs no frame at all (lockstep waiting on remote input): at 3200 loop
+        /// iterations a second, without a floor a stall would become a spin through the whole tick body.
+        /// </summary>
+        private const double FineClockMinSpacingMs = 1.0;
+
+        /// <summary>
+        /// How long the fine clock may go quiet before <see cref="_frameTimer"/> resumes driving frames.
+        /// Two frame periods: long enough that it never fires during normal play, short enough that a
+        /// session which loses its idle time skips rather than stops.
+        /// </summary>
+        private const double FineClockFallbackMs = 34;
+
+        private double _lastFineTickMs = double.NegativeInfinity;
+
+        /// <summary>
+        /// Which clock is actually driving frames, counted per pacing window.
+        ///
+        /// Worth keeping because the first attempt at this — moving the clock to Application.Idle —
+        /// changed the measured judder by nothing at all, and it took counters to establish that the
+        /// handler had never once run. EmuHawk drives its own loop rather than Application.Run, and
+        /// Application.DoEvents does not raise Idle. `timer` staying at zero is now the evidence that
+        /// the fine clock is doing its job; a session where it climbs is one where UpdateValues has
+        /// stopped arriving and the heartbeat has taken over.
+        /// </summary>
+        private int _emuLoopTicksWindow;
+        private int _timerTicksWindow;
+
+        /// <summary>
+        /// How often EmuHawk calls into this tool from its own run loop, per pacing window.
+        ///
+        /// This is the number that decides whether frame pacing is fixable at all. Our tick can only
+        /// run when EmuHawk's ProgramRunLoop hands the UI thread over, so that loop's rate is a hard
+        /// ceiling on ours. If this reads in the hundreds, WM_TIMER's coalescing is what has been
+        /// limiting us to sixty jittery ticks a second and moving the clock here fixes it. If it reads
+        /// about sixty, we are inheriting EmuHawk's own cadence and no clock of ours can beat it —
+        /// which would be worth saying plainly rather than attempting a fourth mechanism.
+        /// </summary>
+        private int _emuLoopCallsWindow;
 
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
@@ -437,7 +503,16 @@ namespace BizHawkNetplay.Tool
             ResumeLayout(false);
 
             _frameTimer = new System.Windows.Forms.Timer();
-            _frameTimer.Tick += (_, __) => FrameTick();
+            // Fallback only. While UpdateValues is running frames this does nothing, so the tick count
+            // stays one-per-frame and `stall%` keeps meaning what it did. If EmuHawk stops calling in —
+            // a modal dialog, a core swap, anything that takes over its loop — this resumes within a
+            // frame or two rather than leaving the session with no clock at all.
+            _frameTimer.Tick += (_, __) =>
+            {
+                if (_paceClock.Elapsed.TotalMilliseconds - _lastFineTickMs < FineClockFallbackMs) return;
+                _timerTicksWindow++;
+                FrameTick();
+            };
 
             LoadAndApplySettings();
             UpdateEnabled();
@@ -1922,10 +1997,12 @@ namespace BizHawkNetplay.Tool
             _lastPacingLogMs = double.NegativeInfinity;
             _stallHintSinceMs = double.NegativeInfinity;
             _stallHintShown = false;
+            _audioDevWasUp = true;   // a fresh session starts assuming sound is up; the edge reports otherwise
             _presentHintSinceMs = double.NegativeInfinity;
             _presentHintShown = false;
             _hashDiagLogged = false;
             _lastTickClockMs = -1;
+            _lastPresentClockMs = -1;
             // A WinForms timer is WM_TIMER, and SetTimer silently raises anything below
             // USER_TIMER_MINIMUM to 10ms — asking for 2 never bought a 2ms cadence, it just hid the
             // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
@@ -1933,6 +2010,9 @@ namespace BizHawkNetplay.Tool
             // FrameTick — the timer deliberately keeps running while a tick is in flight).
             _frameTimer.Interval = 10;
             _frameTimer.Start();
+            // The timer above is only a heartbeat now; UpdateValues is what paces frames. See its
+            // remarks for why WM_TIMER cannot do this job however short its interval is set.
+            _lastFineTickMs = double.NegativeInfinity;
 
             Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
                    $"you are P{_localPort + 1}/{_playerCount}, delay {_sessionDelay}", Color.Green);
@@ -2056,6 +2136,58 @@ namespace BizHawkNetplay.Tool
             catch { }
         }
 
+        /// <summary>
+        /// Runs frames from the message loop's idle time, which is what actually paces the session.
+        /// <see cref="_frameTimer"/> stays running underneath as a heartbeat for the case where the
+        /// queue never goes idle, so the worst this can do is behave exactly as it did before.
+        ///
+        /// WM_TIMER cannot pace a frame clock. It is a synthesised, lowest-priority message: it is only
+        /// generated when the queue is otherwise empty, at most one is ever queued, and it is delivered
+        /// on the system tick rather than on demand. `timeBeginPeriod(1)` above buys a 1.1ms Sleep and
+        /// changes none of that — a session measured ticks arriving 0.6ms to 33ms apart, averaging
+        /// 60/s against a 10ms interval that should have produced 100. Frames therefore landed at
+        /// arbitrary phase against the 16.688ms boundary: sometimes a tick ran no frame, so the next
+        /// ran two and showed only the second. Judder measured 15% of presents, peaking at 28%, on a
+        /// machine idle 94% of the time — a scheduling failure, not a capacity one.
+        ///
+        /// Idle time is the right source because it costs nothing to take. The loop exits the instant
+        /// any message arrives, so the UI is never starved; while nothing is pending it sleeps in 1ms
+        /// steps until the boundary is close, then runs the tick within half a millisecond of it.
+        /// </summary>
+        /// <summary>
+        /// Stops both frame clocks. Unhooking the idle handler matters as much as stopping the timer:
+        /// left attached it would keep being raised for the lifetime of EmuHawk, and the session flags
+        /// it tests are the only thing standing between that and a permanent sleep loop.
+        /// </summary>
+        /// <summary>
+        /// EmuHawk's own per-loop-iteration callback into external tools. Counted only — see
+        /// <see cref="_emuLoopCallsWindow"/> for why its rate is the question that matters.
+        /// </summary>
+        public override void UpdateValues(ToolFormUpdateType type)
+        {
+            _emuLoopCallsWindow++;
+            base.UpdateValues(type);
+
+            // This is the frame clock. EmuHawk calls it once per iteration of the loop that owns the UI
+            // thread, which makes it the finest clock available to us by definition — nothing we could
+            // install can fire between two iterations of the loop we are running inside. Unthrottled
+            // that is ~3200/s against a 16.688ms frame, so a frame lands within about 0.3ms of when it
+            // is due. WM_TIMER, by contrast, is capped near 100/s by its 10ms floor no matter how fast
+            // the loop spins, and measured 64.
+            if (!_sessionActive || _driver == null) return;
+            double nowMs = _paceClock.Elapsed.TotalMilliseconds;
+            if (nowMs < _nextFrameDueMs - FineClockWakeMarginMs) return;
+            if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
+            _lastFineTickMs = nowMs;
+            _emuLoopTicksWindow++;
+            FrameTick();
+        }
+
+        private void StopFramePacing()
+        {
+            _frameTimer.Stop();
+        }
+
         private void FrameTick()
         {
             if (!_sessionActive || _driver == null) return;
@@ -2072,6 +2204,10 @@ namespace BizHawkNetplay.Tool
             _frameTickRunning = true;
             var tickWatch = System.Diagnostics.Stopwatch.StartNew();
             double coreMs = 0, gateMs = 0, renderMs = 0;
+            // Everything else the tick does, so a slow one can be attributed instead of guessed at.
+            // A report that itemises 0.8ms of a 16.1ms tick names nothing: the four original terms
+            // are the four cheap ones, and the interesting time was all in the unmeasured remainder.
+            double audioMs = 0, emuApiMs = 0, uiMs = 0;
             int packetsDrained = 0;
             int frameForTelemetry = _driver.CurrentFrame;
             _lastHashMs = 0;
@@ -2086,7 +2222,33 @@ namespace BizHawkNetplay.Tool
             {
                 // Keep the audio device fed every tick, independent of how many frames we step this
                 // tick (or none, during a stall) — the ring buffer decouples playback from stepping.
+                double audioStart = tickWatch.Elapsed.TotalMilliseconds;
                 _adapter?.PumpAudio();
+                audioMs = tickWatch.Elapsed.TotalMilliseconds - audioStart;
+
+                // Say the moment EmuHawk's sound device stops or restarts, not just that it is down
+                // when something else already went wrong. Sampling it on a slow tick reports the
+                // aftermath: in the one log where this was caught, the device had been down for
+                // ~10 seconds of perfectly healthy ticks before anything else looked wrong, so the
+                // edge is the only thing that dates it. Cheap: a bool compare per tick.
+                if (_adapter != null)
+                {
+                    bool devUp = _adapter.AudioDeviceStarted;
+                    if (devUp != _audioDevWasUp)
+                    {
+                        _audioDevWasUp = devUp;
+                        ConnLog(devUp
+                            ? $"audio device restarted at frame {_driver?.CurrentFrame ?? -1}"
+                            : $"audio device STOPPED at frame {_driver?.CurrentFrame ?? -1} — EmuHawk shut its "
+                              + "sound output down. Note what happened just now (window focus, a headset or "
+                              + "monitor connecting, a device change); it is not yet known what triggers this.",
+                            devUp ? Color.DarkGreen : Color.DarkOrange);
+                    }
+                }
+
+                // Timed together because they are the same kind of thing: calls across the ApiHawk
+                // boundary into EmuHawk, made once per tick for the whole session.
+                double apiStart = tickWatch.Elapsed.TotalMilliseconds;
 
                 // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
                 // its own loop would advance the core on top of ours and desync — snap it back.
@@ -2099,6 +2261,7 @@ namespace BizHawkNetplay.Tool
                 // If EmuHawk's own loop slipped in extra core frames (e.g. a brief unpause), our
                 // counter and the core have diverged — report it plainly rather than as a desync.
                 int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
+                emuApiMs = tickWatch.Elapsed.TotalMilliseconds - apiStart;
                 if (emuDelta != _driver.CurrentFrame)
                 {
                     int diff = emuDelta - _driver.CurrentFrame;
@@ -2264,6 +2427,9 @@ namespace BizHawkNetplay.Tool
                     _adapter!.PresentVideo();
                     renderMs = phase.Elapsed.TotalMilliseconds;
                     _pacing.AddPresent(renderMs);
+                    if (_lastPresentClockMs >= 0)
+                        _pacing.AddPresentInterval(nowMs - _lastPresentClockMs, _frameMs);
+                    _lastPresentClockMs = nowMs;
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
@@ -2297,7 +2463,9 @@ namespace BizHawkNetplay.Tool
                     Log(_adapter!.AudioStats());
                 }
 
+                double uiStart = tickWatch.Elapsed.TotalMilliseconds;
                 UpdateSessionUi(nowMs);
+                uiMs = tickWatch.Elapsed.TotalMilliseconds - uiStart;
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
             finally
@@ -2319,8 +2487,26 @@ namespace BizHawkNetplay.Tool
                             : $", {repairs} repair(s) (last d{tickRollback.LastRollbackDepth}, " +
                               $"{resim} frame(s) resimulated)";
                     }
+                    // The remainder is what none of the named terms covered. It is reported rather
+                    // than left implicit because it was the whole story the one time this mattered:
+                    // 15.3ms of a 16.1ms tick, invisible in a line that itemised only the four
+                    // cheapest things the tick does.
+                    double other = elapsed - (coreMs + gateMs + _lastHashMs + renderMs
+                        + audioMs + emuApiMs + uiMs);
+                    // Audio device state, because a stopped one is silent in every other column: the
+                    // pump early-returns, the ring it drains fills up, and the tick collapses a few
+                    // seconds later with core, gate and stall all reading perfectly healthy.
+                    string audioState = "";
+                    if (_adapter != null)
+                    {
+                        double ring = _adapter.AudioRingFullness;
+                        audioState = $", audiodev {(_adapter.AudioDeviceStarted ? "on" : "STOPPED")}" +
+                            (ring >= 0 ? $", ring {ring:P0}" : "");
+                    }
                     Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
                         $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
+                        $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}, other {other:F1}" +
+                        $"{audioState}, " +
                         $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}{repairStr}");
                 }
                 _frameTickRunning = false;
@@ -2344,7 +2530,11 @@ namespace BizHawkNetplay.Tool
                 : $" — ping {effRttMs:F0}ms{(udpMeasured ? " udp" : "")}" +
                   $"{(_simLatencyMs > 0 ? $" (incl. {2 * _simLatencyMs}ms sim)" : "")}{(_peers.Count > 1 ? " (worst)" : "")}";
             string rbStr = _driver.Strategy is RollbackStrategy rbs
-                ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}, max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
+                // Walk-back only appears once it has happened: it is the price sparse keyframes pays,
+                // and the first thing to look at if a repair costs more than its depth accounts for.
+                ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}" +
+                  $"{(rbs.LastRollbackWalkback > 0 ? $"+{rbs.LastRollbackWalkback}wb" : "")}" +
+                  $", max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
                 : "";
 
             if (_fpsClock.ElapsedMilliseconds >= 500)
@@ -2406,9 +2596,46 @@ namespace BizHawkNetplay.Tool
                 $"Either input delay ({_sessionDelay}) isn't covering the link's worst moments — a ping " +
                 "that looks fine on average still stalls if it swings — or the other machine can't hold " +
                 "full speed and you're waiting for it. Check whether their fps reads CPU-bound: if it " +
-                "does, only faster core settings help. If it doesn't, raise the host's Auto max or " +
-                "manual floor and reconnect (the running delay stays fixed).",
+                $"does, only faster core settings help. If it doesn't: {DelayRemedy(_sessionDelay + 1)}",
                 Color.DarkOrange);
+        }
+
+        /// <summary>
+        /// What to actually change to get a higher input delay next session.
+        ///
+        /// Both delay warnings used to end in "raise the host's Auto max or manual floor" no matter
+        /// the state of the controls, and that is wrong advice more often than right: with <em>Auto
+        /// from ping</em> unticked, Auto max is inert — the one knob the message named could not
+        /// change the outcome however far it was turned. Measured on a ~74ms link left at delay 2,
+        /// a session stalled 30-70% of its ticks from start to finish while the log repeatedly
+        /// advised that knob; ticking the box (or setting the delay by hand) took the next run on the
+        /// same link to 0% stall at a full 60fps. The advice was the difference between a session
+        /// that worked and one that did not, so it has to name the control that is actually live.
+        ///
+        /// Both controls are host-only and disabled for the duration of a session, so reading them
+        /// here reports exactly what this session was started with.
+        /// </summary>
+        private string DelayRemedy(int suggested)
+        {
+            const string fixedTail = "the running delay stays fixed.";
+
+            // A joiner cannot see the host's auto-delay settings, let alone change them.
+            if (!_isHost)
+                return $"Ask the host for input delay {suggested}, then reconnect; {fixedTail}";
+
+            if (!_autoDelayCheck.Checked)
+                return $"\"Auto from ping\" is off, so Auto max does nothing here — tick it, or set " +
+                    $"Input delay to {suggested}, then reconnect; {fixedTail}";
+
+            int cap = (int)_autoDelayMaxBox.Value;
+            if (suggested > cap)
+                return $"\"Auto from ping\" is on but capped at {cap} — raise Auto max to {suggested} " +
+                    $"or more, then reconnect; {fixedTail}";
+
+            // Auto was on and had room: the lobby measurement simply caught the link at a better
+            // moment than the session went on to see.
+            return $"\"Auto from ping\" measured a faster link at connect than this session has seen — " +
+                $"reconnect to re-measure, or set Input delay to {suggested} by hand; {fixedTail}";
         }
 
         /// <summary>
@@ -2456,18 +2683,51 @@ namespace BizHawkNetplay.Tool
         /// between a core that genuinely can't make budget (core mean at or above the frame period)
         /// and a schedule that threw away frames the core could have run.
         /// </summary>
+        /// <summary>
+        /// Rollback activity over the last pacing window, as a rate rather than a running total.
+        ///
+        /// Missing from this line until a player reported the game "slowing down when a lot is going
+        /// on" while `adv` sat at a solid 60fps the whole time. Under rollback those are not in
+        /// conflict: a contradicted prediction re-simulates frames the player has already been shown,
+        /// so the advance rate stays exactly 60 while what is on screen gets rewritten. The rewrites
+        /// are what a player sees, and nothing here counted them — `gate` reports what a repair COST,
+        /// which on a core with a 0.4ms savestate stays near zero however many are happening.
+        /// </summary>
+        private int _pacingRollbacksAtWindowStart;
+        private long _pacingResimAtWindowStart;
+
         private void LogPacingSummary(double nowMs)
         {
             if (!Verbose || nowMs - _lastPacingLogMs < 1000) return;
             _lastPacingLogMs = nowMs;
             var p = _lastPacing;
             if (p.Ticks == 0) return;
+
+            string clockStr = $"clock emuloop {_emuLoopTicksWindow}/{_emuLoopCallsWindow} " +
+                              $"timer {_timerTicksWindow}, ";
+            _timerTicksWindow = 0;
+            _emuLoopCallsWindow = 0;
+            _emuLoopTicksWindow = 0;
+
+            string rbStr = "";
+            if (_driver?.Strategy is RollbackStrategy rb)
+            {
+                int rollbacks = rb.RollbackCount - _pacingRollbacksAtWindowStart;
+                long resim = rb.FramesResimulated - _pacingResimAtWindowStart;
+                _pacingRollbacksAtWindowStart = rb.RollbackCount;
+                _pacingResimAtWindowStart = rb.FramesResimulated;
+                rbStr = $"rollbacks {rollbacks} ({resim} frame(s) resimulated, last d{rb.LastRollbackDepth}, " +
+                        $"max d{rb.MaxRollbackDepthSeen}), ";
+            }
             Log($"pacing: adv {p.AdvancedFps:F0} fps, present {p.PresentedFps:F0}, " +
                 $"tick {p.TicksPerSecond:F0}/s (gap min {p.TickGapMinMs:F1} mean {p.TickGapMeanMs:F1} " +
                 $"max {p.TickGapMaxMs:F1}ms), " +
                 $"core mean {p.CoreMeanMs:F1} p95 {p.CoreP95Ms:F1} max {p.CoreMaxMs:F1}ms, " +
                 $"gate mean {p.GateMeanMs:F1} p95 {p.GateP95Ms:F1}ms, " +
                 $"present mean {p.PresentMeanMs:F1}ms, undrawn {p.UndrawnRenders}, " +
+                $"judder {p.JudderPct:F0}% (gap {p.PresentGapMeanMs:F1}ms ±{p.PresentJitterMs:F1} " +
+                $"max {p.PresentGapMaxMs:F1} vs {_frameMs:F1} target), " +
+                $"{clockStr}{rbStr}" +
                 $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
                 $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");
         }
@@ -2771,8 +3031,7 @@ namespace BizHawkNetplay.Tool
             {
                 ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: smooth " +
                     $"{(_mode == SyncMode.Rollback ? "rollback" : "lockstep")} recommends delay {suggested} " +
-                    $"(this session is {_sessionDelay}). Raise the host's Auto max or manual floor, then reconnect; " +
-                    "the running delay stays fixed.",
+                    $"(this session is {_sessionDelay}). {DelayRemedy(suggested)}",
                     Color.DarkOrange);
             }
             else if (_sessionDelay - suggested >= 2)
@@ -3368,9 +3627,28 @@ namespace BizHawkNetplay.Tool
         {
             ElideConfirmedSaves = true,
             ChecksumAnchorInterval = ChecksumInterval,
+            KeyframeInterval = RepairKeyframeInterval,
             RepairBudgetMs = RepairBudgetFrames * FrameMs(),
             Clock = new StopwatchClock(),
         };
+
+        /// <summary>
+        /// Snapshot every other predicted frame rather than every one.
+        ///
+        /// The snapshot is what a repair spends its budget on: measured on N64 over eight stationary
+        /// runs, a repaired frame costs 9.24ms of which 6.82ms is the snapshot and 2.41ms is the frame.
+        /// Halving the snapshots costs at most one extra re-simulated frame per correction, and buys a
+        /// frame of prediction depth — worth about 17ms of hideable one-way latency.
+        ///
+        /// The second effect is the one that shows up as feel rather than as a number. A worst-case
+        /// repair at this depth costs ~27ms against ~31.5ms before, which is the first time it fits
+        /// inside <see cref="TickBudgetMs"/> (~28.4ms at 60Hz). Until now every max-depth correction
+        /// overran its own tick and landed as a hitch.
+        ///
+        /// Not raised further on purpose: past 3 the walk-back to the nearest keyframe costs more
+        /// frames than the snapshots it avoids, and the measured depth goes back down.
+        /// </summary>
+        private const int RepairKeyframeInterval = 2;
 
         // Reflection flags for reaching EmuHawk internals (Tools/LuaConsole members aren't all public).
         private const System.Reflection.BindingFlags AnyInstance =
@@ -3916,7 +4194,7 @@ namespace BizHawkNetplay.Tool
             bool wasActive = _sessionActive;
             _pendingJoinIp = null; // a failed connect shouldn't land in the recent-IPs list
             ConnLog("connection failed: " + reason, Color.Firebrick);
-            _frameTimer.Stop();
+            StopFramePacing();
             _sessionActive = false;
             _resyncInProgress = false;
             _resyncReleaseQueued = false;
@@ -3938,7 +4216,7 @@ namespace BizHawkNetplay.Tool
                 && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
             { SetBusy(false); return; }
             bool wasActive = _sessionActive;
-            _frameTimer.Stop();
+            StopFramePacing();
 
             // Preserve a clean "friend left" signal without doing socket I/O on the UI thread. Give
             // the per-peer writers one very short opportunity; a state transfer or dead link is closed
@@ -4185,22 +4463,30 @@ namespace BizHawkNetplay.Tool
             double budget = FrameMs();
             return new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
                 .Run(budget, budget * 0.25,
-                    elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
+                    elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget,
+                    // Same constant the session's tuning uses. A depth solved against a different
+                    // snapshot spacing than the one the repair will run is a depth nothing checked.
+                    keyframeInterval: RepairKeyframeInterval);
         }
 
         /// <summary>
-        /// The probe result with the video settings it was measured under, on one line.
+        /// The probe result with the video settings it was measured under.
         ///
         /// A probe number means nothing without them. The verdict is decided by the frame cost, the
         /// frame cost is the video plugin's to spend, and the resolution behind it is not a sync
         /// setting — so it appeared nowhere near the probe: the session's video line prints later, only
         /// once a peer has joined, and the Diagnostics button never printed it at all. Anyone comparing
         /// a run of probes across settings was left matching numbers to a setting from memory.
+        ///
+        /// The measured repair goes on a second line. It answers a different question from the verdict
+        /// — whether the sum the verdict was solved from describes the thing it claims to — and this
+        /// output exists to be read a dozen runs at a time.
         /// </summary>
         private static string DescribeProbe(ProbeResult result, EmuHawkAdapter a)
         {
             string? video = a.VideoSettingsDiagnostic();
-            return video == null ? result.ToString() : $"{result} — video: {video}";
+            string head = video == null ? result.Summary : $"{result.Summary} — video: {video}";
+            return result.RepairDiagnostic.Length == 0 ? head : $"{head}{Environment.NewLine}    {result.RepairDiagnostic}";
         }
 
         private int MeasureRollbackDepth(EmuHawkAdapter a)

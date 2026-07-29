@@ -56,6 +56,11 @@ namespace BizHawkNetplay.Tool
         private short[] _asyncScratch = Array.Empty<short>();
         // Diagnostics so a single test round shows where the audio pipeline breaks.
         private long _audioFrames, _audioPairs, _audioPumps;
+        // Restart bookkeeping for a device that stopped under us — see PumpAudio's revival path.
+        private readonly System.Diagnostics.Stopwatch _audioRevive = System.Diagnostics.Stopwatch.StartNew();
+        private double _lastReviveAttemptMs = double.NegativeInfinity;
+        private const double ReviveIntervalMs = 500; // don't hammer StartSound every tick
+        public int AudioRevivals { get; private set; }
         private int _audioPeak;               // max abs sample seen (0 => core handed us silence)
         private string _audioSyncErr = "";
 
@@ -365,7 +370,17 @@ namespace BizHawkNetplay.Tool
             // EmuHawk disposes and recreates its audio device across a window minimize/restore
             // (Sound.StopSound/StartSound). While it's stopped, skip — do NOT give up permanently, or
             // audio would stay dead until a reconnect. When EmuHawk restarts the device we resume.
-            if (!snd.IsStarted) return;
+            if (!snd.IsStarted)
+            {
+                // Keep draining anyway. This pump is the ring's only consumer, so standing still
+                // lets the core's continued output pile up: observed in play as 300 frames with the
+                // ring pegged at capacity, which is ~0.8s of stale audio waiting to be played the
+                // moment the device comes back. Those samples belong to a moment that has passed —
+                // dropping them costs nothing and keeps the resume clean.
+                if (_soundBuffer.Count > _soundBuffer.Capacity / 4) _soundBuffer.DiscardSamples();
+                ReviveSound(snd);
+                return;
+            }
 
             _audioPumps++;
             try
@@ -379,6 +394,40 @@ namespace BizHawkNetplay.Tool
                 dev.WriteSamples(_pumpScratch, 0, needed);
             }
             catch { /* transient hiccup while the voice is being recreated — skip this tick, stay armed */ }
+        }
+
+        /// <summary>
+        /// Bring EmuHawk's sound device back up after it stopped under us.
+        ///
+        /// Waiting for EmuHawk to do it is what the old code did, and the reasoning was wrong in a way
+        /// this takeover created. <see cref="EnableAudio"/> detaches the input pin precisely so
+        /// EmuHawk's <c>UpdateSound</c> early-returns and leaves the device to us — which also
+        /// short-circuits whatever would have restarted it. So a device that stops mid-session stays
+        /// stopped: observed in play as the pump counter frozen for hundreds of frames with audio
+        /// dead for the rest of the session, recovering only on reconnect, because reconnecting runs
+        /// EnableAudio and its StartSound again.
+        ///
+        /// Having taken the device, we own reviving it. Rate-limited because StartSound is not free
+        /// and the tick runs ~60 times a second; the device reference is re-read on success because a
+        /// stop/start cycle can hand back a different object, and the stale one would then throw on
+        /// every pump forever after.
+        /// </summary>
+        private void ReviveSound(BizHawk.Client.EmuHawk.Sound snd)
+        {
+            double now = _audioRevive.Elapsed.TotalMilliseconds;
+            if (now - _lastReviveAttemptMs < ReviveIntervalMs) return;
+            _lastReviveAttemptMs = now;
+            try
+            {
+                snd.StartSound();
+                if (!snd.IsStarted) return; // sound disabled in config, or the device is genuinely gone
+
+                var devField = typeof(BizHawk.Client.EmuHawk.Sound)
+                    .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (devField?.GetValue(snd) is ISoundOutput fresh) _outputDevice = fresh;
+                AudioRevivals++;
+            }
+            catch { /* try again on the next interval; never let this kill the frame tick */ }
         }
 
         /// <summary>
@@ -401,6 +450,36 @@ namespace BizHawkNetplay.Tool
         /// <summary>Human-readable note on why audio was/wasn't wired up (for the UI log).</summary>
         public string AudioDiagnostic { get; private set; } = "";
 
+        /// <summary>
+        /// Whether EmuHawk's sound device is currently running, and how full our ring is.
+        ///
+        /// Cheap enough to read on a slow tick, and between them they identify a failure the
+        /// per-second audio line only shows in hindsight: EmuHawk stops its device across a window
+        /// minimize/restore, <see cref="PumpAudio"/> early-returns while it is stopped, and since the
+        /// pump is what drains the ring, the ring climbs to full and stays there. Observed once in
+        /// real play — 300 frames with the pump counter frozen and the ring pegged at capacity,
+        /// immediately followed by the frame tick collapsing to 9/s.
+        /// </summary>
+        public bool AudioDeviceStarted
+        {
+            get { try { return _audioReady && _sound != null && _sound.IsStarted; } catch { return false; } }
+        }
+
+        /// <summary>Ring occupancy as a fraction, or -1 if there is no ring to report on.</summary>
+        public double AudioRingFullness
+        {
+            get
+            {
+                try
+                {
+                    if (_soundBuffer == null) return -1;
+                    int cap = _soundBuffer.Capacity;
+                    return cap <= 0 ? -1 : (double)_soundBuffer.Count / cap;
+                }
+                catch { return -1; }
+            }
+        }
+
         /// <summary>Pipeline counters for diagnosing silence: samples produced vs pumped vs buffered.</summary>
         public string AudioStats()
         {
@@ -408,7 +487,8 @@ namespace BizHawkNetplay.Tool
             int cap = _soundBuffer?.Capacity ?? 0;
             string err = string.IsNullOrEmpty(_audioSyncErr) ? "" : $" drainErr='{_audioSyncErr}'";
             return $"audio stats: coreMode={(_coreSyncSound ? "Sync" : "Async")} frames={_audioFrames} " +
-                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts peak={_audioPeak}{err}";
+                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts peak={_audioPeak}" +
+                   $"{(AudioRevivals > 0 ? $" revivals={AudioRevivals}" : "")}{err}";
         }
 
         private void UpdatePeak(short[] buf, int shorts)
