@@ -48,8 +48,21 @@ namespace BizHawkNetplay.Tool
         /// and none. Two periods buys N64 depth 3 where one period allows 1. Repaired frames emit no
         /// audio, but they never did: the sample for a frame is produced by its original (predicted)
         /// run, so a deeper repair costs wall clock, not sound.
+        ///
+        /// Tied to <see cref="MaxFramesPerTick"/> rather than chosen alongside it, because "the
+        /// catch-up path absorbs it" is only true up to that many frames. A repair spending N frame
+        /// periods leaves N frames due when it returns, and a tick may run at most
+        /// <see cref="MaxFramesPerTick"/> of them — so at equality the next tick clears the debt
+        /// exactly, and above it the arrears grow until the pacing rebase discards them, which reads
+        /// as "CPU-bound" in the status bar for a core comfortably inside its budget.
+        ///
+        /// Both were 2, which made the invariant hold by coincidence. It is worth noting what this is
+        /// NOT tied to: <see cref="TickBudgetMs"/> is smaller (~28ms against ~33ms here) but governs a
+        /// different decision — whether to START another frame in this tick — and a repair already
+        /// running is not gated by it. Clamping this to that would cost N64 rollback entirely, for a
+        /// conflict that does not exist.
         /// </summary>
-        private const double RepairBudgetFrames = 2.0;
+        private const double RepairBudgetFrames = MaxFramesPerTick;
 
         /// <summary>At or below this ring depth, rollback is working but has little room — worth saying
         /// so once, since the user chose a mode whose whole point is hiding latency.</summary>
