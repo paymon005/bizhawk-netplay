@@ -376,6 +376,9 @@ namespace BizHawkNetplay.Tool
         private double _nextFrameDueMs;
         private double _recentCoreFrameMs; // conservative rolling cost used before committing a hidden first frame
         private bool _frameTickRunning;
+        // Last seen state of EmuHawk's sound device, so the tick can report the transition rather
+        // than the aftermath. Starts true: a session that never stops it should say nothing.
+        private bool _audioDevWasUp = true;
         private double _lastUiRefreshMs = double.NegativeInfinity;
         private double _lastSlowTickLogMs = double.NegativeInfinity;
         private int _lastVerboseAudioFrame = -1;
@@ -1935,6 +1938,7 @@ namespace BizHawkNetplay.Tool
             _lastPacingLogMs = double.NegativeInfinity;
             _stallHintSinceMs = double.NegativeInfinity;
             _stallHintShown = false;
+            _audioDevWasUp = true;   // a fresh session starts assuming sound is up; the edge reports otherwise
             _presentHintSinceMs = double.NegativeInfinity;
             _presentHintShown = false;
             _hashDiagLogged = false;
@@ -2106,6 +2110,26 @@ namespace BizHawkNetplay.Tool
                 double audioStart = tickWatch.Elapsed.TotalMilliseconds;
                 _adapter?.PumpAudio();
                 audioMs = tickWatch.Elapsed.TotalMilliseconds - audioStart;
+
+                // Say the moment EmuHawk's sound device stops or restarts, not just that it is down
+                // when something else already went wrong. Sampling it on a slow tick reports the
+                // aftermath: in the one log where this was caught, the device had been down for
+                // ~10 seconds of perfectly healthy ticks before anything else looked wrong, so the
+                // edge is the only thing that dates it. Cheap: a bool compare per tick.
+                if (_adapter != null)
+                {
+                    bool devUp = _adapter.AudioDeviceStarted;
+                    if (devUp != _audioDevWasUp)
+                    {
+                        _audioDevWasUp = devUp;
+                        ConnLog(devUp
+                            ? $"audio device restarted at frame {_driver?.CurrentFrame ?? -1}"
+                            : $"audio device STOPPED at frame {_driver?.CurrentFrame ?? -1} — EmuHawk shut its "
+                              + "sound output down. Note what happened just now (window focus, a headset or "
+                              + "monitor connecting, a device change); it is not yet known what triggers this.",
+                            devUp ? Color.DarkGreen : Color.DarkOrange);
+                    }
+                }
 
                 // Timed together because they are the same kind of thing: calls across the ApiHawk
                 // boundary into EmuHawk, made once per tick for the whole session.

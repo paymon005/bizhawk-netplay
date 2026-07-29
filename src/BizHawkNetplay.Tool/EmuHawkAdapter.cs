@@ -365,7 +365,16 @@ namespace BizHawkNetplay.Tool
             // EmuHawk disposes and recreates its audio device across a window minimize/restore
             // (Sound.StopSound/StartSound). While it's stopped, skip — do NOT give up permanently, or
             // audio would stay dead until a reconnect. When EmuHawk restarts the device we resume.
-            if (!snd.IsStarted) return;
+            if (!snd.IsStarted)
+            {
+                // Keep draining anyway. This pump is the ring's only consumer, so standing still
+                // lets the core's continued output pile up: observed in play as 300 frames with the
+                // ring pegged at capacity, which is ~0.8s of stale audio waiting to be played the
+                // moment the device comes back. Those samples belong to a moment that has passed —
+                // dropping them costs nothing and keeps the resume clean.
+                if (_soundBuffer.Count > _soundBuffer.Capacity / 4) _soundBuffer.DiscardSamples();
+                return;
+            }
 
             _audioPumps++;
             try
