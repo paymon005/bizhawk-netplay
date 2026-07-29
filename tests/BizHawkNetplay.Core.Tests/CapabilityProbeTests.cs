@@ -284,6 +284,125 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void SolveMaxDepth_KeyframeSpacingIsExactlyTheOldModelAtOne()
+        {
+            // The search must be the division it replaces wherever a snapshot is taken every frame,
+            // or every existing caller quietly changes answer.
+            foreach (var (frame, load, save) in new[] { (0.2, 0.05, 0.05), (2.0, 1.5, 6.0), (8.0, 6.0, 6.0) })
+                foreach (bool elide in new[] { false, true })
+                    foreach (double repairBudget in new[] { 0.0, 33.366 })
+                        Assert.Equal(
+                            CapabilityProbe.SolveMaxDepth(16.683, 4.171, frame, frame, load, save, elide, repairBudget),
+                            CapabilityProbe.SolveMaxDepth(16.683, 4.171, frame, frame, load, save, elide, repairBudget, 1));
+        }
+
+        [Fact]
+        public void SolveMaxDepth_SparseKeyframesBuyDepthUntilTheWalkBackEatsIt()
+        {
+            // The measured N64 terms, taken from the repair rather than in isolation: eight stationary
+            // runs at Rice 320x240 give live 2.300, load 3.829, save 6.824, frame 2.414 against a
+            // two-frame repair budget. Depth should climb to a peak and come back down, because a
+            // repair walks back up to N-1 frames to reach its keyframe and still leaves keyframes
+            // behind as it goes — so the snapshots fall as ceil((d+N-1)/N), not as d/N.
+            const double budget = 16.683, headroom = 16.683 * 0.25, repairBudget = 2 * 16.683;
+            int Depth(int n) => CapabilityProbe.SolveMaxDepth(budget, headroom,
+                liveFrameMs: 2.300, repairFrameMs: 2.414, loadMs: 3.829, saveMs: 6.824,
+                elideConfirmedSaves: true, repairBudgetMs: repairBudget, keyframeInterval: n);
+
+            Assert.Equal(2, Depth(1));   // a snapshot every frame: what the honest terms say today
+            Assert.Equal(3, Depth(2));   // the shipped setting
+            Assert.Equal(3, Depth(3));
+            Assert.Equal(2, Depth(4));   // past three the walk-back costs more than it saves
+            Assert.True(Depth(8) <= Depth(2), "spacing them further apart must not keep paying");
+        }
+
+        [Fact]
+        public void SolveMaxDepth_ChargesTheWalkBackRatherThanDividingTheSnapshotsAway()
+        {
+            // The naive version of this change divides the snapshot cost by N and forgets that a repair
+            // starts further back. On these terms that would report a depth the repair budget cannot
+            // actually pay for, which is the exact failure this whole exercise exists to stop.
+            const double budget = 16.683, headroom = 16.683 * 0.25;
+            const double frame = 2.414, save = 6.824, load = 3.829, live = 2.300;
+
+            int honest = CapabilityProbe.SolveMaxDepth(budget, headroom, live, frame, load, save,
+                elideConfirmedSaves: true, repairBudgetMs: 2 * budget, keyframeInterval: 3);
+
+            double available = 2 * budget - live - load;
+            int naive = (int)System.Math.Floor(available / (frame + save / 3.0));
+
+            Assert.True(honest < naive,
+                $"the walk-back must cost something: honest {honest} should be under the naive {naive}");
+
+            // And what it does report has to fit, worst case: d+N-1 frames, ceil(that/N) snapshots.
+            int frames = honest + 3 - 1;
+            int saves = (frames + 3 - 1) / 3;
+            Assert.True(frames * frame + saves * save <= available,
+                $"depth {honest} does not fit its own budget");
+            int overFrames = honest + 1 + 3 - 1;
+            int overSaves = (overFrames + 3 - 1) / 3;
+            Assert.True(overFrames * frame + overSaves * save > available,
+                $"depth {honest + 1} would also have fitted, so the answer is not maximal");
+        }
+
+        [Fact]
+        public void RepairProfile_IsTrustedOnlyWhenTheTwoPassesDescribeTheSameWork()
+        {
+            // Accepted: a real stationary in-game run, verbatim — Smash held on a savestate at Rice
+            // 320x240, whose isolated frame and load were 2.124ms and 1.560ms. The slope lands within
+            // a few percent of the frame, and the intercept sits well above the load because it
+            // contains it plus the work the load defers onto the frame after it.
+            var steady = new RepairProfile(1, 6.151, 8, 22.610, 74.274);
+            Assert.Equal(2.351, steady.MarginalFrameMs, 3);
+            Assert.Equal(3.800, steady.ImpliedLoadMs, 3);
+            Assert.True(steady.IsSelfConsistentWith(2.124, 1.560));
+
+            // Rejected: the shapes actually produced by probing a booting game, where the workload
+            // moved between passes. Ocarina's slope came back at four times its isolated frame; Mario
+            // Kart's intercept collapsed to zero, below a load it is supposed to contain.
+            var rampingUp = new RepairProfile(1, 2.735, 8, 15.578, 63.510);
+            Assert.False(rampingUp.IsSelfConsistentWith(0.599, 1.633));
+
+            var collapsedIntercept = new RepairProfile(1, 2.410, 8, 19.665, 74.398);
+            Assert.Equal(0, collapsedIntercept.ImpliedLoadMs, 3);
+            Assert.False(collapsedIntercept.IsSelfConsistentWith(1.852, 1.664));
+
+            // And a slope that ran backwards is never usable.
+            var backwards = new RepairProfile(1, 20.0, 8, 6.0);
+            Assert.False(backwards.IsSelfConsistentWith(2.0, 1.5));
+        }
+
+        [Fact]
+        public void Run_FallsBackToIsolatedTermsWhenTheRepairDecompositionIsIncoherent()
+        {
+            // A scripted clock whose repair passes do not describe a steady cost: the deep pass is far
+            // too cheap for its depth, so the slope comes out well under the isolated frame. The probe
+            // must say so and solve from what it can still trust, rather than quietly using a fit it
+            // has no reason to believe.
+            var emu = new FakeEmuAdapter(portCount: 2);
+            var durations = new List<double>();
+            durations.AddRange(Enumerable.Repeat(0.10, 100)); // save
+            durations.AddRange(Enumerable.Repeat(0.05, 100)); // load
+            durations.AddRange(Enumerable.Repeat(0.20, 100)); // frame, rendering off
+            durations.AddRange(Enumerable.Repeat(0.50, 100)); // frame, rendering on
+            durations.AddRange(Enumerable.Repeat(2.00, 12));  // repair 1f — implausibly dear
+            durations.AddRange(Enumerable.Repeat(2.40, 12));  // repair 8f — barely dearer: slope 0.057
+            durations.AddRange(Enumerable.Repeat(3.20, 12));  // ...re-saving each
+            var result = new CapabilityProbe(emu, new ManualClock(durations), samples: 100)
+                .Run(frameBudgetMs: 16.639, headroomMs: 4.0);
+
+            Assert.NotNull(result.Repair);
+            Assert.False(result.SolvedFromRepairTerms);
+            Assert.Contains("from isolated terms", result.ToString());
+
+            // Same numbers, solved the old way, must be the same answer — that is what "fell back" means.
+            Assert.Equal(
+                CapabilityProbe.SolveMaxDepth(16.639, 4.0, result.LiveFrameMs, result.MedianFrameMs,
+                    result.MedianLoadMs, result.MedianSaveMs, false, 0, 1),
+                result.MaxRollbackDepth);
+        }
+
+        [Fact]
         public void RepairProfile_ReadsTheSlopeAsTheFrameAndTheInterceptAsTheLoad()
         {
             // Measured N64 terms: load 1.4, frame 2.4, save 5.9. A core that behaves exactly as the

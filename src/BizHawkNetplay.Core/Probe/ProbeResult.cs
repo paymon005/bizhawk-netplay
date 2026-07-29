@@ -20,9 +20,13 @@ namespace BizHawkNetplay.Core.Probe
             int depthAtWorstFrame = -1,
             double highFrameMs = 0,
             double liveFrameMs = 0,
-            RepairProfile? repair = null)
+            RepairProfile? repair = null,
+            bool solvedFromRepairTerms = false,
+            int keyframeInterval = 1)
         {
             Repair = repair;
+            SolvedFromRepairTerms = solvedFromRepairTerms;
+            KeyframeInterval = keyframeInterval < 1 ? 1 : keyframeInterval;
             LiveFrameMs = liveFrameMs > 0 ? liveFrameMs : medianFrameMs;
             SteadyStateMs = steadyStateMs > 0 ? steadyStateMs : medianFrameMs + medianSaveMs;
             ReplayDeterministic = replayDeterministic;
@@ -88,6 +92,17 @@ namespace BizHawkNetplay.Core.Probe
         /// against the thing it claims to describe.
         /// </summary>
         public RepairProfile? Repair { get; }
+
+        /// <summary>
+        /// Whether the depth was solved from the repair's own terms rather than from the ones timed in
+        /// isolation. False means the decomposition did not describe a steady workload and was
+        /// discarded — usually because the game was still booting — so the verdict rests on the
+        /// isolated figures, which under-state the once-per-repair cost.
+        /// </summary>
+        public bool SolvedFromRepairTerms { get; }
+
+        /// <summary>Snapshot spacing the depth was solved for. Must match what the session runs.</summary>
+        public int KeyframeInterval { get; }
 
         /// <summary>What the depth model predicts the deep repair costs, from terms timed in isolation
         /// — the sum <see cref="CapabilityProbe.SolveMaxDepth(double,double,double,double,double)"/>
@@ -156,7 +171,10 @@ namespace BizHawkNetplay.Core.Probe
             $"{CoreName}: state={StateSizeBytes / 1024.0:F1}KiB " +
             $"save={MedianSaveMs:F3}ms load={MedianLoadMs:F3}ms frame={MedianFrameMs:F3}ms " +
             $"live={LiveFrameMs:F3}ms " +
-            $"steady={SteadyStateMs:F3}ms budget={FrameBudgetMs:F3}ms -> maxDepth={MaxRollbackDepth} " +
+            $"steady={SteadyStateMs:F3}ms budget={FrameBudgetMs:F3}ms " +
+            $"-> maxDepth={MaxRollbackDepth}" +
+            $"{(KeyframeInterval > 1 ? $" (keyframes 1-in-{KeyframeInterval})" : "")}" +
+            $"{(SolvedFromRepairTerms ? "" : ", from isolated terms")} " +
             $"replay={(ReplayDeterministic ? "ok" : "DIVERGED")} " +
             $"({(RollbackQualified ? "ROLLBACK OK" : "lockstep only")}" +
             $"{(DepthIsMarginal ? $"; MARGINAL — {DepthAtWorstFrame} on a {HighFrameMs:F3}ms frame" : "")})";

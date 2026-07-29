@@ -4208,7 +4208,10 @@ namespace BizHawkNetplay.Tool
             double budget = FrameMs();
             return new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
                 .Run(budget, budget * 0.25,
-                    elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget);
+                    elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget,
+                    // Same constant the session's tuning uses. A depth solved against a different
+                    // snapshot spacing than the one the repair will run is a depth nothing checked.
+                    keyframeInterval: RepairKeyframeInterval);
         }
 
         /// <summary>

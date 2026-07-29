@@ -72,6 +72,41 @@ namespace BizHawkNetplay.Core.Probe
         /// between the two deep passes, which differ by nothing else.</summary>
         public double MarginalSaveMs => Math.Max(0, (DeepResavedMs - DeepMs) / DeepDepth);
 
+        /// <summary>
+        /// Widest and narrowest the slope may sit relative to a frame timed on its own before the
+        /// decomposition is treated as describing something other than a steady workload.
+        /// </summary>
+        private const double SlopeFloor = 0.55;
+        private const double SlopeCeiling = 1.9;
+
+        /// <summary>
+        /// Whether the two points actually describe one steady cost, and so whether the terms taken
+        /// off them are worth solving a depth from.
+        ///
+        /// The decomposition assumes the underlying cost holds still across both passes. It usually
+        /// does — on a held-still in-game state the slope lands within 4% of an isolated frame over
+        /// eight runs. It badly does not while a game is booting, where the probe's several seconds
+        /// span logos, an intro and an attract demo: across ten games probed at boot the slope ran from
+        /// half the isolated frame cost to four times it, and the intercept collapsed to zero on three
+        /// of them where a runaway slope extrapolated back past the origin.
+        ///
+        /// Two things give that away without needing to know what the game was doing. A slope far from
+        /// the frame cost timed on its own means the two passes did not measure the same work. And an
+        /// intercept below the load timed on its own is impossible for a term that contains that load,
+        /// so it can only be fit error.
+        ///
+        /// Deliberately not a repair: a profile that fails this is discarded, not clamped. Salvaging
+        /// one term from a fit whose other term is provably wrong would be inventing a measurement,
+        /// since both come off the same two points.
+        /// </summary>
+        public bool IsSelfConsistentWith(double isolatedFrameMs, double isolatedLoadMs)
+        {
+            if (MarginalFrameMs <= 0 || isolatedFrameMs <= 0) return false;
+            double ratio = MarginalFrameMs / isolatedFrameMs;
+            if (ratio < SlopeFloor || ratio > SlopeCeiling) return false;
+            return ImpliedLoadMs >= isolatedLoadMs;
+        }
+
         public override string ToString() =>
             $"repair {ShallowDepth}f={ShallowMs:F3}ms {DeepDepth}f={DeepMs:F3}ms " +
             $"(+saves {DeepResavedMs:F3}ms) -> per-frame {MarginalFrameMs:F3}ms " +
