@@ -2085,6 +2085,10 @@ namespace BizHawkNetplay.Tool
             _frameTickRunning = true;
             var tickWatch = System.Diagnostics.Stopwatch.StartNew();
             double coreMs = 0, gateMs = 0, renderMs = 0;
+            // Everything else the tick does, so a slow one can be attributed instead of guessed at.
+            // A report that itemises 0.8ms of a 16.1ms tick names nothing: the four original terms
+            // are the four cheap ones, and the interesting time was all in the unmeasured remainder.
+            double audioMs = 0, emuApiMs = 0, uiMs = 0;
             int packetsDrained = 0;
             int frameForTelemetry = _driver.CurrentFrame;
             _lastHashMs = 0;
@@ -2099,7 +2103,13 @@ namespace BizHawkNetplay.Tool
             {
                 // Keep the audio device fed every tick, independent of how many frames we step this
                 // tick (or none, during a stall) — the ring buffer decouples playback from stepping.
+                double audioStart = tickWatch.Elapsed.TotalMilliseconds;
                 _adapter?.PumpAudio();
+                audioMs = tickWatch.Elapsed.TotalMilliseconds - audioStart;
+
+                // Timed together because they are the same kind of thing: calls across the ApiHawk
+                // boundary into EmuHawk, made once per tick for the whole session.
+                double apiStart = tickWatch.Elapsed.TotalMilliseconds;
 
                 // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
                 // its own loop would advance the core on top of ours and desync — snap it back.
@@ -2112,6 +2122,7 @@ namespace BizHawkNetplay.Tool
                 // If EmuHawk's own loop slipped in extra core frames (e.g. a brief unpause), our
                 // counter and the core have diverged — report it plainly rather than as a desync.
                 int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
+                emuApiMs = tickWatch.Elapsed.TotalMilliseconds - apiStart;
                 if (emuDelta != _driver.CurrentFrame)
                 {
                     int diff = emuDelta - _driver.CurrentFrame;
@@ -2310,7 +2321,9 @@ namespace BizHawkNetplay.Tool
                     Log(_adapter!.AudioStats());
                 }
 
+                double uiStart = tickWatch.Elapsed.TotalMilliseconds;
                 UpdateSessionUi(nowMs);
+                uiMs = tickWatch.Elapsed.TotalMilliseconds - uiStart;
             }
             catch (Exception ex) { EndSession("session error: " + ex.Message); }
             finally
@@ -2332,8 +2345,15 @@ namespace BizHawkNetplay.Tool
                             : $", {repairs} repair(s) (last d{tickRollback.LastRollbackDepth}, " +
                               $"{resim} frame(s) resimulated)";
                     }
+                    // The remainder is what none of the named terms covered. It is reported rather
+                    // than left implicit because it was the whole story the one time this mattered:
+                    // 15.3ms of a 16.1ms tick, invisible in a line that itemised only the four
+                    // cheapest things the tick does.
+                    double other = elapsed - (coreMs + gateMs + _lastHashMs + renderMs
+                        + audioMs + emuApiMs + uiMs);
                     Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
                         $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
+                        $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}, other {other:F1}, " +
                         $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}{repairStr}");
                 }
                 _frameTickRunning = false;
