@@ -56,6 +56,11 @@ namespace BizHawkNetplay.Tool
         private short[] _asyncScratch = Array.Empty<short>();
         // Diagnostics so a single test round shows where the audio pipeline breaks.
         private long _audioFrames, _audioPairs, _audioPumps;
+        // Restart bookkeeping for a device that stopped under us — see PumpAudio's revival path.
+        private readonly System.Diagnostics.Stopwatch _audioRevive = System.Diagnostics.Stopwatch.StartNew();
+        private double _lastReviveAttemptMs = double.NegativeInfinity;
+        private const double ReviveIntervalMs = 500; // don't hammer StartSound every tick
+        public int AudioRevivals { get; private set; }
         private int _audioPeak;               // max abs sample seen (0 => core handed us silence)
         private string _audioSyncErr = "";
 
@@ -373,6 +378,7 @@ namespace BizHawkNetplay.Tool
                 // moment the device comes back. Those samples belong to a moment that has passed —
                 // dropping them costs nothing and keeps the resume clean.
                 if (_soundBuffer.Count > _soundBuffer.Capacity / 4) _soundBuffer.DiscardSamples();
+                ReviveSound(snd);
                 return;
             }
 
@@ -388,6 +394,40 @@ namespace BizHawkNetplay.Tool
                 dev.WriteSamples(_pumpScratch, 0, needed);
             }
             catch { /* transient hiccup while the voice is being recreated — skip this tick, stay armed */ }
+        }
+
+        /// <summary>
+        /// Bring EmuHawk's sound device back up after it stopped under us.
+        ///
+        /// Waiting for EmuHawk to do it is what the old code did, and the reasoning was wrong in a way
+        /// this takeover created. <see cref="EnableAudio"/> detaches the input pin precisely so
+        /// EmuHawk's <c>UpdateSound</c> early-returns and leaves the device to us — which also
+        /// short-circuits whatever would have restarted it. So a device that stops mid-session stays
+        /// stopped: observed in play as the pump counter frozen for hundreds of frames with audio
+        /// dead for the rest of the session, recovering only on reconnect, because reconnecting runs
+        /// EnableAudio and its StartSound again.
+        ///
+        /// Having taken the device, we own reviving it. Rate-limited because StartSound is not free
+        /// and the tick runs ~60 times a second; the device reference is re-read on success because a
+        /// stop/start cycle can hand back a different object, and the stale one would then throw on
+        /// every pump forever after.
+        /// </summary>
+        private void ReviveSound(BizHawk.Client.EmuHawk.Sound snd)
+        {
+            double now = _audioRevive.Elapsed.TotalMilliseconds;
+            if (now - _lastReviveAttemptMs < ReviveIntervalMs) return;
+            _lastReviveAttemptMs = now;
+            try
+            {
+                snd.StartSound();
+                if (!snd.IsStarted) return; // sound disabled in config, or the device is genuinely gone
+
+                var devField = typeof(BizHawk.Client.EmuHawk.Sound)
+                    .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (devField?.GetValue(snd) is ISoundOutput fresh) _outputDevice = fresh;
+                AudioRevivals++;
+            }
+            catch { /* try again on the next interval; never let this kill the frame tick */ }
         }
 
         /// <summary>
@@ -447,7 +487,8 @@ namespace BizHawkNetplay.Tool
             int cap = _soundBuffer?.Capacity ?? 0;
             string err = string.IsNullOrEmpty(_audioSyncErr) ? "" : $" drainErr='{_audioSyncErr}'";
             return $"audio stats: coreMode={(_coreSyncSound ? "Sync" : "Async")} frames={_audioFrames} " +
-                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts peak={_audioPeak}{err}";
+                   $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts peak={_audioPeak}" +
+                   $"{(AudioRevivals > 0 ? $" revivals={AudioRevivals}" : "")}{err}";
         }
 
         private void UpdatePeak(short[] buf, int shorts)
