@@ -2423,9 +2423,46 @@ namespace BizHawkNetplay.Tool
                 $"Either input delay ({_sessionDelay}) isn't covering the link's worst moments — a ping " +
                 "that looks fine on average still stalls if it swings — or the other machine can't hold " +
                 "full speed and you're waiting for it. Check whether their fps reads CPU-bound: if it " +
-                "does, only faster core settings help. If it doesn't, raise the host's Auto max or " +
-                "manual floor and reconnect (the running delay stays fixed).",
+                $"does, only faster core settings help. If it doesn't: {DelayRemedy(_sessionDelay + 1)}",
                 Color.DarkOrange);
+        }
+
+        /// <summary>
+        /// What to actually change to get a higher input delay next session.
+        ///
+        /// Both delay warnings used to end in "raise the host's Auto max or manual floor" no matter
+        /// the state of the controls, and that is wrong advice more often than right: with <em>Auto
+        /// from ping</em> unticked, Auto max is inert — the one knob the message named could not
+        /// change the outcome however far it was turned. Measured on a ~74ms link left at delay 2,
+        /// a session stalled 30-70% of its ticks from start to finish while the log repeatedly
+        /// advised that knob; ticking the box (or setting the delay by hand) took the next run on the
+        /// same link to 0% stall at a full 60fps. The advice was the difference between a session
+        /// that worked and one that did not, so it has to name the control that is actually live.
+        ///
+        /// Both controls are host-only and disabled for the duration of a session, so reading them
+        /// here reports exactly what this session was started with.
+        /// </summary>
+        private string DelayRemedy(int suggested)
+        {
+            const string fixedTail = "the running delay stays fixed.";
+
+            // A joiner cannot see the host's auto-delay settings, let alone change them.
+            if (!_isHost)
+                return $"Ask the host for input delay {suggested}, then reconnect; {fixedTail}";
+
+            if (!_autoDelayCheck.Checked)
+                return $"\"Auto from ping\" is off, so Auto max does nothing here — tick it, or set " +
+                    $"Input delay to {suggested}, then reconnect; {fixedTail}";
+
+            int cap = (int)_autoDelayMaxBox.Value;
+            if (suggested > cap)
+                return $"\"Auto from ping\" is on but capped at {cap} — raise Auto max to {suggested} " +
+                    $"or more, then reconnect; {fixedTail}";
+
+            // Auto was on and had room: the lobby measurement simply caught the link at a better
+            // moment than the session went on to see.
+            return $"\"Auto from ping\" measured a faster link at connect than this session has seen — " +
+                $"reconnect to re-measure, or set Input delay to {suggested} by hand; {fixedTail}";
         }
 
         /// <summary>
@@ -2788,8 +2825,7 @@ namespace BizHawkNetplay.Tool
             {
                 ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: smooth " +
                     $"{(_mode == SyncMode.Rollback ? "rollback" : "lockstep")} recommends delay {suggested} " +
-                    $"(this session is {_sessionDelay}). Raise the host's Auto max or manual floor, then reconnect; " +
-                    "the running delay stays fixed.",
+                    $"(this session is {_sessionDelay}). {DelayRemedy(suggested)}",
                     Color.DarkOrange);
             }
             else if (_sessionDelay - suggested >= 2)
