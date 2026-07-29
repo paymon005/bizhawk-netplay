@@ -23,9 +23,13 @@ namespace BizHawkNetplay.Core.Probe
     /// </summary>
     public sealed class RepairProfile
     {
-        /// <param name="deepResavedMs">The deep pass re-run snapshotting every frame. 0 means that pass
-        /// was not taken, which leaves <see cref="MarginalSaveMs"/> at zero rather than negative.</param>
-        public RepairProfile(int shallowDepth, double shallowMs, int deepDepth, double deepMs, double deepResavedMs = 0)
+        /// <param name="resaveDepth">Depth the re-saving pass ran at. Need not match
+        /// <paramref name="deepDepth"/>: the snapshot term is a per-frame cost, so it can be read off
+        /// any depth, and a shallow one costs a fraction of the probe time. 0 means the pass was not
+        /// taken, which leaves <see cref="MarginalSaveMs"/> at zero rather than negative.</param>
+        /// <param name="resavedMs">That pass's measurement.</param>
+        public RepairProfile(int shallowDepth, double shallowMs, int deepDepth, double deepMs,
+            int resaveDepth = 0, double resavedMs = 0)
         {
             if (shallowDepth < 1)
                 throw new ArgumentOutOfRangeException(nameof(shallowDepth), "A repair re-simulates at least one frame.");
@@ -37,7 +41,8 @@ namespace BizHawkNetplay.Core.Probe
             ShallowMs = shallowMs;
             DeepDepth = deepDepth;
             DeepMs = deepMs;
-            DeepResavedMs = deepResavedMs;
+            ResaveDepth = resaveDepth;
+            ResavedMs = resavedMs;
         }
 
         /// <summary>Depths the two passes ran at. Recorded rather than assumed, so a log line stays
@@ -51,9 +56,10 @@ namespace BizHawkNetplay.Core.Probe
         /// <summary>The same at <see cref="DeepDepth"/>.</summary>
         public double DeepMs { get; }
 
-        /// <summary>As <see cref="DeepMs"/>, but snapshotting every re-simulated frame — the shape a
-        /// repair has today.</summary>
-        public double DeepResavedMs { get; }
+        /// <summary>Depth the re-saving pass ran at, and its measurement: one load plus that many
+        /// frames re-simulated, snapshotting each — the shape a repair has today.</summary>
+        public int ResaveDepth { get; }
+        public double ResavedMs { get; }
 
         /// <summary>
         /// Cost of one more re-simulated frame, taken as the slope between the two depths.
@@ -68,9 +74,29 @@ namespace BizHawkNetplay.Core.Probe
         /// compare against a load timed from where the core already stands.</summary>
         public double ImpliedLoadMs => Math.Max(0, ShallowMs - ShallowDepth * MarginalFrameMs);
 
-        /// <summary>Cost of the snapshot taken after each re-simulated frame: the whole difference
-        /// between the two deep passes, which differ by nothing else.</summary>
-        public double MarginalSaveMs => Math.Max(0, (DeepResavedMs - DeepMs) / DeepDepth);
+        /// <summary>
+        /// Cost of the snapshot taken after each re-simulated frame: the re-saving pass minus what the
+        /// same repair costs without the snapshots, per frame.
+        ///
+        /// The subtrahend is read off the line rather than measured again, which is what lets the
+        /// re-saving pass run shallow. It is by far the dearest thing the probe does — one load plus N
+        /// frames each followed by a whole-core snapshot — so at N=8 on N64 it was 52% of the entire
+        /// probe, and the probe runs on the connect path where it lands as a hitch on joining. The
+        /// snapshot is a per-frame cost and reads the same off any depth, so paying for depth 8 bought
+        /// nothing the line did not already have.
+        ///
+        /// Evaluating the line AT the deep depth gives exactly DeepMs, so this reduces to the earlier
+        /// difference-of-two-deep-passes when the two depths coincide — a property worth a test.
+        /// </summary>
+        public double MarginalSaveMs
+        {
+            get
+            {
+                if (ResaveDepth < 1) return 0;
+                double plainAtResaveDepth = ShallowMs + (ResaveDepth - ShallowDepth) * MarginalFrameMs;
+                return Math.Max(0, (ResavedMs - plainAtResaveDepth) / ResaveDepth);
+            }
+        }
 
         /// <summary>
         /// Widest and narrowest the slope may sit relative to a frame timed on its own before the
@@ -109,7 +135,7 @@ namespace BizHawkNetplay.Core.Probe
 
         public override string ToString() =>
             $"repair {ShallowDepth}f={ShallowMs:F3}ms {DeepDepth}f={DeepMs:F3}ms " +
-            $"(+saves {DeepResavedMs:F3}ms) -> per-frame {MarginalFrameMs:F3}ms " +
+            $"({ResaveDepth}f+saves {ResavedMs:F3}ms) -> per-frame {MarginalFrameMs:F3}ms " +
             $"+save {MarginalSaveMs:F3}ms, load {ImpliedLoadMs:F3}ms";
     }
 }

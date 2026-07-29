@@ -108,7 +108,9 @@ namespace BizHawkNetplay.Core.Probe
         /// — the sum <see cref="CapabilityProbe.SolveMaxDepth(double,double,double,double,double)"/>
         /// reasons with.</summary>
         public double ModelledRepairMs =>
-            Repair == null ? 0 : MedianLoadMs + Repair.DeepDepth * (MedianFrameMs + MedianSaveMs);
+            Repair == null || Repair.ResaveDepth < 1
+                ? 0
+                : MedianLoadMs + Repair.ResaveDepth * (MedianFrameMs + MedianSaveMs);
 
         /// <summary>
         /// Signed fraction by which the measured repair overruns the modelled one. Positive means the
@@ -117,7 +119,7 @@ namespace BizHawkNetplay.Core.Probe
         /// cause for alarm.
         /// </summary>
         public double RepairModelError =>
-            Repair == null || ModelledRepairMs <= 0 ? 0 : (Repair.DeepResavedMs - ModelledRepairMs) / ModelledRepairMs;
+            Repair == null || ModelledRepairMs <= 0 ? 0 : (Repair.ResavedMs - ModelledRepairMs) / ModelledRepairMs;
 
         /// <summary>
         /// How far the measured repair may overrun the model before it is worth saying so. Each sample

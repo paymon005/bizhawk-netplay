@@ -96,7 +96,7 @@ namespace BizHawkNetplay.Core.Probe
             var repair = new RepairProfile(
                 RepairProbeShallow, MeasureRepair(RepairProbeShallow, resave: false, neutral),
                 RepairProbeDeep, MeasureRepair(RepairProbeDeep, resave: false, neutral),
-                MeasureRepair(RepairProbeDeep, resave: true, neutral));
+                RepairProbeResave, MeasureRepair(RepairProbeResave, resave: true, neutral));
 
             // Solve from the repair itself where it can be trusted, and from the isolated terms where
             // it cannot. The repair-derived figures are the ones the model actually wants: it charges
@@ -152,6 +152,18 @@ namespace BizHawkNetplay.Core.Probe
         /// </summary>
         private const int RepairProbeShallow = 1;
         private const int RepairProbeDeep = 8;
+
+        /// <summary>
+        /// Depth the re-saving pass runs at — the pass that isolates the snapshot term.
+        ///
+        /// Shallow on purpose. That pass takes a whole-core snapshot after every frame it
+        /// re-simulates, so its cost per sample is depth × (frame + save); at 8 it was 52% of the
+        /// entire probe on N64, and the probe sits on the connect path where it lands as a hitch on
+        /// joining. The snapshot is a per-frame cost, so it reads the same off any depth, and the
+        /// plain repair it is compared against comes off the line the other two passes already fit.
+        /// Two rather than one so each sample still averages a pair of snapshots.
+        /// </summary>
+        private const int RepairProbeResave = 2;
 
         /// <summary>
         /// Samples per repair pass.

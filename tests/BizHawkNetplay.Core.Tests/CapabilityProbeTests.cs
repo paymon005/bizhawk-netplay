@@ -194,7 +194,8 @@ namespace BizHawkNetplay.Core.Tests
             durations.AddRange(Enumerable.Repeat(0.50, 100)); // frame, rendering on — the live term
             durations.AddRange(Enumerable.Repeat(0.25, 25));  // repair, 1 frame   = 0.05 + 1*0.20
             durations.AddRange(Enumerable.Repeat(1.65, 25));  // repair, 8 frames  = 0.05 + 8*0.20
-            durations.AddRange(Enumerable.Repeat(2.45, 25));  // ...re-saving each = 1.65 + 8*0.10
+            durations.AddRange(Enumerable.Repeat(0.65, 25));  // repair, 2 frames re-saving each
+                                                             //                   = 0.05 + 2*0.20 + 2*0.10
             var clock = new ManualClock(durations);
 
             var probe = new CapabilityProbe(emu, clock, samples: 100);
@@ -213,7 +214,8 @@ namespace BizHawkNetplay.Core.Tests
             var repair = Assert.IsType<RepairProfile>(result.Repair);
             Assert.Equal(0.25, repair.ShallowMs, 3);
             Assert.Equal(1.65, repair.DeepMs, 3);
-            Assert.Equal(2.45, repair.DeepResavedMs, 3);
+            Assert.Equal(0.65, repair.ResavedMs, 3);
+            Assert.Equal(2, repair.ResaveDepth);
             Assert.Equal(result.MedianFrameMs, repair.MarginalFrameMs, 3);
             Assert.Equal(result.MedianLoadMs, repair.ImpliedLoadMs, 3);
             Assert.Equal(result.MedianSaveMs, repair.MarginalSaveMs, 3);
@@ -221,13 +223,13 @@ namespace BizHawkNetplay.Core.Tests
             Assert.False(result.RepairCostsMoreThanModelled);
 
             // Adapter was actually exercised the expected number of times.
-            // 1 reference + 100 samples + 3 repair anchors + 25*8 repair re-saves + 1 replay anchor.
-            Assert.Equal(305, emu.SaveCount);
+            // 1 reference + 100 samples + 3 repair anchors + 25*2 repair re-saves + 1 replay anchor.
+            Assert.Equal(155, emu.SaveCount);
             // 100 samples + 3 passes of (25 samples + 1 restore) + 2 in the replay check + 1 final.
             Assert.Equal(181, emu.LoadCount);
             // 100 timed + 100 between the save samples + 100 between the load samples
-            // + (1+25) + (8+200) + (8+200) across the repair passes + 30 replayed twice.
-            Assert.Equal(802, emu.InvisibleFrameCount);
+            // + (1+25) + (8+200) + (2+50) across the repair passes + 30 replayed twice.
+            Assert.Equal(646, emu.InvisibleFrameCount);
             Assert.Equal(100, emu.RenderedFrameCount);
         }
 
@@ -352,7 +354,7 @@ namespace BizHawkNetplay.Core.Tests
             // 320x240, whose isolated frame and load were 2.124ms and 1.560ms. The slope lands within
             // a few percent of the frame, and the intercept sits well above the load because it
             // contains it plus the work the load defers onto the frame after it.
-            var steady = new RepairProfile(1, 6.151, 8, 22.610, 74.274);
+            var steady = new RepairProfile(1, 6.151, 8, 22.610, 8, 74.274);
             Assert.Equal(2.351, steady.MarginalFrameMs, 3);
             Assert.Equal(3.800, steady.ImpliedLoadMs, 3);
             Assert.True(steady.IsSelfConsistentWith(2.124, 1.560));
@@ -360,10 +362,10 @@ namespace BizHawkNetplay.Core.Tests
             // Rejected: the shapes actually produced by probing a booting game, where the workload
             // moved between passes. Ocarina's slope came back at four times its isolated frame; Mario
             // Kart's intercept collapsed to zero, below a load it is supposed to contain.
-            var rampingUp = new RepairProfile(1, 2.735, 8, 15.578, 63.510);
+            var rampingUp = new RepairProfile(1, 2.735, 8, 15.578, 8, 63.510);
             Assert.False(rampingUp.IsSelfConsistentWith(0.599, 1.633));
 
-            var collapsedIntercept = new RepairProfile(1, 2.410, 8, 19.665, 74.398);
+            var collapsedIntercept = new RepairProfile(1, 2.410, 8, 19.665, 8, 74.398);
             Assert.Equal(0, collapsedIntercept.ImpliedLoadMs, 3);
             Assert.False(collapsedIntercept.IsSelfConsistentWith(1.852, 1.664));
 
@@ -412,7 +414,7 @@ namespace BizHawkNetplay.Core.Tests
             var linear = new RepairProfile(
                 shallowDepth: 1, shallowMs: 1.4 + 2.4,
                 deepDepth: 8, deepMs: 1.4 + 8 * 2.4,
-                deepResavedMs: 1.4 + 8 * 2.4 + 8 * 5.9);
+                resaveDepth: 8, resavedMs: 1.4 + 8 * 2.4 + 8 * 5.9);
 
             Assert.Equal(2.4, linear.MarginalFrameMs, 3);
             Assert.Equal(1.4, linear.ImpliedLoadMs, 3);
@@ -424,11 +426,36 @@ namespace BizHawkNetplay.Core.Tests
             var cacheCold = new RepairProfile(
                 shallowDepth: 1, shallowMs: 1.4 + 3.6,
                 deepDepth: 8, deepMs: 1.4 + 8 * 3.6,
-                deepResavedMs: 1.4 + 8 * 3.6 + 8 * 5.9);
+                resaveDepth: 8, resavedMs: 1.4 + 8 * 3.6 + 8 * 5.9);
 
             Assert.Equal(3.6, cacheCold.MarginalFrameMs, 3);
             Assert.Equal(1.4, cacheCold.ImpliedLoadMs, 3);
             Assert.Equal(5.9, cacheCold.MarginalSaveMs, 3);
+        }
+
+        [Fact]
+        public void RepairProfile_ReadsTheSameSnapshotCostFromAnyResaveDepth()
+        {
+            // The whole justification for running the re-saving pass shallow -- it is 52% of the probe
+            // at depth 8, on the connect path, where it lands as a hitch on joining. The snapshot is a
+            // per-frame cost, so reading it off two frames must give what eight would, and at the deep
+            // depth the answer must be identical to the difference-of-two-deep-passes this replaced.
+            const double load = 1.4, frame = 2.4, save = 5.9;
+            double Plain(int d) => load + d * frame;
+            double Resaved(int d) => Plain(d) + d * save;
+
+            foreach (int resaveDepth in new[] { 1, 2, 3, 4, 8 })
+            {
+                var p = new RepairProfile(1, Plain(1), 8, Plain(8), resaveDepth, Resaved(resaveDepth));
+                Assert.Equal(save, p.MarginalSaveMs, 6);
+            }
+
+            // At the deep depth it is literally the old formula, since the line evaluated there is DeepMs.
+            var atDeep = new RepairProfile(1, Plain(1), 8, Plain(8), 8, Resaved(8));
+            Assert.Equal((Resaved(8) - Plain(8)) / 8, atDeep.MarginalSaveMs, 6);
+
+            // A pass that was not run reports nothing rather than a negative cost.
+            Assert.Equal(0, new RepairProfile(1, Plain(1), 8, Plain(8)).MarginalSaveMs, 6);
         }
 
         [Fact]
@@ -465,7 +492,7 @@ namespace BizHawkNetplay.Core.Tests
             ProbeResult WithRepair(double measuredDeepResaved) => new ProbeResult(
                 "N64", 1024, medianSaveMs: 5.9, medianLoadMs: 1.4, medianFrameMs: 2.4,
                 frameBudgetMs: 16.683, headroomMs: 4.17, maxRollbackDepth: 3,
-                repair: new RepairProfile(1, 3.8, 8, 20.6, measuredDeepResaved));
+                repair: new RepairProfile(1, 3.8, 8, 20.6, 8, measuredDeepResaved));
 
             Assert.Equal(67.8, WithRepair(67.8).ModelledRepairMs, 3);
 
