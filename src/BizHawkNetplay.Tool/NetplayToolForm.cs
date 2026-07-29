@@ -417,6 +417,49 @@ namespace BizHawkNetplay.Tool
         [System.Runtime.InteropServices.DllImport("winmm.dll")] private static extern uint timeEndPeriod(uint uMilliseconds);
         private bool _timerResRaised;
 
+        /// <summary>
+        /// Whether anything is waiting in this thread's message queue. The idle pacing loop below runs
+        /// only while this is false, so input, painting and every other message still get served
+        /// promptly — the loop is using time the message pump would otherwise have spent blocked.
+        /// </summary>
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool PeekMessage(out NativeMsg msg, IntPtr hWnd, uint min, uint max, uint remove);
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct NativeMsg
+        {
+            public IntPtr HWnd; public uint Message; public IntPtr WParam; public IntPtr LParam;
+            public uint Time; public int X; public int Y;
+        }
+
+        private const uint PmNoRemove = 0;
+        private static bool MessagePending() => PeekMessage(out _, IntPtr.Zero, 0, 0, PmNoRemove);
+
+        /// <summary>
+        /// How close to the frame boundary the idle loop stops sleeping and runs the tick. Sleep(1)
+        /// measures ~1.1ms on a machine with the timer resolution raised, so waking within half a
+        /// millisecond of the boundary is about as fine as this mechanism goes.
+        /// </summary>
+        private const double IdleWakeMarginMs = 0.5;
+
+        /// <summary>
+        /// Floor on how often the idle loop may enter the tick. Normally irrelevant — the tick advances
+        /// the due time a whole period per frame, so it naturally runs about sixty times a second. It
+        /// matters when the tick runs no frame at all (lockstep waiting on remote input): without a
+        /// floor the loop would re-enter as fast as the CPU allows and turn a stall into a spin.
+        /// </summary>
+        private const double IdleMinTickSpacingMs = 1.0;
+
+        /// <summary>
+        /// How long the idle clock may go quiet before <see cref="_frameTimer"/> resumes driving frames.
+        /// Two frame periods: long enough that it never fires during normal play, short enough that a
+        /// session which loses its idle time skips rather than stops.
+        /// </summary>
+        private const double IdlePacingFallbackMs = 34;
+
+        private bool _idlePacingHooked;
+        private double _lastIdleTickMs = double.NegativeInfinity;
+
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
         public NetplayToolForm()
@@ -454,7 +497,15 @@ namespace BizHawkNetplay.Tool
             ResumeLayout(false);
 
             _frameTimer = new System.Windows.Forms.Timer();
-            _frameTimer.Tick += (_, __) => FrameTick();
+            // Fallback only. While OnIdlePace is running frames this does nothing, so the tick count
+            // stays one-per-frame and `stall%` keeps meaning what it did. If idle time dries up — a
+            // message storm, a nested pump that never yields — this takes back over within a frame or
+            // two rather than leaving the session with no clock at all.
+            _frameTimer.Tick += (_, __) =>
+            {
+                if (_paceClock.Elapsed.TotalMilliseconds - _lastIdleTickMs < IdlePacingFallbackMs) return;
+                FrameTick();
+            };
 
             LoadAndApplySettings();
             UpdateEnabled();
@@ -1952,6 +2003,14 @@ namespace BizHawkNetplay.Tool
             // FrameTick — the timer deliberately keeps running while a tick is in flight).
             _frameTimer.Interval = 10;
             _frameTimer.Start();
+            // The timer above is now only a heartbeat; OnIdlePace is what paces frames. See its remarks
+            // for why WM_TIMER cannot do this job however short its interval is set.
+            if (!_idlePacingHooked)
+            {
+                _lastIdleTickMs = double.NegativeInfinity;
+                Application.Idle += OnIdlePace;
+                _idlePacingHooked = true;
+            }
 
             Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
                    $"you are P{_localPort + 1}/{_playerCount}, delay {_sessionDelay}", Color.Green);
@@ -2073,6 +2132,55 @@ namespace BizHawkNetplay.Tool
                     $"{_frameMs:F2}ms frame period — the frame tick cannot beat this.");
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Runs frames from the message loop's idle time, which is what actually paces the session.
+        /// <see cref="_frameTimer"/> stays running underneath as a heartbeat for the case where the
+        /// queue never goes idle, so the worst this can do is behave exactly as it did before.
+        ///
+        /// WM_TIMER cannot pace a frame clock. It is a synthesised, lowest-priority message: it is only
+        /// generated when the queue is otherwise empty, at most one is ever queued, and it is delivered
+        /// on the system tick rather than on demand. `timeBeginPeriod(1)` above buys a 1.1ms Sleep and
+        /// changes none of that — a session measured ticks arriving 0.6ms to 33ms apart, averaging
+        /// 60/s against a 10ms interval that should have produced 100. Frames therefore landed at
+        /// arbitrary phase against the 16.688ms boundary: sometimes a tick ran no frame, so the next
+        /// ran two and showed only the second. Judder measured 15% of presents, peaking at 28%, on a
+        /// machine idle 94% of the time — a scheduling failure, not a capacity one.
+        ///
+        /// Idle time is the right source because it costs nothing to take. The loop exits the instant
+        /// any message arrives, so the UI is never starved; while nothing is pending it sleeps in 1ms
+        /// steps until the boundary is close, then runs the tick within half a millisecond of it.
+        /// </summary>
+        /// <summary>
+        /// Stops both frame clocks. Unhooking the idle handler matters as much as stopping the timer:
+        /// left attached it would keep being raised for the lifetime of EmuHawk, and the session flags
+        /// it tests are the only thing standing between that and a permanent sleep loop.
+        /// </summary>
+        private void StopFramePacing()
+        {
+            _frameTimer.Stop();
+            if (!_idlePacingHooked) return;
+            Application.Idle -= OnIdlePace;
+            _idlePacingHooked = false;
+        }
+
+        private void OnIdlePace(object? sender, EventArgs e)
+        {
+            while (_sessionActive && _driver != null && !MessagePending())
+            {
+                double nowMs = _paceClock.Elapsed.TotalMilliseconds;
+                if (nowMs < _nextFrameDueMs - IdleWakeMarginMs ||
+                    nowMs - _lastIdleTickMs < IdleMinTickSpacingMs)
+                {
+                    // Sleep rather than spin: this loop must cost a parked thread, not a busy core.
+                    Thread.Sleep(1);
+                    continue;
+                }
+
+                _lastIdleTickMs = nowMs;
+                FrameTick();
+            }
         }
 
         private void FrameTick()
@@ -4075,7 +4183,7 @@ namespace BizHawkNetplay.Tool
             bool wasActive = _sessionActive;
             _pendingJoinIp = null; // a failed connect shouldn't land in the recent-IPs list
             ConnLog("connection failed: " + reason, Color.Firebrick);
-            _frameTimer.Stop();
+            StopFramePacing();
             _sessionActive = false;
             _resyncInProgress = false;
             _resyncReleaseQueued = false;
@@ -4097,7 +4205,7 @@ namespace BizHawkNetplay.Tool
                 && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
             { SetBusy(false); return; }
             bool wasActive = _sessionActive;
-            _frameTimer.Stop();
+            StopFramePacing();
 
             // Preserve a clean "friend left" signal without doing socket I/O on the UI thread. Give
             // the per-peer writers one very short opportunity; a state transfer or dead link is closed
