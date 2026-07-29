@@ -183,8 +183,8 @@ namespace BizHawkNetplay.Core.Tests
             var emu = new FakeEmuAdapter(portCount: 2);
 
             // Probe order: 1 reference save (untimed), then samples of save x100, load x100,
-            // frame-without-render x100, frame-with-render x100, then three whole-repair passes of 12
-            // (samples/8). Feed constant per-op durations. This is a perfectly linear core — the repair
+            // frame-without-render x100, frame-with-render x100, then three whole-repair passes of 25
+            // (samples/4). Feed constant per-op durations. This is a perfectly linear core — the repair
             // durations below are exactly load + depth*frame (+ depth*save on the last) — so every
             // derived term must come back as the isolated figure it was built from.
             var durations = new List<double>();
@@ -192,9 +192,9 @@ namespace BizHawkNetplay.Core.Tests
             durations.AddRange(Enumerable.Repeat(0.05, 100)); // load
             durations.AddRange(Enumerable.Repeat(0.20, 100)); // frame, rendering off — the repair term
             durations.AddRange(Enumerable.Repeat(0.50, 100)); // frame, rendering on — the live term
-            durations.AddRange(Enumerable.Repeat(0.25, 12));  // repair, 1 frame   = 0.05 + 1*0.20
-            durations.AddRange(Enumerable.Repeat(1.65, 12));  // repair, 8 frames  = 0.05 + 8*0.20
-            durations.AddRange(Enumerable.Repeat(2.45, 12));  // ...re-saving each = 1.65 + 8*0.10
+            durations.AddRange(Enumerable.Repeat(0.25, 25));  // repair, 1 frame   = 0.05 + 1*0.20
+            durations.AddRange(Enumerable.Repeat(1.65, 25));  // repair, 8 frames  = 0.05 + 8*0.20
+            durations.AddRange(Enumerable.Repeat(2.45, 25));  // ...re-saving each = 1.65 + 8*0.10
             var clock = new ManualClock(durations);
 
             var probe = new CapabilityProbe(emu, clock, samples: 100);
@@ -221,13 +221,13 @@ namespace BizHawkNetplay.Core.Tests
             Assert.False(result.RepairCostsMoreThanModelled);
 
             // Adapter was actually exercised the expected number of times.
-            // 1 reference + 100 samples + 3 repair anchors + 12*8 repair re-saves + 1 replay anchor.
-            Assert.Equal(201, emu.SaveCount);
-            // 100 samples + 3 passes of (12 samples + 1 restore) + 2 in the replay check + 1 final.
-            Assert.Equal(142, emu.LoadCount);
+            // 1 reference + 100 samples + 3 repair anchors + 25*8 repair re-saves + 1 replay anchor.
+            Assert.Equal(305, emu.SaveCount);
+            // 100 samples + 3 passes of (25 samples + 1 restore) + 2 in the replay check + 1 final.
+            Assert.Equal(181, emu.LoadCount);
             // 100 timed + 100 between the save samples + 100 between the load samples
-            // + (1+12) + (8+96) + (8+96) across the repair passes + 30 replayed twice.
-            Assert.Equal(581, emu.InvisibleFrameCount);
+            // + (1+25) + (8+200) + (8+200) across the repair passes + 30 replayed twice.
+            Assert.Equal(802, emu.InvisibleFrameCount);
             Assert.Equal(100, emu.RenderedFrameCount);
         }
 

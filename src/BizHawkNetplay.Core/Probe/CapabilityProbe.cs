@@ -154,17 +154,28 @@ namespace BizHawkNetplay.Core.Probe
         private const int RepairProbeDeep = 8;
 
         /// <summary>
-        /// Samples per repair pass. Each already averages over up to <see cref="RepairProbeDeep"/>
-        /// frames and is correspondingly steadier than a single-frame sample, so it needs fewer
-        /// repetitions; the full count would add seconds to a probe for resolution it does not need.
+        /// Samples per repair pass.
         ///
-        /// The probe runs synchronously on the UI thread, so this is freeze length. Eight samples costs
-        /// an N64 at native resolution about 0.8s — most of it the pass that re-snapshots every frame,
-        /// which is 68ms a sample on its own. That roughly triples the probe's freeze, and is the price
-        /// of knowing what the snapshot in a repair really costs rather than assuming it costs what an
-        /// isolated one does.
+        /// Each already averages over up to <see cref="RepairProbeDeep"/> frames, so it is steadier
+        /// than a single-frame sample and needs fewer repetitions than the isolated passes.
+        ///
+        /// It was eight, and eight was too few for the one term that decides the verdict. Over sixteen
+        /// runs of one configuration, the snapshot cost taken from the repair moved with a standard
+        /// deviation of 0.5ms while the isolated save — measured at three times the sample count —
+        /// moved by 0.12ms. That matters because two snapshots are most of what a repair at the depth
+        /// N64 reaches actually costs, so its noise is the verdict's noise: across eight runs the
+        /// margin at depth 3 ranged from 3.84ms down to 0.22ms, and the low one is a single dear
+        /// snapshot measurement away from reporting a depth too shallow to qualify at all.
+        ///
+        /// Not all of that spread is sampling — a repair pass allocates and frees a whole-core state
+        /// eight times per sample, so it is genuinely more exposed to system memory pressure than a
+        /// pass that allocates and holds. More samples narrow the part that is sampling and leave the
+        /// rest, which is the honest most this can do.
+        ///
+        /// The probe runs synchronously on the UI thread, so this is freeze length: on N64 at native
+        /// resolution about 1.8s, most of it the pass that re-snapshots every frame at 68ms a sample.
         /// </summary>
-        private int RepairSamples => Math.Max(8, _samples / 8);
+        private int RepairSamples => Math.Max(16, _samples / 4);
 
         /// <summary>
         /// Times one whole repair shape: a load, then <paramref name="depth"/> frames re-simulated from

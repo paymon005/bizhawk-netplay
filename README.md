@@ -195,7 +195,7 @@ That matters because none of the model's three assumptions is obvious on a recom
 
 The first thing it caught was the probe. Saving does not advance the core, so the save pass was snapshotting memory nothing had touched since the previous sample, and the load pass was then restoring the state the core was already standing on — 16.7 MiB written back over identical bytes. Both are cheaper than the real operation: across six N64 configurations `save=` wandered between 5.6 and 6.7 ms with no pattern while the same snapshot timed inside a repair held steady at ~7.0 ms (±5%), and `load=` read ~1.4 ms against ~3.0. Understating both inflated the depth verdict, by enough to report 4 where the answer was 3. Those passes now advance a frame between samples, and the repair line stands as the standing cross-check.
 
-Measured and reported, not spent: the depth is still solved from the isolated terms, which are now timed against state that actually changes. Costs about 0.8 s of extra freeze on N64, most of it the pass that re-snapshots every frame.
+Measured and reported, not spent: the depth is still solved from the isolated terms, which are now timed against state that actually changes. Costs about 1.8 s of extra freeze on N64, most of it the pass that re-snapshots every frame — the sample count is set by how far the snapshot term can be allowed to wobble, since two of them are most of what a repair costs.
 
 ### Sweeping the probe unattended
 
