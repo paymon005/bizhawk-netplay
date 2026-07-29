@@ -2008,21 +2008,6 @@ namespace BizHawkNetplay.Tool
             // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
             // comfortably under a frame period so long as we don't serialize on top of it (see
             // FrameTick — the timer deliberately keeps running while a tick is in flight).
-            // EmuHawk's own loop rate is a hard ceiling on our frame clock — see
-            // EmuHawkAdapter.SuppressLoopThrottle. Do this before starting the clock so the first
-            // window is already measuring the unthrottled loop.
-            if (_adapter != null)
-            {
-                bool ok = _adapter.SuppressLoopThrottle(true);
-                ConnLog(ok
-                    ? "EmuHawk loop throttle suppressed for this session — frame pacing is bounded by " +
-                      "that loop's rate, and throttled it runs barely faster than the console itself. " +
-                      "Costs a busy core until you disconnect; watch `emuloop` in the pacing line."
-                    : "could not reach EmuHawk's throttle settings — frame pacing stays bounded by its " +
-                      "loop rate (~64/s against a 59.92Hz console), so expect judder.",
-                    ok ? Color.DarkGreen : Color.DarkOrange);
-            }
-
             _frameTimer.Interval = 10;
             _frameTimer.Start();
             // The timer above is only a heartbeat now; UpdateValues is what paces frames. See its
@@ -2201,9 +2186,6 @@ namespace BizHawkNetplay.Tool
         private void StopFramePacing()
         {
             _frameTimer.Stop();
-            // Give the user's throttle settings back. Runs on every exit path, including a failed
-            // connect, so a session that never started cannot leave a core spinning.
-            try { _adapter?.SuppressLoopThrottle(false); } catch { }
         }
 
         private void FrameTick()
