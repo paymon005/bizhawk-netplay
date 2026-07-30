@@ -44,7 +44,7 @@ public class MultiPlayerRollbackTests
     {
         private readonly Clock _clock;
         private readonly int _latency;
-        private readonly Queue<(long at, byte[] data)> _inbound = new Queue<(long, byte[])>();
+        private readonly Queue<(long at, byte[] data)> _inbound = new();
         private LatencyHub[] _others = Array.Empty<LatencyHub>();
 
         private LatencyHub(Clock clock, int latency) { _clock = clock; _latency = latency; }

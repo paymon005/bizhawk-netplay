@@ -29,7 +29,7 @@ public readonly struct SessionGeneration : IEquatable<SessionGeneration>
     public bool IsValid => SessionId != 0 && Epoch >= 0;
 
     /// <summary>Return the next input timeline within the same session.</summary>
-    public SessionGeneration Next() => new SessionGeneration(SessionId, checked(Epoch + 1));
+    public SessionGeneration Next() => new(SessionId, checked(Epoch + 1));
 
     public bool Equals(SessionGeneration other) =>
         SessionId == other.SessionId && Epoch == other.Epoch;

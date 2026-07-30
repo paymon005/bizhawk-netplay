@@ -9,7 +9,7 @@ public class LatencySimTransportTests
     /// <summary>An inbound-only fake: Deliver() simulates a datagram arriving from the wire.</summary>
     private sealed class QueueTransport : ITransport
     {
-        private readonly Queue<byte[]> _in = new Queue<byte[]>();
+        private readonly Queue<byte[]> _in = new();
         public void Deliver(byte[] d) => _in.Enqueue(d);
         public void Send(byte[] datagram) { /* outbound not exercised here */ }
         public bool TryReceive(out byte[] datagram)

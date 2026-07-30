@@ -19,7 +19,7 @@ public sealed class FrameAdvantageTracker
         public bool Known;
     }
 
-    private readonly Dictionary<int, PeerSample> _samples = new Dictionary<int, PeerSample>();
+    private readonly Dictionary<int, PeerSample> _samples = new();
     private int _lastPublishedAdvantage;
     private int _revision;
 

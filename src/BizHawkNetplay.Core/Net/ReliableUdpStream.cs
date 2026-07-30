@@ -32,10 +32,10 @@ public sealed class ReliableUdpStream : Stream
     private const int DeadRetries = 40;   // consecutive fruitless retransmits of the base -> fault
 
     private readonly Action<byte[]> _send;
-    private readonly object _gate = new object();
+    private readonly object _gate = new();
 
     // Sender state (guarded by _gate).
-    private readonly SortedDictionary<uint, byte[]> _unacked = new SortedDictionary<uint, byte[]>();
+    private readonly SortedDictionary<uint, byte[]> _unacked = new();
     private uint _nextSeq;                // next DATA seq to assign
     private uint _sendBase;               // lowest unacked seq
     private long _baseSentTicks;          // when _sendBase was last (re)sent
@@ -45,14 +45,14 @@ public sealed class ReliableUdpStream : Stream
     private uint _finSeq;                 // seq marking end-of-stream (all data seq < _finSeq)
 
     // Receiver state (guarded by _gate).
-    private readonly SortedDictionary<uint, byte[]> _reorder = new SortedDictionary<uint, byte[]>();
+    private readonly SortedDictionary<uint, byte[]> _reorder = new();
     private uint _rcvBase;                // next in-order seq to deliver
     // Reassembled bytes waiting for Read, held as the 1KiB SEGMENTS they arrived in rather than as
     // individual bytes. A Queue<byte> meant one enqueue per byte and one dequeue per byte: shipping
     // a multi-megabyte savestate through it was millions of operations plus repeated doubling of a
     // backing array well past the large-object threshold — all to move bytes that arrived in
     // ready-made blocks. This queues the blocks and block-copies out of the head.
-    private readonly Queue<byte[]> _readable = new Queue<byte[]>();
+    private readonly Queue<byte[]> _readable = new();
     private int _readableHeadOffset;   // bytes already handed out of the block at the head
     private int _readableBytes;        // total bytes across the queue, minus the head offset
     private bool _finReceived;

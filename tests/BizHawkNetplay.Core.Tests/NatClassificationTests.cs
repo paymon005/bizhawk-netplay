@@ -13,7 +13,7 @@ namespace BizHawkNetplay.Core.Tests;
 /// </summary>
 public class NatClassificationTests
 {
-    private static IPEndPoint Ep(string addr, int port) => new IPEndPoint(IPAddress.Parse(addr), port);
+    private static IPEndPoint Ep(string addr, int port) => new(IPAddress.Parse(addr), port);
 
     [Fact]
     public void OneMappingForEveryDestinationIsPunchable()

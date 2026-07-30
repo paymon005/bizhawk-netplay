@@ -42,10 +42,10 @@ public sealed class NegotiationResult
     public int InputDelay { get; }
 
     public static NegotiationResult Reject(string reason) =>
-        new NegotiationResult(false, reason, SyncMode.Lockstep, 0);
+        new(false, reason, SyncMode.Lockstep, 0);
 
     public static NegotiationResult Accept(SyncMode mode, int inputDelay) =>
-        new NegotiationResult(true, null, mode, inputDelay);
+        new(true, null, mode, inputDelay);
 }
 
 /// <summary>

@@ -25,8 +25,8 @@ namespace BizHawkNetplay.Core.Session;
 public sealed class ConnectionLifecycle
 {
     private int _attempt;
-    private readonly object _lock = new object();
-    private readonly HashSet<IDisposable> _tracked = new HashSet<IDisposable>();
+    private readonly object _lock = new();
+    private readonly HashSet<IDisposable> _tracked = new();
     private bool _rejectNew;
 
     /// <summary>Start a new attempt; every previously issued token is now stale.</summary>

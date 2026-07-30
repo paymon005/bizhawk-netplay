@@ -18,12 +18,12 @@ public class ControlChannelTests
     /// which is exactly what a real NetworkStream would do, minus the eternity.</summary>
     private sealed class SocketLikeStream : Stream
     {
-        private readonly Queue<byte[]> _chunks = new Queue<byte[]>();
+        private readonly Queue<byte[]> _chunks = new();
         private byte[]? _current;
         private int _offset;
         private int _readTimeout = System.Threading.Timeout.Infinite;
 
-        public readonly List<int> TimeoutsSeenPerRead = new List<int>();
+        public readonly List<int> TimeoutsSeenPerRead = new();
 
         public void Enqueue(byte[] chunk) => _chunks.Enqueue(chunk);
 

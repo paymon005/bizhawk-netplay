@@ -13,7 +13,7 @@ public class InputGenerationTests
 {
     private sealed class QueueTransport : ITransport
     {
-        private readonly Queue<byte[]> _inbound = new Queue<byte[]>();
+        private readonly Queue<byte[]> _inbound = new();
 
         public void Enqueue(byte[] datagram) => _inbound.Enqueue(datagram);
         public void Send(byte[] datagram) { }

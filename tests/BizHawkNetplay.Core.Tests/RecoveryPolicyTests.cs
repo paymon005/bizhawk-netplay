@@ -16,7 +16,7 @@ public class RecoveryPolicyTests
         int awaitingEpoch = 0, long appliedDeadline = 0,
         bool resyncReceiving = false, long receiveDeadline = 0,
         long graceUntil = 0, long lastRecv = 1) =>
-        new LinkHealth.LinkSnapshot(awaitingEpoch, appliedDeadline,
+        new(awaitingEpoch, appliedDeadline,
             resyncReceiving, receiveDeadline, graceUntil, lastRecv);
 
     [Fact]

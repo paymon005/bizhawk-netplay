@@ -691,10 +691,10 @@ public sealed partial class NetplayToolForm
     // Windowed against the strategy's lifetime counters. CounterWindow, not a plain baseline field,
     // because the strategy is REPLACED by a resync, a reconnect or a mid-session netcode change —
     // see its remarks for the negative figures that produced.
-    private readonly CounterWindow _pacingRollbacks = new CounterWindow();
-    private readonly CounterWindow _pacingResim = new CounterWindow();
-    private readonly CounterWindow _pacingSavesTaken = new CounterWindow();
-    private readonly CounterWindow _pacingSavesElided = new CounterWindow();
+    private readonly CounterWindow _pacingRollbacks = new();
+    private readonly CounterWindow _pacingResim = new();
+    private readonly CounterWindow _pacingSavesTaken = new();
+    private readonly CounterWindow _pacingSavesElided = new();
 
     private void LogPacingSummary(double nowMs)
     {

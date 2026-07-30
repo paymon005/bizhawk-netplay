@@ -11,7 +11,7 @@ namespace BizHawkNetplay.Core.Tests;
 /// </summary>
 public class ChecksumLedgerTests
 {
-    private static readonly SessionGeneration Gen = new SessionGeneration(0xfeedbeefcafe1234UL, 3);
+    private static readonly SessionGeneration Gen = new(0xfeedbeefcafe1234UL, 3);
 
     [Fact]
     public void ResolvesOnlyWhenEveryPlayerReported_AndAgreesOnEqualHashes()

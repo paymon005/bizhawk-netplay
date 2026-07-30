@@ -18,7 +18,7 @@ namespace BizHawkNetplay.Core.Tests;
 /// </summary>
 public class MeshUdpTransportTests
 {
-    private static IPEndPoint Loop(int port) => new IPEndPoint(IPAddress.Loopback, port);
+    private static IPEndPoint Loop(int port) => new(IPAddress.Loopback, port);
 
     [Fact]
     public void PeerRoute_DeDuplicatesCandidatesInOrder()
@@ -279,7 +279,7 @@ public class MeshUdpTransportTests
             var joinCh = new ControlChannel(joiner.OpenControl(hostEndpoint));
             var state = new byte[60_000];
             new Random(7).NextBytes(state);
-            PeerIdentity Id() => new PeerIdentity(1, "ROM", "GPGX", "2.11.1.0", "SYNC", new[] { "L0", "L1" }, true, 20);
+            PeerIdentity Id() => new(1, "ROM", "GPGX", "2.11.1.0", "SYNC", new[] { "L0", "L1" }, true, 20);
 
             var hostTask = System.Threading.Tasks.Task.Run(() =>
                 Handshake.RunHost(hostCh, Id(), new SessionPreferences(2, false), state, host.LocalPort));

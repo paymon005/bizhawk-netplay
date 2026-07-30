@@ -15,7 +15,7 @@ public sealed partial class NetplayToolForm
     private ListView _playersList = null!;
     private Label _punchInstructions = null!;
     private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
-    private readonly ToolTip _tips = new ToolTip(); // owns a native window — disposed with the form
+    private readonly ToolTip _tips = new(); // owns a native window — disposed with the form
     private CheckBox _verboseCheck = null!;
 
     // ------------------------------------------------------------------ persisted settings

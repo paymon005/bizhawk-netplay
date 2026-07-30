@@ -29,7 +29,7 @@ public class MultiPlayerLockstepTests
     /// <summary>In-memory full-delivery hub: what any instance sends, every other instance receives.</summary>
     private sealed class HubTransport : ITransport
     {
-        private readonly ConcurrentQueue<byte[]> _inbound = new ConcurrentQueue<byte[]>();
+        private readonly ConcurrentQueue<byte[]> _inbound = new();
         private ConcurrentQueue<byte[]>[] _others = Array.Empty<ConcurrentQueue<byte[]>>();
 
         public void Connect(HubTransport[] all) =>

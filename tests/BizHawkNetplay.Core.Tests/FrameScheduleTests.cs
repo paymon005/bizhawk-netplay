@@ -13,7 +13,7 @@ public class FrameScheduleTests
 {
     private const double Frame60 = 1000.0 / 60.0;   // 16.667ms
 
-    private static FrameSchedule Sixty() => new FrameSchedule(Frame60, minBudgetMs: 8.0, maxFramesPerTick: 2);
+    private static FrameSchedule Sixty() => new(Frame60, minBudgetMs: 8.0, maxFramesPerTick: 2);
 
     [Fact]
     public void AnEarlyCallbackTakesTheFrameItNearlyEarned()

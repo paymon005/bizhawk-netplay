@@ -24,9 +24,9 @@ public class ReliableUdpStreamTests
     {
         private readonly Random _rng;
         private readonly double _drop;
-        private readonly object _l = new object();
-        private readonly List<byte[]> _aToB = new List<byte[]>();
-        private readonly List<byte[]> _bToA = new List<byte[]>();
+        private readonly object _l = new();
+        private readonly List<byte[]> _aToB = new();
+        private readonly List<byte[]> _bToA = new();
         private ReliableUdpStream _a = null!, _b = null!;
         private volatile bool _run = true;
         private Thread _t1 = null!, _t2 = null!;
@@ -172,7 +172,7 @@ public class ReliableUdpStreamTests
         var hostState = new byte[120_000];
         new Random(1234).NextBytes(hostState);
 
-        PeerIdentity Id() => new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, 20);
+        PeerIdentity Id() => new(1, "ROMHASH", "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, 20);
 
         var hostTask = Task.Run(() =>
             Handshake.RunHost(hostCh, Id(), new SessionPreferences(3, wantRollback: true), hostState, 47800));

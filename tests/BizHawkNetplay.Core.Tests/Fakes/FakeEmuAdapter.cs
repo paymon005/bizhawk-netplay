@@ -99,7 +99,7 @@ public sealed class FakeEmuAdapter : IEmuAdapter
     /// test in the suite — loss, latency, sparse keyframes, checksums, ring bounds — doubles as a
     /// use-after-release detector, and the poison below turns a silent wrong answer into a loud one.
     /// </summary>
-    private readonly Stack<byte[]> _statePool = new Stack<byte[]>();
+    private readonly Stack<byte[]> _statePool = new();
 
     /// <summary>Buffers this adapter had to create. Below <see cref="SaveCount"/> exactly to the
     /// extent the pool is doing its job — and the guard against the reuse coverage above being

@@ -54,7 +54,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private const int FreshWindowMs = 2500;
 
     private readonly Socket _socket;
-    private readonly ConcurrentQueue<byte[]> _inbound = new ConcurrentQueue<byte[]>();
+    private readonly ConcurrentQueue<byte[]> _inbound = new();
     /// <summary>Backlog ceiling: ~8s of four-player input, far above anything a healthy session
     /// reaches, and low enough that the memory behind it stays bounded. See EnqueueInput.</summary>
     private const int MaxInboundBacklog = 1024;
@@ -70,7 +70,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private sealed class RouteTable
     {
         public static readonly RouteTable Empty =
-            new RouteTable(Array.Empty<PeerRoute>(), Array.Empty<IPEndPoint>());
+            new(Array.Empty<PeerRoute>(), Array.Empty<IPEndPoint>());
 
         private readonly Dictionary<IPEndPoint, IPEndPoint> _knownEndpoints;
 
@@ -135,30 +135,30 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     }
 
     // Per-candidate liveness: endpoint -> last time we heard anything back from it (stopwatch ms).
-    private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new ConcurrentDictionary<IPEndPoint, long>();
-    private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new ConcurrentDictionary<IPEndPoint, long>();
-    private readonly ConcurrentDictionary<IPEndPoint, double> _rtt = new ConcurrentDictionary<IPEndPoint, double>();
+    private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new();
+    private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new();
+    private readonly ConcurrentDictionary<IPEndPoint, double> _rtt = new();
     // Raw sample window per candidate, kept alongside the EMA above. The EMA is what send-path
     // selection wants (one smooth number); a delay decision wants the distribution, because what
     // stalls a session is the worst packet rather than the typical one.
     private readonly ConcurrentDictionary<IPEndPoint, RttWindow> _rttWindows =
-        new ConcurrentDictionary<IPEndPoint, RttWindow>();
+        new();
     private long _burstUntilMs = long.MinValue;
     // Last candidate input was actually sent through, per logical peer — the failover anchor
     // while a repunch has the liveness table cleared.
-    private readonly ConcurrentDictionary<int, IPEndPoint> _lastSelected = new ConcurrentDictionary<int, IPEndPoint>();
+    private readonly ConcurrentDictionary<int, IPEndPoint> _lastSelected = new();
 
     // Reliable control streams carried on this same socket, keyed by peer endpoint — what lets a
     // hole-punched joiner run the ordinary handshake into a normal hosted lobby with no TCP.
     private readonly ConcurrentDictionary<IPEndPoint, ReliableUdpStream> _controlStreams =
-        new ConcurrentDictionary<IPEndPoint, ReliableUdpStream>();
+        new();
     private static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
 
     // Reflexive-address discovery: while a request is pending, the receive loop watches for the STUN
     // response on this same socket (so the reflexive port is the one the mesh actually uses).
     private volatile byte[]? _pendingStunTxn;
     private volatile IPEndPoint? _reflexive;
-    private readonly ManualResetEventSlim _stunEvent = new ManualResetEventSlim(false);
+    private readonly ManualResetEventSlim _stunEvent = new(false);
 
     private MeshUdpTransport(int localPort)
     {
@@ -173,7 +173,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// <summary>The local UDP port actually bound (read this when binding to port 0).</summary>
     public int LocalPort => ((IPEndPoint)_socket.LocalEndPoint).Port;
 
-    public static MeshUdpTransport Bind(int localPort) => new MeshUdpTransport(localPort);
+    public static MeshUdpTransport Bind(int localPort) => new(localPort);
 
     /// <summary>
     /// Compatibility API for callers that have a flat endpoint list. Every unique endpoint is treated

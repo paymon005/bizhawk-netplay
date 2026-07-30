@@ -665,7 +665,7 @@ public sealed partial class NetplayToolForm
         var mesh = _mesh;
         if (mesh == null) return LobbyMeshSample.None;
 
-        var routes = new List<PeerRoute> { new PeerRoute(0, new[] { hostEndpoint }) };
+        var routes = new List<PeerRoute> { new(0, new[] { hostEndpoint }) };
         routes.AddRange(peerRoutes);
         try { mesh.SetPeerRoutes(routes); }
         catch { return LobbyMeshSample.None; }

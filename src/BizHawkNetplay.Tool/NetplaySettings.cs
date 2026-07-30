@@ -24,7 +24,7 @@ internal sealed class NetplaySettings
     public int AutoDelayMax = 8; // cap automatic increases without overriding an explicit peer request
     public int Netcode = 0;     // index into the netcode dropdown (Automatic/Rollback/Lockstep)
     public int InputSource = 0; // index into the "My controls" dropdown (P1..P4, or Assigned port)
-    public readonly List<string> RecentIps = new List<string>();
+    public readonly List<string> RecentIps = new();
 
     private static string FilePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

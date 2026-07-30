@@ -460,7 +460,7 @@ public sealed partial class NetplayToolForm
     /// <see cref="ChecksumInterval"/>, since eliding snapshots would otherwise take the checksum's
     /// own state with them and stop desync detection without saying so.
     /// </summary>
-    private RollbackTuning RollbackTuningForSession() => new RollbackTuning
+    private RollbackTuning RollbackTuningForSession() => new()
     {
         ElideConfirmedSaves = true,
         ChecksumAnchorInterval = ChecksumInterval,

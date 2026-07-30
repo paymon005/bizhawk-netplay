@@ -7,11 +7,11 @@ namespace BizHawkNetplay.Core.Tests;
 
 public class InputSerializerTests
 {
-    private static ControllerLayout NesLayout() => new ControllerLayout(
+    private static ControllerLayout NesLayout() => new(
         new[] { "Up", "Down", "Left", "Right", "A", "B", "Start", "Select" },
         Array.Empty<AxisSpec>());
 
-    private static ControllerLayout AnalogLayout() => new ControllerLayout(
+    private static ControllerLayout AnalogLayout() => new(
         new[] { "A", "B" },
         new[]
         {

@@ -61,10 +61,10 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     private int _costCap;               // horizon the measured repair budget affords (<= _maxRollback)
 
     // state[N] = whole-core state captured entering frame N (i.e. the result of frames 0..N-1).
-    private readonly Dictionary<int, StateHandle> _states = new Dictionary<int, StateHandle>();
+    private readonly Dictionary<int, StateHandle> _states = new();
     // applied[N] = the InputSet actually run for frame N (real where known, predicted otherwise).
-    private readonly Dictionary<int, InputSet> _applied = new Dictionary<int, InputSet>();
-    private readonly List<int> _pruneScratch = new List<int>();
+    private readonly Dictionary<int, InputSet> _applied = new();
+    private readonly List<int> _pruneScratch = new();
 
     private int _advantageStallFrames;      // frames still owed back because we measured ourselves ahead
     private int _lastAdvantageSequence = -1; // makes periodic UI refreshes edge-triggered

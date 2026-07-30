@@ -138,8 +138,8 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // Our own public UDP endpoint, discovered once per session and reused. Volatile: written by the
     // STUN thread, read by the join thread building its HELLO and by the post-GO share.
     private volatile IPEndPoint? _localReflexive;
-    private readonly ManualResetEventSlim _reflexiveKnown = new ManualResetEventSlim(false);
-    private List<PeerRoute> _meshOthers = new List<PeerRoute>(); // joiner: grouped routes to non-host peers
+    private readonly ManualResetEventSlim _reflexiveKnown = new(false);
+    private List<PeerRoute> _meshOthers = new(); // joiner: grouped routes to non-host peers
 
     // UDP-punch path (2-player, no port-forwarding): one socket does STUN + hole-punch, then carries
     // both the reliable control channel and the input hot path. Set up in two steps (generate our
@@ -153,8 +153,8 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         public IPEndPoint Endpoint = null!;
         public System.IO.Stream Control = null!;
     }
-    private readonly ConcurrentQueue<PunchAdmission> _punchAdmissions = new ConcurrentQueue<PunchAdmission>();
-    private readonly List<IPEndPoint> _lobbyPunchTargets = new List<IPEndPoint>();
+    private readonly ConcurrentQueue<PunchAdmission> _punchAdmissions = new();
+    private readonly List<IPEndPoint> _lobbyPunchTargets = new();
     // volatile: the accept thread reads this as its teardown signal (null => Disconnect stopped us),
     // and it's written from the UI thread. Every other cross-thread field here is volatile too.
     private volatile TcpListener? _listener;
@@ -180,18 +180,18 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private FrameDriver? _driver;
     private bool _sessionDriverPrepared; // built/started before READY, activated only after GO
     private byte[]? _preJoinRestoreState; // restored if pre-READY import never reaches GO
-    private readonly List<PeerLink> _peers = new List<PeerLink>();
+    private readonly List<PeerLink> _peers = new();
     private readonly System.Windows.Forms.Timer _frameTimer;
     // Session lifecycle as one object; see SessionPhase for why rebuilding and awaiting-a-rejoin
     // are independent rather than two values of one enum.
-    private readonly SessionPhase _phase = new SessionPhase();
+    private readonly SessionPhase _phase = new();
     private bool _isHost;      // host is authoritative for desync detection + resync
     private int _playerCount = 2;
     private int _localPort;    // our controller port, for rebuilding the driver on resync
     private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
     // Tells "the emulation drifted once" apart from "these two machines were never comparing the
     // same thing": a real drift agrees for a while first, a systematic mismatch never agrees at all.
-    private readonly DesyncTrend _desyncTrend = new DesyncTrend();
+    private readonly DesyncTrend _desyncTrend = new();
     private string? _videoDiagnostic; // resolution/plugin line, quoted back if desyncs turn systematic
     private long _lastResyncStamp; // monotonic timestamp; debounces near-simultaneous resync triggers
     private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
@@ -202,19 +202,19 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // time for shallower visual corrections; in lockstep it also prevents routine network stalls.
     private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
     private double _lastStallLogMs = double.NegativeInfinity;
-    private readonly object _generationLock = new object();
+    private readonly object _generationLock = new();
     private SessionGeneration _generation = SessionGeneration.Legacy;
-    private readonly FrameAdvantageTracker _frameAdvantage = new FrameAdvantageTracker();
+    private readonly FrameAdvantageTracker _frameAdvantage = new();
 
     // Desync detection: the host aggregates every peer's checksum for a frame (its own + each
     // joiner's); once it has them all it verifies they agree. Joiners just report to the host.
     // The aggregation rules live in Core (ChecksumLedger); the lock serializes UI + reader threads.
-    private readonly object _hashLock = new object();
-    private readonly ChecksumLedger _checksums = new ChecksumLedger();
+    private readonly object _hashLock = new();
+    private readonly ChecksumLedger _checksums = new();
 
     // Live round-trip time per control link, for connection-quality feedback.
-    private readonly System.Diagnostics.Stopwatch _pingClock = new System.Diagnostics.Stopwatch();
-    private readonly object _pingLock = new object();
+    private readonly System.Diagnostics.Stopwatch _pingClock = new();
+    private readonly object _pingLock = new();
     private int _sessionDelay;    // the input delay this session negotiated
     private bool _delayHintShown; // one-time "raise your delay" hint per session
 
@@ -263,13 +263,13 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     // Saved EmuHawk config we override for the session's duration (keep running while unfocused).
 
-    private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
+    private readonly System.Diagnostics.Stopwatch _paceClock = new();
     private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
     private const int MaxFramesPerTick = 2;  // WinForms callbacks can arrive ~25ms apart; one frame caps near 40fps
     private const double FrameTickWorkBudgetMs = 8.0; // floor for fast cores; see TickBudgetMs
     // The pacing clock's arithmetic: due time, catch-up admission, budget, rebase. See FrameSchedule.
     private readonly FrameSchedule _schedule =
-        new FrameSchedule(1000.0 / 60.0, FrameTickWorkBudgetMs, MaxFramesPerTick);
+        new(1000.0 / 60.0, FrameTickWorkBudgetMs, MaxFramesPerTick);
     // Last seen state of EmuHawk's sound device, so the tick can report the transition rather
     // than the aftermath. Starts true: a session that never stops it should say nothing.
     private bool _audioDevWasUp = true;
@@ -281,22 +281,22 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     // Actual sustained emulation speed, sampled ~2x/sec, so the status bar can flag a CPU-bound
     // instance (the real cause of "lag" on a heavy core) rather than it looking like a netcode fault.
-    private readonly System.Diagnostics.Stopwatch _fpsClock = new System.Diagnostics.Stopwatch();
+    private readonly System.Diagnostics.Stopwatch _fpsClock = new();
     private int _fpsCount;
     private double _actualFps = -1;
 
     // Advanced fps alone can't tell a slow core from a stalling link from pacing debt being
     // discarded — all three read as "under 60". These carry the breakdown that separates them.
-    private readonly PacingStats _pacing = new PacingStats();
+    private readonly PacingStats _pacing = new();
     private PacingSummary _lastPacing;
     private double _lastPacingLogMs = double.NegativeInfinity;
     // One-shot session advisories: say it when the problem is real, say it once, and not for a
     // single bad second. The policy is SustainedTrigger; these only hold the thresholds.
-    private readonly SustainedTrigger _stallHint = new SustainedTrigger(StallHintSustainMs);
-    private readonly SustainedTrigger _presentHint = new SustainedTrigger(StallHintSustainMs);
+    private readonly SustainedTrigger _stallHint = new(StallHintSustainMs);
+    private readonly SustainedTrigger _presentHint = new(StallHintSustainMs);
     // One-shot "rollback costs more than it can afford here" advisory; fires as soon as the
     // measured cost latches, since it is a property of the core and CPU, not a passing condition.
-    private readonly SustainedTrigger _rollbackCostHint = new SustainedTrigger(0);
+    private readonly SustainedTrigger _rollbackCostHint = new(0);
     private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
     private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
     private double _lastPresentClockMs = -1; // ...and of the previous present, for judder stats

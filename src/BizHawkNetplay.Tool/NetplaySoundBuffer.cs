@@ -21,7 +21,7 @@ namespace BizHawkNetplay.Tool;
 /// </summary>
 internal sealed class NetplaySoundBuffer : ISoundProvider
 {
-    private readonly object _lock = new object();
+    private readonly object _lock = new();
     private readonly short[] _ring; // interleaved (L,R,…) shorts
     private readonly int _capacity;
     private int _read, _write, _count;

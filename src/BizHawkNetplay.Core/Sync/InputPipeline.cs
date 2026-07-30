@@ -22,7 +22,7 @@ public sealed class InputPipeline
     // How far PruneBefore has already swept, so the ordinary call removes one frame instead of
     // reading every key of every port's map. See PruneBefore.
     private int _prunedBelow;
-    private readonly List<int> _sweepScratch = new List<int>();
+    private readonly List<int> _sweepScratch = new();
     private const int MaxPruneSweep = 256;
 
     public InputPipeline(int portCount)

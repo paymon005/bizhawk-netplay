@@ -91,7 +91,7 @@ public sealed partial class NetplayToolForm
         var mesh = MeshUdpTransport.Bind(0);
         _mesh = mesh;
         _transport = WrapSimLatency(mesh);
-        mesh.SetPeerRoutes(new List<PeerRoute> { new PeerRoute(0, new[] { host }) });
+        mesh.SetPeerRoutes(new List<PeerRoute> { new(0, new[] { host }) });
         _localReflexive = null;                       // new socket, new answer
         try { _reflexiveKnown.Reset(); } catch { }
         SetBusy(true);

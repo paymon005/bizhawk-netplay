@@ -923,7 +923,7 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     /// and it is the same pair <see cref="ExportState"/> already round-trips for session start and
     /// resync, so the format is proven rather than newly trusted.
     /// </summary>
-    private readonly Stack<MemoryStream> _statePool = new Stack<MemoryStream>();
+    private readonly Stack<MemoryStream> _statePool = new();
 
     /// <summary>Largest state seen, so a fresh buffer starts big enough to avoid growth copies.</summary>
     private int _stateSizeHint = 1 << 16;

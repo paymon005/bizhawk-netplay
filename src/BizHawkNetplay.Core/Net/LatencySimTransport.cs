@@ -18,7 +18,7 @@ public sealed class LatencySimTransport : ITransport, IDisposable
     private readonly ITransport _inner;
     private readonly int _delayMs;
     private readonly Func<long> _nowMs;
-    private readonly Queue<Pending> _buffer = new Queue<Pending>();
+    private readonly Queue<Pending> _buffer = new();
 
     private readonly struct Pending
     {

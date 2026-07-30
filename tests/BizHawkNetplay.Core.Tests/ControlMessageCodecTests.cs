@@ -12,7 +12,7 @@ namespace BizHawkNetplay.Core.Tests;
 /// </summary>
 public class ControlMessageCodecTests
 {
-    private static readonly SessionGeneration Gen = new SessionGeneration(0x0102030405060708UL, 9);
+    private static readonly SessionGeneration Gen = new(0x0102030405060708UL, 9);
 
     [Fact]
     public void Pacing_RoundTrips_AndRejectsWrongShapes()

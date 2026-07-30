@@ -19,7 +19,7 @@ public class FrameDriverDelayTests
     /// <summary>Trivial in-memory paired transport: immediate, lossless delivery to the peer.</summary>
     private sealed class Pipe : ITransport
     {
-        private readonly Queue<byte[]> _in = new Queue<byte[]>();
+        private readonly Queue<byte[]> _in = new();
         private Pipe _peer = null!;
         public static (Pipe a, Pipe b) Pair() { var a = new Pipe(); var b = new Pipe(); a._peer = b; b._peer = a; return (a, b); }
         public void Send(byte[] datagram) => _peer._in.Enqueue((byte[])datagram.Clone());
@@ -32,7 +32,7 @@ public class FrameDriverDelayTests
 
     private sealed class CountingTransport : ITransport
     {
-        private readonly Queue<byte[]> _in = new Queue<byte[]>();
+        private readonly Queue<byte[]> _in = new();
         public int Sends { get; private set; }
         public int Pending => _in.Count;
         public void Enqueue(byte[] datagram) => _in.Enqueue(datagram);

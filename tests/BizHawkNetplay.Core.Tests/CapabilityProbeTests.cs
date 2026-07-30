@@ -489,7 +489,7 @@ public class CapabilityProbeTests
         // Modelled: 1.4 + 8*(2.4 + 5.9) = 67.8ms. Only the optimistic direction is an alarm — a
         // session that predicts as far as a 67.8ms repair allows, on a core where the repair
         // actually takes 90, overruns its budget every time it corrects.
-        ProbeResult WithRepair(double measuredDeepResaved) => new ProbeResult(
+        ProbeResult WithRepair(double measuredDeepResaved) => new(
             "N64", 1024, medianSaveMs: 5.9, medianLoadMs: 1.4, medianFrameMs: 2.4,
             frameBudgetMs: 16.683, headroomMs: 4.17, maxRollbackDepth: 3,
             repair: new RepairProfile(1, 3.8, 8, 20.6, 8, measuredDeepResaved));
@@ -519,7 +519,7 @@ public class CapabilityProbeTests
     [Fact]
     public void Result_StaysQuietAboutAnOverrunThatCannotReachTheVerdict()
     {
-        ProbeResult WithSolveSource(bool solvedFromRepairTerms) => new ProbeResult(
+        ProbeResult WithSolveSource(bool solvedFromRepairTerms) => new(
             "GPGX", 806000, medianSaveMs: 0.401, medianLoadMs: 0.237, medianFrameMs: 0.243,
             frameBudgetMs: 16.688, headroomMs: 16.0, maxRollbackDepth: 73,
             repair: new RepairProfile(1, 0.767, 8, 2.459, 2, 1.796),

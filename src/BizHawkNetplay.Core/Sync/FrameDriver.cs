@@ -57,7 +57,7 @@ public sealed class FrameDriver : IDisposable
     private int _lastPacketsDrained;
 
     // Rolling window of the local port's most recent serialized inputs, for redundant sends.
-    private readonly LinkedList<KeyValuePair<int, byte[]>> _sendWindow = new LinkedList<KeyValuePair<int, byte[]>>();
+    private readonly LinkedList<KeyValuePair<int, byte[]>> _sendWindow = new();
     private int _lastStamp = -1;
     private bool _started;
 
@@ -66,7 +66,7 @@ public sealed class FrameDriver : IDisposable
     // are produced strictly in order. A few payload-bytes per frame — memory is negligible.
     private const int RetransmitKeepFrames = 240;   // ~4 s at 60 fps
     private const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
-    private readonly Dictionary<int, byte[]> _sentPayloads = new Dictionary<int, byte[]>();
+    private readonly Dictionary<int, byte[]> _sentPayloads = new();
     private int _oldestSentPayload = -1;
     private readonly long[] _lastGapRequestMs;
     private readonly int[] _newestRemoteFrame; // highest frame ever decoded per port (-1 = none)

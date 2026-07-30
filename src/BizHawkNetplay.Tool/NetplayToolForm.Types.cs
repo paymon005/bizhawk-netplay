@@ -25,8 +25,8 @@ public sealed partial class NetplayToolForm
         public IPEndPoint? ReflexiveEndpoint;       // public (STUN) endpoint, for NAT traversal; null until reported
         public Thread? Reader;
         public Thread? Writer;
-        public readonly ConcurrentQueue<OutboundMessage> Outbound = new ConcurrentQueue<OutboundMessage>();
-        public readonly AutoResetEvent OutboundSignal = new AutoResetEvent(false);
+        public readonly ConcurrentQueue<OutboundMessage> Outbound = new();
+        public readonly AutoResetEvent OutboundSignal = new(false);
         public volatile bool WriterRunning;
         public long QueuedBytes;
         public int Attempt;               // connection-attempt token for stale reader/writer callbacks
@@ -112,6 +112,6 @@ public sealed partial class NetplayToolForm
     private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
     // Attempt tokens + tracked handshake sockets live in Core (ConnectionLifecycle), which
     // atomically closes the accept-vs-teardown registration race.
-    private readonly ConnectionLifecycle _lifecycle = new ConnectionLifecycle();
+    private readonly ConnectionLifecycle _lifecycle = new();
     private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
 }

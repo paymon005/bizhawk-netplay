@@ -18,10 +18,10 @@ namespace BizHawkNetplay.Core.Tests;
 public class HandshakeTests
 {
     private static PeerIdentity Id(string rom = "ROMHASH", int depth = 20) =>
-        new PeerIdentity(1, rom, "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, depth);
+        new(1, rom, "GPGX", "2.11.1.0", "SYNC1", new[] { "L0", "L1" }, true, depth);
 
     private static SessionGeneration Generation(ulong sessionId = 0x1234UL, int epoch = 1) =>
-        new SessionGeneration(sessionId, epoch);
+        new(sessionId, epoch);
 
     private static (ControlChannel host, ControlChannel client, Action dispose) TcpPair()
     {

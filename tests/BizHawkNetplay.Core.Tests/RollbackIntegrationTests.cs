@@ -52,7 +52,7 @@ public class RollbackIntegrationTests
     private sealed class LatencyLink : ITransport
     {
         private readonly Clock _clock;
-        private readonly Queue<(long at, byte[] data)> _inbound = new Queue<(long, byte[])>();
+        private readonly Queue<(long at, byte[] data)> _inbound = new();
         private LatencyLink _peer = null!;
         private readonly Func<byte[], bool>? _drop;
         public int Latency;
@@ -123,7 +123,7 @@ public class RollbackIntegrationTests
     }
 
     /// <summary>Elision on, with checksum anchors at the interval the test polls.</summary>
-    private static RollbackTuning Eliding(int checksumInterval = 0) => new RollbackTuning
+    private static RollbackTuning Eliding(int checksumInterval = 0) => new()
     {
         ElideConfirmedSaves = true,
         ChecksumAnchorInterval = checksumInterval,
@@ -251,7 +251,7 @@ public class RollbackIntegrationTests
     }
 
     /// <summary>Elision on, plus snapshots only every <paramref name="every"/>th predicted frame.</summary>
-    private static RollbackTuning Keyframed(int every, int checksumInterval = 0) => new RollbackTuning
+    private static RollbackTuning Keyframed(int every, int checksumInterval = 0) => new()
     {
         ElideConfirmedSaves = true,
         ChecksumAnchorInterval = checksumInterval,
@@ -941,7 +941,7 @@ public class RollbackIntegrationTests
 
         (RollbackStrategy strategy, Instance a, Instance b) RunWith(bool budgeted)
         {
-            RollbackTuning Tune() => new RollbackTuning
+            RollbackTuning Tune() => new()
             {
                 ElideConfirmedSaves = true,
                 // Every repair is scripted to "take" 100ms against a 5ms allowance.

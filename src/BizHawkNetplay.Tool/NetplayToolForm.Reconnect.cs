@@ -148,7 +148,7 @@ public sealed partial class NetplayToolForm
         if (_mesh == null || _peers.Count == 0) return;
         var routes = new List<PeerRoute>
         {
-            new PeerRoute(_peers[0].RemotePort, new[] { _peers[0].UdpEndpoint }) // the host
+            new(_peers[0].RemotePort, new[] { _peers[0].UdpEndpoint }) // the host
         };
         routes.AddRange(_meshOthers);
         try { _mesh.SetPeerRoutes(routes); } catch { }

@@ -22,8 +22,8 @@ internal sealed class InputSetController : IController
 {
     private static readonly IReadOnlyCollection<(string, int)> NoHaptics = Array.Empty<(string, int)>();
 
-    private readonly Dictionary<string, bool> _buttons = new Dictionary<string, bool>(StringComparer.Ordinal);
-    private readonly Dictionary<string, int> _axes = new Dictionary<string, int>(StringComparer.Ordinal);
+    private readonly Dictionary<string, bool> _buttons = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _axes = new(StringComparer.Ordinal);
     private readonly IReadOnlyList<CoreLayout> _layouts;
 
     public InputSetController(ControllerDefinition definition, IReadOnlyList<CoreLayout> layouts)

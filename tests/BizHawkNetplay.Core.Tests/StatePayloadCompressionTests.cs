@@ -13,7 +13,7 @@ namespace BizHawkNetplay.Core.Tests;
 /// </summary>
 public class StatePayloadCompressionTests
 {
-    private static readonly SessionGeneration Gen = new SessionGeneration(0x0123456789ABCDEFUL, 7);
+    private static readonly SessionGeneration Gen = new(0x0123456789ABCDEFUL, 7);
 
     private static byte[] RoundTrip(byte[] state)
     {

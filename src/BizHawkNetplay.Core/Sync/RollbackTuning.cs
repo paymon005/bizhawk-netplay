@@ -81,5 +81,5 @@ public sealed class RollbackTuning
     public IMonotonicClock? Clock { get; init; }
 
     /// <summary>The original behaviour: save every frame, no anchors, no cost ceiling.</summary>
-    public static readonly RollbackTuning Legacy = new RollbackTuning();
+    public static readonly RollbackTuning Legacy = new();
 }

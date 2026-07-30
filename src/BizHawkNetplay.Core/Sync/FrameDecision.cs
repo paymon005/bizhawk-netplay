@@ -20,6 +20,6 @@ public readonly struct FrameDecision
     /// <summary>Inputs to apply this frame; null iff <see cref="Stall"/>.</summary>
     public InputSet? Inputs { get; }
 
-    public static FrameDecision Run(InputSet inputs) => new FrameDecision(false, inputs);
-    public static readonly FrameDecision StallDecision = new FrameDecision(true, null);
+    public static FrameDecision Run(InputSet inputs) => new(false, inputs);
+    public static readonly FrameDecision StallDecision = new(true, null);
 }

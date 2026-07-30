@@ -35,7 +35,7 @@ public sealed class ChecksumLedger
     private const int StaleFrameAge = 600;
 
     private readonly Dictionary<SessionGeneration, Dictionary<int, Dictionary<int, uint>>> _byGeneration =
-        new Dictionary<SessionGeneration, Dictionary<int, Dictionary<int, uint>>>();
+        new();
 
     /// <summary>
     /// Record one player's checksum for a frame and resolve the frame if this completed it.

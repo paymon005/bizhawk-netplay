@@ -48,7 +48,7 @@ public sealed class ControlChannel
     private const int MaxFrameLength = 64 * 1024 * 1024; // 64 MiB ceiling (states are ~1 MiB)
 
     private readonly Stream _stream;
-    private readonly object _writeLock = new object();
+    private readonly object _writeLock = new();
 
     public ControlChannel(Stream stream)
     {

@@ -10,11 +10,11 @@ public class SessionNegotiatorTests
         int protocol = 1, string rom = "ROMHASH", string core = "GPGX",
         string coreVer = "2.11.1.0", string sync = "SYNC1",
         bool deterministic = true, int depth = 20, string layout = "L0")
-        => new PeerIdentity(protocol, rom, core, coreVer, sync,
+        => new(protocol, rom, core, coreVer, sync,
             new[] { layout, "L1" }, deterministic, depth);
 
     private static SessionPreferences Pref(int delay = 2, bool rollback = false, string password = "")
-        => new SessionPreferences(delay, rollback, password);
+        => new(delay, rollback, password);
 
     [Fact]
     public void MatchingPeers_AcceptLockstep()

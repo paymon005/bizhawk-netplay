@@ -8,7 +8,7 @@ namespace BizHawkNetplay.Core.Tests;
 public class LockstepAndPipelineTests
 {
     private static PortInput Btn(bool a) =>
-        new PortInput(new[] { a }, Array.Empty<int>());
+        new(new[] { a }, Array.Empty<int>());
 
     [Fact]
     public void Frontier_StartsEmpty()
