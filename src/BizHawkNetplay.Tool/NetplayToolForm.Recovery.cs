@@ -379,7 +379,7 @@ namespace BizHawkNetplay.Tool
         private void RebaseFrameSchedule()
         {
             if (!_paceClock.IsRunning) _paceClock.Start();
-            _nextFrameDueMs = _paceClock.Elapsed.TotalMilliseconds;
+            _schedule.RebaseTo(_paceClock.Elapsed.TotalMilliseconds);
             // The pause froze stepping but not the FPS sample clock — restart the sample so the
             // first post-resume status line doesn't read ~0 fps and flash "CPU-bound" (KI-7).
             _fpsClock.Restart();

@@ -269,8 +269,9 @@ namespace BizHawkNetplay.Tool
         private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
         private const int MaxFramesPerTick = 2;  // WinForms callbacks can arrive ~25ms apart; one frame caps near 40fps
         private const double FrameTickWorkBudgetMs = 8.0; // floor for fast cores; see TickBudgetMs
-        private double _nextFrameDueMs;
-        private double _recentCoreFrameMs; // conservative rolling cost used before committing a hidden first frame
+        // The pacing clock's arithmetic: due time, catch-up admission, budget, rebase. See FrameSchedule.
+        private readonly FrameSchedule _schedule =
+            new FrameSchedule(1000.0 / 60.0, FrameTickWorkBudgetMs, MaxFramesPerTick);
         // Last seen state of EmuHawk's sound device, so the tick can report the transition rather
         // than the aftermath. Starts true: a session that never stops it should say nothing.
         private bool _audioDevWasUp = true;

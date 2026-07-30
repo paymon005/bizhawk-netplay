@@ -60,7 +60,7 @@ namespace BizHawkNetplay.Tool
         /// the mid-burst audio pump are what keep that safe; this only stops the budget from
         /// forbidding the burst outright.
         /// </summary>
-        private double TickBudgetMs() => Math.Max(FrameTickWorkBudgetMs, 1.7 * _frameMs);
+        private double TickBudgetMs() => _schedule.BudgetMs;
 
         /// <summary>
         /// How early the FIRST frame of a tick may run.
@@ -78,7 +78,7 @@ namespace BizHawkNetplay.Tool
         /// lead the wall clock by more than this tolerance. Frames two and later stay strict, so a
         /// catch-up burst still requires genuinely accumulated debt.
         /// </summary>
-        private double EarlyFrameToleranceMs => _frameMs * 0.5;
+        private double EarlyFrameToleranceMs => _schedule.EarlyToleranceMs;
 
         /// <summary>
         /// Report what the OS actually gives us for a short sleep, once per session.
@@ -144,7 +144,7 @@ namespace BizHawkNetplay.Tool
             // the loop spins, and measured 64.
             if (!_sessionActive || _driver == null) return;
             double nowMs = _paceClock.Elapsed.TotalMilliseconds;
-            if (nowMs < _nextFrameDueMs - FineClockWakeMarginMs) return;
+            if (!_schedule.ShouldWake(nowMs, FineClockWakeMarginMs)) return;
             if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
             _lastFineTickMs = nowMs;
             _emuLoopTicksWindow++;
@@ -324,11 +324,8 @@ namespace BizHawkNetplay.Tool
                 }
 
                 double nowMs = _paceClock.Elapsed.TotalMilliseconds;
-                if (nowMs - _nextFrameDueMs > 3.0 * _frameMs)
+                if (_schedule.TryRebase(nowMs))
                 {
-                    // Discard wall-clock debt, not emulated frames. Chasing a large hitch indefinitely
-                    // is what starves WinForms presentation on slow cores.
-                    _nextFrameDueMs = nowMs;
                     _pacingRebases++;
                     _pacing.AddRebase();
                 }
@@ -338,8 +335,7 @@ namespace BizHawkNetplay.Tool
                 bool timeSyncThisTick = false;
                 int framesThisTick = 0;
                 bool committedSecondFrame = false;
-                while (framesThisTick < MaxFramesPerTick
-                    && nowMs + (framesThisTick == 0 ? EarlyFrameToleranceMs : 0.25) >= _nextFrameDueMs)
+                while (_schedule.MayRunFrame(nowMs, framesThisTick))
                 {
                     // Normally this loop runs once. A second frame compensates for an irregular ~25ms
                     // WinForms callback without reviving the old eight-frame catch-up bursts. Never start
@@ -380,7 +376,7 @@ namespace BizHawkNetplay.Tool
                         if (timeSync)
                         {
                             // Advantage debt is denominated in emulated frames, not timer callbacks.
-                            _nextFrameDueMs += _frameMs;
+                            _schedule.SkipFrame();
                         }
                         if (Verbose && nowMs - _lastStallLogMs >= 1000)
                         {
@@ -417,11 +413,8 @@ namespace BizHawkNetplay.Tool
                         bool secondGateSafe = _driver.Strategy is LockstepStrategy
                             || (_driver.Strategy is RollbackStrategy secondRollback
                                 && !secondRollback.HasPendingTimeSyncDebt);
-                        bool anotherFrameDue = framesThisTick + 1 < MaxFramesPerTick
-                            && nowMs + 0.25 >= _nextFrameDueMs + _frameMs
-                            && _recentCoreFrameMs > 0
-                            && tickWatch.Elapsed.TotalMilliseconds + 2.0 * _recentCoreFrameMs
-                                < TickBudgetMs()
+                        bool anotherFrameDue =
+                            _schedule.AnotherFrameFits(nowMs, framesThisTick, tickWatch.Elapsed.TotalMilliseconds)
                             && secondGateSafe
                             && _driver.NextFrameFullyConfirmed;
                         if (anotherFrameDue) committedSecondFrame = true;
@@ -429,14 +422,11 @@ namespace BizHawkNetplay.Tool
                         double frameCoreMs = phase.Elapsed.TotalMilliseconds;
                         coreMs += frameCoreMs;
                         _pacing.AddFrame(frameCoreMs, rendered: !anotherFrameDue);
-                        _recentCoreFrameMs = _recentCoreFrameMs <= 0
-                            ? frameCoreMs
-                            : Math.Max(frameCoreMs, _recentCoreFrameMs * 0.9);
                         _driver.CompleteFrame();
                         steppedThisTick = true;
                         framesThisTick++;
                         if (framesThisTick >= 2) committedSecondFrame = false;
-                        _nextFrameDueMs += _frameMs;
+                        _schedule.FrameCompleted(frameCoreMs);
                         MaybeSendChecksum();
                         _fpsCount++;
                     }

@@ -243,8 +243,8 @@ namespace BizHawkNetplay.Tool
             lock (_pingLock) { foreach (var link in _peers) { link.PingMs = -1; link.PingCount = 0; } }
             _pingClock.Restart();
             _paceClock.Restart();
-            _nextFrameDueMs = 0;
-            _recentCoreFrameMs = 0;
+            _schedule.FrameMs = _frameMs;
+            _schedule.Restart(0);
             _lastUiRefreshMs = double.NegativeInfinity;
             _lastSlowTickLogMs = double.NegativeInfinity;
             _lastVerboseAudioFrame = -1;
