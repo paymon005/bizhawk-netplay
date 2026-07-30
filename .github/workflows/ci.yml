@@ -16,13 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The tool is pinned to the .NET 5 SDK (C# 9) because it has to load inside BizHawk 2.11's
-      # .NET Framework 4.8 host. 5.0 is out of support; moving the TEST project to a current LTS is
-      # tracked as a deliberate decision, not an oversight — it needs a newer SDK installed on the
-      # developer's machine too, or `dotnet test` stops working locally.
+      # The SDK, not the target. BizHawkNetplay.Core stays netstandard2.0 and the Tool stays net48 —
+      # those are fixed by BizHawk 2.11 being the .NET Framework 4.8 build, and no SDK changes them.
+      # Only the TEST project targets a runtime, and it is on current LTS: it ran on net5.0 until
+      # 2026-07, four years past end of support, for no reason other than that being the newest SDK
+      # that happened to be installed.
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '5.0.x'
+          dotnet-version: '10.0.x'
 
       # Core + the test project only. BizHawkNetplay.Tool compiles against assemblies from a local
       # BizHawk install (see Directory.Build.props / BizHawkHome), which no runner has — so the
