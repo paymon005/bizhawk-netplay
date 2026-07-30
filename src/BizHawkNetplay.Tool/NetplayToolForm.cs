@@ -2393,10 +2393,10 @@ namespace BizHawkNetplay.Tool
             _worstGateSinceLogMs = 0;
             _gateSpikesSinceLog = 0;
             _gcGateWindow0 = _gcGateWindow1 = _gcGateWindow2 = 0;
-            _pacingRollbacksAtWindowStart = 0;
-            _pacingResimAtWindowStart = 0;
-            _pacingSavesTakenAtWindowStart = 0;
-            _pacingSavesElidedAtWindowStart = 0;
+            _pacingRollbacks.Reset();
+            _pacingResim.Reset();
+            _pacingSavesTaken.Reset();
+            _pacingSavesElided.Reset();
             // A WinForms timer is WM_TIMER, and SetTimer silently raises anything below
             // USER_TIMER_MINIMUM to 10ms — asking for 2 never bought a 2ms cadence, it just hid the
             // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
@@ -3244,10 +3244,13 @@ namespace BizHawkNetplay.Tool
         /// are what a player sees, and nothing here counted them — `gate` reports what a repair COST,
         /// which on a core with a 0.4ms savestate stays near zero however many are happening.
         /// </summary>
-        private int _pacingRollbacksAtWindowStart;
-        private long _pacingResimAtWindowStart;
-        private int _pacingSavesTakenAtWindowStart;
-        private int _pacingSavesElidedAtWindowStart;
+        // Windowed against the strategy's lifetime counters. CounterWindow, not a plain baseline field,
+        // because the strategy is REPLACED by a resync, a reconnect or a mid-session netcode change —
+        // see its remarks for the negative figures that produced.
+        private readonly CounterWindow _pacingRollbacks = new CounterWindow();
+        private readonly CounterWindow _pacingResim = new CounterWindow();
+        private readonly CounterWindow _pacingSavesTaken = new CounterWindow();
+        private readonly CounterWindow _pacingSavesElided = new CounterWindow();
 
         private void LogPacingSummary(double nowMs)
         {
@@ -3265,18 +3268,14 @@ namespace BizHawkNetplay.Tool
             string rbStr = "";
             if (_driver?.Strategy is RollbackStrategy rb)
             {
-                int rollbacks = rb.RollbackCount - _pacingRollbacksAtWindowStart;
-                long resim = rb.FramesResimulated - _pacingResimAtWindowStart;
+                long rollbacks = _pacingRollbacks.Observe(rb.RollbackCount);
+                long resim = _pacingResim.Observe(rb.FramesResimulated);
                 // Snapshots actually taken versus elided. The elision rule turns rollback's steady
                 // state from a savestate every frame into nearly none, so the allocation rate this
                 // path is responsible for is a measured number rather than something to reason about
                 // from the tuning constants.
-                int taken = rb.SavesTaken - _pacingSavesTakenAtWindowStart;
-                int elided = rb.SavesElided - _pacingSavesElidedAtWindowStart;
-                _pacingRollbacksAtWindowStart = rb.RollbackCount;
-                _pacingResimAtWindowStart = rb.FramesResimulated;
-                _pacingSavesTakenAtWindowStart = rb.SavesTaken;
-                _pacingSavesElidedAtWindowStart = rb.SavesElided;
+                long taken = _pacingSavesTaken.Observe(rb.SavesTaken);
+                long elided = _pacingSavesElided.Observe(rb.SavesElided);
                 // buffers=N is the acceptance test for the state pool: it should climb to the ring's
                 // size in the first second or two and then stop. Still climbing means the pool is
                 // being outrun and savestates are still being allocated per frame.
