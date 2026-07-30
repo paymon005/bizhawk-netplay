@@ -109,5 +109,30 @@ namespace BizHawkNetplay.Core.Tests
             var ser = new InputSerializer(NesLayout());
             Assert.Throws<ArgumentException>(() => ser.Deserialize(new byte[2]));
         }
+
+        [Fact]
+        public void DeserializeAtOffset_ReadsOnePayloadOutOfAPackedRun()
+        {
+            var ser = new InputSerializer(AnalogLayout());
+            var first = new PortInput(new[] { true, false }, new[] { -100, 60000, 999_999 });
+            var second = new PortInput(new[] { false, true }, new[] { 42, 7, 0 });
+
+            // Lay the two payloads out back to back, the way a datagram carries a redundant window.
+            var packed = ser.Serialize(first).Concat(ser.Serialize(second)).ToArray();
+            int width = ser.PayloadSize;
+
+            Assert.True(first.ValueEquals(ser.Deserialize(packed, 0)));
+            Assert.True(second.ValueEquals(ser.Deserialize(packed, width)));
+        }
+
+        [Fact]
+        public void DeserializeAtOffset_RefusesAPayloadThatWouldRunOffTheEnd()
+        {
+            var ser = new InputSerializer(NesLayout());
+            var buffer = new byte[3];
+            Assert.Throws<ArgumentOutOfRangeException>(() => ser.Deserialize(buffer, -1));
+            Assert.Throws<ArgumentOutOfRangeException>(() => ser.Deserialize(buffer, 3));
+            Assert.Throws<ArgumentNullException>(() => ser.Deserialize(null!, 0));
+        }
     }
 }

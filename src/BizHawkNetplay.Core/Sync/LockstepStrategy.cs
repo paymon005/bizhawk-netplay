@@ -36,7 +36,7 @@ namespace BizHawkNetplay.Core.Sync
             // Checksum cadence is owned by the SessionManager; nothing to do per frame here.
         }
 
-        public void OnRemoteInput(InputFrame input)
+        public void OnRemoteInput(int frame, int port)
         {
             // The pipeline advances the port frontier; the driver retries BeginFrame next tick,
             // which unstalls automatically once the gap is filled.

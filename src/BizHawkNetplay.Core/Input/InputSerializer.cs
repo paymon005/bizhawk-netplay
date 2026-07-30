@@ -60,12 +60,26 @@ namespace BizHawkNetplay.Core.Input
             if (payload == null) throw new ArgumentNullException(nameof(payload));
             if (payload.Length != _layout.PayloadByteWidth)
                 throw new ArgumentException($"Payload size {payload.Length} != expected {_layout.PayloadByteWidth}");
+            return Deserialize(payload, 0);
+        }
 
-            int offset = 0;
+        /// <summary>
+        /// Unpack one port's input from the middle of a larger buffer. A datagram carries a whole
+        /// redundant window back to back, and the receive path drops most of those frames as already
+        /// held — copying each one into its own array before deciding that was the waste.
+        /// </summary>
+        public PortInput Deserialize(byte[] buffer, int offset)
+        {
+            if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+            if (offset < 0 || buffer.Length - offset < _layout.PayloadByteWidth)
+                throw new ArgumentOutOfRangeException(nameof(offset),
+                    $"Payload of {_layout.PayloadByteWidth} bytes does not fit at offset {offset} of {buffer.Length}");
+
+            int cursor = offset;
             var buttons = new bool[_layout.Buttons.Count];
             for (int i = 0; i < buttons.Length; i++)
-                buttons[i] = (payload[offset + (i >> 3)] & (1 << (i & 7))) != 0;
-            offset += _layout.ButtonByteWidth;
+                buttons[i] = (buffer[cursor + (i >> 3)] & (1 << (i & 7))) != 0;
+            cursor += _layout.ButtonByteWidth;
 
             var axes = new int[_layout.Axes.Count];
             for (int i = 0; i < axes.Length; i++)
@@ -74,9 +88,9 @@ namespace BizHawkNetplay.Core.Input
                 int width = axis.ByteWidth;
                 ulong rel = 0;
                 for (int b = 0; b < width; b++)
-                    rel |= (ulong)payload[offset + b] << (8 * b);
+                    rel |= (ulong)buffer[cursor + b] << (8 * b);
                 axes[i] = (int)((long)rel + axis.Min);
-                offset += width;
+                cursor += width;
             }
 
             return new PortInput(buttons, axes);

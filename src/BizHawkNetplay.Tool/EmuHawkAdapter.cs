@@ -29,6 +29,7 @@ namespace BizHawkNetplay.Tool
         private readonly IEmulator _emulator;
         private readonly IStatable _statable;
         private readonly CoreLayout[] _layouts;
+        private InputSetController? _controller; // reused every frame; see Controller()
         private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
         private readonly AnalogBind?[][] _analogBinds; // [port][axisIndex] -> host analog binding (null if unbound)
         private readonly bool[][] _axisReversed;      // [port][axisIndex] -> core axis IsReversed flag
@@ -306,8 +307,7 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         public void AdvanceRenderedFrame(InputSet inputs)
         {
-            var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
-            _emulator.FrameAdvance(controller, render: true, renderSound: true);
+            _emulator.FrameAdvance(Controller(inputs), render: true, renderSound: true);
             try
             {
                 _coreSound ??= _emulator.ServiceProvider.GetService<ISoundProvider>();
@@ -326,8 +326,7 @@ namespace BizHawkNetplay.Tool
             // renderVideo=false skips only the video render — used for the throwaway intermediate frames
             // of a catch-up burst (their picture is never shown), which lets a heavy core recover from a
             // hitch faster. Sound is always rendered so audio stays continuous, and emulation is identical.
-            var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputs);
-            _emulator.FrameAdvance(controller, render: renderVideo, renderSound: true);
+            _emulator.FrameAdvance(Controller(inputs), render: renderVideo, renderSound: true);
 
             // Drain the samples the core just generated into our ring buffer. EmuHawk's audio device
             // pulls from that ring at the steady real-time rate (PumpAudio → UpdateSound), so the ring
@@ -947,10 +946,21 @@ namespace BizHawkNetplay.Tool
         public void RunFramesInvisible(int count, Func<int, InputSet> inputsFor)
         {
             for (int i = 0; i < count; i++)
-            {
-                var controller = new InputSetController(_emulator.ControllerDefinition, _layouts, inputsFor(i));
-                _emulator.FrameAdvance(controller, render: false, renderSound: false);
-            }
+                _emulator.FrameAdvance(Controller(inputsFor(i)), render: false, renderSound: false);
+        }
+
+        /// <summary>
+        /// The one controller this adapter presents to the core, refilled for <paramref name="inputs"/>.
+        /// Rebuilt only when the core's controller definition or our layouts change identity — which is
+        /// what a core reboot does, and the one case where a cached name map would be wrong.
+        /// </summary>
+        private InputSetController Controller(InputSet inputs)
+        {
+            var definition = _emulator.ControllerDefinition;
+            if (_controller == null || !_controller.Matches(definition, _layouts))
+                _controller = new InputSetController(definition, _layouts);
+            _controller.Update(inputs);
+            return _controller;
         }
 
         // --- Integrity ----------------------------------------------------------------

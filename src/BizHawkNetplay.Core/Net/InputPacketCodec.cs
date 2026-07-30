@@ -110,13 +110,39 @@ namespace BizHawkNetplay.Core.Net
         }
 
         /// <summary>
-        /// Decode a datagram into per-frame <see cref="InputFrame"/>s. Returns false for unknown,
-        /// malformed, or differently generated datagrams rather than throwing — the input channel
-        /// is untrusted UDP.
+        /// A validated input datagram described in place: which port and frames it covers, and where
+        /// each frame's bytes start. No payload is copied, which matters because most of them are
+        /// thrown away — a datagram repeats the last R frames, so at delay 4 nine frames arrive and
+        /// typically eight are already held. With three remotes at 60Hz that was ~1,600–2,300 arrays a
+        /// second allocated purely to be discarded, and the churn scales with the player count.
         /// </summary>
-        public bool TryDecodeInput(byte[] datagram, out List<InputFrame> frames)
+        public readonly struct InputWindow
         {
-            frames = new List<InputFrame>();
+            public InputWindow(byte port, int baseFrame, int count, int payloadSize)
+            {
+                Port = port;
+                BaseFrame = baseFrame;
+                Count = count;
+                PayloadSize = payloadSize;
+            }
+
+            public byte Port { get; }
+            public int BaseFrame { get; }
+            public int Count { get; }
+            public int PayloadSize { get; }
+
+            /// <summary>Offset within the datagram of the payload for <c>BaseFrame + index</c>.</summary>
+            public int OffsetOf(int index) => HeaderSize + index * PayloadSize;
+        }
+
+        /// <summary>
+        /// Validate a datagram and describe its contents without copying any of them. Same acceptance
+        /// rules and same rejection counters as <see cref="TryDecodeInput"/> — that method is now this
+        /// one plus the copying.
+        /// </summary>
+        public bool TryDecodeInputWindow(byte[] datagram, out InputWindow window)
+        {
+            window = default;
             if (datagram == null || datagram.Length < HeaderSize) return false;
             if (datagram[0] != TypeInput) return false;   // a request, not ours to refuse — see counters
             if (ReadUInt64(datagram, 2) != _generation.SessionId ||
@@ -150,13 +176,26 @@ namespace BizHawkNetplay.Core.Net
             }
             if (count == 0) { RejectedMalformed++; return false; }
 
-            int offset = HeaderSize;
-            for (int i = 0; i < count; i++)
+            window = new InputWindow(port, baseFrame, count, payloadSize);
+            return true;
+        }
+
+        /// <summary>
+        /// Decode a datagram into per-frame <see cref="InputFrame"/>s. Returns false for unknown,
+        /// malformed, or differently generated datagrams rather than throwing — the input channel
+        /// is untrusted UDP. The receive hot path uses <see cref="TryDecodeInputWindow"/> instead and
+        /// copies only the frames it will keep.
+        /// </summary>
+        public bool TryDecodeInput(byte[] datagram, out List<InputFrame> frames)
+        {
+            frames = new List<InputFrame>();
+            if (!TryDecodeInputWindow(datagram, out var window)) return false;
+
+            for (int i = 0; i < window.Count; i++)
             {
-                var payload = new byte[payloadSize];
-                Buffer.BlockCopy(datagram, offset, payload, 0, payloadSize);
-                offset += payloadSize;
-                frames.Add(new InputFrame(baseFrame + i, port, payload));
+                var payload = new byte[window.PayloadSize];
+                Buffer.BlockCopy(datagram, window.OffsetOf(i), payload, 0, window.PayloadSize);
+                frames.Add(new InputFrame(window.BaseFrame + i, window.Port, payload));
             }
             return true;
         }

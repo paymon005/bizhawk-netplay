@@ -200,5 +200,89 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0, codec.RejectedPayloadSize);
             Assert.Equal(-1, codec.LastSizeMismatchPort);  // no size disagreement to report
         }
+
+        [Fact]
+        public void DecodeWindow_DescribesTheSameFramesTheCopyingDecodeProduces()
+        {
+            var generation = new SessionGeneration(0x9191919191919191UL, 2);
+            var codec = new InputPacketCodec(new[] { 1, 3 }, generation);
+            var packet = codec.EncodeInput(1, new[]
+            {
+                new KeyValuePair<int, byte[]>(40, new byte[] { 1, 2, 3 }),
+                new KeyValuePair<int, byte[]>(41, new byte[] { 4, 5, 6 }),
+                new KeyValuePair<int, byte[]>(42, new byte[] { 7, 8, 9 }),
+            });
+
+            Assert.True(codec.TryDecodeInputWindow(packet, out var window));
+            Assert.Equal(1, window.Port);
+            Assert.Equal(40, window.BaseFrame);
+            Assert.Equal(3, window.Count);
+            Assert.Equal(3, window.PayloadSize);
+
+            // The offsets must land exactly where the copying decode's payloads came from.
+            Assert.True(codec.TryDecodeInput(packet, out var frames));
+            Assert.Equal(window.Count, frames.Count);
+            for (int i = 0; i < frames.Count; i++)
+            {
+                Assert.Equal(window.BaseFrame + i, frames[i].Frame);
+                Assert.Equal(window.Port, frames[i].Port);
+                for (int b = 0; b < window.PayloadSize; b++)
+                    Assert.Equal(frames[i].Payload[b], packet[window.OffsetOf(i) + b]);
+            }
+        }
+
+        [Fact]
+        public void DecodeWindow_RefusesAndCountsExactlyWhatTheCopyingDecodeDoes()
+        {
+            var generation = new SessionGeneration(0x3131313131313131UL, 1);
+            var sender = new InputPacketCodec(new[] { 1, 1, 3 }, generation);
+            var packet = sender.EncodeInput(2,
+                new[] { new KeyValuePair<int, byte[]>(10, new byte[] { 1, 2, 3 }) });
+
+            var viaWindow = new InputPacketCodec(new[] { 1, 1, 1 }, generation);
+            var viaCopy = new InputPacketCodec(new[] { 1, 1, 1 }, generation);
+            Assert.False(viaWindow.TryDecodeInputWindow(packet, out _));
+            Assert.False(viaCopy.TryDecodeInput(packet, out _));
+
+            // Both entry points share one set of acceptance rules and one set of counters, so a
+            // diagnosis drawn from the logs means the same thing whichever the hot path used.
+            Assert.Equal(viaCopy.RejectedTotal, viaWindow.RejectedTotal);
+            Assert.Equal(viaCopy.RejectedPayloadSize, viaWindow.RejectedPayloadSize);
+            Assert.Equal(viaCopy.LastSizeMismatchPort, viaWindow.LastSizeMismatchPort);
+            Assert.Equal(viaCopy.LastSizeMismatchObserved, viaWindow.LastSizeMismatchObserved);
+
+            var request = viaWindow.EncodeRequest(1, 7);
+            Assert.False(viaWindow.TryDecodeInputWindow(request, out _));
+            Assert.Equal(viaCopy.RejectedTotal, viaWindow.RejectedTotal); // still not a refusal
+        }
+
+        /// <summary>
+        /// The reason the window decode exists. A datagram repeats the last R frames, so at delay 4
+        /// nine frames arrive and eight are typically already held; copying all nine before the caller
+        /// drops eight allocated ~1,600–2,300 arrays a second at four players. Describing the datagram
+        /// in place costs nothing at all.
+        /// </summary>
+        [Fact]
+        public void DecodeWindow_AllocatesNothing()
+        {
+            var generation = new SessionGeneration(0x7373737373737373UL, 4);
+            var codec = new InputPacketCodec(new[] { 1, 2 }, generation);
+            var frames = new List<KeyValuePair<int, byte[]>>();
+            for (int f = 0; f < 9; f++) frames.Add(new KeyValuePair<int, byte[]>(100 + f, new byte[] { 1, 2 }));
+            var packet = codec.EncodeInput(1, frames);
+
+            Assert.True(codec.TryDecodeInputWindow(packet, out _)); // warm any first-call cost
+
+            // Assertions stay outside the measured region — an assert that allocates would be
+            // indistinguishable from a decode that does.
+            int decodedFrames = 0;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 1000; i++)
+                if (codec.TryDecodeInputWindow(packet, out var window)) decodedFrames += window.Count;
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+            Assert.Equal(9000, decodedFrames);
+            Assert.True(allocated == 0, $"decoding 1000 windows allocated {allocated} bytes; expected none");
+        }
     }
 }

@@ -314,14 +314,13 @@ namespace BizHawkNetplay.Core.Sync
             return true;
         }
 
-        public void OnRemoteInput(InputFrame input)
+        public void OnRemoteInput(int frame, int port)
         {
-            int f = input.Frame;
+            int f = frame;
             // Only already-simulated frames can be mispredicted; a not-yet-run frame will simply use
             // the real input when we reach it. (_applied holds exactly the frames we've run and kept.)
             if (!_applied.TryGetValue(f, out var applied)) return;
 
-            int port = input.Port;
             if (port < 0 || port >= _portCount) return;
 
             // The pipeline was updated with the real input just before this call; compare it against

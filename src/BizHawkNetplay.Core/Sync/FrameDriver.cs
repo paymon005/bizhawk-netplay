@@ -344,7 +344,10 @@ namespace BizHawkNetplay.Core.Sync
             while (drained < maxDatagrams && _transport.TryReceive(out var datagram))
             {
                 drained++;
-                if (!_codec.TryDecodeInput(datagram, out var frames))
+                // Describe the datagram without copying it. A window repeats the last R frames, nearly
+                // all of which we already hold, so the payload for a frame is copied out only once the
+                // filters below have decided we are actually going to keep it.
+                if (!_codec.TryDecodeInputWindow(datagram, out var window))
                 {
                     // Not an input window — maybe a peer asking us to re-send frames that slid out
                     // of our redundant window (rollback loss recovery). Anything else is ignored.
@@ -352,37 +355,41 @@ namespace BizHawkNetplay.Core.Sync
                         ServeGapRequest(target, fromFrame);
                     continue;
                 }
-                foreach (var inFrame in frames)
+                int port = window.Port;
+                if (port == _localPort) continue;      // never let the wire override our own port
+
+                // Any well-decoded frame from a remote port proves that port's UDP path is alive,
+                // including a redundant frame we already hold during a lockstep stall.
+                _lastRemoteInputStamp[port] = Stopwatch.GetTimestamp();
+                // Track the newest frame the peer has SENT (even if we drop it below): the gap
+                // between this and the confirmed frontier is what tells us a missing frame has
+                // slid out of the peer's live resend window and must be requested.
+                int newest = window.BaseFrame + window.Count - 1;
+                if (newest > _newestRemoteFrame[port]) _newestRemoteFrame[port] = newest;
+
+                for (int i = 0; i < window.Count; i++)
                 {
-                    if (inFrame.Port == _localPort) continue;      // never let the wire override our own port
-                    // Any well-decoded frame from a remote port proves that port's UDP path is alive,
-                    // including a redundant frame we already hold during a lockstep stall.
-                    _lastRemoteInputStamp[inFrame.Port] = Stopwatch.GetTimestamp();
-                    // Track the newest frame the peer has SENT (even if we drop it below): the gap
-                    // between this and the confirmed frontier is what tells us a missing frame has
-                    // slid out of the peer's live resend window and must be requested.
-                    if (inFrame.Frame > _newestRemoteFrame[inFrame.Port])
-                        _newestRemoteFrame[inFrame.Port] = inFrame.Frame;
+                    int frame = window.BaseFrame + i;
                     // Genuine redundancy: we already hold this exact (port, frame). This is also the
                     // ONLY way an earlier-than-current frame reaches lockstep — it can't have advanced
                     // past a frame it lacked — so with _rollbackWindow==0 this matches the old
                     // "< CurrentFrame" drop exactly. In rollback, a late correction for an
                     // already-simulated frame is NOT yet in the pipeline, so it falls through below.
-                    if (_pipeline.TryGet(inFrame.Port, inFrame.Frame, out _)) continue;
+                    if (_pipeline.TryGet(port, frame, out _)) continue;
                     // Too old to act on: before the rollback ring / pruned history can reach. For
                     // lockstep (window 0) that is anything strictly before the current frame.
                     // Rollback gets one extra frame of grace below the window: a hard-cap stall at
                     // frame N is waiting for exactly frame N - window - 1 (the first frame past the
                     // stalled horizon), and the ring's prune margin keeps that frame's base state
                     // alive for the repair — dropping it here would make the stall permanent.
-                    if (inFrame.Frame < CurrentFrame - _rollbackWindow - (_rollbackWindow > 0 ? 1 : 0)) continue;
+                    if (frame < CurrentFrame - _rollbackWindow - (_rollbackWindow > 0 ? 1 : 0)) continue;
                     // Impossibly far in the future — bogus, or a pre-resync datagram (high frame number)
                     // arriving after we rebuilt at frame 0. Left unchecked it would sit in the pipeline
                     // and reapply thousands of frames later.
-                    if (inFrame.Frame > CurrentFrame + _maxLead) continue;
-                    var input = _serializers[inFrame.Port].Deserialize(inFrame.Payload);
-                    _pipeline.Add(inFrame.Port, inFrame.Frame, input);
-                    _strategy.OnRemoteInput(inFrame);
+                    if (frame > CurrentFrame + _maxLead) continue;
+                    var input = _serializers[port].Deserialize(datagram, window.OffsetOf(i));
+                    _pipeline.Add(port, frame, input);
+                    _strategy.OnRemoteInput(frame, port);
                 }
             }
             return drained;
