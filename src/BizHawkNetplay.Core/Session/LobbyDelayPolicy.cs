@@ -44,6 +44,41 @@ namespace BizHawkNetplay.Core.Session
     }
 
     /// <summary>
+    /// One peer's report of its own UDP mesh before GO: its worst edge, and how much of the mesh that
+    /// figure actually covers. The host's control links reach only the joiners, so on a 4-player mesh
+    /// it can measure 3 of the 6 edges by itself and only ever over TCP; the joiner-to-joiner edges
+    /// exist solely in reports like this one.
+    /// </summary>
+    public readonly struct LobbyMeshSample
+    {
+        public static readonly LobbyMeshSample None = default;
+
+        public LobbyMeshSample(LobbyRttSample rtt, int measuredEdges, int totalEdges)
+        {
+            Rtt = rtt;
+            MeasuredEdges = measuredEdges < 0 ? 0 : measuredEdges;
+            TotalEdges = totalEdges < MeasuredEdges ? MeasuredEdges : totalEdges;
+        }
+
+        /// <summary>Worst edge's settled and high-water round-trip, on the UDP path input rides.</summary>
+        public LobbyRttSample Rtt { get; }
+
+        /// <summary>How many of this peer's edges answered a probe.</summary>
+        public int MeasuredEdges { get; }
+
+        /// <summary>How many edges this peer has in total.</summary>
+        public int TotalEdges { get; }
+
+        /// <summary>False when nothing answered — the caller must then fall back to its own probes
+        /// rather than treat a zero as a fast link.</summary>
+        public bool HasMeasurement => MeasuredEdges > 0;
+
+        /// <summary>True when every edge reported. A partial mesh still yields a usable lower bound,
+        /// but it is a lower bound and worth naming as one.</summary>
+        public bool IsComplete => TotalEdges > 0 && MeasuredEdges >= TotalEdges;
+    }
+
+    /// <summary>
     /// Converts a settled lobby RTT into an input delay before the frame driver is constructed.
     /// The manual/negotiated value is a floor; <paramref name="automaticMaximum"/> limits only the
     /// automatic increase, so a peer explicitly asking for more delay is never silently overridden.

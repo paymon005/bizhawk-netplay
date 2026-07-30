@@ -484,5 +484,158 @@ namespace BizHawkNetplay.Core.Tests
             }
             finally { dispose3(); }
         }
+
+        // ---- the pre-GO mesh round -------------------------------------------------------
+
+        [Fact]
+        public void MeshRound_LetsAJoinerToJoinerEdgeRaiseTheDelayNobodyElseCanSee()
+        {
+            var (hostCh1, clientCh1, d1) = TcpPair();
+            var (hostCh2, clientCh2, d2) = TcpPair();
+            try
+            {
+                var generation = Generation(0xBEEFUL, epoch: 2);
+                var hostState = new byte[512];
+                const int players = 3;
+                const int provisionalDelay = 2;
+
+                // The host's own links are fast. The edge BETWEEN the two joiners is not — and it is
+                // the one edge no control link on this host touches.
+                var j1Mesh = new LobbyMeshSample(new LobbyRttSample(90, 130), measuredEdges: 2, totalEdges: 2);
+                var j2Mesh = new LobbyMeshSample(new LobbyRttSample(88, 120), measuredEdges: 2, totalEdges: 2);
+
+                var c1 = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh1, Id(), new SessionPreferences(1, false), 51001,
+                    measureMesh: (hostUdpPort, routes) =>
+                    {
+                        Assert.Equal(47800, hostUdpPort);        // the joiner measures the host edge too
+                        Assert.Equal(2, Assert.Single(routes).RemotePort);
+                        return j1Mesh;
+                    }));
+                var c2 = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh2, Id(), new SessionPreferences(1, false), 51002,
+                    measureMesh: (_, __) => j2Mesh));
+
+                var hostPrefs = new SessionPreferences(1, false);
+                var g1 = Handshake.HostGreet(hostCh1, Id(), hostPrefs, 47800);
+                var g2 = Handshake.HostGreet(hostCh2, Id(), hostPrefs, 47800);
+
+                var j1Ep = new IPEndPoint(IPAddress.Loopback, g1.UdpPort);
+                var j2Ep = new IPEndPoint(IPAddress.Loopback, g2.UdpPort);
+                Handshake.HostSendStart(hostCh1, 1, players, provisionalDelay, SyncMode.Lockstep, hostState,
+                    generation, new[] { new PeerRoute(2, new[] { j2Ep }) });
+                Handshake.HostSendStart(hostCh2, 2, players, provisionalDelay, SyncMode.Lockstep, hostState,
+                    generation, new[] { new PeerRoute(1, new[] { j1Ep }) });
+
+                Handshake.HostRequestMeshRtt(hostCh1, generation);
+                Handshake.HostRequestMeshRtt(hostCh2, generation);
+                var r1 = Handshake.HostWaitMeshRtt(hostCh1, generation);
+                var r2 = Handshake.HostWaitMeshRtt(hostCh2, generation);
+
+                Assert.True(r1.HasMeasurement);
+                Assert.True(r1.IsComplete);
+                Assert.Equal(90, r1.Rtt.MedianMs, 3);
+                Assert.Equal(40, r1.Rtt.JitterMs, 3);
+                Assert.Equal(88, r2.Rtt.MedianMs, 3);
+
+                double worstRtt = Math.Max(r1.Rtt.MedianMs, r2.Rtt.MedianMs);
+                double worstJitter = Math.Max(r1.Rtt.JitterMs, r2.Rtt.JitterMs);
+                int finalDelay = LobbyDelayPolicy.Choose(worstRtt, frameMs: 16.64, SyncMode.Lockstep,
+                    manualFloor: provisionalDelay, automaticMaximum: 20, jitterMs: worstJitter).Frames;
+                Assert.True(finalDelay > provisionalDelay,
+                    "the joiner-to-joiner edge should have bought delay the host could not have measured");
+
+                Handshake.HostSendInputDelay(hostCh1, generation, finalDelay);
+                Handshake.HostSendInputDelay(hostCh2, generation, finalDelay);
+                Handshake.HostRequestReady(hostCh1, generation);
+                Handshake.HostRequestReady(hostCh2, generation);
+                Handshake.HostWaitReady(hostCh1, generation);
+                Handshake.HostWaitReady(hostCh2, generation);
+                Handshake.HostSendGo(hostCh1, generation);
+                Handshake.HostSendGo(hostCh2, generation);
+
+                var p1 = c1.GetAwaiter().GetResult();
+                var p2 = c2.GetAwaiter().GetResult();
+
+                // Both joiners built their params on the FINAL delay, not the one WELCOME carried.
+                Assert.Equal(finalDelay, p1.InputDelay);
+                Assert.Equal(finalDelay, p2.InputDelay);
+            }
+            finally { d1(); d2(); }
+        }
+
+        [Fact]
+        public void MeshRound_AJoinerThatMeasuredNothingSaysSoRatherThanReportingZero()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var generation = Generation(0xC0DEUL, epoch: 1);
+                var client = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh, Id(), new SessionPreferences(1, false), 51001,
+                    measureMesh: (_, __) => new LobbyMeshSample(default, measuredEdges: 0, totalEdges: 3)));
+
+                Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
+                Handshake.HostSendStart(hostCh, 1, 2, 3, SyncMode.Lockstep, new byte[8], generation);
+                Handshake.HostRequestMeshRtt(hostCh, generation);
+                var report = Handshake.HostWaitMeshRtt(hostCh, generation);
+
+                // Zero round-trip and "nothing answered" are the same bytes on the wire but must not
+                // be the same claim: read as a measurement, an unpunched mesh looks like a perfect one.
+                Assert.False(report.HasMeasurement);
+                Assert.False(report.IsComplete);
+                Assert.Equal(0, report.MeasuredEdges);
+                Assert.Equal(3, report.TotalEdges);
+
+                Handshake.HostSendInputDelay(hostCh, generation, 3);
+                Handshake.HostRequestReady(hostCh, generation);
+                Handshake.HostWaitReady(hostCh, generation);
+                Handshake.HostSendGo(hostCh, generation);
+                Assert.Equal(3, client.GetAwaiter().GetResult().InputDelay);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void MeshRound_RefusesAReportFromAnotherGeneration()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var expected = Generation(0x1111UL, epoch: 4);
+                var stale = Generation(0x1111UL, epoch: 3);
+                Task.Run(() => clientCh.Send(ControlMessageType.MeshRtt,
+                    ControlMessageCodec.EncodeMeshRtt(stale, 10, 12, 1, 1))).GetAwaiter().GetResult();
+
+                var ex = Assert.Throws<HandshakeException>(() => Handshake.HostWaitMeshRtt(hostCh, expected));
+                Assert.Contains("generation mismatch", ex.Message);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void MeshRound_ClientRefusesADelayThatArrivesAfterItCommittedToOne()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var generation = Generation(0x2222UL, epoch: 1);
+                var client = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh, Id(), new SessionPreferences(1, false), 51001));
+
+                Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
+                Handshake.HostSendStart(hostCh, 1, 2, 2, SyncMode.Lockstep, new byte[8], generation);
+                Handshake.HostRequestReady(hostCh, generation);
+                Handshake.HostWaitReady(hostCh, generation);
+                // READY means the driver is already built for a delay. Changing it now would put this
+                // peer on a different timeline from the rest of the lobby.
+                Handshake.HostSendInputDelay(hostCh, generation, 9);
+                Handshake.HostSendGo(hostCh, generation);
+
+                var ex = Assert.Throws<HandshakeException>(() => client.GetAwaiter().GetResult());
+                Assert.Contains("after READY", ex.Message);
+            }
+            finally { dispose(); }
+        }
     }
 }

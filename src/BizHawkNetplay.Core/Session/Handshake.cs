@@ -322,11 +322,56 @@ namespace BizHawkNetplay.Core.Session
             ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
             SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
         {
+            HostSendStart(channel, assignedPort, playerCount, inputDelay, mode, state, generation, peerRoutes);
+            HostRequestReady(channel, generation);
+        }
+
+        /// <summary>
+        /// The assignment and state alone, WITHOUT the READY request — so a caller that wants to run the
+        /// mesh round first has somewhere to stand. The joiner has its routes from this point on, which
+        /// is what lets it punch and measure the edges the host cannot see.
+        /// </summary>
+        public static void HostSendStart(
+            ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
+            SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
+        {
             channel.Send(ControlMessageType.Welcome,
                 HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes));
             channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
-            channel.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(generation));
         }
+
+        /// <summary>Ask this joiner to apply everything it has been sent and acknowledge READY.</summary>
+        public static void HostRequestReady(ControlChannel channel, SessionGeneration generation)
+            => channel.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(generation));
+
+        /// <summary>Host: ask one joiner to measure its own UDP mesh edges and report the worst.</summary>
+        public static void HostRequestMeshRtt(ControlChannel channel, SessionGeneration generation)
+            => channel.Send(ControlMessageType.MeshRtt, HandshakeCodec.EncodeGeneration(generation));
+
+        /// <summary>Host: take one joiner's mesh report. Throws if it is missing, malformed, or for a
+        /// different generation — the report feeds the delay every peer will then be held to.</summary>
+        public static LobbyMeshSample HostWaitMeshRtt(ControlChannel channel, SessionGeneration generation)
+        {
+            var (type, body) = channel.Receive();
+            if (type == ControlMessageType.Error)
+                throw new HandshakeException(Encoding.UTF8.GetString(body));
+            if (type != ControlMessageType.MeshRtt)
+                throw new HandshakeException($"expected a mesh RTT report from joiner, got {type}");
+            if (!ControlMessageCodec.TryDecodeMeshRtt(body, out var reported, out double medianMs,
+                    out double highMs, out int measuredEdges, out int totalEdges))
+                throw new HandshakeException("joiner sent a malformed mesh RTT report");
+            if (reported != generation)
+                throw new HandshakeException(
+                    $"mesh RTT generation mismatch: expected {generation}, got {reported}");
+            return new LobbyMeshSample(new LobbyRttSample(medianMs, highMs), measuredEdges, totalEdges);
+        }
+
+        /// <summary>Host: publish the authoritative delay once every edge has reported. Sent after the
+        /// mesh round and before READY, so the joiner builds its driver on the final figure rather than
+        /// the provisional one WELCOME carried.</summary>
+        public static void HostSendInputDelay(ControlChannel channel, SessionGeneration generation, int delay)
+            => channel.Send(ControlMessageType.InputDelay,
+                ControlMessageCodec.EncodeInputDelay(generation, delay));
 
         /// <summary>Host side of the apply barrier: wait until this joiner imported the state and rebuilt
         /// its driver for <paramref name="generation"/>.</summary>
@@ -351,7 +396,8 @@ namespace BizHawkNetplay.Core.Session
         /// </summary>
         public static SessionParams RunClientMulti(
             ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
-            Action<SessionParams>? beforeReady = null, Action? afterGreet = null)
+            Action<SessionParams>? beforeReady = null, Action? afterGreet = null,
+            Func<int, IReadOnlyList<PeerRoute>, LobbyMeshSample>? measureMesh = null)
         {
             var joinNonce = SessionAuth.NewNonce();
             channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
@@ -371,13 +417,14 @@ namespace BizHawkNetplay.Core.Session
             VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
             afterGreet?.Invoke();
 
-            return ReceiveStartData(channel, hostUdpPort, beforeReady);
+            return ReceiveStartData(channel, hostUdpPort, beforeReady, measureMesh);
         }
 
         /// <summary>Receive the authoritative WELCOME and state, let the caller apply them, acknowledge
         /// that exact generation, then remain blocked until the host releases the same generation.</summary>
         private static SessionParams ReceiveStartData(
-            ControlChannel channel, int hostUdpPort, Action<SessionParams>? beforeReady)
+            ControlChannel channel, int hostUdpPort, Action<SessionParams>? beforeReady,
+            Func<int, IReadOnlyList<PeerRoute>, LobbyMeshSample>? measureMesh = null)
         {
             int assignedPort = 0, playerCount = 0, delay = 0;
             SyncMode mode = SyncMode.Lockstep;
@@ -419,6 +466,35 @@ namespace BizHawkNetplay.Core.Session
                 {
                     if (initialState != null) throw new HandshakeException("host sent STATE more than once");
                     initialState = body;
+                    continue;
+                }
+                if (type == ControlMessageType.MeshRtt)
+                {
+                    // WELCOME first, because the routes it carries are the thing being measured.
+                    if (!haveWelcome)
+                        throw new HandshakeException("host asked for a mesh measurement before sending WELCOME");
+                    RequireGeneration(ControlMessageType.MeshRtt, body, generation);
+                    var mesh = measureMesh != null
+                        ? measureMesh(hostUdpPort, peerRoutes)
+                        : LobbyMeshSample.None;
+                    channel.Send(ControlMessageType.MeshRtt, ControlMessageCodec.EncodeMeshRtt(
+                        generation, mesh.Rtt.MedianMs, mesh.Rtt.HighMs, mesh.MeasuredEdges, mesh.TotalEdges));
+                    continue;
+                }
+                if (type == ControlMessageType.InputDelay)
+                {
+                    if (!haveWelcome)
+                        throw new HandshakeException("host sent an input delay before WELCOME");
+                    // After READY this peer's driver is already built for a delay; a late change would
+                    // put it on a different timeline from everyone else, which is a desync, not a tweak.
+                    if (readySent)
+                        throw new HandshakeException("host changed the input delay after READY");
+                    if (!ControlMessageCodec.TryDecodeInputDelay(body, out var delayGeneration, out int finalDelay))
+                        throw new HandshakeException("host sent a malformed input delay");
+                    if (delayGeneration != generation)
+                        throw new HandshakeException(
+                            $"input delay generation mismatch: expected {generation}, got {delayGeneration}");
+                    delay = finalDelay;
                     continue;
                 }
                 if (type == ControlMessageType.Ready)

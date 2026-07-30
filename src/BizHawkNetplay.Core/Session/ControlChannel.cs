@@ -27,6 +27,11 @@ namespace BizHawkNetplay.Core.Session
         Pacing = 18,
         ResyncApplied = 19, // joiner -> host: authoritative state imported/rebuilt for this generation
         ResyncResume = 20,  // host -> joiner: every peer applied this generation; resume stepping
+        // Pre-GO mesh measurement. Host -> joiner carries the generation alone ("measure your UDP edges
+        // now"); joiner -> host carries the generation plus its worst edge. The host's own control links
+        // reach only the joiners, so without this round nobody ever measures a joiner-to-joiner edge.
+        MeshRtt = 21,
+        InputDelay = 22,    // host -> joiner: the authoritative delay, once every edge has reported
     }
 
     /// <summary>

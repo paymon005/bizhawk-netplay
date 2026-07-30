@@ -486,6 +486,101 @@ namespace BizHawkNetplay.Core.Tests
             }
         }
 
+        [Fact]
+        public void WorstRttStats_TakeEachPeersBestPathThenTheWorstPeer_AndReportCoverage()
+        {
+            var sender = MeshUdpTransport.Bind(0);
+            try
+            {
+                var fast = Loop(40001);
+                var backup = Loop(40002);
+                var other = Loop(40003);
+                var silent = Loop(40004);
+                sender.SetPeerRoutes(new[]
+                {
+                    new PeerRoute(1, new[] { fast, backup }),
+                    new PeerRoute(2, new[] { other }),
+                    new PeerRoute(3, new[] { silent }), // never answers
+                });
+
+                foreach (double sample in new double[] { 4, 5, 6, 20 }) sender.RecordRtt(fast, sample);
+                foreach (double sample in new double[] { 90, 91, 92, 300 }) sender.RecordRtt(backup, sample);
+                foreach (double sample in new double[] { 30, 31, 32, 120 }) sender.RecordRtt(other, sample);
+
+                Assert.True(sender.TryGetWorstRttStats(out double medianMs, out double highMs,
+                    out int measured, out int total));
+
+                // Peer 1 is reached over its BEST candidate (fast: median 5.5), so its slow sibling
+                // must not be what sizes the session; peer 2 is then the worst peer overall.
+                Assert.Equal(31.5, medianMs, 3);
+                Assert.Equal(120, highMs, 3);
+
+                // Peer 3 answered nothing. Counting it as measured would let an unpunched path read as
+                // a fast one — the figure is a lower bound and the counts are how the caller knows.
+                Assert.Equal(2, measured);
+                Assert.Equal(3, total);
+            }
+            finally { sender.Dispose(); }
+        }
+
+        [Fact]
+        public void RttBurst_MeasuresEveryEdgeBeforeAnyInputFlows()
+        {
+            var a = MeshUdpTransport.Bind(0);
+            var b = MeshUdpTransport.Bind(0);
+            var c = MeshUdpTransport.Bind(0);
+            try
+            {
+                a.SetPeers(new[] { Loop(b.LocalPort), Loop(c.LocalPort) });
+                b.SetPeers(new[] { Loop(a.LocalPort), Loop(c.LocalPort) });
+                c.SetPeers(new[] { Loop(a.LocalPort), Loop(b.LocalPort) });
+
+                // Every peer bursts at once, exactly as the lobby round does — an edge only opens when
+                // both of its ends are knocking.
+                a.BeginRttBurst(500);
+                b.BeginRttBurst(500);
+                c.BeginRttBurst(500);
+
+                WaitUntil(() => a.TryGetWorstRttStats(out _, out _, out int m, out int t) && m == t && t == 2,
+                    "the burst did not measure both of this peer's edges");
+
+                Assert.True(a.TryGetWorstRttStats(out double medianMs, out double highMs,
+                    out int measured, out int total));
+                Assert.Equal(2, measured);
+                Assert.Equal(2, total);
+                Assert.InRange(medianMs, 0, 500);
+                Assert.True(highMs >= medianMs, "the high-water mark can never sit below the median");
+
+                // Not one input datagram was sent: the measurement rides the punch/keepalive exchange,
+                // which is what makes it available before GO rather than after.
+                Assert.False(a.TryReceive(out _));
+            }
+            finally { a.Dispose(); b.Dispose(); c.Dispose(); }
+        }
+
+        [Fact]
+        public void RttBurst_StartsEachCandidatesSampleWindowOver()
+        {
+            var sender = MeshUdpTransport.Bind(0);
+            try
+            {
+                var peer = Loop(40010);
+                sender.SetPeerRoutes(new[] { new PeerRoute(1, new[] { peer }) });
+                foreach (double sample in new double[] { 500, 510, 520 }) sender.RecordRtt(peer, sample);
+                Assert.True(sender.TryGetRttStats(peer, out double before, out _));
+                Assert.Equal(510, before, 3);
+
+                // A lobby measurement must describe the link as it is now, not carry in whatever the
+                // punch loop happened to see while the session was still filling up.
+                sender.BeginRttBurst(0);
+                Assert.False(sender.TryGetRttStats(peer, out _, out _));
+                Assert.False(sender.TryGetWorstRttStats(out _, out _, out int measured, out int total));
+                Assert.Equal(0, measured);
+                Assert.Equal(1, total);
+            }
+            finally { sender.Dispose(); }
+        }
+
         private static void WaitUntil(Func<bool> condition, string message, int timeoutMs = 3000)
         {
             var sw = Stopwatch.StartNew();

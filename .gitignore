@@ -19,6 +19,9 @@
 .idea/
 *.dll.config
 
+# Claude Code scratch worktrees (the settings file next to it IS tracked)
+.claude/worktrees/
+
 # NuGet
 *.nupkg
 packages/

@@ -40,6 +40,12 @@ namespace BizHawkNetplay.Core.Net
 
         private const int PunchTickMs = 250;     // probe cadence while a candidate is unconfirmed
         private const int KeepaliveMs = 1000;    // re-probe cadence once a candidate is alive (holds the NAT mapping)
+        // Lobby-measurement cadence. The steady-state cadences above exist to hold NAT mappings open,
+        // not to characterize a link: at 250ms a one-second window yields four samples per edge, which
+        // is too few to separate a link's settled cost from its jitter. A short burst before GO buys a
+        // proper sample set on the path input will actually ride.
+        private const int BurstTickMs = 60;
+        private const int RttWindowSamples = 24; // ~1.4s of burst per candidate
         private const int AliveWindowMs = 8000;  // no traffic for this long => the path is considered down again
         // Send-path selection is stricter than plain liveness: with keepalive acks arriving at least
         // every ~1.25s on a healthy path (and input at frame rate on the active one), a candidate not
@@ -77,10 +83,61 @@ namespace BizHawkNetplay.Core.Net
                 _knownEndpoints.TryGetValue(endpoint, out known!);
         }
 
+        /// <summary>
+        /// A bounded ring of raw round-trip samples for one candidate, summarized the same way the
+        /// control-channel lobby probe summarizes its own: median for the settled cost, nearest-rank
+        /// 85th percentile for the high-water mark. Using the same statistic on both transports is what
+        /// makes a UDP reading and a TCP reading comparable enough to take the worst of.
+        /// </summary>
+        private sealed class RttWindow
+        {
+            private readonly double[] _samples = new double[RttWindowSamples];
+            private int _count;
+            private int _next;
+
+            public void Add(double sample)
+            {
+                lock (_samples)
+                {
+                    _samples[_next] = sample;
+                    _next = (_next + 1) % RttWindowSamples;
+                    if (_count < RttWindowSamples) _count++;
+                }
+            }
+
+            public bool TryDescribe(out double medianMs, out double highMs)
+            {
+                double[] sorted;
+                lock (_samples)
+                {
+                    if (_count == 0) { medianMs = 0; highMs = 0; return false; }
+                    sorted = new double[_count];
+                    Array.Copy(_samples, sorted, _count);
+                }
+                Array.Sort(sorted);
+                int middle = sorted.Length / 2;
+                medianMs = sorted.Length % 2 == 0
+                    ? (sorted[middle - 1] + sorted[middle]) / 2.0
+                    : sorted[middle];
+                int rank = (int)Math.Ceiling(0.85 * sorted.Length);
+                if (rank < 1) rank = 1;
+                if (rank > sorted.Length) rank = sorted.Length;
+                highMs = sorted[rank - 1];
+                if (highMs < medianMs) highMs = medianMs;
+                return true;
+            }
+        }
+
         // Per-candidate liveness: endpoint -> last time we heard anything back from it (stopwatch ms).
         private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new ConcurrentDictionary<IPEndPoint, long>();
         private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new ConcurrentDictionary<IPEndPoint, long>();
         private readonly ConcurrentDictionary<IPEndPoint, double> _rtt = new ConcurrentDictionary<IPEndPoint, double>();
+        // Raw sample window per candidate, kept alongside the EMA above. The EMA is what send-path
+        // selection wants (one smooth number); a delay decision wants the distribution, because what
+        // stalls a session is the worst packet rather than the typical one.
+        private readonly ConcurrentDictionary<IPEndPoint, RttWindow> _rttWindows =
+            new ConcurrentDictionary<IPEndPoint, RttWindow>();
+        private long _burstUntilMs = long.MinValue;
         // Last candidate input was actually sent through, per logical peer — the failover anchor
         // while a repunch has the liveness table cleared.
         private readonly ConcurrentDictionary<int, IPEndPoint> _lastSelected = new ConcurrentDictionary<int, IPEndPoint>();
@@ -177,6 +234,7 @@ namespace BizHawkNetplay.Core.Net
             foreach (var k in _alive.Keys.ToArray()) if (!keep.Contains(k)) _alive.TryRemove(k, out _);
             foreach (var k in _lastPunch.Keys.ToArray()) if (!keep.Contains(k)) _lastPunch.TryRemove(k, out _);
             foreach (var k in _rtt.Keys.ToArray()) if (!keep.Contains(k)) _rtt.TryRemove(k, out _);
+            foreach (var k in _rttWindows.Keys.ToArray()) if (!keep.Contains(k)) _rttWindows.TryRemove(k, out _);
             foreach (var kv in _lastSelected.ToArray()) if (!keep.Contains(kv.Value)) _lastSelected.TryRemove(kv.Key, out _);
         }
 
@@ -258,6 +316,74 @@ namespace BizHawkNetplay.Core.Net
         {
             // Same EMA shape as the control-channel ping, so the two readings are comparable.
             _rtt.AddOrUpdate(endpoint, sample, (_, prev) => 0.8 * prev + 0.2 * sample);
+            _rttWindows.GetOrAdd(endpoint, _ => new RttWindow()).Add(sample);
+        }
+
+        /// <summary>
+        /// Probe every candidate at <see cref="BurstTickMs"/> for the next <paramref name="durationMs"/>
+        /// and start each candidate's sample window over. Called once per peer in the lobby, before GO:
+        /// the resulting figures are the only measurement of the joiner-to-joiner edges that exists, and
+        /// they are taken on the UDP path rather than on the control link.
+        /// </summary>
+        public void BeginRttBurst(int durationMs)
+        {
+            if (durationMs < 0) throw new ArgumentOutOfRangeException(nameof(durationMs));
+            _rttWindows.Clear();
+            _lastPunch.Clear();   // probe on the very next tick rather than waiting out the keepalive
+            Interlocked.Exchange(ref _burstUntilMs, Clock.ElapsedMilliseconds + durationMs);
+        }
+
+        /// <summary>
+        /// Per-candidate view of the burst window: the settled round-trip and its high-water mark on
+        /// this exact path. False until at least one probe has been answered.
+        /// </summary>
+        public bool TryGetRttStats(IPEndPoint endpoint, out double medianMs, out double highMs)
+        {
+            medianMs = 0;
+            highMs = 0;
+            return endpoint != null
+                && _rttWindows.TryGetValue(endpoint, out var window)
+                && window.TryDescribe(out medianMs, out highMs);
+        }
+
+        /// <summary>
+        /// Aggregate the sample windows the way a session-wide input delay has to be chosen: per logical
+        /// peer take its best candidate (the path input would actually use), then take the worst median
+        /// and the worst high-water mark across peers — independently, because one delay has to cover
+        /// every edge on both counts even when the offenders are different peers.
+        ///
+        /// <paramref name="measuredRoutes"/>/<paramref name="totalRoutes"/> let the caller say how much
+        /// of the mesh the figure actually covers: a route whose punch never completed contributes
+        /// nothing, and silently averaging it away would be exactly the blind spot this exists to close.
+        /// </summary>
+        public bool TryGetWorstRttStats(out double medianMs, out double highMs,
+            out int measuredRoutes, out int totalRoutes)
+        {
+            medianMs = -1;
+            highMs = -1;
+            measuredRoutes = 0;
+            var routes = _routeTable.Routes;
+            totalRoutes = routes.Length;
+            foreach (var route in routes)
+            {
+                double bestMedian = double.MaxValue, bestHigh = 0;
+                bool measured = false;
+                foreach (var endpoint in route.Candidates)
+                {
+                    if (!TryGetRttStats(endpoint, out double candidateMedian, out double candidateHigh)) continue;
+                    if (!measured || candidateMedian < bestMedian)
+                    {
+                        bestMedian = candidateMedian;
+                        bestHigh = candidateHigh;
+                    }
+                    measured = true;
+                }
+                if (!measured) continue;
+                measuredRoutes++;
+                if (bestMedian > medianMs) medianMs = bestMedian;
+                if (bestHigh > highMs) highMs = bestHigh;
+            }
+            return measuredRoutes > 0;
         }
 
         private IPEndPoint? SelectSendCandidate(PeerRoute route, long now)
@@ -423,15 +549,18 @@ namespace BizHawkNetplay.Core.Net
         {
             while (_running)
             {
+                bool bursting = false;
                 try
                 {
                     long now = Clock.ElapsedMilliseconds;
+                    bursting = now < Interlocked.Read(ref _burstUntilMs);
                     var endpoints = _routeTable.Endpoints;
                     foreach (var p in endpoints)
                     {
                         bool alive = IsEndpointAlive(p);
-                        // Probe aggressively until confirmed, then just often enough to hold the mapping.
-                        int due = alive ? KeepaliveMs : PunchTickMs;
+                        // Probe aggressively until confirmed, then just often enough to hold the mapping —
+                        // unless a lobby measurement is in flight, which wants samples, not mappings.
+                        int due = bursting ? BurstTickMs : alive ? KeepaliveMs : PunchTickMs;
                         bool neverSent = !_lastPunch.TryGetValue(p, out var lastSent);
                         if (neverSent || now - lastSent >= due)
                         {
@@ -445,7 +574,7 @@ namespace BizHawkNetplay.Core.Net
                     }
                 }
                 catch { /* transient; keep the loop alive */ }
-                Thread.Sleep(PunchTickMs);
+                Thread.Sleep(bursting ? BurstTickMs : PunchTickMs);
             }
         }
 

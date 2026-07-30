@@ -123,5 +123,81 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x02 }, checksum[12..16]); // frame
             Assert.Equal(new byte[] { 0xAA, 0xBB, 0xCC, 0xDD }, checksum[16..20]); // hash
         }
+
+        [Fact]
+        public void MeshRtt_RoundTripsWithSubMillisecondResolution()
+        {
+            // A LAN mesh edge measures well under a millisecond. Rounding the report to whole
+            // milliseconds would turn every local edge into either 0 or 1 and make the delay
+            // decision blind precisely where it should be cheapest, so the wire carries microseconds.
+            var body = ControlMessageCodec.EncodeMeshRtt(Gen, medianMs: 0.375, highMs: 1.5,
+                measuredEdges: 2, totalEdges: 3);
+            Assert.Equal(ControlMessageCodec.MeshRttSize, body.Length);
+
+            Assert.True(ControlMessageCodec.TryDecodeMeshRtt(body, out var generation,
+                out double medianMs, out double highMs, out int measured, out int total));
+            Assert.Equal(Gen, generation);
+            Assert.Equal(0.375, medianMs, 3);
+            Assert.Equal(1.5, highMs, 3);
+            Assert.Equal(2, measured);
+            Assert.Equal(3, total);
+        }
+
+        [Fact]
+        public void MeshRtt_RejectsShapesThatWouldCorruptADelayDecision()
+        {
+            var body = ControlMessageCodec.EncodeMeshRtt(Gen, 12.0, 20.0, 1, 1);
+
+            Assert.False(ControlMessageCodec.TryDecodeMeshRtt(null!, out _, out _, out _, out _, out _));
+            Assert.False(ControlMessageCodec.TryDecodeMeshRtt(new byte[27], out _, out _, out _, out _, out _));
+            Assert.False(ControlMessageCodec.TryDecodeMeshRtt(new byte[29], out _, out _, out _, out _, out _));
+
+            // Negative microseconds would decode as a negative RTT and could only lower the delay.
+            var negative = (byte[])body.Clone();
+            negative[12] = 0xFF;
+            Assert.False(ControlMessageCodec.TryDecodeMeshRtt(negative, out _, out _, out _, out _, out _));
+
+            // More edges measured than exist is a peer overstating its own coverage.
+            var overCounted = ControlMessageCodec.EncodeMeshRtt(Gen, 1, 1, 1, 1);
+            overCounted[23] = 5;
+            Assert.False(ControlMessageCodec.TryDecodeMeshRtt(overCounted, out _, out _, out _, out _, out _));
+
+            // A high-water below the median is incoherent; clamp rather than report negative jitter.
+            var inverted = ControlMessageCodec.EncodeMeshRtt(Gen, 40.0, 40.0, 1, 1);
+            WriteBigEndian(inverted, 16, 1000); // high = 1ms, median stays 40ms
+            Assert.True(ControlMessageCodec.TryDecodeMeshRtt(inverted, out _, out double median,
+                out double high, out _, out _));
+            Assert.Equal(median, high, 3);
+        }
+
+        [Fact]
+        public void InputDelay_RoundTripsAndRefusesOutOfRangeValues()
+        {
+            var body = ControlMessageCodec.EncodeInputDelay(Gen, 7);
+            Assert.Equal(ControlMessageCodec.InputDelaySize, body.Length);
+            Assert.True(ControlMessageCodec.TryDecodeInputDelay(body, out var generation, out int delay));
+            Assert.Equal(Gen, generation);
+            Assert.Equal(7, delay);
+
+            Assert.Throws<ArgumentOutOfRangeException>(() => ControlMessageCodec.EncodeInputDelay(Gen, 0));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                ControlMessageCodec.EncodeInputDelay(Gen, HandshakeCodec.MaxInputDelay + 1));
+
+            // A peer-supplied delay outside the wire bound is refused, not clamped: the host and the
+            // joiner have to build their drivers on the SAME number, and a silently clamped one is a
+            // different number on each end.
+            var tooLarge = ControlMessageCodec.EncodeInputDelay(Gen, 1);
+            WriteBigEndian(tooLarge, 12, HandshakeCodec.MaxInputDelay + 1);
+            Assert.False(ControlMessageCodec.TryDecodeInputDelay(tooLarge, out _, out _));
+            Assert.False(ControlMessageCodec.TryDecodeInputDelay(new byte[15], out _, out _));
+        }
+
+        private static void WriteBigEndian(byte[] b, int offset, int value)
+        {
+            b[offset] = (byte)(value >> 24);
+            b[offset + 1] = (byte)(value >> 16);
+            b[offset + 2] = (byte)(value >> 8);
+            b[offset + 3] = (byte)value;
+        }
     }
 }

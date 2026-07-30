@@ -29,6 +29,12 @@ namespace BizHawkNetplay.Core.Session
         public const int ChecksumSize = 20;
         public const int ResyncBeginSize = 20;
         public const int GenerationSize = 12;
+        public const int MeshRttSize = 28;
+        public const int InputDelaySize = 16;
+
+        /// <summary>Round-trip figures above this are a broken clock, not a slow link, and must not be
+        /// allowed to buy input delay. Also bounds what a hostile peer can report.</summary>
+        public const double MaxMeshRttMs = 10_000;
 
         // ---- pacing -----------------------------------------------------------------
 
@@ -136,6 +142,81 @@ namespace BizHawkNetplay.Core.Session
             state = new byte[body.Length - GenerationSize];
             Buffer.BlockCopy(body, GenerationSize, state, 0, state.Length);
             return true;
+        }
+
+        // ---- pre-GO mesh measurement -------------------------------------------------
+
+        /// <summary>
+        /// A joiner's report of its worst UDP mesh edge: generation, median and high-water round-trip
+        /// (microseconds on the wire, so sub-millisecond LAN figures survive the trip), and how many of
+        /// its edges actually answered. The counts matter as much as the timings — a report covering
+        /// 1 of 3 edges is not the same claim as one covering 3 of 3, and the host says so in the log
+        /// rather than presenting a partial measurement as a complete one.
+        /// </summary>
+        public static byte[] EncodeMeshRtt(SessionGeneration generation, double medianMs, double highMs,
+            int measuredEdges, int totalEdges)
+        {
+            if (measuredEdges < 0 || totalEdges < 0 || measuredEdges > totalEdges)
+                throw new ArgumentOutOfRangeException(nameof(measuredEdges));
+            var body = new byte[MeshRttSize];
+            WriteGeneration(body, 0, generation);
+            WriteInt32(body, 12, ToMicros(medianMs));
+            WriteInt32(body, 16, ToMicros(highMs));
+            WriteInt32(body, 20, measuredEdges);
+            WriteInt32(body, 24, totalEdges);
+            return body;
+        }
+
+        public static bool TryDecodeMeshRtt(byte[] body, out SessionGeneration generation,
+            out double medianMs, out double highMs, out int measuredEdges, out int totalEdges)
+        {
+            generation = default;
+            medianMs = 0;
+            highMs = 0;
+            measuredEdges = 0;
+            totalEdges = 0;
+            if (body == null || body.Length != MeshRttSize || !TryReadGeneration(body, 0, out generation))
+                return false;
+            int medianMicros = ReadInt32(body, 12);
+            int highMicros = ReadInt32(body, 16);
+            measuredEdges = ReadInt32(body, 20);
+            totalEdges = ReadInt32(body, 24);
+            if (medianMicros < 0 || highMicros < 0 || measuredEdges < 0 || totalEdges < 0
+                || measuredEdges > totalEdges || totalEdges > HandshakeCodec.MaxPlayers)
+                return false;
+            medianMs = medianMicros / 1000.0;
+            highMs = highMicros / 1000.0;
+            if (medianMs > MaxMeshRttMs || highMs > MaxMeshRttMs) return false;
+            if (highMs < medianMs) highMs = medianMs;
+            return true;
+        }
+
+        /// <summary>The host's authoritative delay, sent after the mesh round and before READY.</summary>
+        public static byte[] EncodeInputDelay(SessionGeneration generation, int delay)
+        {
+            if (delay < 1 || delay > HandshakeCodec.MaxInputDelay)
+                throw new ArgumentOutOfRangeException(nameof(delay));
+            var body = new byte[InputDelaySize];
+            WriteGeneration(body, 0, generation);
+            WriteInt32(body, 12, delay);
+            return body;
+        }
+
+        public static bool TryDecodeInputDelay(byte[] body, out SessionGeneration generation, out int delay)
+        {
+            generation = default;
+            delay = 0;
+            if (body == null || body.Length != InputDelaySize || !TryReadGeneration(body, 0, out generation))
+                return false;
+            delay = ReadInt32(body, 12);
+            return delay >= 1 && delay <= HandshakeCodec.MaxInputDelay;
+        }
+
+        private static int ToMicros(double ms)
+        {
+            if (double.IsNaN(ms) || ms <= 0) return 0;
+            if (ms > MaxMeshRttMs) ms = MaxMeshRttMs;
+            return (int)Math.Round(ms * 1000.0);
         }
 
         /// <summary>Tolerant decode of a bare 12-byte generation body (READY/GO, resync ack/resume).</summary>

@@ -37,7 +37,9 @@ namespace BizHawkNetplay.Tool
         // domains too large to read whole. That value also crosses the wire, so the same rule applies:
         // a version bump turns a build mismatch into a clean refusal at the handshake instead of a
         // phantom desync every interval.
-        private const int Protocol = 11;
+        // 12: the lobby now measures every UDP mesh edge and the host publishes the settled delay in its
+        // own control frame (MeshRtt / InputDelay), which an older build neither sends nor expects.
+        private const int Protocol = 12;
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
@@ -266,6 +268,10 @@ namespace BizHawkNetplay.Tool
         // now needs the link's swing as well as its median (see LobbyDelayPolicy).
         private const int LobbyProbeSamples = 9;
         private const int LobbyProbeTimeoutMs = 5000;
+        // How long every peer bursts probes across its own UDP edges before GO. Long enough for both
+        // ends of a joiner-to-joiner path to punch through NAT and then leave a usable sample set,
+        // short enough to vanish into a lobby that already took seconds to ship a savestate.
+        private const int MeshProbeWindowMs = 1500;
         // How long a started punch keeps knocking. Long on purpose: the asymmetric flow means one
         // side starts minutes before the other finishes reading a text message.
         private const int PunchPatienceSeconds = 300;
@@ -1557,12 +1563,12 @@ namespace BizHawkNetplay.Tool
                     mode = allRollback ? SyncMode.Rollback : SyncMode.Lockstep;
                 }
 
+                double worstRttMs = -1;
+                double worstJitterMs = 0;
                 if (autoDelay)
                 {
                     UiConnLog($"measuring lobby ping ({LobbyProbeSamples} samples per player)…",
                         Color.DarkSlateBlue);
-                    double worstRttMs = -1;
-                    double worstJitterMs = 0;
                     foreach (var link in links)
                     {
                         if (!IsConnectionAttemptCurrent(attempt)) return;
@@ -1573,8 +1579,6 @@ namespace BizHawkNetplay.Tool
                         // worst of each even when they come from different players.
                         if (sample.JitterMs > worstJitterMs) worstJitterMs = sample.JitterMs;
                     }
-                    finalDelay = SelectLobbyDelay(finalDelay, autoDelayMax, mode, worstRttMs,
-                        lobbyFrameMs, simulatedOneWayMs, players, worstJitterMs);
                 }
 
                 // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
@@ -1583,12 +1587,29 @@ namespace BizHawkNetplay.Tool
                 // Trust the negotiated endpoints before asking clients to prepare their drivers: their
                 // pre-READY neutral windows can then queue instead of being rejected as foreign UDP.
                 _mesh!.SetPeerRoutes(RoutesExcept(links, null));
+                // WELCOME + state, but NOT the READY request: the routes WELCOME carries are what every
+                // joiner needs before it can punch and measure the edges this machine cannot see, and
+                // READY is the point of no return for the delay each driver gets built with.
                 foreach (var link in links)
                 {
                     ConfigureStateTransferTimeouts(link, state.Length);
-                    Handshake.HostSendWelcome(link.Control, link.RemotePort, players, finalDelay, mode, state,
+                    Handshake.HostSendStart(link.Control, link.RemotePort, players, finalDelay, mode, state,
                         generation, RoutesExcept(links, link));
                 }
+
+                if (autoDelay)
+                {
+                    MeasureLobbyMesh(links, generation, players, attempt, ref worstRttMs, ref worstJitterMs);
+                    finalDelay = SelectLobbyDelay(finalDelay, autoDelayMax, mode, worstRttMs,
+                        lobbyFrameMs, simulatedOneWayMs, players, worstJitterMs);
+                }
+                if (!IsConnectionAttemptCurrent(attempt)) return;
+
+                // Publish the settled figure before anyone builds a driver. Sent unconditionally, so the
+                // delay every peer runs is one number decided in one place rather than each end's own
+                // reading of WELCOME.
+                foreach (var link in links) Handshake.HostSendInputDelay(link.Control, generation, finalDelay);
+                foreach (var link in links) Handshake.HostRequestReady(link.Control, generation);
 
                 // Nobody is released while the host is still synchronously shipping a large state to
                 // another joiner. Once every control link acknowledges that all start data arrived,
@@ -1670,6 +1691,98 @@ namespace BizHawkNetplay.Tool
             greetings.Add(greet);
             UiConnLog($"P{assignedPort + 1} joined via UDP punch from {admission.Endpoint.Address} " +
                       $"({links.Count}/{need})", Color.DarkGreen);
+        }
+
+        /// <summary>
+        /// The mesh round, run between WELCOME and READY. Every peer bursts probes across its own UDP
+        /// edges at the same moment, each joiner reports its worst, and the figures fold into the same
+        /// worst-median / worst-jitter pair the control-link probe produced.
+        ///
+        /// This exists because the host's own links are a star: on a 4-player session it can reach 3 of
+        /// the mesh's 6 edges, and only over TCP. A slow or jittery joiner-to-joiner path was invisible
+        /// to the delay decision, which is exactly the path that then stalls lockstep or deepens every
+        /// rollback repair — and it was invisible in the one topology where it matters most.
+        /// </summary>
+        private void MeasureLobbyMesh(List<PeerLink> links, SessionGeneration generation, int players,
+            int attempt, ref double worstRttMs, ref double worstJitterMs)
+        {
+            var mesh = _mesh;
+            if (mesh == null || links.Count == 0) return;
+
+            UiConnLog($"measuring the {players}-player UDP mesh directly ({MeshProbeWindowMs}ms)…",
+                Color.DarkSlateBlue);
+            // Everyone bursts at once: a joiner-to-joiner edge only opens when both ends are knocking,
+            // so the host's own burst and the requests below have to overlap, not queue.
+            mesh.BeginRttBurst(MeshProbeWindowMs);
+            foreach (var link in links) Handshake.HostRequestMeshRtt(link.Control, generation);
+
+            int measuredEdges = 0, totalEdges = 0;
+            foreach (var link in links)
+            {
+                if (!IsConnectionAttemptCurrent(attempt)) return;
+                var report = Handshake.HostWaitMeshRtt(link.Control, generation);
+                totalEdges += report.TotalEdges;
+                measuredEdges += report.MeasuredEdges;
+                if (!report.HasMeasurement)
+                {
+                    UiConnLog($"{link.Label} could not measure any of its {report.TotalEdges} UDP edge(s) — " +
+                              "its direct paths have not opened yet, so the delay below covers only the " +
+                              "edges that did answer.", Color.DarkOrange);
+                    continue;
+                }
+                Fold(report.Rtt, ref worstRttMs, ref worstJitterMs);
+            }
+
+            // The host's own edges, on UDP this time. Its burst ran while it was blocked above.
+            if (mesh.TryGetWorstRttStats(out double hostMedianMs, out double hostHighMs,
+                    out int hostMeasured, out int hostTotal))
+            {
+                measuredEdges += hostMeasured;
+                totalEdges += hostTotal;
+                Fold(new LobbyRttSample(hostMedianMs, hostHighMs), ref worstRttMs, ref worstJitterMs);
+            }
+            else totalEdges += links.Count;
+
+            // Each edge is measured from both ends, so the mesh's 6 logical edges arrive as 12 reports.
+            // Say what was covered rather than implying the whole mesh was.
+            if (measuredEdges >= totalEdges && totalEdges > 0)
+                UiConnLog($"mesh measured: all {totalEdges} direct path(s) answered.", Color.DarkGreen);
+            else
+                UiConnLog($"mesh measured: {measuredEdges} of {totalEdges} direct path(s) answered — the " +
+                          "delay below is a lower bound, and a path that opens later may need more.",
+                    Color.DarkOrange);
+
+            static void Fold(LobbyRttSample sample, ref double rtt, ref double jitter)
+            {
+                if (sample.MedianMs > rtt) rtt = sample.MedianMs;
+                if (sample.JitterMs > jitter) jitter = sample.JitterMs;
+            }
+        }
+
+        /// <summary>
+        /// Joiner half of the mesh round: point the mesh at the host and every other joiner, burst
+        /// probes over those paths, and report the worst edge back. Installing the routes here rather
+        /// than at READY is what gives the punch time to complete before anyone commits to a delay;
+        /// the same set is installed again by <see cref="ApplyJoinerMesh"/> a moment later, which
+        /// leaves the confirmations and samples taken here intact.
+        /// </summary>
+        private LobbyMeshSample MeasureJoinerMesh(IPAddress hostIp, int hostUdpPort,
+            IReadOnlyList<PeerRoute> peerRoutes)
+        {
+            var mesh = _mesh;
+            if (mesh == null) return LobbyMeshSample.None;
+
+            var routes = new List<PeerRoute> { new PeerRoute(0, new[] { new IPEndPoint(hostIp, hostUdpPort) }) };
+            routes.AddRange(peerRoutes);
+            try { mesh.SetPeerRoutes(routes); }
+            catch { return LobbyMeshSample.None; }
+
+            mesh.BeginRttBurst(MeshProbeWindowMs);
+            Thread.Sleep(MeshProbeWindowMs);
+            if (!mesh.TryGetWorstRttStats(out double medianMs, out double highMs,
+                    out int measuredRoutes, out int totalRoutes))
+                return new LobbyMeshSample(default, 0, routes.Count);
+            return new LobbyMeshSample(new LobbyRttSample(medianMs, highMs), measuredRoutes, totalRoutes);
         }
 
         /// <summary>Lobby RTT probe with the deadline on whichever pipe the link actually uses.</summary>
@@ -1804,6 +1917,19 @@ namespace BizHawkNetplay.Tool
                             UiConnLog("connected and authenticated — waiting for the host to fill the " +
                                       "lobby and start. This can take a while in a 3-4 player session; " +
                                       "Disconnect still cancels.", Color.DarkGreen);
+                        }, measureMesh: (hostUdpPort, peerRoutes) =>
+                        {
+                            UiConnLog($"measuring my {peerRoutes.Count + 1} direct UDP path(s) " +
+                                      $"({MeshProbeWindowMs}ms)…", Color.DarkSlateBlue);
+                            var sample = MeasureJoinerMesh(remoteIp, hostUdpPort, peerRoutes);
+                            UiConnLog(sample.HasMeasurement
+                                ? $"my worst direct path: ~{sample.Rtt.MedianMs:F0}ms " +
+                                  $"(±{sample.Rtt.JitterMs:F0}ms), {sample.MeasuredEdges}/{sample.TotalEdges} " +
+                                  "path(s) answered"
+                                : $"none of my {sample.TotalEdges} direct path(s) answered in time — the host " +
+                                  "will size the delay from the paths that did",
+                                sample.IsComplete ? Color.DarkGreen : Color.DarkOrange);
+                            return sample;
                         });
                     }
                     catch (Exception ex) when (greetDeadline.Expired)
@@ -3171,7 +3297,7 @@ namespace BizHawkNetplay.Tool
                 ? $"; explicit floor {manualFloor} remains above the automatic max"
                 : $"; manual floor {manualFloor}, max {automaticMaximum}";
             string meshNote = players > 2
-                ? " Host-to-player lobby links were measured; direct joiner-to-joiner paths can differ."
+                ? " Figure covers every direct UDP path, joiner-to-joiner included, not just this host's links."
                 : "";
 
             UiConnLog($"Auto delay: worst lobby RTT ~{effectiveRttMs:F0}ms{simulated}{jitter} → " +
