@@ -136,6 +136,8 @@ So: high `stall%` is a network or peer-speed problem, low `stall%` with fps unde
 
 That last one is a ceiling on everything else: a frame is presented at most once per timer callback, so if the tick rate falls below the console's frame rate the picture judders however fast the core runs. It should sit comfortably above 60.
 
+**Sim latency** (Diagnostics tab) delays inbound UDP so rollback can be exercised without a second machine — but it delays only what *that* instance receives. Setting it on the joiners alone leaves the host with input arriving instantly, so the host never mispredicts and logs `rollbacks 0` while the joiners roll back normally. **Set it on every instance, host included**, or you are testing one direction of one machine. The lobby's auto-delay only folds in the sim value of the machine it is running on, so a joiner's setting is invisible to the delay the host chooses — a session run this way will start at the delay the real (0ms) loopback deserves, which is the point if you want to see rollback work hard, and the wrong thing if you meant to test auto-delay.
+
 On connect the tool verifies ROM/core/version/sync-settings/layout match (refusing with a reason otherwise), transfers the host's savestate so both sims start identical, then runs. It trades memory-hash checksums every 300 frames (~5s) and, on a mismatch, resyncs everyone from the host's authoritative state (saving the diverged state to quick-slot 10 for inspection) rather than ending.
 
 **Frame-driving model:** the tool pauses EmuHawk and steps the core exactly one confirmed frame per timer tick with only the merged network inputs — it *owns the clock* rather than fighting EmuHawk's own loop (which pausing would silence). This is what makes lockstep stalls safe, and it keeps input capture entirely out of the emulation path so both peers stay deterministic. Under load it renders only the last frame of a catch-up burst (Dolphin-style frame-skip) to keep heavy cores responsive.
@@ -234,11 +236,13 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
   for playing with people you trust; not a hostile-network guarantee.
 - **The session password** is verified by a nonce challenge-response (`SessionAuth`): the password is never sent (not even hashed), a captured proof can't be replayed to another session, and role-tagging blocks a reflection attack. An empty password means an open session. A refused joiner (wrong password, wrong ROM/core, a HELLO that never arrives) only loses its own connection — the host logs it and keeps listening, so a typo doesn't cost you the lobby. Still not a fortress — it's a shared secret over a plaintext control channel with no forward secrecy — but it's a real gate, not an echo-able hash.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
-- **Symmetric NAT is untested** over a real internet path. So is **rollback above 2 players** — it is
-  implemented and simulated (four peers, asymmetric per-edge latency, loss, reordering and clock
-  skew), not played. 4-player **lockstep** was verified on hardware in July 2025; nothing since,
-  including every performance decision in the tool, has been measured above 2 players. See
-  `KNOWN-ISSUES.md` KI-11. Everything below the socket layer is unit-tested.
+- **Symmetric NAT is untested** over a real internet path, and so is anything above 2 players **on
+  separate machines**. 4-player lockstep was verified on hardware in July 2025; 4-player rollback was
+  measured in July 2026 on four instances of one machine, where it absorbed a simulated 400ms
+  round-trip at input delay 2 without stalling and hit its ring cap at 600ms. What that leaves open
+  is four *separate* machines, a heavy core (a repair there costs ~10x what it does on SNES), and a
+  real internet path. Numbers and caveats in `KNOWN-ISSUES.md` KI-11. Everything below the socket
+  layer is unit-tested.
 
 ## License
 

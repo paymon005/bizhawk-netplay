@@ -16,32 +16,43 @@ rejoin) before trusting them; rollback with 3+ players and symmetric NAT remain 
 punch, lobby RTT probe, and auto-delay (4) all worked; the session then hit the mutual soft-cap
 freeze fixed in v0.10.2 (see Fixed below). Retest on v0.10.2.
 
-**KI-11 (validation) — no 4-player session has been *measured*, and none at all on this build.**
-4-player **lockstep** was verified working on hardware in July 2025, so the N-player path is not
-untried. What has never happened is a 4-player session anyone took numbers from: every performance
-decision in this tool — the tick budget, the repair budget, keyframe spacing, the savestate pool
-sizing — was measured on 2-player Genesis. Four players is a different shape: six mesh edges instead
-of one, three remote ports to predict instead of one, three times the input traffic per peer, and a
-correction from any of them rolls everyone back. Rollback above 2 players has never been played at
-all, on any build.
+**KI-11 (validation) — 4-player rollback is measured, but on one machine.**
+4-player **lockstep** was verified on hardware in July 2025. As of 2026-07-30 v0.20.0, 4-player
+**rollback** has been run and measured too — four EmuHawk instances on one machine, Snes9x, PAL
+(20ms frame period), delay 2, with simulated one-way UDP latency raised across five runs. Numbers
+from the joiner side, since sim latency only delays what the instance it is set on *receives*:
 
-Simulation now covers four peers on an asymmetric, lossy, reordering, clock-skewed mesh
-(`MultiPlayerRollbackTests`), including the 4-player form of the mutual soft-cap freeze fixed in
-v0.10.2 — but a simulated core costs nothing to save, load or re-simulate, and a real one costs
-everything. That is the gap, and only hardware closes it.
+| sim one-way (RTT) | max rollback depth | worst repair | repairs >5ms | stall | fps (target 50) |
+|---|---|---|---|---|---|
+| 50ms (100ms) | 3 | 2.1–4.5ms | 0 | 0% | 48–52 |
+| 100ms (200ms) | 6 | 2.4–5.6ms | 0–2 | 0% | 48–52 |
+| 150ms (300ms) | 10 | 4.5–6.4ms | 1–7 | 0–4% | 47–51 |
+| 200ms (400ms) | 11 | 4.7–7.3ms | 0–10 | 0% | 49–51 |
+| 300ms (600ms) | 17 | 8.4–10.1ms | 2–9 | 74–90%, then 0–7% | 24–51 |
 
-*What to read off one deliberate 4-player session (SNES is the near-term target):*
-- **`mesh measured: X of Y direct path(s) answered`** in the connection log, at start. Anything short
-  of X = Y means the delay figure below it covers only part of the mesh — and on a real internet path
-  that is the joiner-to-joiner edges, which are exactly the ones nothing else can see.
-- **The `Auto delay` line** — whether the delay it picked is above what the host's own links alone
-  would have suggested. If it isn't, the mesh round found nothing and the feature is a no-op.
-- **`stall N%`** per peer. High on one peer only means that peer's worst edge; high on everyone means
-  the delay is under-covering the link.
-- **Rollback depth and `present N`** on the two heaviest machines. Four players means more frequent
-  corrections at the same depth — this is where a simulated core and a real one diverge most.
-- Whether the **checksum agreement** line appears at all with Verbose on (it is the input to the
-  systematic-mismatch advisory, which was misfiring before this build).
+**Rollback absorbed 400ms round-trip at input delay 2** — worst single repair ~7ms against a 20ms
+budget, no stalling, full framerate, while re-simulating up to ~110 frames a second. It was
+described as feeling fine throughout. At 600ms it stops absorbing: depth reaches the 16-frame ring
+cap, `stalling — waiting for remote input` appears, and the session runs on the hard cap. That is
+the designed behaviour and the log names it; delay 2 is simply not viable at 600ms (the tool's own
+advice asked for 17). Checksums agreed across all runs.
+
+*What that does and does not settle.* It settles that the sync layer, the repair loop and the
+savestate pool hold up at four players on a light core, well past any plausible internet link. It
+does not settle: four **separate machines** (this was one CPU, one GPU, one scheduler, and a
+loopback mesh with no NAT); a **heavy core**, where a repair costs 6-9ms per frame instead of 0.6
+and the same depths would be an order of magnitude dearer; or four players over a **real internet
+path**, where the joiner-to-joiner edges are the ones nothing else can measure.
+
+*What to read off a four-machine session when one happens:*
+- **`mesh measured: X of Y direct path(s) answered`** at start. Anything short of X = Y means the
+  delay below it covers only part of the mesh — on a real path that is the joiner-to-joiner edges.
+- **The `Auto delay` line** — whether it picked above what the host's own links alone would suggest.
+  If not, the mesh round found nothing and the feature is a no-op on that network.
+- **`stall N%`** per peer. High on one peer means that peer's worst edge; high on everyone means the
+  delay is under-covering the link.
+- **Rollback depth and gate cost** on the two heaviest machines. This is where a light core and a
+  heavy one diverge most.
 
 ## Fixed (2026-07-27, v0.11.3)
 
