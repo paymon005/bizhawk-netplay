@@ -1,0 +1,16 @@
+# Commits that changed formatting only. `git blame` skips these so it reports the commit that last
+# said something about a line, rather than the sweep that reindented it.
+#
+# Local:  git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub: honoured automatically for a file at this path.
+#
+# Full 40-character SHAs are required; abbreviations are rejected. Only add a commit here if it is
+# provably mechanical — the namespace sweep was verified to change nothing but namespace
+# declarations and braces once whitespace is ignored.
+
+# C# 12 sweep 1/3: file-scoped namespaces (108 files)
+f79e234d50765e92fa59acdee3e59303798e9346
+# C# 12 sweep 2/3: implicit object creation (47 files)
+3dfbf16fef62b83158c0571cb341758f86c45779
+# C# 12 sweep 3/3: collection expressions (29 files)
+c5d3564cef3b820a0ef00cf426c1d1edd5d750a8

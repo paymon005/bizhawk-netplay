@@ -86,7 +86,11 @@ tests/
 
 ## Building
 
-Prereqs: .NET SDK (5.0+) and the .NET Framework 4.8 targeting pack. The tool compiles against a local BizHawk install; point `BizHawkHome` at yours if it differs from the default in [Directory.Build.props](Directory.Build.props):
+Prereqs: the **.NET 10 SDK** and the .NET Framework 4.8 targeting pack. The SDK major matters — the
+test project targets `net10.0`, so an older SDK fails with `NETSDK1045` before it compiles anything.
+Core stays `netstandard2.0` and the Tool stays `net48` regardless; only the tests target a runtime.
+The tool compiles against a local BizHawk install; point `BizHawkHome` at yours if it differs from
+the default in [Directory.Build.props](Directory.Build.props):
 
 ```sh
 # Core + tests (no BizHawk needed)
