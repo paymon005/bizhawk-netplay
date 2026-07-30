@@ -30,6 +30,13 @@ namespace BizHawkNetplay.Core.Sync
         private readonly ISyncStrategy _strategy;
         private readonly InputSerializer[] _serializers;
         private readonly InputPacketCodec _codec;
+
+        /// <summary>
+        /// The wire codec, exposed so a session can report WHY input stopped arriving. "No UDP input
+        /// from P3" and "P3's packets are arriving and being thrown away" are indistinguishable from
+        /// the outside, need opposite fixes, and the second one used to leave no trace at all.
+        /// </summary>
+        public InputPacketCodec Codec => _codec;
         private readonly SessionGeneration _generation;
 
         private readonly int _localPort;

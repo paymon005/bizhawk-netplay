@@ -1786,6 +1786,15 @@ namespace BizHawkNetplay.Tool
                             try { tcp.ReceiveTimeout = 0; } catch { }
                             channel.BodyReadTimeoutMs = len =>
                                 StateTransferBudget.SocketTimeoutMs(len, HandshakeReceiveTimeoutMs);
+
+                            // Say so. Everything above this point is the only part of joining that has a
+                            // deadline; from here the wait is deliberately unbounded because the host may
+                            // still be short a player. A joiner was given no signal at all that its
+                            // connection had succeeded, so a perfectly healthy 3-player lobby looked
+                            // identical to a failed connect for however long the last slot took to fill.
+                            UiConnLog("connected and authenticated — waiting for the host to fill the " +
+                                      "lobby and start. This can take a while in a 3-4 player session; " +
+                                      "Disconnect still cancels.", Color.DarkGreen);
                         });
                     }
                     catch (Exception ex) when (greetDeadline.Expired)
@@ -2936,11 +2945,40 @@ namespace BizHawkNetplay.Tool
                 if (!_udpWarningActive)
                 {
                     _udpWarningActive = true;
-                    Log($"no UDP input from P{port + 1} for {seconds:F1}s — re-punching the input path");
+                    Log($"no UDP input from P{port + 1} for {seconds:F1}s — re-punching the input path" +
+                        RejectionNote());
                 }
             }
             if (seconds >= UdpLostAfterSeconds)
-                EndSession($"UDP input path lost for P{port + 1} ({seconds:F0}s without input; control link was still alive)");
+                EndSession($"UDP input path lost for P{port + 1} ({seconds:F0}s without input; " +
+                           $"control link was still alive){RejectionNote()}");
+        }
+
+        /// <summary>
+        /// If input datagrams are being refused on arrival, say so and say why — otherwise "".
+        ///
+        /// Appended to the UDP-silence warnings because those two situations are indistinguishable from
+        /// the chair and need opposite fixes. A 3-player NES session reported "no UDP input from P3" and
+        /// then dropped the session for a lost UDP path, twice, with the two joiners swapping slots in
+        /// between — so it was the third PORT failing, not either person's network, and the packets were
+        /// arriving all along and being discarded for a size disagreement. Nothing in the log could have
+        /// told anyone that.
+        /// </summary>
+        private string RejectionNote()
+        {
+            var codec = _driver?.Codec;
+            if (codec == null || codec.RejectedTotal == 0) return "";
+
+            string detail = codec.LastSizeMismatchPort >= 0
+                ? $" — P{codec.LastSizeMismatchPort + 1}'s input is {codec.LastSizeMismatchObserved} byte(s) " +
+                  $"per frame, this machine expects {codec.LastSizeMismatchExpected} for that port, so the " +
+                  "controller/peripheral configuration differs between you (on NES/SNES check the multitap " +
+                  "or Four Score setting on every machine, then reconnect)"
+                : "";
+            return $" — NOTE: {codec.RejectedTotal} input packet(s) arrived and were REFUSED " +
+                   $"(gen {codec.RejectedGeneration}, port {codec.RejectedUnknownPort}, " +
+                   $"size {codec.RejectedPayloadSize}, malformed {codec.RejectedMalformed}){detail}. " +
+                   "This is not a network fault — the packets are getting through.";
         }
 
         private void MaybeSendChecksum()

@@ -137,5 +137,68 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(FrameStep.Stalled, driver.OnPreFrame());
             Assert.Equal(staleFrame, driver.CurrentFrame);
         }
+
+        /// <summary>
+        /// A refused input packet must leave evidence naming the port and both sizes.
+        ///
+        /// A 3-player NES session failed twice with "no UDP input from P3", dropping the session for a
+        /// lost UDP path — while the two joiners swapped slots between attempts, so it was the third
+        /// PORT failing rather than either person's network. The packets were arriving the whole time
+        /// and being discarded for a payload-size disagreement, and the drop was a bare `return false`
+        /// with no counter behind it, so nothing in any log could have said so.
+        /// </summary>
+        [Fact]
+        public void Decode_ReportsThePortAndBothSizesWhenAPeerDisagreesOnPayloadSize()
+        {
+            var generation = new SessionGeneration(0x5151515151515151UL, 3);
+
+            // Sender's port 2 serializes 3 bytes per frame (say, a multitap layout); the receiver
+            // computes 1 for that port because its peripheral configuration differs.
+            var sender = new InputPacketCodec(new[] { 1, 1, 3 }, generation);
+            var receiver = new InputPacketCodec(new[] { 1, 1, 1 }, generation);
+
+            var packet = sender.EncodeInput(2, new[]
+            {
+                new KeyValuePair<int, byte[]>(10, new byte[] { 1, 2, 3 }),
+                new KeyValuePair<int, byte[]>(11, new byte[] { 4, 5, 6 }),
+            });
+
+            Assert.False(receiver.TryDecodeInput(packet, out var frames));
+            Assert.Empty(frames);
+
+            // The point of the test: the refusal is attributable, not silent.
+            Assert.Equal(1, receiver.RejectedPayloadSize);
+            Assert.Equal(1, receiver.RejectedTotal);
+            Assert.Equal(2, receiver.LastSizeMismatchPort);
+            Assert.Equal(1, receiver.LastSizeMismatchExpected);
+            Assert.Equal(3, receiver.LastSizeMismatchObserved);
+
+            // A matching peer is unaffected and counts nothing.
+            var agreeing = new InputPacketCodec(new[] { 1, 1, 3 }, generation);
+            Assert.True(agreeing.TryDecodeInput(packet, out var ok));
+            Assert.Equal(2, ok.Count);
+            Assert.Equal(0, agreeing.RejectedTotal);
+        }
+
+        /// <summary>
+        /// A gap request is not an input packet and must not be counted as a refusal — otherwise the
+        /// rejection counters would read non-zero on every healthy session and mean nothing.
+        /// </summary>
+        [Fact]
+        public void Decode_DoesNotCountRequestsOrForeignGenerationsAsTheSameThing()
+        {
+            var generation = new SessionGeneration(0x2727272727272727UL, 1);
+            var codec = new InputPacketCodec(new[] { 1, 1 }, generation);
+
+            Assert.False(codec.TryDecodeInput(codec.EncodeRequest(1, 42), out _));
+            Assert.Equal(0, codec.RejectedTotal);   // a request is not a refusal
+
+            var foreign = new InputPacketCodec(new[] { 1, 1 }, generation.Next());
+            var stale = foreign.EncodeInput(1, new[] { new KeyValuePair<int, byte[]>(5, new byte[] { 9 }) });
+            Assert.False(codec.TryDecodeInput(stale, out _));
+            Assert.Equal(1, codec.RejectedGeneration);
+            Assert.Equal(0, codec.RejectedPayloadSize);
+            Assert.Equal(-1, codec.LastSizeMismatchPort);  // no size disagreement to report
+        }
     }
 }
