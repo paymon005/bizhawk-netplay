@@ -27,10 +27,18 @@ namespace BizHawkNetplay.Core.Session
     /// "AwaitingReconnect" as alternatives would have been unable to express the one case that matters
     /// most, which is exactly what a session-state enum proposed for this code did.
     ///
-    /// The two flags a peer thread reads stay <c>volatile</c>, and the properties over them are
-    /// therefore volatile reads. Composite questions like <see cref="IsPlaying"/> read them one after
-    /// another and are not atomic — as the hand-written version was not — so they answer "was this
-    /// true a moment ago", which is all any caller on another thread can act on anyway.
+    /// <b>Single writer.</b> Every mutating method here must be called from the UI thread, which is
+    /// where the form has always maintained these flags. The two that peer threads READ stay
+    /// <c>volatile</c>, and the properties over them are therefore volatile reads — but nothing here
+    /// is interlocked, so <see cref="TryQueueResume"/> is a check-then-set that is only atomic by
+    /// virtue of that single writer, not by its own construction. Composite questions like
+    /// <see cref="IsPlaying"/> read two flags in sequence and are likewise not atomic, so off-thread
+    /// they answer "was this true a moment ago" — which is all a reader on another thread could act
+    /// on anyway, and is exactly what the four booleans offered before.
+    ///
+    /// The transitions refuse impossible states rather than trusting callers to check first. Every
+    /// caller does check today, so the guards change nothing now; they exist because the whole point
+    /// of naming these transitions was to stop the next one from having to know the rules.
     /// </summary>
     public sealed class SessionPhase
     {
@@ -82,6 +90,7 @@ namespace BizHawkNetplay.Core.Session
         /// </summary>
         public bool BeginRebuild(RebuildReason reason)
         {
+            if (!_active) return false;   // nothing to rebuild before GO or after the session ends
             if (reason == RebuildReason.None) return false;
             if (IsRebuilding) return false;
             _rebuild = reason;
@@ -96,16 +105,28 @@ namespace BizHawkNetplay.Core.Session
             _resumeQueued = false;
         }
 
-        /// <summary>Mark the resume as sent, so it is sent once. Returns false if it already was.</summary>
+        /// <summary>
+        /// Mark the resume as sent, so it is sent once. Returns false if it already was, or if no
+        /// rebuild is in flight to resume from.
+        ///
+        /// That second condition is not merely defensive. Both call sites fire when a peer reports it
+        /// applied the new baseline, and a report arriving after the rebuild already ended would find
+        /// the queue flag cleared by <see cref="EndRebuild"/>, the generation unchanged, and would
+        /// therefore put a second RESUME on the wire for a session that had already resumed.
+        /// </summary>
         public bool TryQueueResume()
         {
+            if (!IsRebuilding) return false;
             if (_resumeQueued) return false;
             _resumeQueued = true;
             return true;
         }
 
-        /// <summary>A seat is empty; hold it.</summary>
-        public void BeginAwaitingRejoin() => _awaitingRejoin = true;
+        /// <summary>A seat is empty; hold it. Only meaningful inside a session.</summary>
+        public void BeginAwaitingRejoin()
+        {
+            if (_active) _awaitingRejoin = true;
+        }
 
         /// <summary>The seat is filled, or the wait was given up on.</summary>
         public void EndAwaitingRejoin() => _awaitingRejoin = false;

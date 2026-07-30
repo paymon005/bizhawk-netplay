@@ -168,6 +168,45 @@ namespace BizHawkNetplay.Core.Tests
         }
 
         [Fact]
+        public void NothingRebuildsOrHoldsASeatOutsideASession()
+        {
+            // Before GO and after the session ends there is no timeline to rebuild and no seat to
+            // hold. Every caller checks this today; the type checking it is what stops the next one
+            // from having to.
+            var p = new SessionPhase();
+
+            Assert.False(p.BeginRebuild(RebuildReason.Desync));
+            p.BeginAwaitingRejoin();
+            Assert.False(p.IsRebuilding);
+            Assert.False(p.AwaitingRejoin);
+
+            p.Start();
+            p.BeginRebuild(RebuildReason.Desync);
+            p.Stop();
+
+            Assert.False(p.BeginRebuild(RebuildReason.PeerLoss));
+            p.BeginAwaitingRejoin();
+            Assert.False(p.IsRebuilding);
+            Assert.False(p.AwaitingRejoin);
+        }
+
+        [Fact]
+        public void ALateAppliedReportCannotResumeATwiceResumedSession()
+        {
+            // Both callers fire when a peer reports it applied the baseline. One arriving after the
+            // rebuild ended finds the queue flag cleared and the generation unchanged, so without this
+            // it would put a second RESUME on the wire for a session that already resumed.
+            var p = new SessionPhase();
+            p.Start();
+            p.BeginRebuild(RebuildReason.Desync);
+            Assert.True(p.TryQueueResume());
+            p.EndRebuild();
+
+            Assert.False(p.TryQueueResume());
+            Assert.False(p.ResumeQueued);
+        }
+
+        [Fact]
         public void AwaitingARejoinAloneStopsPlayWithoutClaimingARebuild()
         {
             // A joiner waiting to be let back in is held, but nothing is being rebuilt for it yet.
