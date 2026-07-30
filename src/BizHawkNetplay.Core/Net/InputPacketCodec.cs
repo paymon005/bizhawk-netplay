@@ -46,6 +46,36 @@ namespace BizHawkNetplay.Core.Net
         public SessionGeneration Generation => _generation;
 
         /// <summary>
+        /// Input datagrams thrown away, by reason. A rejected input packet used to vanish without a
+        /// trace: <c>TryDecodeInput</c> returned false and the receive loop simply moved on. That made
+        /// a whole class of failure undiagnosable from a log — a 3-player NES session where every packet
+        /// from the third port was discarded on arrival read exactly like a network problem ("no UDP
+        /// input from P3"), while the UDP path had opened and the packets were in fact arriving.
+        ///
+        /// A datagram that is not an input packet at all is NOT counted here; those are gap requests
+        /// and are handled by the caller. These count only packets that claimed to be input and were
+        /// then refused.
+        /// </summary>
+        public long RejectedGeneration { get; private set; }
+        public long RejectedUnknownPort { get; private set; }
+        public long RejectedPayloadSize { get; private set; }
+        public long RejectedMalformed { get; private set; }
+
+        /// <summary>Total input datagrams refused, for a cheap "is anything being dropped" check.</summary>
+        public long RejectedTotal =>
+            RejectedGeneration + RejectedUnknownPort + RejectedPayloadSize + RejectedMalformed;
+
+        /// <summary>
+        /// The last size disagreement observed, as (port, expected, observed) — the payload size this
+        /// machine computes for that port against the one the sender evidently used. Non-zero expected
+        /// means a peer is running a different controller/peripheral configuration for that port, which
+        /// no amount of network diagnosis will fix, so it is worth naming exactly.
+        /// </summary>
+        public int LastSizeMismatchPort { get; private set; } = -1;
+        public int LastSizeMismatchExpected { get; private set; }
+        public int LastSizeMismatchObserved { get; private set; }
+
+        /// <summary>
         /// Encode a contiguous, ascending window of (frame, payload) for one port. Frames must be
         /// consecutive; payloads must match the port's fixed size.
         /// </summary>
@@ -88,17 +118,37 @@ namespace BizHawkNetplay.Core.Net
         {
             frames = new List<InputFrame>();
             if (datagram == null || datagram.Length < HeaderSize) return false;
-            if (datagram[0] != TypeInput) return false;
+            if (datagram[0] != TypeInput) return false;   // a request, not ours to refuse — see counters
             if (ReadUInt64(datagram, 2) != _generation.SessionId ||
-                ReadInt32(datagram, 10) != _generation.Epoch) return false;
+                ReadInt32(datagram, 10) != _generation.Epoch) { RejectedGeneration++; return false; }
 
             byte port = datagram[1];
-            if (port >= _payloadSizes.Length) return false;
+            if (port >= _payloadSizes.Length) { RejectedUnknownPort++; return false; }
             int payloadSize = _payloadSizes[port];
 
             int baseFrame = ReadInt32(datagram, 14);
             int count = datagram[18];
-            if (payloadSize <= 0 || datagram.Length != HeaderSize + count * payloadSize) return false;
+            if (payloadSize <= 0)
+            {
+                // This machine has no serializable layout for that port at all, yet a peer is sending
+                // input for it — the session was started with more players than this core exposes
+                // controllers for.
+                RejectedPayloadSize++;
+                LastSizeMismatchPort = port;
+                LastSizeMismatchExpected = payloadSize;
+                LastSizeMismatchObserved = count > 0 ? (datagram.Length - HeaderSize) / count : 0;
+                return false;
+            }
+            if (datagram.Length != HeaderSize + count * payloadSize)
+            {
+                RejectedPayloadSize++;
+                LastSizeMismatchPort = port;
+                LastSizeMismatchExpected = payloadSize;
+                // What the sender must have been using, inferred from the frame count it declared.
+                LastSizeMismatchObserved = count > 0 ? (datagram.Length - HeaderSize) / count : 0;
+                return false;
+            }
+            if (count == 0) { RejectedMalformed++; return false; }
 
             int offset = HeaderSize;
             for (int i = 0; i < count; i++)
