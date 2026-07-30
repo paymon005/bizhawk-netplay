@@ -1,6 +1,14 @@
 <Project>
   <PropertyGroup>
-    <LangVersion>9.0</LangVersion>
+    <!-- Pinned, never "latest": that would silently mean a different language after each SDK update.
+         This is a compiler setting only — Core stays netstandard2.0 and the Tool stays net48, and
+         features needing runtime support (static abstract interface members, ref fields, the ^1 / 1..2
+         index-range operators, `required` without attribute shims) remain unavailable there whatever
+         this says. 12 rather than 13/14 because nothing above it is usable on net48 anyway, and C# 14
+         turns `field` into a contextual keyword inside property accessors.
+         Raising this permits new syntax; it does not ask for a sweep. Adopt features in new code or in
+         files already being changed, not in a rewrite that alters no behaviour and buries git blame. -->
+    <LangVersion>12.0</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
