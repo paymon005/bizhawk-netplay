@@ -262,8 +262,8 @@ public sealed partial class NetplayToolForm
         // session, which knows more than the lobby thread could.
         _lobbyPhaseText = "";
 
-        ApplySessionHostOwnership(true); // background input, blocked frame advance, snapshot pause
-        try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
+        // Ownership and rewind suspension were taken at the first pause, back when the lobby opened;
+        // PauseForSession is idempotent about that and this call is just the re-pause.
         PauseForSession(); // we own the clock now
         _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
         _resyncCount = 0;

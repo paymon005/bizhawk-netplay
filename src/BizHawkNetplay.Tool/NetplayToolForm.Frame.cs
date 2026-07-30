@@ -113,11 +113,12 @@ public sealed partial class NetplayToolForm
         // advantage is placement, not frequency: it runs inside EmuHawk's loop immediately before
         // StepRunLoop_Core, rather than as a separate message subject to coalescing — which is also
         // why the pause reassertion below has to happen here.
+        // Before BOTH guards below. EmuHawk runs StepRunLoop_Core immediately after this callback,
+        // so any iteration that returns without reasserting leaves a window for its loop to step the
+        // core — and that applies from the moment we take the clock at the lobby, not only once a
+        // session is running. _pausedByUs is the ownership flag, not _phase.IsActive.
+        if (_pausedByUs) ReassertPause();
         if (!_phase.IsActive || _driver == null) return;
-        // BEFORE the scheduling early-returns below. EmuHawk runs StepRunLoop_Core immediately after
-        // this callback, so on any iteration where no frame is due — the common case — returning
-        // without reasserting would leave a window for its loop to step the core itself.
-        ReassertPause();
         double nowMs = _paceClock.Elapsed.TotalMilliseconds;
         if (!_schedule.ShouldWake(nowMs, FineClockWakeMarginMs)) return;
         if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
@@ -186,6 +187,11 @@ public sealed partial class NetplayToolForm
     private void FrameTick()
     {
         if (!_phase.IsActive || _driver == null) return;
+        // Snapshot the field into a local for the rest of the tick. The null check above does not
+        // survive the first call the compiler cannot see inside — a field could be reassigned by
+        // anything — so every later use was a nullable dereference, which is what CS8602 was
+        // pointing at. A local is the fix; suppressing it with ! would only hide the same question.
+        var driver = _driver;
         if (_frameTickRunning) return;
 
         // Deliberately NOT stopping the timer here. Stopping on entry and restarting in the finally
@@ -210,13 +216,13 @@ public sealed partial class NetplayToolForm
         int gcTick0Before = GC.CollectionCount(0), gcTick1Before = GC.CollectionCount(1),
             gcTick2Before = GC.CollectionCount(2);
         int packetsDrained = 0;
-        int frameForTelemetry = _driver.CurrentFrame;
+        int frameForTelemetry = driver.CurrentFrame;
         _lastHashMs = 0;
         // Snapshot the repair counters so a slow tick can report what this tick actually did rather
         // than a session total. "rollback/gate" covers both repair and the savestate work around it,
         // and those need opposite fixes — a 190ms gate that turns out to have run no repair at all
         // is a different bug from one that resimulated forty frames.
-        var tickRollback = _driver.Strategy as RollbackStrategy;
+        var tickRollback = driver.Strategy as RollbackStrategy;
         int repairsBefore = tickRollback?.RollbackCount ?? 0;
         long resimBefore = tickRollback?.FramesResimulated ?? 0;
         try
@@ -239,8 +245,8 @@ public sealed partial class NetplayToolForm
                 {
                     _audioDevWasUp = devUp;
                     ConnLog(devUp
-                        ? $"audio device restarted at frame {_driver?.CurrentFrame ?? -1}"
-                        : $"audio device STOPPED at frame {_driver?.CurrentFrame ?? -1} — EmuHawk shut its "
+                        ? $"audio device restarted at frame {driver.CurrentFrame}"
+                        : $"audio device STOPPED at frame {driver.CurrentFrame} — EmuHawk shut its "
                           + "sound output down. Note what happened just now (window focus, a headset or "
                           + "monitor connecting, a device change); it is not yet known what triggers this.",
                         devUp ? Color.DarkGreen : Color.DarkOrange);
@@ -259,9 +265,9 @@ public sealed partial class NetplayToolForm
             // counter and the core have diverged — report it plainly rather than as a desync.
             int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
             emuApiMs = tickWatch.Elapsed.TotalMilliseconds - apiStart;
-            if (emuDelta != _driver.CurrentFrame)
+            if (emuDelta != driver.CurrentFrame)
             {
-                int diff = emuDelta - _driver.CurrentFrame;
+                int diff = emuDelta - driver.CurrentFrame;
                 string why = diff > 0
                     ? $"EmuHawk advanced {diff} extra frame(s) — did you unpause?"
                     : $"the core's frame count jumped back {-diff} — a rewind/load-state hotkey fired?";
@@ -273,7 +279,7 @@ public sealed partial class NetplayToolForm
             // resyncs everyone. Sticky pause and drift validation above must still run here.
             if (_phase.AwaitingRejoin)
             {
-                if (_phase.IsRebuilding) _driver.ResendLocalInputIfDue();
+                if (_phase.IsRebuilding) driver.ResendLocalInputIfDue();
                 MaybeSendPing();
                 CheckLinkTimeouts();
                 return;
@@ -281,8 +287,8 @@ public sealed partial class NetplayToolForm
 
             // Drain once per callback; FrameDriver caps the number of datagrams consumed. This is
             // deliberately separate from input sends, so Pump + Capture cannot duplicate a packet.
-            _driver.PumpNetwork();
-            packetsDrained = _driver.LastPacketsDrained;
+            driver.PumpNetwork();
+            packetsDrained = driver.LastPacketsDrained;
 
             // State capture/import stays on this thread, but whole-state transfer runs on each
             // peer's writer thread. Hold the new baseline while that transfer is in flight.
@@ -291,7 +297,7 @@ public sealed partial class NetplayToolForm
                 // Every peer may rebuild at a different instant. Keep publishing this epoch's
                 // neutral/start window so an early sender is not lost by peers still rejecting
                 // new-generation UDP with their old driver.
-                _driver.ResendLocalInputIfDue();
+                driver.ResendLocalInputIfDue();
                 MaybeSendPing();
                 CheckLinkTimeouts();
                 return;
@@ -321,21 +327,21 @@ public sealed partial class NetplayToolForm
                     // already queued. Draining once per tick would judge this frame's readiness on
                     // network state captured before that work — turning an input that did arrive in
                     // time into a stall that costs the whole tick.
-                    _driver.PumpNetwork();
-                    packetsDrained += _driver.LastPacketsDrained;
+                    driver.PumpNetwork();
+                    packetsDrained += driver.LastPacketsDrained;
                     // A catch-up burst is the longest this callback ever goes without returning to
                     // the message loop, so top the ring up mid-tick rather than only at tick start.
                     _adapter?.PumpAudio();
                 }
 
-                _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
+                driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
                 // Collection counts either side of the frame decision. Two field reads per
                 // generation, no allocation — see the gcGate/gcTick remarks in the slow-tick line
                 // for why this is the one measurement that can settle a 55.8ms gate.
                 int g0Before = GC.CollectionCount(0), g1Before = GC.CollectionCount(1),
                     g2Before = GC.CollectionCount(2);
                 var phase = System.Diagnostics.Stopwatch.StartNew();
-                if (!_driver.CurrentFrameReady())
+                if (!driver.CurrentFrameReady())
                 {
                     double stallGateMs = phase.Elapsed.TotalMilliseconds;
                     gateMs += stallGateMs;
@@ -343,8 +349,8 @@ public sealed partial class NetplayToolForm
                         ref gcGate0, ref gcGate1, ref gcGate2);
                     _pacing.AddGate(stallGateMs);
                     stalledThisTick = true;
-                    _driver.ResendLocalInputIfDue();
-                    bool timeSync = _driver.Strategy is RollbackStrategy stalledRollback
+                    driver.ResendLocalInputIfDue();
+                    bool timeSync = driver.Strategy is RollbackStrategy stalledRollback
                         && stalledRollback.LastStallWasTimeSync;
                     timeSyncThisTick = timeSync;
                     if (timeSync)
@@ -356,8 +362,8 @@ public sealed partial class NetplayToolForm
                     {
                         _lastStallLogMs = nowMs;
                         Log(timeSync
-                            ? $"time-sync yield at frame {_driver.CurrentFrame}"
-                            : $"stalling at frame {_driver.CurrentFrame} — waiting for remote input");
+                            ? $"time-sync yield at frame {driver.CurrentFrame}"
+                            : $"stalling at frame {driver.CurrentFrame} — waiting for remote input");
                     }
                     break;
                 }
@@ -384,19 +390,19 @@ public sealed partial class NetplayToolForm
                     // both frames fit the UI budget. If one frame unexpectedly spikes after that
                     // commitment, finish the visible second frame once; the conservative rolling
                     // estimate prevents that spike from causing repeated two-frame callbacks.
-                    bool secondGateSafe = _driver.Strategy is LockstepStrategy
-                        || (_driver.Strategy is RollbackStrategy secondRollback
+                    bool secondGateSafe = driver.Strategy is LockstepStrategy
+                        || (driver.Strategy is RollbackStrategy secondRollback
                             && !secondRollback.HasPendingTimeSyncDebt);
                     bool anotherFrameDue =
                         _schedule.AnotherFrameFits(nowMs, framesThisTick, tickWatch.Elapsed.TotalMilliseconds)
                         && secondGateSafe
-                        && _driver.NextFrameFullyConfirmed;
+                        && driver.NextFrameFullyConfirmed;
                     if (anotherFrameDue) committedSecondFrame = true;
-                    _adapter!.AdvanceFrame(_driver.CurrentInputs(), renderVideo: !anotherFrameDue);
+                    _adapter!.AdvanceFrame(driver.CurrentInputs(), renderVideo: !anotherFrameDue);
                     double frameCoreMs = phase.Elapsed.TotalMilliseconds;
                     coreMs += frameCoreMs;
                     _pacing.AddFrame(frameCoreMs, rendered: !anotherFrameDue);
-                    _driver.CompleteFrame();
+                    driver.CompleteFrame();
                     steppedThisTick = true;
                     framesThisTick++;
                     if (framesThisTick >= 2) committedSecondFrame = false;

@@ -19,8 +19,9 @@ public sealed partial class NetplayToolForm
     private bool _prevAcceptBackgroundInputControllerOnly;
     private bool _prevRunInBackground;
     private bool _prevBlockFrameAdvance;
-    private bool _prevPaused;   // was EmuHawk already paused when we first took the clock?
-    private bool _pausedByUs;   // ...and have we actually taken it, so there is something to undo
+    private bool _prevPaused;        // was EmuHawk already paused when we first took the clock?
+    private bool _pausedByUs;        // ...and have we actually taken it, so there is something to undo
+    private bool _prevRewindEnabled; // the user's rewind preference, to restore on teardown
     private Label _status = null!;
 
 
@@ -52,7 +53,26 @@ public sealed partial class NetplayToolForm
         {
             if (enable)
             {
+                // Idempotent: acquisition happens at the FIRST pause and a session pauses several
+                // times on the way in. Re-running would snapshot the values we ourselves just wrote,
+                // and teardown would then "restore" the user's settings to ours.
+                if (_configApplied) return;
+                _configApplied = true;
+
+                // Taken first, and independent of everything below, because this is the guard that
+                // actually stops EmuHawk stepping the core. Pause cannot: advancing a paused core is
+                // exactly what the Frame Advance hotkey is for. Failing to reach the config is no
+                // reason to skip it — which is what the earlier ordering did.
+                try { _prevBlockFrameAdvance = MainForm.BlockFrameAdvance; MainForm.BlockFrameAdvance = true; }
+                catch (Exception ex) { Log("(note) could not block EmuHawk's frame advance: " + ex.Message); }
+
                 _config = (APIs.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                // Rewind rewrites the frame counter the whole timeline is indexed by, and a lobby
+                // baseline is every bit as rewindable as a running session. Snapshot the preference
+                // now so teardown can restore it even if the config becomes unreachable later.
+                _prevRewindEnabled = _config?.Rewind.Enabled ?? true;
+                try { APIs.EmuClient.EnableRewind(false); } catch { }
+
                 if (_config == null) { Log("(note) couldn't reach config to disable pause-on-unfocus"); return; }
                 _prevRunInBackground = _config.RunInBackground;
                 _prevAcceptBackgroundInput = _config.AcceptBackgroundInput;
@@ -60,23 +80,20 @@ public sealed partial class NetplayToolForm
                 _config.RunInBackground = true;
                 _config.AcceptBackgroundInput = true;
                 _config.AcceptBackgroundInputControllerOnly = true;
-                try { _prevBlockFrameAdvance = MainForm.BlockFrameAdvance; MainForm.BlockFrameAdvance = true; }
-                catch (Exception ex) { Log("(note) could not block EmuHawk's frame advance: " + ex.Message); }
-                _configApplied = true;
-                Log("run-in-background enabled (controller-only); EmuHawk's own frame advance blocked");
+                Log("EmuHawk's own frame advance blocked and rewind suspended; run-in-background " +
+                    "enabled (controller-only)");
             }
-            else if (_configApplied && _config != null)
+            else if (_configApplied)
             {
-                _config.RunInBackground = _prevRunInBackground;
-                _config.AcceptBackgroundInput = _prevAcceptBackgroundInput;
-                _config.AcceptBackgroundInputControllerOnly = _prevAcceptBackgroundInputControllerOnly;
-                try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
-                // Resume rewind if the user's preference says it should be on. EnableRewind is a
-                // suspend/resume, not a config change, so Config.Rewind.Enabled still holds their
-                // intent — and reading it now rather than at session start honours a change made
-                // while we were playing.
-                try { APIs.EmuClient.EnableRewind(_config.Rewind.Enabled); } catch { }
                 _configApplied = false;
+                try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
+                try { APIs.EmuClient.EnableRewind(_prevRewindEnabled); } catch { }
+                if (_config != null)
+                {
+                    _config.RunInBackground = _prevRunInBackground;
+                    _config.AcceptBackgroundInput = _prevAcceptBackgroundInput;
+                    _config.AcceptBackgroundInputControllerOnly = _prevAcceptBackgroundInputControllerOnly;
+                }
             }
         }
         catch (Exception ex) { Log("(note) host-ownership adjust failed: " + ex.Message); }
@@ -111,6 +128,14 @@ public sealed partial class NetplayToolForm
         {
             try { _prevPaused = MainForm.EmulatorPaused; } catch { _prevPaused = false; }
             _pausedByUs = true;
+            // Ownership starts HERE, not at GO. Between this pause and the session starting, the
+            // host probes, exports the authoritative state and then waits — possibly for minutes —
+            // and a joiner imports that state and waits for GO. Anything that moves the core in that
+            // window (the Frame Advance hotkey, a window activation that unpauses) silently changes
+            // the baseline the peers agreed on, and the post-GO drift check cannot see it because
+            // _startEmuFrame is only sampled once the session begins. The host never re-imports what
+            // it exported, so on its side that drift is a desync at frame 0.
+            ApplySessionHostOwnership(true);
         }
         APIs.EmuClient.Pause();
     }
