@@ -32,9 +32,15 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
     private readonly AnalogBind?[][] _analogBinds; // [port][axisIndex] -> host analog binding (null if unbound)
     private readonly bool[][] _axisReversed;      // [port][axisIndex] -> core axis IsReversed flag
+    // [assignedPort][sourcePort] — whether reading the source port's bindings for the assigned
+    // port's layout maps control-for-control. See BuildRemapCompatibility.
+    private readonly bool[][] _remapCompatible;
     // The N64 stick gate. EmuHawk applies this right after latching physical input; see
     // ApplyAxisConstraints for what its absence did to analog magnitude.
     private readonly bool _useCircularAnalogConstraint;
+    // EmuHawk's live config, for the master volume the audio pump has to apply itself. Read per
+    // pump, not cached as a value: the slider moves while you play.
+    private readonly Config? _hostConfig;
     private readonly Dictionary<string, int>? _constraintScratch;
 
     // Raw main-memory access for the periodic desync checksum, resolved lazily (see HashMainMemory).
@@ -77,6 +83,8 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         _bindings = BuildBindings();
         _analogBinds = BuildAnalogBinds();
         _axisReversed = BuildAxisReversed();
+        _remapCompatible = BuildRemapCompatibility();
+        try { _hostConfig = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference; } catch { }
         _useCircularAnalogConstraint = ReadCircularAnalogConstraintSetting();
         if (_useCircularAnalogConstraint)
             _constraintScratch = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -267,12 +275,12 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         // ever sees the merged inputs we feed in AdvanceFrame, so there is no physical leak, no
         // hotkey firing, and both peers stay deterministic.
         var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
-        // Optionally source the pad from a different port's bindings, but only if that port's layout
-        // has the same button set (guards mixed-layout cores); otherwise fall back to the assigned port.
-        var binds = _bindings[port];
+        // Optionally source the pad from a different port's bindings, but only where the two ports
+        // genuinely describe the same controls — see BuildRemapCompatibility. Buttons and axes make
+        // the same decision, so it is made once here rather than tested twice on different grounds.
         int src = InputSourcePort;
-        if (src >= 0 && src < _bindings.Length && _bindings[src].Length == layout.Buttons.Count)
-            binds = _bindings[src];
+        bool remap = src >= 0 && src < _layouts.Length && _remapCompatible[port][src];
+        var binds = remap ? _bindings[src] : _bindings[port];
         var buttons = new bool[layout.Buttons.Count];
         for (int i = 0; i < buttons.Length; i++)
             buttons[i] = EvaluateBinding(binds[i], pressed);
@@ -291,7 +299,7 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
             // feeds it raw host axis values unconditionally, outside the hotkey gate that filters
             // button events. It also means axes refresh only when EmuHawk's main loop runs, which a
             // catch-up burst inside one timer callback does not do; see AppendAnalogState.
-            int axSrc = (src >= 0 && src < _analogBinds.Length && _analogBinds[src].Length == axes.Length) ? src : port;
+            int axSrc = remap ? src : port;
             IReadOnlyDictionary<string, int>? hostAxes;
             try { hostAxes = _apis.Input.GetPressedAxes(); }
             catch { hostAxes = null; } // ResolveAxis treats null as "no live axes" (neutral)
@@ -413,7 +421,7 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         _audioPumps++;
         try
         {
-            dev.ApplyVolumeSettings(1.0); // full volume; the user's master volume is baked into the samples' source
+            dev.ApplyVolumeSettings(HostAttenuation());
             int needed = dev.CalculateSamplesNeeded(); // sample-pairs the device can accept right now
             if (needed <= 0) return;
             int shorts = needed * _soundChannels;
@@ -917,6 +925,81 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         }
         catch { }
         return true;
+    }
+
+    /// <summary>
+    /// Which ports' bindings may stand in for which other ports', for the "My controls" remap that
+    /// lets a player assigned P3 keep using their P1 pad.
+    ///
+    /// The old test was that the two ports had the same NUMBER of buttons, while the comment beside
+    /// it claimed "the same button set". Those are not the same test, and on a core whose ports are
+    /// not identical — a light gun against a pad, a multitap seat with fewer controls — two ports
+    /// can match on count and mean entirely different things, silently mapping A to Trigger.
+    ///
+    /// Compare the control NAMES instead, position for position, with the "P&lt;n&gt; " prefix removed:
+    /// that prefix is exactly what BizHawk grouped the ports by in the first place, so what is left
+    /// is the port-relative control identity.
+    ///
+    /// Built once. <see cref="ReadLocalInput"/> runs every frame and must not be doing string work.
+    /// </summary>
+    private bool[][] BuildRemapCompatibility()
+    {
+        var m = new bool[_layouts.Length][];
+        for (int a = 0; a < _layouts.Length; a++)
+        {
+            m[a] = new bool[_layouts.Length];
+            for (int b = 0; b < _layouts.Length; b++) m[a][b] = LayoutsLineUp(_layouts[a], _layouts[b]);
+        }
+        return m;
+    }
+
+    private static bool LayoutsLineUp(CoreLayout a, CoreLayout b)
+    {
+        if (a.Buttons.Count != b.Buttons.Count || a.Axes.Count != b.Axes.Count) return false;
+        for (int i = 0; i < a.Buttons.Count; i++)
+            if (!string.Equals(StripPortPrefix(a.Buttons[i]), StripPortPrefix(b.Buttons[i]), StringComparison.Ordinal))
+                return false;
+        for (int i = 0; i < a.Axes.Count; i++)
+            if (!string.Equals(StripPortPrefix(a.Axes[i].Name), StripPortPrefix(b.Axes[i].Name), StringComparison.Ordinal))
+                return false;
+        return true;
+    }
+
+    /// <summary>"P2 X Axis" -> "X Axis". Mirrors ControllerDefinition's own <c>^P(\d+) </c>, which is
+    /// how a control got assigned to a port to begin with.</summary>
+    private static string StripPortPrefix(string control)
+    {
+        if (control.Length < 3 || control[0] != 'P') return control;
+        int d = 1;
+        while (d < control.Length && control[d] >= '0' && control[d] <= '9') d++;
+        return d > 1 && d < control.Length && control[d] == ' ' ? control.Substring(d + 1) : control;
+    }
+
+    /// <summary>
+    /// The master volume, as EmuHawk would apply it.
+    ///
+    /// Volume is NOT baked into the samples a core produces, whatever the comment here used to say:
+    /// EmuHawk computes an attenuation and hands it to the output device
+    /// (<c>MainForm</c> line ~2960, <c>Sound.UpdateSound</c> -> <c>ApplyVolumeSettings</c>). We drive
+    /// that device ourselves during a session, so passing 1.0 meant a session ignored the volume
+    /// slider and the mute checkbox entirely and always played at full.
+    ///
+    /// Only the normal-playback branch of EmuHawk's formula applies: rewind/fast-forward and
+    /// frame-advance muting are frontend modes a session never enters. Falls back to full volume if
+    /// the config is unreachable, which is what it did before and is the audible-rather-than-silent
+    /// direction to fail in.
+    /// </summary>
+    private double HostAttenuation()
+    {
+        var cfg = _hostConfig;
+        if (cfg == null) return 1.0;
+        try
+        {
+            if (!cfg.SoundEnabledNormal) return 0.0;
+            double atten = cfg.SoundVolume / 100.0;
+            return atten < 0 ? 0.0 : atten > 1 ? 1.0 : atten;
+        }
+        catch { return 1.0; }
     }
 
     /// <summary>The core's IsReversed flag per axis (BizHawk applies it when mapping host -> core).</summary>

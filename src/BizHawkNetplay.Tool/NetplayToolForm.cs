@@ -338,9 +338,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     /// <summary>
     /// Floor on how often the fine clock may enter the tick. Normally irrelevant — the tick advances
-    /// the due time a whole period per frame, so it naturally runs about sixty times a second. It
-    /// matters when the tick runs no frame at all (lockstep waiting on remote input): at 3200 loop
-    /// iterations a second, without a floor a stall would become a spin through the whole tick body.
+    /// the due time a whole period per frame, so it naturally runs about sixty times a second, and
+    /// the host loop cannot offer more than ~66 while paused anyway (see UpdateValues). It is kept
+    /// because the floor is the cheap guard, not because the loop is fast: were the paused-throttle
+    /// sleep ever to change upstream, a stall would otherwise become a spin through the whole tick
+    /// body rather than a wait.
     /// </summary>
     private const double FineClockMinSpacingMs = 1.0;
 

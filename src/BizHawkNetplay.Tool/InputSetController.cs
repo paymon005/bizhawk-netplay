@@ -32,10 +32,14 @@ internal sealed class InputSetController : IController
         _layouts = layouts;
         // Seed every key the layouts can produce, so Update only ever overwrites values. A write to
         // an existing key neither rehashes nor grows the table.
+        //
+        // Neutral, not zero. An axis carries its own resting value and it is not always 0 — an
+        // unsigned stick or trigger is typically 0..255 resting at 128, where 0 is a full-scale
+        // deflection. Seeding zero held such an axis hard over until something wrote to it.
         foreach (var layout in layouts)
         {
             foreach (var button in layout.Buttons) _buttons[button] = false;
-            foreach (var axis in layout.Axes) _axes[axis.Name] = 0;
+            foreach (var axis in layout.Axes) _axes[axis.Name] = axis.Neutral;
         }
     }
 
@@ -61,14 +65,26 @@ internal sealed class InputSetController : IController
             var port = p < inputs.Ports.Length ? inputs.Ports[p] : null;
             for (int i = 0; i < layout.Buttons.Count; i++)
                 _buttons[layout.Buttons[i]] = port != null && port.Buttons[i];
+            // Same reason as the constructor: an absent port rests at each axis's own Neutral. On a
+            // four-port core hosting two players this is every frame for the two empty seats, so
+            // zero here meant a 0..255 axis sat at full deflection for the whole session — which is
+            // exactly the "unused ports read neutral" promise the README makes.
             for (int j = 0; j < layout.Axes.Count; j++)
-                _axes[layout.Axes[j].Name] = port != null ? port.Axes[j] : 0;
+                _axes[layout.Axes[j].Name] = port != null ? port.Axes[j] : layout.Axes[j].Neutral;
         }
     }
 
     public bool IsPressed(string button) => _buttons.TryGetValue(button, out var v) && v;
 
-    public int AxisValue(string name) => _axes.TryGetValue(name, out var v) ? v : 0;
+    /// <summary>
+    /// An axis the negotiated layouts never described — a core asking for something outside the
+    /// control surface both peers agreed on. Answer with the core's own resting value rather than
+    /// zero, which for an unsigned axis is a full-scale deflection. The lookup only runs on the
+    /// miss path; every axis the layouts do describe was seeded in the constructor.
+    /// </summary>
+    public int AxisValue(string name) => _axes.TryGetValue(name, out var v)
+        ? v
+        : Definition.Axes.TryGetValue(name, out var spec) ? spec.Neutral : 0;
 
     public IReadOnlyCollection<(string Name, int Strength)> GetHapticsSnapshot() => NoHaptics;
 

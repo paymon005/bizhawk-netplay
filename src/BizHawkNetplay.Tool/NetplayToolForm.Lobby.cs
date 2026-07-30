@@ -92,7 +92,7 @@ public sealed partial class NetplayToolForm
             // its state and the peers arriving, so the sims start on different frames and desync
             // immediately. Paused here == the frame all peers resume from. (Probing below advances
             // frames invisibly and restores, so it must be paused first.)
-            APIs.EmuClient.Pause();
+            PauseForSession();
 
             // Netcode: Automatic prefers rollback but drops to lockstep if the probe fails; Rollback
             // forces it; Lockstep forces lockstep. We "want" rollback unless Lockstep is chosen, and

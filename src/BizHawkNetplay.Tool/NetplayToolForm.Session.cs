@@ -262,9 +262,9 @@ public sealed partial class NetplayToolForm
         // session, which knows more than the lobby thread could.
         _lobbyPhaseText = "";
 
-        ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
+        ApplySessionHostOwnership(true); // background input, blocked frame advance, snapshot pause
         try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync
-        APIs.EmuClient.Pause(); // we own the clock now
+        PauseForSession(); // we own the clock now
         _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
         _resyncCount = 0;
         _desyncTrend.Reset();

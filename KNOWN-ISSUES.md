@@ -74,9 +74,12 @@ settings profile 1.0 needs, and worth knowing before blaming the netcode for som
 Peers must run the same plugin regardless: the handshake compares the core's sync-settings blob and
 refuses a mismatch up front.
 
-**KI-11 (validation) — FOUR-player is what's left; three-player is done on real hardware.**
-See KI-8 for the 3-player internet sessions (SNES rollback, N64 lockstep and rollback, separate
-machines). The single-machine caveat below applies to the **4-player** measurements only.
+**KI-11 (validation) — what's left is four SEPARATE MACHINES, and a heavy core at four players.**
+Four players over a real internet path is **done** — see KI-8, which has the logs: all 12 mesh paths
+answered, six desync recoveries, a drop and rejoin. What that session did *not* cover is four
+distinct machines: the three joiners ran on one laptop, so the joiner-to-joiner mesh legs were
+loopback and only the host's legs met the network. The single-machine caveat below is about the
+**latency measurements**, which are a separate exercise again.
 4-player **lockstep** was verified on hardware in July 2025. As of 2026-07-30 v0.20.0, 4-player
 **rollback** has been run and measured too — four EmuHawk instances on one machine, Snes9x, PAL
 (20ms frame period), delay 2, with simulated one-way UDP latency raised across five runs. Numbers
@@ -100,11 +103,14 @@ advice asked for 17). Checksums agreed across all runs.
 *What that does and does not settle.* It settles that the sync layer, the repair loop and the
 savestate pool hold up at four players on a light core, well past any plausible internet link. It
 does not settle: four **separate machines** (this was one CPU, one GPU, one scheduler, and a
-loopback mesh with no NAT); a **heavy core** *at four players*, where a repair costs 6-9ms per frame
-instead of 0.6 and the same depths would be an order of magnitude dearer — though N64 rollback has
-since been played at three players over the internet at delay 5 without complaint (KI-8), which is
-the first evidence against the pessimistic reading; or four players over a **real internet
-path**, where the joiner-to-joiner edges are the ones nothing else can measure.
+loopback mesh with no NAT), or a **heavy core** *at four players*, where a repair costs 6-9ms per
+frame instead of 0.6 and the same depths would be an order of magnitude dearer — though N64 rollback
+has since been played at three players over the internet at delay 5 without complaint (KI-8), which
+is the first evidence against the pessimistic reading.
+
+Four players over a real internet path is no longer on this list; KI-8 settled it. The
+joiner-to-joiner edges, however, are still unmeasured on a real network, because that session's
+joiners shared a machine — which is exactly what four separate machines would finally exercise.
 
 *What to read off a four-machine session when one happens:*
 - **`mesh measured: X of Y direct path(s) answered`** at start. Anything short of X = Y means the

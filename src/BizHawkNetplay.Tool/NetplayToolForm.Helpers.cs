@@ -18,15 +18,35 @@ public sealed partial class NetplayToolForm
     private bool _prevAcceptBackgroundInput;
     private bool _prevAcceptBackgroundInputControllerOnly;
     private bool _prevRunInBackground;
+    private bool _prevBlockFrameAdvance;
+    private bool _prevPaused;   // was EmuHawk already paused when we first took the clock?
+    private bool _pausedByUs;   // ...and have we actually taken it, so there is something to undo
     private Label _status = null!;
 
 
     /// <summary>
-    /// While a session is live, keep EmuHawk running and accepting input even when its window
-    /// isn't focused — otherwise two instances on one screen pause each other (only one can be
-    /// focused). Restores the user's original settings when the session ends.
+    /// Take, and later hand back, the host state a live session owns. One lifecycle, because these
+    /// have to be undone together or not at all — a session that ends leaving any of them applied
+    /// has changed the emulator out from under the user.
+    ///
+    /// <list type="bullet">
+    /// <item>Run-in-background, so two instances on one screen don't pause each other (only one can
+    /// be focused). Controller-only: the unfocused window still reads its gamepad, but background
+    /// KEYBOARD is ignored, so typing elsewhere can't fire a rewind/load-state hotkey.</item>
+    /// <item><c>BlockFrameAdvance</c>, so EmuHawk's own run loop cannot step the core. This is the
+    /// real guard, not the sticky pause: <c>GeneralUpdateActiveExtTools</c> is followed immediately
+    /// by <c>StepRunLoop_Core</c>, so anything that unpauses between the two gets a frame in through
+    /// EmuHawk's ordinary controller chain — a frame we neither fed nor sent. It gates only
+    /// <c>StepRunLoop_Core</c>; our own <c>IEmulator.FrameAdvance</c> calls are untouched.</item>
+    /// <item>Rewind, suspended for the session because rewinding rewrites the frame counter the
+    /// whole timeline is indexed by. It was suspended and then never resumed — for the rest of the
+    /// EmuHawk run, not just the session.</item>
+    /// </list>
+    ///
+    /// Pause is snapshotted rather than assumed. Teardown used to unpause unconditionally, which
+    /// started the emulator for someone who had deliberately paused it before connecting.
     /// </summary>
-    private void ApplyBackgroundConfig(bool enable)
+    private void ApplySessionHostOwnership(bool enable)
     {
         try
         {
@@ -39,22 +59,68 @@ public sealed partial class NetplayToolForm
                 _prevAcceptBackgroundInputControllerOnly = _config.AcceptBackgroundInputControllerOnly;
                 _config.RunInBackground = true;
                 _config.AcceptBackgroundInput = true;
-                // Controller-only: the unfocused window still reads its gamepad, but background
-                // KEYBOARD is ignored — so typing in another window can't fire an EmuHawk hotkey
-                // (rewind/load-state) that would desync the session.
                 _config.AcceptBackgroundInputControllerOnly = true;
+                try { _prevBlockFrameAdvance = MainForm.BlockFrameAdvance; MainForm.BlockFrameAdvance = true; }
+                catch (Exception ex) { Log("(note) could not block EmuHawk's frame advance: " + ex.Message); }
                 _configApplied = true;
-                Log("run-in-background enabled (controller-only) for this session");
+                Log("run-in-background enabled (controller-only); EmuHawk's own frame advance blocked");
             }
             else if (_configApplied && _config != null)
             {
                 _config.RunInBackground = _prevRunInBackground;
                 _config.AcceptBackgroundInput = _prevAcceptBackgroundInput;
                 _config.AcceptBackgroundInputControllerOnly = _prevAcceptBackgroundInputControllerOnly;
+                try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
+                // Resume rewind if the user's preference says it should be on. EnableRewind is a
+                // suspend/resume, not a config change, so Config.Rewind.Enabled still holds their
+                // intent — and reading it now rather than at session start honours a change made
+                // while we were playing.
+                try { APIs.EmuClient.EnableRewind(_config.Rewind.Enabled); } catch { }
                 _configApplied = false;
             }
         }
-        catch (Exception ex) { Log("(note) background-config adjust failed: " + ex.Message); }
+        catch (Exception ex) { Log("(note) host-ownership adjust failed: " + ex.Message); }
+    }
+
+    /// <summary>
+    /// Snap EmuHawk back to paused if anything unpaused it. <see cref="ApplySessionHostOwnership"/>'s
+    /// BlockFrameAdvance is what actually prevents a stolen frame; this keeps the emulator's own
+    /// state consistent with the fact that we own the clock, and gives the user a reason in the log.
+    /// Called from both clocks — the fine one and the WinForms fallback, which does not pass through
+    /// <c>UpdateValues</c> at all.
+    /// </summary>
+    private void ReassertPause()
+    {
+        if (APIs.EmuClient.IsPaused()) return;
+        APIs.EmuClient.Pause();
+        if (Verbose) Log("re-paused (the session owns the frame clock — don't unpause)");
+    }
+
+    /// <summary>
+    /// Pause for the session, remembering whether the user already had it paused so teardown can put
+    /// it back exactly as it was.
+    ///
+    /// The snapshot has to happen at the FIRST pause, which is entering the lobby — not when the
+    /// driver takes the clock. Reading it later always reports "paused", because by then we are the
+    /// reason it is: that would make every session end leave the emulator frozen. Idempotent for the
+    /// same reason, since a session pauses more than once on the way in.
+    /// </summary>
+    private void PauseForSession()
+    {
+        if (!_pausedByUs)
+        {
+            try { _prevPaused = MainForm.EmulatorPaused; } catch { _prevPaused = false; }
+            _pausedByUs = true;
+        }
+        APIs.EmuClient.Pause();
+    }
+
+    /// <summary>Undo <see cref="PauseForSession"/>, leaving a deliberately-paused emulator paused.</summary>
+    private void RestorePauseState()
+    {
+        bool restoreToRunning = _pausedByUs && !_prevPaused;
+        _pausedByUs = false;
+        if (restoreToRunning) { try { APIs.EmuClient.Unpause(); } catch { } }
     }
 
     private double FrameMs()

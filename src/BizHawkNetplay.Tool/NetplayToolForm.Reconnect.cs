@@ -423,8 +423,8 @@ public sealed partial class NetplayToolForm
         TeardownNetwork();
         if (!wasActive) RestorePreJoinState();
         try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
-        ApplyBackgroundConfig(false);
-        try { APIs.EmuClient.Unpause(); } catch { } // undo the freeze from OnGo
+        ApplySessionHostOwnership(false);
+        RestorePauseState(); // undo the freeze from OnGo, unless it was already paused before it
         ResetPunchUi();
         SetBusy(false);
         Status("Idle.", Color.DimGray);
@@ -459,8 +459,10 @@ public sealed partial class NetplayToolForm
         if (!wasActive) RestorePreJoinState();
 
         try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
-        ApplyBackgroundConfig(false); // restore the user's focus/pause preferences
-        try { APIs.EmuClient.Unpause(); } catch { }
+        ApplySessionHostOwnership(false); // restore focus prefs, frame-advance block and rewind
+        // Only unpause if we were the ones who paused it. Someone who paused EmuHawk deliberately
+        // and then joined a session used to get it running again when the session ended.
+        RestorePauseState();
         lock (_hashLock) { _checksums.Clear(); }
 
         _netcodeLabel.Text = "Netcode in use: —";

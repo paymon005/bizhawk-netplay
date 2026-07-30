@@ -62,7 +62,7 @@ public sealed partial class NetplayToolForm
                 return;
             }
 
-            APIs.EmuClient.Pause(); // freeze now so the resume frame is fixed before the state arrives
+            PauseForSession(); // freeze now so the resume frame is fixed before the state arrives
 
             _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
             _punchPrefs = LocalPreferences(isHost: false); // punching is always the joining side

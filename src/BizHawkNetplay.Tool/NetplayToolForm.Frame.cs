@@ -100,12 +100,24 @@ public sealed partial class NetplayToolForm
         base.UpdateValues(type);
 
         // This is the frame clock. EmuHawk calls it once per iteration of the loop that owns the UI
-        // thread, which makes it the finest clock available to us by definition — nothing we could
-        // install can fire between two iterations of the loop we are running inside. Unthrottled
-        // that is ~3200/s against a 16.688ms frame, so a frame lands within about 0.3ms of when it
-        // is due. WM_TIMER, by contrast, is capped near 100/s by its 10ms floor no matter how fast
-        // the loop spins, and measured 64.
+        // thread, so nothing we could install can fire between two iterations of the loop we are
+        // running inside.
+        //
+        // It is NOT the ~3200/s this comment used to claim. That figure is the unthrottled loop, and
+        // a session is not unthrottled — it is PAUSED, and BizHawk's Throttle.Step opens with
+        // "if (signal_paused && !signal_continuousFrameAdvancing) { Thread.Sleep(15); return; }",
+        // unconditionally. So the ceiling here is ~66/s, which is what the pacing line's `tick N/s`
+        // has been reporting all along (50-65 in real sessions).
+        //
+        // That makes it comparable in RATE to the WM_TIMER fallback, not thirty times better. Its
+        // advantage is placement, not frequency: it runs inside EmuHawk's loop immediately before
+        // StepRunLoop_Core, rather than as a separate message subject to coalescing — which is also
+        // why the pause reassertion below has to happen here.
         if (!_phase.IsActive || _driver == null) return;
+        // BEFORE the scheduling early-returns below. EmuHawk runs StepRunLoop_Core immediately after
+        // this callback, so on any iteration where no frame is due — the common case — returning
+        // without reasserting would leave a window for its loop to step the core itself.
+        ReassertPause();
         double nowMs = _paceClock.Elapsed.TotalMilliseconds;
         if (!_schedule.ShouldWake(nowMs, FineClockWakeMarginMs)) return;
         if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
@@ -239,13 +251,9 @@ public sealed partial class NetplayToolForm
             // boundary into EmuHawk, made once per tick for the whole session.
             double apiStart = tickWatch.Elapsed.TotalMilliseconds;
 
-            // Sticky pause: we own the frame clock. If the user (or anything) unpauses EmuHawk,
-            // its own loop would advance the core on top of ours and desync — snap it back.
-            if (!APIs.EmuClient.IsPaused())
-            {
-                APIs.EmuClient.Pause();
-                if (Verbose) Log("re-paused (the session owns the frame clock — don't unpause)");
-            }
+            // Also here, not only in UpdateValues: the WinForms fallback clock calls FrameTick
+            // directly and never passes through UpdateValues at all.
+            ReassertPause();
 
             // If EmuHawk's own loop slipped in extra core frames (e.g. a brief unpause), our
             // counter and the core have diverged — report it plainly rather than as a desync.
@@ -405,10 +413,16 @@ public sealed partial class NetplayToolForm
             if (_lastTickClockMs >= 0) _pacing.AddTickInterval(nowMs - _lastTickClockMs);
             _lastTickClockMs = nowMs;
 
-            // We hold EmuHawk paused, so its own run loop never presents the frames we advance here —
-            // a paused window just keeps showing whatever its swapchain last held, which is why the
-            // host's picture froze while the core, audio and netplay all kept running. Present the
-            // latest frame ourselves, once per tick (the video twin of PumpAudio above).
+            // Present the latest frame ourselves, once per tick (the video twin of PumpAudio above).
+            //
+            // The reason recorded here was that a paused EmuHawk "never presents". That is wrong:
+            // MainForm's loop calls Render() every iteration, right after the external-tool callback
+            // and regardless of pause, and Render() reads the live video provider. But the symptom
+            // this was added for was real and reproducible — the host's picture froze while the core,
+            // audio and netplay all kept running — so the call stays until something explains the
+            // gap between those two facts. Worth measuring before removing: if Render() does cover
+            // it on the normal path, this is a duplicate costing the ~0.2-0.3ms `present mean` in
+            // the pacing line, and would still be needed for the WinForms fallback clock.
             if (steppedThisTick)
             {
                 var phase = System.Diagnostics.Stopwatch.StartNew();
