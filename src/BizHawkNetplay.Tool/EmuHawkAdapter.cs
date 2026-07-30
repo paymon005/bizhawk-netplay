@@ -437,12 +437,36 @@ namespace BizHawkNetplay.Tool
         /// (audio, netplay) kept running. MainForm.Render() re-presents the current video provider; we
         /// call it once per tick after stepping, the video twin of <see cref="PumpAudio"/>. Best-effort.
         /// </summary>
-        public void PresentVideo()
+        /// <returns>
+        /// True if a picture actually reached the window. This returned void and swallowed every
+        /// failure, while the caller counted a present regardless — so a window that had stopped
+        /// rendering entirely still reported a healthy presented-fps, which is precisely the symptom
+        /// this method exists to detect. Consecutive failures are counted so a persistent one is
+        /// distinguishable from the transient hiccup the catch was written for.
+        /// </returns>
+        public bool PresentVideo()
         {
             var form = _mainForm;
-            if (form == null || form.IsDisposed) return;
-            try { form.Render(); } catch { /* transient present hiccup — next tick tries again */ }
+            if (form == null || form.IsDisposed) { PresentFailuresInARow++; return false; }
+            try
+            {
+                form.Render();
+                PresentFailuresInARow = 0;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                PresentFailuresInARow++;
+                if (LastPresentError == null) LastPresentError = ex.Message;
+                return false;
+            }
         }
+
+        /// <summary>Presents that failed back to back; zero once one succeeds.</summary>
+        public int PresentFailuresInARow { get; private set; }
+
+        /// <summary>The first present failure of the session, kept so it can be reported once.</summary>
+        public string? LastPresentError { get; private set; }
 
         /// <summary>True once <see cref="EnableAudio"/> has wired up the sound output for the session.</summary>
         public bool AudioReady => _audioReady;
@@ -806,20 +830,84 @@ namespace BizHawkNetplay.Tool
         private IMemorySaveStateApi MemorySave => _apis.MemorySaveState
             ?? throw new InvalidOperationException("MemorySaveState API unavailable (non-statable core?)");
 
-        public StateHandle SaveStateToMemory() =>
-            new StateHandle(_emulator.Frame, MemorySave.SaveCoreStateToMemory());
+        /// <summary>
+        /// Buffers retired by <see cref="ReleaseState"/>, waiting to be written into again.
+        ///
+        /// Rollback used <c>IMemorySaveStateApi.SaveCoreStateToMemory()</c>, which clones the core
+        /// into a brand-new array under a fresh GUID every time and offers no way to write into a
+        /// buffer you already own. A session measured 33 of those a second — the elision rule only
+        /// halves the rate while a peer is being predicted continuously, which is the normal case at
+        /// any delay below the link's latency. At 787KiB each that is 26.5MB/s of allocation, every
+        /// byte of it nine times over the Large Object Heap threshold, on a runtime (net48) that
+        /// neither compacts the LOH nor reclaims it outside a blocking gen2.
+        ///
+        /// The bill arrived as gen2 collections landing inside the frame decision one to two times a
+        /// second, and occasionally as a 52.5ms pause there with no repair running at all — a hitch
+        /// no column could account for, because a collection is not work this code is doing.
+        ///
+        /// Reusing the buffers removes the allocation rather than tuning what collects it. The pool
+        /// stabilizes at the ring's size within a second or two and then never allocates again.
+        /// <see cref="IStatable"/> is the seam that makes it possible: it writes into a stream we own,
+        /// and it is the same pair <see cref="ExportState"/> already round-trips for session start and
+        /// resync, so the format is proven rather than newly trusted.
+        /// </summary>
+        private readonly Stack<MemoryStream> _statePool = new Stack<MemoryStream>();
 
-        public void LoadStateFromMemory(StateHandle handle) =>
-            MemorySave.LoadCoreStateFromMemory((string)handle.Token);
+        /// <summary>Largest state seen, so a fresh buffer starts big enough to avoid growth copies.</summary>
+        private int _stateSizeHint = 1 << 16;
+
+        /// <summary>
+        /// Cap on retained buffers. The ring keeps roughly maxRollback + margin states, so this is far
+        /// above steady state and exists only so a pathological release burst cannot pin memory.
+        /// </summary>
+        private const int StatePoolCap = 64;
+
+        public StateHandle SaveStateToMemory()
+        {
+            MemoryStream ms;
+            if (_statePool.Count > 0) ms = _statePool.Pop();
+            else { ms = new MemoryStream(_stateSizeHint); StateBuffersAllocated++; }
+            ms.SetLength(0);
+            ms.Position = 0;
+            using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
+                _statable.SaveStateBinary(bw);
+            if (ms.Length > _stateSizeHint) _stateSizeHint = (int)ms.Length;
+            return new StateHandle(_emulator.Frame, ms);
+        }
+
+        public void LoadStateFromMemory(StateHandle handle)
+        {
+            var ms = (MemoryStream)handle.Token;
+            ms.Position = 0;
+            using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+            _statable.LoadStateBinary(br);
+        }
 
         public void ReleaseState(StateHandle handle)
         {
-            // The rollback ring evicts a state every frame; free the underlying GUID blob so it
-            // doesn't accumulate. Tolerate an already-deleted/unknown id (DeleteState of a stale
-            // GUID is a no-op or throws depending on build — swallow either way).
-            try { MemorySave.DeleteState((string)handle.Token); }
-            catch { /* already gone / unknown token — nothing to free */ }
+            // Retire the buffer for reuse rather than dropping it for the collector. Over the cap it
+            // is simply let go, which is the old behaviour for that one buffer.
+            if (!(handle.Token is MemoryStream ms)) return;
+            if (_statePool.Count >= StatePoolCap) return;
+            ms.SetLength(0);
+            _statePool.Push(ms);
         }
+
+        /// <summary>Drop every retired buffer. Called when a session ends so a long idle between
+        /// sessions does not hold the ring's worth of memory for nothing.</summary>
+        public void ClearStatePool()
+        {
+            while (_statePool.Count > 0) _statePool.Pop().Dispose();
+        }
+
+        /// <summary>Buffers currently retired and reusable. Reported so a session can show the pool
+        /// reaching steady state — once it stops growing, the save path has stopped allocating.</summary>
+        public int StatePoolSize => _statePool.Count;
+
+        /// <summary>Buffers created since the session began. This is the number that matters: it should
+        /// climb to the ring's size in the first second or two and then stop. If it keeps climbing, the
+        /// pool is being outrun and the allocation this exists to remove is still happening.</summary>
+        public int StateBuffersAllocated { get; private set; }
 
         public byte[] ExportState()
         {

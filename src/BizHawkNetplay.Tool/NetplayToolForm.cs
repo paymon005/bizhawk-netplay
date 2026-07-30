@@ -2003,6 +2003,16 @@ namespace BizHawkNetplay.Tool
             _hashDiagLogged = false;
             _lastTickClockMs = -1;
             _lastPresentClockMs = -1;
+            // Per-session, not per-window: a spike from a previous session must not be reported as
+            // this one's worst case, and the save/rollback baselines belong to the strategy that is
+            // about to be created rather than the one that just went away.
+            _worstGateSinceLogMs = 0;
+            _gateSpikesSinceLog = 0;
+            _gcGateWindow0 = _gcGateWindow1 = _gcGateWindow2 = 0;
+            _pacingRollbacksAtWindowStart = 0;
+            _pacingResimAtWindowStart = 0;
+            _pacingSavesTakenAtWindowStart = 0;
+            _pacingSavesElidedAtWindowStart = 0;
             // A WinForms timer is WM_TIMER, and SetTimer silently raises anything below
             // USER_TIMER_MINIMUM to 10ms — asking for 2 never bought a 2ms cadence, it just hid the
             // real floor. State it honestly: ~10ms is the fastest this mechanism goes, which is still
@@ -2186,6 +2196,55 @@ namespace BizHawkNetplay.Tool
         private void StopFramePacing()
         {
             _frameTimer.Stop();
+            // The ring's worth of savestate buffers is real memory; hand it back rather than holding
+            // it across a long idle between sessions.
+            try { _adapter?.ClearStatePool(); } catch { }
+        }
+
+        /// <summary>
+        /// Worst frame-decision cost, and how many were bad, since the pacing line last printed.
+        ///
+        /// These are kept here rather than in <see cref="PacingStats"/> because the pacing window and
+        /// the pacing *print* run on different clocks — the window rolls over every 500ms inside
+        /// UpdateSessionUi, the line prints once a second — so roughly every other window is summarized
+        /// into <c>_lastPacing</c> and then overwritten before anyone reads it. A one-off spike landing
+        /// in a dropped window leaves no trace at all, and a spike that does survive still cannot move
+        /// <c>gate p95</c>, which is nearest-rank over ~30 samples and therefore reports the second
+        /// largest by construction. That is why a session showed `gate mean 0.0 p95 0.0` in every window
+        /// while individual ticks were spending 55.8ms there. These two carry across dropped windows so
+        /// the worst case can never go unreported again.
+        /// </summary>
+        private double _worstGateSinceLogMs;
+        private int _gateSpikesSinceLog;
+
+        /// <summary>
+        /// Frame-decision cost above which something unexplained happened. A repair's honest cost is
+        /// one state load plus its re-simulated frames plus their snapshots; at the shallow depths a
+        /// healthy link produces that is ~1-2ms on Genesis and under ~19ms on N64 even at depth 1 with
+        /// every snapshot taken. Five is clear of the former and well under the latter, so on a light
+        /// core this only fires for something the repair model does not account for.
+        /// </summary>
+        private const double GateSpikeMs = 5.0;
+
+        /// <summary>Collections observed inside the frame decision, per pacing window.</summary>
+        private int _gcGateWindow0, _gcGateWindow1, _gcGateWindow2;
+
+        /// <summary>
+        /// Record one frame-decision sample: its cost against the spike accounting, and how many
+        /// collections happened while it ran. Allocation-free; called on both the stall and ready paths
+        /// so neither can hide a spike from the other.
+        /// </summary>
+        private void NoteGate(double gateMs, int g0Before, int g1Before, int g2Before,
+                              ref int gcGate0, ref int gcGate1, ref int gcGate2)
+        {
+            if (gateMs > _worstGateSinceLogMs) _worstGateSinceLogMs = gateMs;
+            if (gateMs >= GateSpikeMs) _gateSpikesSinceLog++;
+
+            int d0 = GC.CollectionCount(0) - g0Before;
+            int d1 = GC.CollectionCount(1) - g1Before;
+            int d2 = GC.CollectionCount(2) - g2Before;
+            gcGate0 += d0; gcGate1 += d1; gcGate2 += d2;
+            _gcGateWindow0 += d0; _gcGateWindow1 += d1; _gcGateWindow2 += d2;
         }
 
         private void FrameTick()
@@ -2208,6 +2267,12 @@ namespace BizHawkNetplay.Tool
             // A report that itemises 0.8ms of a 16.1ms tick names nothing: the four original terms
             // are the four cheap ones, and the interesting time was all in the unmeasured remainder.
             double audioMs = 0, emuApiMs = 0, uiMs = 0;
+            // Collections during this tick, and the subset of them that landed inside the frame
+            // decision. Both are needed: the tick figure says a pause happened at all, the gate figure
+            // says it happened in the span that has been reporting impossible costs.
+            int gcGate0 = 0, gcGate1 = 0, gcGate2 = 0;
+            int gcTick0Before = GC.CollectionCount(0), gcTick1Before = GC.CollectionCount(1),
+                gcTick2Before = GC.CollectionCount(2);
             int packetsDrained = 0;
             int frameForTelemetry = _driver.CurrentFrame;
             _lastHashMs = 0;
@@ -2336,11 +2401,18 @@ namespace BizHawkNetplay.Tool
                     }
 
                     _driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
+                    // Collection counts either side of the frame decision. Two field reads per
+                    // generation, no allocation — see the gcGate/gcTick remarks in the slow-tick line
+                    // for why this is the one measurement that can settle a 55.8ms gate.
+                    int g0Before = GC.CollectionCount(0), g1Before = GC.CollectionCount(1),
+                        g2Before = GC.CollectionCount(2);
                     var phase = System.Diagnostics.Stopwatch.StartNew();
                     if (!_driver.CurrentFrameReady())
                     {
                         double stallGateMs = phase.Elapsed.TotalMilliseconds;
                         gateMs += stallGateMs;
+                        NoteGate(stallGateMs, g0Before, g1Before, g2Before,
+                            ref gcGate0, ref gcGate1, ref gcGate2);
                         _pacing.AddGate(stallGateMs);
                         stalledThisTick = true;
                         _driver.ResendLocalInputIfDue();
@@ -2375,6 +2447,8 @@ namespace BizHawkNetplay.Tool
                             _lastHashMs += anchorHashMs;
                         }
                         gateMs += readyGateMs;
+                        NoteGate(readyGateMs, g0Before, g1Before, g2Before,
+                            ref gcGate0, ref gcGate1, ref gcGate2);
                         _pacing.AddGate(readyGateMs);
                         phase.Restart();
                         // When wall-clock debt already makes a second frame due, the first picture is
@@ -2424,12 +2498,34 @@ namespace BizHawkNetplay.Tool
                 if (steppedThisTick)
                 {
                     var phase = System.Diagnostics.Stopwatch.StartNew();
-                    _adapter!.PresentVideo();
+                    bool presented = _adapter!.PresentVideo();
                     renderMs = phase.Elapsed.TotalMilliseconds;
-                    _pacing.AddPresent(renderMs);
-                    if (_lastPresentClockMs >= 0)
-                        _pacing.AddPresentInterval(nowMs - _lastPresentClockMs, _frameMs);
-                    _lastPresentClockMs = nowMs;
+
+                    // Stamp AFTER the picture is on screen, not from the tick's entry timestamp.
+                    //
+                    // This measured `nowMs`, read before the frame decision and the core step ran. The
+                    // whole point of the metric is spacing between pictures, and everything variable
+                    // about that spacing — the repair, the core, the render — happens between those two
+                    // instants. It was therefore reporting how regularly the CLOCK fired, which is very
+                    // regular, and was structurally blind to the case it was built to catch: a tick
+                    // whose frame decision cost 55.8ms presented 55.8ms late and still recorded a
+                    // textbook 16.7ms gap. That is a large part of why judder read 0-3% through
+                    // sessions the player described as hitching.
+                    double presentedAtMs = _paceClock.Elapsed.TotalMilliseconds;
+                    if (presented)
+                    {
+                        _pacing.AddPresent(renderMs);
+                        if (_lastPresentClockMs >= 0)
+                            _pacing.AddPresentInterval(presentedAtMs - _lastPresentClockMs, _frameMs);
+                        _lastPresentClockMs = presentedAtMs;
+                    }
+                    else if (_adapter.PresentFailuresInARow == 1)
+                    {
+                        // Once, on the first failure: a persistent one now shows as presented-fps
+                        // falling rather than as a healthy number over a frozen window.
+                        ConnLog("video present failed — the picture may be frozen while emulation " +
+                                $"continues: {_adapter.LastPresentError ?? "no detail"}", Color.Firebrick);
+                    }
                 }
 
                 // Liveness runs every tick, independent of stepping (so a stall doesn't stop our pings
@@ -2503,10 +2599,24 @@ namespace BizHawkNetplay.Tool
                         audioState = $", audiodev {(_adapter.AudioDeviceStarted ? "on" : "STOPPED")}" +
                             (ring >= 0 ? $", ring {ring:P0}" : "");
                     }
+                    // Garbage collection, because nothing else on this line can explain a frame decision
+                    // costing 55.8ms. That span cannot block — it holds no transport reference and
+                    // contains no sleep, wait, lock or socket call — and the work it does at depth 1 is
+                    // one state load, one invisible frame and at most two snapshots, which is ~1-2ms on
+                    // a core whose frames cost 0.6ms. It is also the most allocation-hostile thing the
+                    // tick does: a whole-core savestate is a fresh ~787KiB array, nine times the Large
+                    // Object Heap threshold, and net48 neither compacts the LOH nor collects it outside
+                    // a blocking gen2. A pause is therefore both plausible here and, being another
+                    // thread's bill, invisible in every column that measures our own work.
+                    int gcTick0 = GC.CollectionCount(0) - gcTick0Before;
+                    int gcTick1 = GC.CollectionCount(1) - gcTick1Before;
+                    int gcTick2 = GC.CollectionCount(2) - gcTick2Before;
+                    string gcStr = $", gc tick {gcTick0}/{gcTick1}/{gcTick2} gate {gcGate0}/{gcGate1}/{gcGate2}";
+
                     Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
                         $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
                         $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}, other {other:F1}" +
-                        $"{audioState}, " +
+                        $"{audioState}{gcStr}, " +
                         $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}{repairStr}");
                 }
                 _frameTickRunning = false;
@@ -2532,6 +2642,8 @@ namespace BizHawkNetplay.Tool
             string rbStr = _driver.Strategy is RollbackStrategy rbs
                 // Walk-back only appears once it has happened: it is the price sparse keyframes pays,
                 // and the first thing to look at if a repair costs more than its depth accounts for.
+                // d and wb are disjoint now: d is how far the correction reached, wb the extra frames
+                // replayed to get to a keyframe. Their sum is what the repair actually re-simulated.
                 ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}" +
                   $"{(rbs.LastRollbackWalkback > 0 ? $"+{rbs.LastRollbackWalkback}wb" : "")}" +
                   $", max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
@@ -2695,6 +2807,8 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private int _pacingRollbacksAtWindowStart;
         private long _pacingResimAtWindowStart;
+        private int _pacingSavesTakenAtWindowStart;
+        private int _pacingSavesElidedAtWindowStart;
 
         private void LogPacingSummary(double nowMs)
         {
@@ -2714,11 +2828,31 @@ namespace BizHawkNetplay.Tool
             {
                 int rollbacks = rb.RollbackCount - _pacingRollbacksAtWindowStart;
                 long resim = rb.FramesResimulated - _pacingResimAtWindowStart;
+                // Snapshots actually taken versus elided. The elision rule turns rollback's steady
+                // state from a savestate every frame into nearly none, so the allocation rate this
+                // path is responsible for is a measured number rather than something to reason about
+                // from the tuning constants.
+                int taken = rb.SavesTaken - _pacingSavesTakenAtWindowStart;
+                int elided = rb.SavesElided - _pacingSavesElidedAtWindowStart;
                 _pacingRollbacksAtWindowStart = rb.RollbackCount;
                 _pacingResimAtWindowStart = rb.FramesResimulated;
+                _pacingSavesTakenAtWindowStart = rb.SavesTaken;
+                _pacingSavesElidedAtWindowStart = rb.SavesElided;
+                // buffers=N is the acceptance test for the state pool: it should climb to the ring's
+                // size in the first second or two and then stop. Still climbing means the pool is
+                // being outrun and savestates are still being allocated per frame.
                 rbStr = $"rollbacks {rollbacks} ({resim} frame(s) resimulated, last d{rb.LastRollbackDepth}, " +
-                        $"max d{rb.MaxRollbackDepthSeen}), ";
+                        $"max d{rb.MaxRollbackDepthSeen}), saves {taken} taken/{elided} elided" +
+                        $"{(_adapter != null ? $" (pool {_adapter.StatePoolSize}, buffers {_adapter.StateBuffersAllocated})" : "")}, ";
             }
+
+            // Worst frame decision since this line last printed, not since the window opened — see
+            // _worstGateSinceLogMs for why the windowed figures could not see these at all.
+            string gateStr = $"gate worst {_worstGateSinceLogMs:F1}ms ({_gateSpikesSinceLog} over {GateSpikeMs:F0}ms), " +
+                             $"gc {_gcGateWindow0}/{_gcGateWindow1}/{_gcGateWindow2} in gate, ";
+            _worstGateSinceLogMs = 0;
+            _gateSpikesSinceLog = 0;
+            _gcGateWindow0 = _gcGateWindow1 = _gcGateWindow2 = 0;
             Log($"pacing: adv {p.AdvancedFps:F0} fps, present {p.PresentedFps:F0}, " +
                 $"tick {p.TicksPerSecond:F0}/s (gap min {p.TickGapMinMs:F1} mean {p.TickGapMeanMs:F1} " +
                 $"max {p.TickGapMaxMs:F1}ms), " +
@@ -2727,7 +2861,7 @@ namespace BizHawkNetplay.Tool
                 $"present mean {p.PresentMeanMs:F1}ms, undrawn {p.UndrawnRenders}, " +
                 $"judder {p.JudderPct:F0}% (gap {p.PresentGapMeanMs:F1}ms ±{p.PresentJitterMs:F1} " +
                 $"max {p.PresentGapMaxMs:F1} vs {_frameMs:F1} target), " +
-                $"{clockStr}{rbStr}" +
+                $"{gateStr}{clockStr}{rbStr}" +
                 $"stall {p.StallTickPct:F0}% of {p.Ticks} ticks (tsync {p.TimeSyncTickPct:F0}%), " +
                 $"rebases {p.Rebases}, budget {TickBudgetMs():F0}ms");
         }

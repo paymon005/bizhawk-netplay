@@ -121,7 +121,21 @@ namespace BizHawkNetplay.Core.Sync
 
         // --- Diagnostics (surfaced in the status line / asserted by tests) --------------
         public int RollbackCount { get; private set; }
+
+        /// <summary>
+        /// How far back the last correction reached — the distance from the frame being decided to the
+        /// earliest frame whose inputs turned out wrong. This is the quantity the prediction caps bound
+        /// and the probe's depth model is solved for.
+        /// </summary>
         public int LastRollbackDepth { get; private set; }
+
+        /// <summary>
+        /// Frames the last repair actually re-simulated, which is <see cref="LastRollbackDepth"/> plus
+        /// <see cref="LastRollbackWalkback"/>. Kept apart from the depth because they answer different
+        /// questions: depth is how wrong the prediction was, this is what the correction cost.
+        /// </summary>
+        public int LastReplayedFrames { get; private set; }
+
         public int MaxRollbackDepthSeen { get; private set; }
         public long FramesResimulated { get; private set; }
         public int PredictionStalls { get; private set; }
@@ -393,8 +407,14 @@ namespace BizHawkNetplay.Core.Sync
             if (_clock != null && count > 0) RecordRepairCost((_clock.NowMs - startedMs) / count);
 
             RollbackCount++;
-            LastRollbackDepth = count;
-            if (count > MaxRollbackDepthSeen) MaxRollbackDepthSeen = count;
+            // Depth is how far the correction reached back; the walkback to the nearest keyframe is
+            // extra frames replayed to GET there, and is reported separately below. Both were `count`,
+            // which is their sum, so the status line rendered a true depth-3 correction with one
+            // walkback frame as "d4+1wb" — the walkback counted once in the depth and again beside it.
+            int correctionDepth = frame - r;
+            LastRollbackDepth = correctionDepth;
+            LastReplayedFrames = count;
+            if (correctionDepth > MaxRollbackDepthSeen) MaxRollbackDepthSeen = correctionDepth;
             FramesResimulated += count;
             // Reported apart from the depth, because it is the price of sparse keyframes and the thing
             // to look at if a repair costs more than the depth alone says it should.
