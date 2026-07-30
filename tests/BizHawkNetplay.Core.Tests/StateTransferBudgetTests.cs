@@ -1,5 +1,6 @@
 using BizHawkNetplay.Core.Session;
 using Xunit;
+using static BizHawkNetplay.Core.Tests.Net48Compat;
 
 namespace BizHawkNetplay.Core.Tests;
 
@@ -64,7 +65,8 @@ public class StateTransferBudgetTests
         // forever. And a bigger state buys more time, never less.
         double small = StateTransferBudget.SurvivorReceiveDeadlineSeconds(64 * 1024, 60);
         double large = StateTransferBudget.SurvivorReceiveDeadlineSeconds(8 * 1024 * 1024, 60);
-        Assert.True(double.IsFinite(small) && double.IsFinite(large));
+        // double.IsFinite is .NET Core only; this project's Core also runs on net48.
+        Assert.True(IsFinite(small) && IsFinite(large));
         Assert.True(large > small);
     }
 

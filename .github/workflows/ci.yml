@@ -25,8 +25,16 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      # Core + the test project only. BizHawkNetplay.Tool compiles against assemblies from a local
-      # BizHawk install (see Directory.Build.props / BizHawkHome), which no runner has — so the
-      # solution as a whole is deliberately not built here.
+      # Runs the suite TWICE — the test project multi-targets net10.0 and net48. Core is
+      # netstandard2.0 and BizHawk executes it inside a .NET Framework 4.8 host, so net48 is the
+      # runtime it actually ships on; testing only on net10.0 left the production runtime
+      # unexercised. Not hypothetical: the savestate path runs DeflateStream, whose implementation
+      # differs between .NET Framework and .NET Core. windows-latest carries the 4.8 dev pack.
+      #
+      # BizHawkNetplay.Tool is still NOT built here. It compiles against assemblies from a local
+      # BizHawk install (Directory.Build.props / BizHawkHome) that no runner has. Fixing that —
+      # fetching a pinned BizHawk 2.11.1 and building the shipping DLL — is the top open CI item,
+      # and it matters more now that the Tool is compiled at C# 12, a language version Microsoft
+      # considers unsupported on net48 (which defaults to 7.3).
       - name: Test
         run: dotnet test tests/BizHawkNetplay.Core.Tests --nologo -c Release

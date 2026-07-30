@@ -2,6 +2,7 @@ using System;
 using BizHawkNetplay.Core.Net;
 using BizHawkNetplay.Core.Session;
 using Xunit;
+using static BizHawkNetplay.Core.Tests.Net48Compat;
 
 namespace BizHawkNetplay.Core.Tests;
 
@@ -149,8 +150,8 @@ public class ControlMessageCodecTests
 
         var checksum = ControlMessageCodec.EncodeChecksum(
             new SessionGeneration(0x1122334455667788UL, 1), 2, 0xAABBCCDD);
-        Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x02 }, checksum[12..16]); // frame
-        Assert.Equal(new byte[] { 0xAA, 0xBB, 0xCC, 0xDD }, checksum[16..20]); // hash
+        Assert.Equal(new byte[] { 0x00, 0x00, 0x00, 0x02 }, Slice(checksum, 12, 4)); // frame
+        Assert.Equal(new byte[] { 0xAA, 0xBB, 0xCC, 0xDD }, Slice(checksum, 16, 4)); // hash
     }
 
     [Fact]

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using BizHawkNetplay.Core.Net;
 using BizHawkNetplay.Core.Session;
 using Xunit;
+using static BizHawkNetplay.Core.Tests.Net48Compat;
 
 namespace BizHawkNetplay.Core.Tests;
 
@@ -158,7 +159,7 @@ public class ReliableUdpStreamTests
         feeder.Wait(TimeSpan.FromSeconds(10));
 
         Assert.Equal(3, n);
-        Assert.Equal(new byte[] { 42, 43, 44 }, buffer[0..3]);
+        Assert.Equal(new byte[] { 42, 43, 44 }, Slice(buffer, 0, 3));
     }
 
     [Fact]
