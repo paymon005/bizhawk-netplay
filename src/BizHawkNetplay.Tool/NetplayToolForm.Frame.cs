@@ -18,6 +18,32 @@ namespace BizHawkNetplay.Tool
 {
     public sealed partial class NetplayToolForm
     {
+        // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
+        /// <summary>
+        /// How often EmuHawk calls into this tool from its own run loop, per pacing window.
+        ///
+        /// This is the number that decides whether frame pacing is fixable at all. Our tick can only
+        /// run when EmuHawk's ProgramRunLoop hands the UI thread over, so that loop's rate is a hard
+        /// ceiling on ours. If this reads in the hundreds, WM_TIMER's coalescing is what has been
+        /// limiting us to sixty jittery ticks a second and moving the clock here fixes it. If it reads
+        /// about sixty, we are inheriting EmuHawk's own cadence and no clock of ours can beat it —
+        /// which would be worth saying plainly rather than attempting a fourth mechanism.
+        /// </summary>
+        private int _emuLoopCallsWindow;
+        /// <summary>
+        /// Which clock is actually driving frames, counted per pacing window.
+        ///
+        /// Worth keeping because the first attempt at this — moving the clock to Application.Idle —
+        /// changed the measured judder by nothing at all, and it took counters to establish that the
+        /// handler had never once run. EmuHawk drives its own loop rather than Application.Run, and
+        /// Application.DoEvents does not raise Idle. `timer` staying at zero is now the evidence that
+        /// the fine clock is doing its job; a session where it climbs is one where UpdateValues has
+        /// stopped arriving and the heartbeat has taken over.
+        /// </summary>
+        private int _emuLoopTicksWindow;
+        private bool _frameTickRunning;
+        private int _timerTicksWindow;
+
         /// <summary>
         /// How long one frame-tick callback may spend before it must return to the message loop.
         ///

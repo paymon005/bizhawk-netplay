@@ -18,6 +18,9 @@ namespace BizHawkNetplay.Tool
 {
     public sealed partial class NetplayToolForm
     {
+        // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
+        private int _delayBoxSyncedTo = -1;   // last session delay pushed into _delayBox; see RefreshLiveSettingsUi
+
         // ------------------------------------------------------------------ session
 
         private void BeginSessionHost(List<PeerLink> links, int players, int delay, SyncMode mode,

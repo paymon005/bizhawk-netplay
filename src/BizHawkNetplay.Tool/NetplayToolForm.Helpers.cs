@@ -18,6 +18,15 @@ namespace BizHawkNetplay.Tool
 {
     public sealed partial class NetplayToolForm
     {
+        // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
+        private Config? _config;
+        private bool _configApplied;
+        private int _logLines;      // lines currently in _log, tracked so trimming needn't split its text
+        private bool _prevAcceptBackgroundInput;
+        private bool _prevAcceptBackgroundInputControllerOnly;
+        private bool _prevRunInBackground;
+        private Label _status = null!;
+
 
         /// <summary>
         /// While a session is live, keep EmuHawk running and accepting input even when its window

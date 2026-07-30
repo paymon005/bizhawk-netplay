@@ -18,6 +18,10 @@ namespace BizHawkNetplay.Tool
 {
     public sealed partial class NetplayToolForm
     {
+        // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
+        private PeerIdentity? _punchId;         // prepared handshake identity, captured when punch setup began
+        private SessionPreferences? _punchPrefs;
+
         // ------------------------------------------------------------------ UDP punch (no port-forwarding)
 
         /// <summary>

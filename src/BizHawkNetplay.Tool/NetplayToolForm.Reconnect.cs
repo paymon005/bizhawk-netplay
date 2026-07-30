@@ -18,6 +18,11 @@ namespace BizHawkNetplay.Tool
 {
     public sealed partial class NetplayToolForm
     {
+        // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
+        private int _reconnectPort = -1;           // controller port waiting to be refilled
+        private long _reconnectStartedStamp;
+        private Thread? _reconnectThread;
+
         // ------------------------------------------------------------------ reconnect
 
         /// <summary>

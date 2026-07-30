@@ -18,6 +18,18 @@ namespace BizHawkNetplay.Tool
 {
     public sealed partial class NetplayToolForm
     {
+        // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
+        private CheckBox _forceDesyncCheck = null!;
+        private CheckBox _freezeInputCheck = null!;
+        private Label _myCodeLabel = null!;
+        private Label _peerCodeLabel = null!;
+        private Label _playersHint = null!;
+        private ListView _playersList = null!;
+        private Label _punchInstructions = null!;
+        private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
+        private readonly ToolTip _tips = new ToolTip(); // owns a native window — disposed with the form
+        private CheckBox _verboseCheck = null!;
+
         // ------------------------------------------------------------------ persisted settings
 
         /// <summary>Load remembered prefs and apply them to the controls, then hook change-to-save.</summary>

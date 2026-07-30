@@ -95,7 +95,6 @@ namespace BizHawkNetplay.Tool
         private ComboBox _ipBox = null!;
         private NumericUpDown _portBox = null!;
         private NumericUpDown _playersBox = null!;
-        private Label _playersHint = null!;
         private NumericUpDown _delayBox = null!;
         private CheckBox _autoDelayCheck = null!;
         private NumericUpDown _autoDelayMaxBox = null!;
@@ -104,33 +103,22 @@ namespace BizHawkNetplay.Tool
         private Button _probeButton = null!;
         private Button _testInputButton = null!;
         private Button _pubAddrButton = null!;
-        private CheckBox _verboseCheck = null!;
-        private CheckBox _freezeInputCheck = null!;
-        private CheckBox _forceDesyncCheck = null!;
         private ComboBox _netcodeCombo = null!;
         private ComboBox _inputSourceCombo = null!;
         private Label _netcodeLabel = null!;
         private Button _applyLiveButton = null!;
-        private int _delayBoxSyncedTo = -1;   // last session delay pushed into _delayBox; see RefreshLiveSettingsUi
         private RichTextBox _connLog = null!;
         private CheckBox _simUnresponsiveCheck = null!;
         private CheckBox _upnpCheck = null!;
         private TextBox _passwordBox = null!;
         private NumericUpDown _simLatencyBox = null!;
-        private ListView _playersList = null!;
-        private Label _status = null!;
         private Button _punchButton = null!;
-        private Label _punchInstructions = null!;
-        private Label _myCodeLabel = null!;
-        private Label _peerCodeLabel = null!;
         private GroupBox _punchGroup = null!;
         private TextBox _myCodeBox = null!;
         private Button _copyCodeButton = null!;
         private TextBox _peerCodeBox = null!;
         private Button _connectButton = null!;
         private Label _punchStatus = null!;
-        private readonly ToolTip _tips = new ToolTip(); // owns a native window — disposed with the form
-        private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
         private bool _loadingSettings;                  // suppress change-handler saves while applying loaded prefs
         private string? _pendingJoinIp;                 // regular-join IP awaiting a successful connect, then recorded
 
@@ -142,104 +130,7 @@ namespace BizHawkNetplay.Tool
 
         private int _startEmuFrame; // emulator FrameCount at session start, for drift detection
         private TextBox _log = null!;
-        private int _logLines;      // lines currently in _log, tracked so trimming needn't split its text
 
-        /// <summary>One control link to a peer. Host: one per joiner. Joiner: one (the host).</summary>
-        private sealed class PeerLink
-        {
-            public TcpClient Tcp = null!;      // null for a punched link (control rides the mesh socket)
-            public System.IO.Stream? ControlStream; // punched links: the reliable stream under Control
-            public ControlChannel Control = null!;
-            public int RemotePort;            // the controller port this peer owns (host peer = 0)
-            public Handshake.JoinerGreeting? Greeting; // what this peer asked for; lobby-only
-            public bool HoldsState;           // has already been sent the initial savestate (lobby-only)
-            public IPEndPoint UdpEndpoint = null!;      // LAN/observed endpoint (from TCP source + reported port)
-            public IPEndPoint? ReflexiveEndpoint;       // public (STUN) endpoint, for NAT traversal; null until reported
-            public Thread? Reader;
-            public Thread? Writer;
-            public readonly ConcurrentQueue<OutboundMessage> Outbound = new ConcurrentQueue<OutboundMessage>();
-            public readonly AutoResetEvent OutboundSignal = new AutoResetEvent(false);
-            public volatile bool WriterRunning;
-            public long QueuedBytes;
-            public int Attempt;               // connection-attempt token for stale reader/writer callbacks
-            public double PingMs = -1;        // guarded by _pingLock
-            public int PingCount;             // guarded by _pingLock
-            public long LastRecvTicks;        // Stopwatch ticks of the last message from this peer (Interlocked)
-            public volatile bool ResyncReceiving; // large inbound state frame is allowed to exceed ping timeout
-            public int ReceivingResyncEpoch;      // expected generation while ResyncReceiving is true
-            public int ReceivingResyncBytes;      // declared state size, checked against the completed frame
-            // Parameters the announced state must be rebuilt under, taken from its ResyncBegin.
-            public int ReceivingResyncDelay;
-            public SyncMode ReceivingResyncMode;
-            public bool ReceivingResyncIsSettingsChange;
-            public long ResyncReceiveDeadlineTicks; // bounds BEGIN-without-a-complete-state stalls
-            public long TimeoutGraceUntilTicks;   // we sent this peer a whole state: its reader is busy consuming
-                                                  // that frame and can't pong until it lands (Interlocked)
-            // Frame-advantage exchange (ControlMessageType.Pacing), guarded by _pingLock. Advantage
-            // measured locally is inflated by one-way latency; subtracting the peer's own measurement
-            // cancels that term, which is why both numbers have to travel.
-            public int LocalAdvantage;            // our frame minus theirs, as of their last report
-            public int RemoteAdvantage;           // the same quantity as they measured it
-            public bool AdvantageKnown;           // false until a peer on a build that reports has answered
-            public int PacingSendSequence;         // our monotonically increasing wire sample id
-            public int LastReceivedPacingSequence; // peer sample most recently incorporated
-            public int AwaitingAppliedEpoch;       // host barrier: non-zero until this peer applies that epoch
-            public long AppliedDeadlineTicks;      // bounds a peer that stays alive but never applies state
-            public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
-            public string Label = "";
-        }
-
-        private sealed class OutboundMessage
-        {
-            public OutboundMessage(ControlMessageType type, byte[] body, Action<bool>? completed)
-            {
-                Type = type; Body = body; Completed = completed;
-            }
-            public ControlMessageType Type { get; }
-            public byte[] Body { get; }
-            public Action<bool>? Completed { get; }
-        }
-
-        /// <summary>
-        /// A socket receive timeout applies to each individual read, so a peer can otherwise keep a
-        /// greeting alive forever by sending one byte just before every timeout. This timer bounds the
-        /// whole authentication phase and closes the socket to unblock a pending read at the deadline.
-        /// </summary>
-        private sealed class AbsoluteSocketDeadline : IDisposable
-        {
-            private readonly TcpClient _tcp;
-            private readonly System.Threading.Timer _timer;
-            // 0 = armed, 1 = completed/disarmed, 2 = expired and owns closing the socket.
-            private int _state;
-
-            public AbsoluteSocketDeadline(TcpClient tcp, int timeoutMs)
-            {
-                _tcp = tcp;
-                _timer = new System.Threading.Timer(_ => Expire(), null, timeoutMs, Timeout.Infinite);
-            }
-
-            public bool Expired => Volatile.Read(ref _state) == 2;
-
-            public bool TryComplete()
-            {
-                int previous = Interlocked.CompareExchange(ref _state, 1, 0);
-                if (previous == 0)
-                    try { _timer.Change(Timeout.Infinite, Timeout.Infinite); } catch { }
-                return previous != 2;
-            }
-
-            private void Expire()
-            {
-                if (Interlocked.CompareExchange(ref _state, 2, 0) != 0) return;
-                try { _tcp.Close(); } catch { }
-            }
-
-            public void Dispose()
-            {
-                TryComplete();
-                try { _timer.Dispose(); } catch { }
-            }
-        }
 
         // --- Session state (all touched on the UI thread except where noted) ---
         private EmuHawkAdapter? _adapter;
@@ -254,8 +145,6 @@ namespace BizHawkNetplay.Tool
         // UDP-punch path (2-player, no port-forwarding): one socket does STUN + hole-punch, then carries
         // both the reliable control channel and the input hot path. Set up in two steps (generate our
         // connect code, then punch to the pasted peer code) before the normal session bring-up runs.
-        private PeerIdentity? _punchId;         // prepared handshake identity, captured when punch setup began
-        private SessionPreferences? _punchPrefs;
 
         // Punched joiners admitted into a normal hosted lobby (RemotePlay-style): the UI-side punch
         // worker confirms the path and enqueues the confirmed control stream; the lobby thread greets
@@ -271,11 +160,6 @@ namespace BizHawkNetplay.Tool
         // and it's written from the UI thread. Every other cross-thread field here is volatile too.
         private volatile TcpListener? _listener;
         private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
-        private volatile TcpClient? _greetingTcp; // a joiner we've accepted but are still greeting, so teardown can abort it
-        // Attempt tokens + tracked handshake sockets live in Core (ConnectionLifecycle), which
-        // atomically closes the accept-vs-teardown registration race.
-        private readonly ConnectionLifecycle _lifecycle = new ConnectionLifecycle();
-        private const int HandshakeReceiveTimeoutMs = 15000; // a joiner that connects but never HELLOs can't wedge the host
         // Odd count, and enough of them that the high-water figure means something: the delay estimate
         // now needs the link's swing as well as its median (see LobbyDelayPolicy).
         private const int LobbyProbeSamples = 9;
@@ -339,9 +223,6 @@ namespace BizHawkNetplay.Tool
         // rejoin (into the same port, with the current state) instead of ending. Host-side only — a
         // joiner that loses the host ends and the user rejoins manually. One outstanding drop at a time.
         private volatile bool _awaitingReconnect;
-        private int _reconnectPort = -1;           // controller port waiting to be refilled
-        private Thread? _reconnectThread;
-        private long _reconnectStartedStamp;
         private byte[]? _reconnectState; // authoritative baseline captured at the instant the peer drops
         private SessionGeneration _reconnectGeneration;
         private PeerLink? _pendingReconnectLink; // READY, but held outside _peers until every survivor applies
@@ -383,11 +264,6 @@ namespace BizHawkNetplay.Tool
         private const int RollbackDepthCap = 16;      // clamp the ring so resim cost + memory stay bounded
 
         // Saved EmuHawk config we override for the session's duration (keep running while unfocused).
-        private Config? _config;
-        private bool _prevRunInBackground;
-        private bool _prevAcceptBackgroundInput;
-        private bool _prevAcceptBackgroundInputControllerOnly;
-        private bool _configApplied;
 
         private readonly System.Diagnostics.Stopwatch _paceClock = new System.Diagnostics.Stopwatch();
         private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
@@ -395,7 +271,6 @@ namespace BizHawkNetplay.Tool
         private const double FrameTickWorkBudgetMs = 8.0; // floor for fast cores; see TickBudgetMs
         private double _nextFrameDueMs;
         private double _recentCoreFrameMs; // conservative rolling cost used before committing a hidden first frame
-        private bool _frameTickRunning;
         // Last seen state of EmuHawk's sound device, so the tick can report the transition rather
         // than the aftermath. Starts true: a session that never stops it should say nothing.
         private bool _audioDevWasUp = true;
@@ -461,30 +336,7 @@ namespace BizHawkNetplay.Tool
 
         private double _lastFineTickMs = double.NegativeInfinity;
 
-        /// <summary>
-        /// Which clock is actually driving frames, counted per pacing window.
-        ///
-        /// Worth keeping because the first attempt at this — moving the clock to Application.Idle —
-        /// changed the measured judder by nothing at all, and it took counters to establish that the
-        /// handler had never once run. EmuHawk drives its own loop rather than Application.Run, and
-        /// Application.DoEvents does not raise Idle. `timer` staying at zero is now the evidence that
-        /// the fine clock is doing its job; a session where it climbs is one where UpdateValues has
-        /// stopped arriving and the heartbeat has taken over.
-        /// </summary>
-        private int _emuLoopTicksWindow;
-        private int _timerTicksWindow;
 
-        /// <summary>
-        /// How often EmuHawk calls into this tool from its own run loop, per pacing window.
-        ///
-        /// This is the number that decides whether frame pacing is fixable at all. Our tick can only
-        /// run when EmuHawk's ProgramRunLoop hands the UI thread over, so that loop's rate is a hard
-        /// ceiling on ours. If this reads in the hundreds, WM_TIMER's coalescing is what has been
-        /// limiting us to sixty jittery ticks a second and moving the clock here fixes it. If it reads
-        /// about sixty, we are inheriting EmuHawk's own cadence and no clock of ours can beat it —
-        /// which would be worth saying plainly rather than attempting a fourth mechanism.
-        /// </summary>
-        private int _emuLoopCallsWindow;
 
         protected override string WindowTitleStatic => "BizHawk Netplay";
 
