@@ -252,10 +252,14 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
 - **Three players works on real hardware over the internet.** Several 20–30 minute sessions on three
   separate machines: Gauntlet II (SNES) on **rollback** at low delay, Mario Golf (N64) on
   **lockstep**, and Pokémon Stadium (N64) on **rollback at delay 5**, all reported as playing well.
-  No logs were kept, so those are players' judgements rather than measurements. What remains open is
-  **four** players on separate machines, and whether **desync recovery and drop/rejoin** actually
-  fire and recover in real play — nobody was watching for them, and an uneventful session is not
-  evidence that recovery works. 4-player rollback was measured in July 2026 on four instances of one
+  No logs were kept, so those are players' judgements rather than measurements.
+- **Four players, desync recovery and live settings changes are proven on a real internet path**
+  (2026-07-30, logs kept): host on broadband, three joiners behind mobile carrier-grade NAT, all 12
+  mesh paths answered. Six injected desyncs each recovered to `back in sync — recovery confirmed`,
+  seven live delay/netcode changes rebuilt the session without dropping anyone, and protocol 13's
+  compression moved a 421KiB state as 85KiB — 20% — arriving byte-exact every time. What remains
+  open is **drop and rejoin**, which needs an ungraceful break (kill the process) rather than
+  Disconnect, since a deliberate leave ends the session by design. 4-player rollback was measured in July 2026 on four instances of one
   machine, absorbing a simulated 400ms round-trip at input delay 2 without stalling and hitting its
   ring cap at 600ms. Numbers and caveats in `KNOWN-ISSUES.md` KI-8 and KI-11.
 - **The N64 Rice video plugin renders some games incorrectly.** A BizHawk plugin issue rather than a

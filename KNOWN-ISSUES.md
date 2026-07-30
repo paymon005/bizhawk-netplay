@@ -26,12 +26,27 @@ depth. At delay 5 over the internet it was reported as working well. Note the re
 player's judgement, not telemetry. No logs were captured from these sessions, so there are no
 numbers here and none should be inferred.
 
-*What it does NOT settle, and why this stays open:* nobody was watching for desyncs, so whether a
-**resync or a drop/rejoin actually fired and recovered** is unknown. That machinery — session
-generations, gap retransmission, mesh route failover, bounded state transfers — is precisely what
-KI-8 was opened for, and playing without incident is not evidence that recovery works; it is
-evidence that it wasn't needed. Still wanted: one session with the log kept, ideally with a
-deliberate mid-game drop and rejoin, and a forced desync via the diagnostic checkbox.
+**Desync recovery is now proven in real play (2026-07-30, 4 players, logs kept).** Host on home
+broadband, three joiners behind mobile carrier-grade NAT, SNES/Snes9x, rollback delay 4:
+
+- `mesh measured: all 12 direct path(s) answered` — the full four-player mesh over a real path.
+- **Six deliberate desyncs** injected from a joiner via *Force desync (diag)*. Every one: the host
+  detected the mismatch, shipped an authoritative state, all three peers applied it, and both sides
+  logged `back in sync — recovery confirmed`. Checksums agreed continuously between injections.
+- **Seven live settings changes** — input delay 4→2→4→6→2→1 and netcode both directions — each
+  rebuilding the timeline with no disconnection.
+- **Protocol 13 compression measured on the wire:** 421KiB captured, 85–93KiB transferred, a
+  consistent 20–22%. Every transfer arrived intact; the post-resync `checksum frame 0` agreed each
+  time, so decompression is byte-exact on a real link.
+
+That settles the half of KI-8 about resync: session generations, the authoritative state transfer,
+the bounded deadlines and the generation gating all work at four players over the internet.
+
+*What stays open:* **drop and rejoin.** It could not be exercised, and the reason is worth writing
+down — a *graceful* leave (Disconnect, or closing the tool) is handled at `Peers.cs` by ending the
+session outright, deliberately, because the peer meant to go. The 60-second reconnect wait is for an
+unexpected break, so testing it requires killing EmuHawk from Task Manager or pulling the network,
+not pressing Disconnect.
 
 **The Rice plugin renders some games incorrectly** (visible on the N64 titles above). That is a
 BizHawk video-plugin issue, not a netplay one — but it is the first real entry in the N64
