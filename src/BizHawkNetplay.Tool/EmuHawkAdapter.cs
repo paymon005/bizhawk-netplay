@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -279,10 +280,17 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         var axes = new int[layout.Axes.Count];
         if (axes.Length > 0)
         {
-            // Read live host analog axes — paused-safe via the same host coalescer GetPressedButtons
-            // uses (values are in BizHawk's ±10000 convention) — and apply BizHawk's own analog-bind
-            // math so the captured value matches exactly what local play would feed the core. Same
-            // source-port remap as buttons, so a player assigned P2/P3/P4 uses their P1 stick.
+            // Read live host analog axes (BizHawk's ±10000 convention) and apply BizHawk's own
+            // analog-bind math, so the captured value matches exactly what local play would feed the
+            // core. Same source-port remap as buttons, so a player assigned P2/P3/P4 uses their P1 stick.
+            //
+            // NOT the same coalescer as GetPressedButtons, whatever this comment used to claim:
+            // InputApi.GetPressedAxes reads ControllerInputCoalescer while GetPressedButtons reads
+            // HostInputCoalescer (InputApi.cs:43-48 in 2.11.1). ControllerInputCoalescer is the right
+            // one — it is the source LatchFromPhysical itself consumes, and InputManager.ProcessInput
+            // feeds it raw host axis values unconditionally, outside the hotkey gate that filters
+            // button events. It also means axes refresh only when EmuHawk's main loop runs, which a
+            // catch-up burst inside one timer callback does not do; see AppendAnalogState.
             int axSrc = (src >= 0 && src < _analogBinds.Length && _analogBinds[src].Length == axes.Length) ? src : port;
             IReadOnlyDictionary<string, int>? hostAxes;
             try { hostAxes = _apis.Input.GetPressedAxes(); }
@@ -729,7 +737,110 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
                 if (EvaluateBinding(_bindings[0][i], set)) on.Add(l0.Buttons[i]);
             sb.Append("resolved P1 pressed: [").Append(string.Join(", ", on)).Append("]");
         }
+        AppendAnalogState(sb);
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// The analog half of the input test. Buttons were the only thing this reported, which is why
+    /// "the N64 stick only gives min or max, never medium" stayed a matter of opinion: every stage
+    /// that could explain it was invisible.
+    ///
+    /// It prints the whole chain per axis — the bind, the live host reading, and the core value
+    /// <see cref="ResolveAxis"/> derives from it — so the three candidate explanations separate on
+    /// sight rather than by argument:
+    ///
+    /// * <c>host=</c> absent, or the raw dictionary empty, means the pad's axes are not reaching
+    ///   <c>GetPressedAxes</c> at all. Then analog is dead and the only thing that can still move
+    ///   the axis is a button bind, which is worth stating because of the next point.
+    /// * <c>BUTTON BIND ACTIVE</c> means the value came from the digital branch, which by
+    ///   construction yields exactly ±1 and therefore exactly Min or Max. That branch producing
+    ///   every non-neutral reading IS the reported symptom, so it is called out rather than left to
+    ///   be inferred from a number that looks plausible.
+    /// * a smoothly varying <c>host=</c> with a smoothly varying result means capture is fine and
+    ///   the loss is downstream — sampling cadence, not resolution.
+    ///
+    /// Read it while holding the stick at roughly half deflection; that is the case in dispute.
+    /// </summary>
+    private void AppendAnalogState(StringBuilder sb)
+    {
+        if (_layouts.Length == 0 || _layouts[0].Axes.Count == 0)
+        {
+            sb.Append("\nanalog: this core exposes no axes.");
+            return;
+        }
+
+        IReadOnlyDictionary<string, int>? hostAxes;
+        try { hostAxes = _apis.Input.GetPressedAxes(); }
+        catch (Exception ex)
+        {
+            sb.Append("\nanalog: GetPressedAxes threw: ").Append(ex.Message);
+            return;
+        }
+
+        var layout = _layouts[0];
+        sb.Append("\nanalog: ").Append(layout.Axes.Count).Append(" axis/axes on P1, circular constraint ")
+          .Append(_useCircularAnalogConstraint ? "ON" : "OFF")
+          .Append(", GetPressedAxes reported ").Append(hostAxes == null ? 0 : hostAxes.Count)
+          .Append(" host axis/axes\n");
+
+        // The raw dictionary, verbatim. If the stick is missing from here, nothing downstream can
+        // recover it, and no amount of staring at the resolved value would say so.
+        if (hostAxes != null && hostAxes.Count > 0)
+        {
+            sb.Append("  host axes now: [");
+            bool first = true;
+            foreach (var kv in hostAxes)
+            {
+                if (!first) sb.Append(", ");
+                sb.Append(kv.Key).Append('=').Append(kv.Value);
+                first = false;
+            }
+            sb.Append("]\n");
+        }
+
+        var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
+        for (int j = 0; j < layout.Axes.Count; j++)
+        {
+            var spec = layout.Axes[j];
+            var bindN = _analogBinds[0][j];
+            sb.Append("  '").Append(spec.Name).Append("' [").Append(spec.Min).Append("..").Append(spec.Max)
+              .Append(" neutral=").Append(spec.Neutral).Append(']');
+            if (_axisReversed[0][j]) sb.Append(" reversed");
+
+            if (bindN == null) { sb.Append("  <- UNBOUND (always neutral)\n"); continue; }
+            var bind = bindN.Value;
+
+            sb.Append("\n      bind '").Append(bind.Value).Append("' mult=")
+              .Append(bind.Mult.ToString("0.00", CultureInfo.InvariantCulture))
+              .Append(" deadzone=").Append(bind.Deadzone.ToString("0.00", CultureInfo.InvariantCulture))
+              .Append(" btn+='").Append(bind.ButtonBindPositive).Append("' btn-='")
+              .Append(bind.ButtonBindNegative).Append("'\n");
+
+            bool plus = !string.IsNullOrEmpty(bind.ButtonBindPositive)
+                        && EvaluateBinding(bind.ButtonBindPositive, pressed);
+            bool minus = !string.IsNullOrEmpty(bind.ButtonBindNegative)
+                         && EvaluateBinding(bind.ButtonBindNegative, pressed);
+            int raw = 0;
+            bool haveRaw = hostAxes != null && !string.IsNullOrEmpty(bind.Value)
+                           && hostAxes.TryGetValue(bind.Value, out raw);
+            int resolved = ResolveAxis(bindN, spec, _axisReversed[0][j], hostAxes, pressed);
+
+            sb.Append("      host=").Append(haveRaw ? raw.ToString(CultureInfo.InvariantCulture) : "ABSENT")
+              .Append(haveRaw ? $" ({raw / 10000f:0.000} of full)" : " (bind name not in the dictionary above)")
+              .Append("  ->  core value ").Append(resolved).Append('\n');
+
+            // The digital branch wins over the stick whenever it fires, exactly as BizHawk's
+            // LatchFromPhysical does — and it can only ever produce full deflection.
+            if (plus ^ minus)
+                sb.Append("      !! BUTTON BIND ACTIVE (")
+                  .Append(plus ? "positive" : "negative")
+                  .Append(") — the stick is being ignored this instant and the value is forced to ")
+                  .Append(plus ? "Max" : "Min").Append(", never anything between.\n");
+            else if (!haveRaw)
+                sb.Append("      !! no host reading for this axis — it can only ever read neutral, " +
+                         "or full deflection if a button bind fires.\n");
+        }
     }
 
     private string[][] BuildBindings()
