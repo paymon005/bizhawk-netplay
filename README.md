@@ -67,11 +67,15 @@ src/
     Input/  ControllerLayout, InputSerializer (generic-over-any-core packing)
     Sync/   ISyncStrategy, LockstepStrategy, RollbackStrategy, InputPipeline, FrameDriver
     Probe/  CapabilityProbe, ProbeResult      (§5 rollback-feasibility math)
-    Net/    ITransport, MeshUdpTransport (mesh + punch), PunchedPeerLink + ReliableUdpStream
-            (UDP-punch path), StunClient, UpnpPortMapper, ConnectCode, InputPacketCodec
-    Session/ PeerIdentity, SessionNegotiator, ControlChannel, Handshake, HandshakeCodec
+    Net/    ITransport, MeshUdpTransport (mesh + punch + reliable control streams),
+            ReliableUdpStream, StunClient, UpnpPortMapper, ConnectCode, InputPacketCodec
+    Session/ PeerIdentity, SessionNegotiator, ControlChannel, Handshake, HandshakeCodec,
+            SessionPhase (session lifecycle), DelayAdvice, SustainedTrigger, RecoveryPolicy
   BizHawkNetplay.Tool/    net48 — the only project that references BizHawk
-    NetplayToolForm.cs    [ExternalTool] entry point (host/join, session UI, folds in the probe)
+    NetplayToolForm*.cs   [ExternalTool] entry point, split into partials by region:
+                          .Ui .Lobby .Punch .Session .Frame .Telemetry .Peers .Recovery
+                          .Reconnect .Probe .Helpers .Types — shared state lives in the
+                          root NetplayToolForm.cs, each partial owns state only it uses
     EmuHawkAdapter.cs     IEmuAdapter bridged onto ApiHawk + emulator services
     InputSetController.cs  InputSet -> IController for invisible frame advance
     NetplaySettings.cs    persisted UI prefs (UPnP, port, delay, netcode, input source, recent IPs)

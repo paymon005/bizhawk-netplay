@@ -1,4 +1,3 @@
-using BizHawkNetplay.Core.Input;
 using BizHawkNetplay.Core.Net;
 
 namespace BizHawkNetplay.Core.Sync

@@ -174,12 +174,18 @@ namespace BizHawkNetplay.Core.Tests
             s.Restart(0);
             int frames = 0;
             for (double now = 0; now < 10_000; now += 5.0)
-                while (s.MayRunFrame(now, frames % 2) && frames < 100_000)
+            {
+                // Per CALLBACK, not global parity: the argument is "how many has THIS callback run",
+                // and passing frames % 2 made every other callback start as though it had already run
+                // one — which suppresses exactly the first-frame tolerance this test is about.
+                int framesThisCallback = 0;
+                while (s.MayRunFrame(now, framesThisCallback))
                 {
                     s.FrameCompleted(0.5);
                     frames++;
-                    if (frames % 2 == 0) break;   // model a callback that runs at most two
+                    framesThisCallback++;   // MayRunFrame's own cap ends the callback at two
                 }
+            }
 
             // 10 seconds at 60Hz is 600 frames, give or take the half-period of slack.
             Assert.InRange(frames, 598, 602);

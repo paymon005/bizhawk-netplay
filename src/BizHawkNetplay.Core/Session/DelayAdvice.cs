@@ -17,12 +17,28 @@ namespace BizHawkNetplay.Core.Session
         /// <summary>
         /// The one action that changes a running session's delay, addressed to whoever can take it.
         /// A joiner cannot touch the control, so it is told what to ask for.
+        ///
+        /// <paramref name="maxSelectable"/> is the ceiling the control actually offers. Past it there
+        /// is no action to name: the stalling hint asks for <c>sessionDelay + 1</c> and the lobby's
+        /// recommendation is clamped to a protocol limit three times the UI's, so both could tell a
+        /// host at the maximum to "set Input delay to 21" — a number the box will not accept, in a
+        /// message whose whole job is to be followed literally. At the ceiling the honest answer is
+        /// that delay is spent and the remaining causes are elsewhere.
         /// </summary>
-        public static string ApplyNow(bool isHost, int suggested) => isHost
-            ? $"Set Input delay to {suggested} and press \"Apply changes\" — everyone stays connected " +
-              "through a brief pause."
-            : $"Ask the host to set Input delay to {suggested} and press \"Apply changes\" — everyone " +
-              "stays connected through a brief pause, nobody rejoins.";
+        public static string ApplyNow(bool isHost, int suggested, int maxSelectable)
+        {
+            if (suggested > maxSelectable)
+                return $"Input delay is already at its maximum of {maxSelectable}, so more of it isn't " +
+                    "available — what's left is a link too slow or too jittery for this netcode, or a " +
+                    "peer that can't hold full speed. Rollback absorbs far more latency than lockstep " +
+                    "if you aren't already on it.";
+
+            return isHost
+                ? $"Set Input delay to {suggested} and press \"Apply changes\" — everyone stays " +
+                  "connected through a brief pause."
+                : $"Ask the host to set Input delay to {suggested} and press \"Apply changes\" — " +
+                  "everyone stays connected through a brief pause, nobody rejoins.";
+        }
 
         /// <summary>
         /// <see cref="ApplyNow"/> plus, for a host, why the lobby started lower than this. That tail is
@@ -32,9 +48,14 @@ namespace BizHawkNetplay.Core.Session
         /// Only ever attach this to advice about being UNDER-delayed. The tail explains a number that
         /// came out too low; on the over-delayed warning it reads as nonsense.
         /// </summary>
-        public static string Remedy(bool isHost, int suggested, bool autoFromPing, int autoMax)
+        public static string Remedy(bool isHost, int suggested, bool autoFromPing, int autoMax,
+            int maxSelectable)
         {
-            string apply = ApplyNow(isHost, suggested);
+            string apply = ApplyNow(isHost, suggested, maxSelectable);
+
+            // Past the ceiling the tail contradicts the message: there is no point explaining why the
+            // lobby didn't choose a number that the control could never have reached either.
+            if (suggested > maxSelectable) return apply;
 
             // A joiner cannot see the host's auto-delay settings, so the rest would be noise to it.
             if (!isHost) return apply;

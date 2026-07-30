@@ -10,7 +10,6 @@ using BizHawk.Client.Common;
 using BizHawk.Client.EmuHawk;
 using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Net;
-using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
 

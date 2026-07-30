@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using Xunit;

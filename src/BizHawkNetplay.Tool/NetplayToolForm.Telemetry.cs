@@ -1,16 +1,6 @@
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Drawing;
-using System.Net;
-using System.Net.Sockets;
 using System.Threading;
-using System.Windows.Forms;
-using BizHawk.Client.Common;
-using BizHawk.Client.EmuHawk;
-using BizHawk.Emulation.Common;
-using BizHawkNetplay.Core.Net;
-using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
 
@@ -316,10 +306,12 @@ namespace BizHawkNetplay.Tool
         }
         /// <summary>Session-shaped wrappers over <see cref="DelayAdvice"/>: the controls it needs are
         /// this form's, the wording and the branching are not.</summary>
-        private string ApplyDelayAdvice(int suggested) => DelayAdvice.ApplyNow(_isHost, suggested);
+        private string ApplyDelayAdvice(int suggested) =>
+            DelayAdvice.ApplyNow(_isHost, suggested, (int)_delayBox.Maximum);
 
         private string DelayRemedy(int suggested) => DelayAdvice.Remedy(
-            _isHost, suggested, _autoDelayCheck.Checked, (int)_autoDelayMaxBox.Value);
+            _isHost, suggested, _autoDelayCheck.Checked, (int)_autoDelayMaxBox.Value,
+            (int)_delayBox.Maximum);
 
 
         /// <summary>

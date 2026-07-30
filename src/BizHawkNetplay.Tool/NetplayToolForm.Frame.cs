@@ -1,16 +1,8 @@
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Drawing;
-using System.Net;
-using System.Net.Sockets;
 using System.Threading;
-using System.Windows.Forms;
 using BizHawk.Client.Common;
-using BizHawk.Client.EmuHawk;
-using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Net;
-using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
 
@@ -63,24 +55,6 @@ namespace BizHawkNetplay.Tool
         private double TickBudgetMs() => _schedule.BudgetMs;
 
         /// <summary>
-        /// How early the FIRST frame of a tick may run.
-        ///
-        /// Callbacks do not arrive on a clean 16.7ms cadence — measured gaps run 3ms to 35ms around a
-        /// 16.7ms mean, because our WM_TIMER is only delivered when the host pumps its message queue.
-        /// Against a strict due-time that pattern is worst-case: the tick that lands early runs no
-        /// frame at all, so the one after it finds two due, runs both, and shows only the second. One
-        /// picture is lost per pair, which is why presented frames sat near 50 while the core emulated
-        /// a steady 60.
-        ///
-        /// Letting the first frame run up to half a period early lets an early tick take the frame it
-        /// nearly earned, turning "none then two" into "one then one". Long-run rate is untouched —
-        /// _nextFrameDueMs still advances by exactly one period per frame — so the emulation can never
-        /// lead the wall clock by more than this tolerance. Frames two and later stay strict, so a
-        /// catch-up burst still requires genuinely accumulated debt.
-        /// </summary>
-        private double EarlyFrameToleranceMs => _schedule.EarlyToleranceMs;
-
-        /// <summary>
         /// Report what the OS actually gives us for a short sleep, once per session.
         ///
         /// The frame tick rides WM_TIMER, whose delivery is bound to the system clock tick, and on
@@ -105,31 +79,20 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// Runs frames from the message loop's idle time, which is what actually paces the session.
-        /// <see cref="_frameTimer"/> stays running underneath as a heartbeat for the case where the
-        /// queue never goes idle, so the worst this can do is behave exactly as it did before.
+        /// EmuHawk's own per-loop-iteration callback into external tools, and the session's real frame
+        /// clock. Counted as well as used — see <see cref="_emuLoopCallsWindow"/> for why its rate is
+        /// the question that matters.
         ///
-        /// WM_TIMER cannot pace a frame clock. It is a synthesised, lowest-priority message: it is only
-        /// generated when the queue is otherwise empty, at most one is ever queued, and it is delivered
-        /// on the system tick rather than on demand. `timeBeginPeriod(1)` above buys a 1.1ms Sleep and
-        /// changes none of that — a session measured ticks arriving 0.6ms to 33ms apart, averaging
-        /// 60/s against a 10ms interval that should have produced 100. Frames therefore landed at
-        /// arbitrary phase against the 16.688ms boundary: sometimes a tick ran no frame, so the next
-        /// ran two and showed only the second. Judder measured 15% of presents, peaking at 28%, on a
-        /// machine idle 94% of the time — a scheduling failure, not a capacity one.
-        ///
-        /// Idle time is the right source because it costs nothing to take. The loop exits the instant
-        /// any message arrives, so the UI is never starved; while nothing is pending it sleeps in 1ms
-        /// steps until the boundary is close, then runs the tick within half a millisecond of it.
-        /// </summary>
-        /// <summary>
-        /// Stops both frame clocks. Unhooking the idle handler matters as much as stopping the timer:
-        /// left attached it would keep being raised for the lifetime of EmuHawk, and the session flags
-        /// it tests are the only thing standing between that and a permanent sleep loop.
-        /// </summary>
-        /// <summary>
-        /// EmuHawk's own per-loop-iteration callback into external tools. Counted only — see
-        /// <see cref="_emuLoopCallsWindow"/> for why its rate is the question that matters.
+        /// WM_TIMER cannot pace a frame clock, which is what led here. It is a synthesised,
+        /// lowest-priority message: generated only when the queue is otherwise empty, never more than
+        /// one queued, delivered on the system tick rather than on demand. `timeBeginPeriod(1)` buys a
+        /// 1.1ms Sleep and changes none of that — a session measured ticks arriving 0.6ms to 33ms
+        /// apart, averaging 60/s against a 10ms interval that should have produced 100. Frames landed
+        /// at arbitrary phase against the 16.688ms boundary, so a tick that ran no frame was followed
+        /// by one that ran two and showed only the second: judder measured 15% of presents, peaking at
+        /// 28%, on a machine idle 94% of the time — a scheduling failure, not a capacity one.
+        /// <see cref="_frameTimer"/> stays running underneath as a heartbeat for the case where this
+        /// callback stops arriving, so the worst this can do is behave as it did before.
         /// </summary>
         public override void UpdateValues(ToolFormUpdateType type)
         {
@@ -151,6 +114,9 @@ namespace BizHawkNetplay.Tool
             FrameTick();
         }
 
+        /// <summary>Stops the heartbeat timer and hands back the session's memory. The fine clock needs
+        /// no unhooking — it is EmuHawk's own callback, gated on <see cref="SessionPhase.IsActive"/>,
+        /// so clearing that flag is what stops it.</summary>
         private void StopFramePacing()
         {
             _frameTimer.Stop();
