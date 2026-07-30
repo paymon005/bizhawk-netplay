@@ -1,0 +1,27 @@
+root = true
+
+# Style rules the C# 12 sweep applied, kept so they stay applied. Without this file the next `dotnet
+# format` run — or anyone's IDE — would have no opinion, and the codebase would drift straight back
+# to a mixture of both styles, which is worse than either one consistently.
+#
+# Severity is `warning`, not `error`: these are readability preferences, and a style disagreement
+# must never be the thing that stops a build.
+
+[*.cs]
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+
+# --- C# 10: one less level of indentation on every file in the tree -------------------------------
+csharp_style_namespace_declarations = file_scoped:warning
+
+# --- C# 9/12: don't repeat a type the compiler already knows --------------------------------------
+csharp_style_implicit_object_creation_when_type_is_apparent = true:warning
+dotnet_style_prefer_collection_expression = when_types_loosely_match:warning
+
+# --- Deliberately NOT enabled ---------------------------------------------------------------------
+# Primary constructors (IDE0290). They read as a tidy-up but change what the type actually is: the
+# parameter is captured into compiler-generated storage whose mutability and lifetime differ from the
+# readonly fields it replaces, and for types that validate their arguments there is nowhere to put the
+# check. Several Core types here throw from their constructors on purpose.
+dotnet_diagnostic.IDE0290.severity = none
