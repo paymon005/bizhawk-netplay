@@ -219,7 +219,17 @@ namespace BizHawkNetplay.Tool
 
         // --- Input --------------------------------------------------------------------
 
-        public int PortCount => _layouts.Length;
+        /// <summary>
+        /// Ports a session may actually use. This counted layout slots, including empty ones that
+        /// serialize to zero bytes — see <see cref="UsablePorts"/> for what that cost a 3-player NES
+        /// session. Every caller wants the usable figure: the player-count cap, the host's minimum
+        /// check, and the per-port layout dump all break in the same way on a slot that carries no input.
+        /// </summary>
+        public int PortCount => UsablePorts(_layouts);
+
+        /// <summary>Total layout slots the core declared, usable or not. Diagnostic only — reported at
+        /// session start so a core that declares more ports than it populates is visible.</summary>
+        public int DeclaredPortCount => _layouts.Length;
 
         public CoreLayout GetControllerLayout(int port) => _layouts[port];
 
@@ -1157,7 +1167,28 @@ namespace BizHawkNetplay.Tool
         public static int PortCountOf(IEmulator emulator)
         {
             if (emulator == null) throw new ArgumentNullException(nameof(emulator));
-            return BuildLayouts(emulator.ControllerDefinition).Length;
+            return UsablePorts(BuildLayouts(emulator.ControllerDefinition));
+        }
+
+        /// <summary>
+        /// Leading run of ports that can actually carry input — a layout with no buttons and no axes
+        /// serializes to zero bytes and is a slot, not a controller.
+        ///
+        /// <see cref="BuildLayouts"/> allocates one slot per player number it finds anywhere in the
+        /// core's flat control list, and those slots are not guaranteed to be populated. QuickNES
+        /// reports three, of which the third is empty — so a 3-player session passed the player-count
+        /// cap, and then every packet for port 2 was refused on arrival because the receiving side had
+        /// nothing to deserialize it into. Both ends agreed there was no input to exchange, no frame
+        /// ever advanced, and the session died at frame 0 blaming the UDP path.
+        ///
+        /// The run is counted from port 0 and stops at the first empty slot, because ports are assigned
+        /// contiguously: a usable port sitting behind an unusable one is unreachable anyway.
+        /// </summary>
+        private static int UsablePorts(CoreLayout[] layouts)
+        {
+            int usable = 0;
+            while (usable < layouts.Length && layouts[usable].PayloadByteWidth > 0) usable++;
+            return usable;
         }
 
         private static CoreLayout[] BuildLayouts(ControllerDefinition def)

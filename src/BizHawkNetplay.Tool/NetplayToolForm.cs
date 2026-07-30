@@ -1042,9 +1042,18 @@ namespace BizHawkNetplay.Tool
                     // Belt-and-braces: RefreshPlayerLimit normally keeps the box at or below this, so
                     // reaching here means the core changed under us. Never clamp silently — an
                     // unexplained "waiting for 1 player(s)" after asking for 4 is the confusing case.
+                    // Name the declared count too when it is higher. A core that declares a port it
+                    // never populates (QuickNES declares three, the third empty) used to pass this cap
+                    // and then fail at frame 0 with every packet for that port refused on arrival —
+                    // which read as a lost UDP path rather than as an unusable controller.
+                    string declared = _adapter.DeclaredPortCount > portCount
+                        ? $" (it declares {_adapter.DeclaredPortCount} but only {portCount} carry input — " +
+                          "a core can name a port it never wires up; on NES try NesHawk rather than QuickNES)"
+                        : "";
                     ConnLog($"hosting {players} players, not {(int)_playersBox.Value} — this core exposes only " +
-                            $"{portCount} controller port(s). Enable the core's multitap/adapter " +
-                            "(Genesis: 4-Way Play or Team Player) for more.", Color.DarkOrange);
+                            $"{portCount} usable controller port(s){declared}. Enable the core's " +
+                            "multitap/adapter (Genesis: 4-Way Play or Team Player; SNES: multitap; " +
+                            "NES: Four Score) for more.", Color.DarkOrange);
                     RefreshPlayerLimit();
                 }
 
