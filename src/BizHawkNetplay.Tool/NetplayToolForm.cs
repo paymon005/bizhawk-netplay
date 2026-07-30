@@ -1158,7 +1158,10 @@ namespace BizHawkNetplay.Tool
                     _mesh = MeshUdpTransport.Bind(0); _transport = WrapSimLatency(_mesh);
                     // Start finding our public endpoint NOW, so the HELLO can carry it and the host can
                     // put it in the routes it hands every other joiner. It runs while the TCP connect
-                    // and the lobby wait happen, so it usually costs nothing at all.
+                    // and the lobby wait happen, so it usually costs nothing at all. Cleared first:
+                    // the answer belongs to a socket, and this is a new one.
+                    _localReflexive = null;
+                    try { _reflexiveKnown.Reset(); } catch { }
                     StartReflexiveDiscovery(_mesh, attempt);
                     string ip = joinIp!.ToString(); // parsed above, before the pause
                     // Remember the address WITH its port: the dropdown's whole job is to let you rejoin
@@ -1252,6 +1255,8 @@ namespace BizHawkNetplay.Tool
             _mesh = mesh;
             _transport = WrapSimLatency(mesh);
             mesh.SetPeerRoutes(new List<PeerRoute> { new PeerRoute(0, new[] { host }) });
+            _localReflexive = null;                       // new socket, new answer
+            try { _reflexiveKnown.Reset(); } catch { }
             SetBusy(true);
             _punchButton.Enabled = false;
             _punchStatus.Text = "finding your public address…";
