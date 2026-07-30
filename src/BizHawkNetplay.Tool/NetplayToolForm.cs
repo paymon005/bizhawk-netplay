@@ -1281,16 +1281,22 @@ namespace BizHawkNetplay.Tool
                         Label = $"host ({host.Address})",
                     };
                     bool initialStateApplied = false;
+                    int preparations = 0;
                     try { control.ReadTimeout = HandshakeReceiveTimeoutMs; } catch { }
                     var sp = Handshake.RunClientMulti(channel, id, prefs, mesh.LocalPort, beforeReady: ready =>
                     {
+                        if (++preparations > 1)
+                            UiConnLog($"the host restarted the lobby — someone else dropped out before the " +
+                                      $"start. Re-preparing as P{ready.LocalPort + 1} of {ready.PlayerCount}; " +
+                                      "your connection is fine.", Color.DarkOrange);
                         InvokeUiBlocking(() =>
                         {
                             if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
                             PrepareSessionJoiner(ready, peerLink);
                         });
                         initialStateApplied = true;
-                    }, afterGreet: () =>
+                    }, measureMesh: (_, peerRoutes) => MeasureJoinerMesh(host, peerRoutes),
+                       afterGreet: () =>
                     {
                         // Auth done. The lobby wait is legitimately unbounded (the host may wait
                         // minutes for other players); started frames must still finish.
@@ -1903,13 +1909,26 @@ namespace BizHawkNetplay.Tool
         /// the same set is installed again by <see cref="ApplyJoinerMesh"/> a moment later, which
         /// leaves the confirmations and samples taken here intact.
         /// </summary>
-        private LobbyMeshSample MeasureJoinerMesh(IPAddress hostIp, int hostUdpPort,
-            IReadOnlyList<PeerRoute> peerRoutes)
+        private LobbyMeshSample MeasureJoinerMesh(IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes)
+        {
+            UiConnLog($"measuring my {peerRoutes.Count + 1} direct UDP path(s) ({MeshProbeWindowMs}ms)…",
+                Color.DarkSlateBlue);
+            var sample = TakeJoinerMeshSample(hostEndpoint, peerRoutes);
+            UiConnLog(sample.HasMeasurement
+                ? $"my worst direct path: ~{sample.Rtt.MedianMs:F0}ms (±{sample.Rtt.JitterMs:F0}ms), " +
+                  $"{sample.MeasuredEdges}/{sample.TotalEdges} path(s) answered"
+                : $"none of my {sample.TotalEdges} direct path(s) answered in time — the host will size " +
+                  "the delay from the paths that did",
+                sample.IsComplete ? Color.DarkGreen : Color.DarkOrange);
+            return sample;
+        }
+
+        private LobbyMeshSample TakeJoinerMeshSample(IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes)
         {
             var mesh = _mesh;
             if (mesh == null) return LobbyMeshSample.None;
 
-            var routes = new List<PeerRoute> { new PeerRoute(0, new[] { new IPEndPoint(hostIp, hostUdpPort) }) };
+            var routes = new List<PeerRoute> { new PeerRoute(0, new[] { hostEndpoint }) };
             routes.AddRange(peerRoutes);
             try { mesh.SetPeerRoutes(routes); }
             catch { return LobbyMeshSample.None; }
@@ -2060,19 +2079,7 @@ namespace BizHawkNetplay.Tool
                                       "lobby and start. This can take a while in a 3-4 player session; " +
                                       "Disconnect still cancels.", Color.DarkGreen);
                         }, measureMesh: (hostUdpPort, peerRoutes) =>
-                        {
-                            UiConnLog($"measuring my {peerRoutes.Count + 1} direct UDP path(s) " +
-                                      $"({MeshProbeWindowMs}ms)…", Color.DarkSlateBlue);
-                            var sample = MeasureJoinerMesh(remoteIp, hostUdpPort, peerRoutes);
-                            UiConnLog(sample.HasMeasurement
-                                ? $"my worst direct path: ~{sample.Rtt.MedianMs:F0}ms " +
-                                  $"(±{sample.Rtt.JitterMs:F0}ms), {sample.MeasuredEdges}/{sample.TotalEdges} " +
-                                  "path(s) answered"
-                                : $"none of my {sample.TotalEdges} direct path(s) answered in time — the host " +
-                                  "will size the delay from the paths that did",
-                                sample.IsComplete ? Color.DarkGreen : Color.DarkOrange);
-                            return sample;
-                        });
+                            MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes));
                     }
                     catch (Exception ex) when (greetDeadline.Expired)
                     {
