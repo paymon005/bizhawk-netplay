@@ -13,14 +13,15 @@ namespace BizHawkNetplay.Core.Session
     ///   Pacing      (28): generation, sequence, acknowledges, frame, localAdvantage
     ///   Checksum    (20): generation, frame, hash(uint32)
     ///   ResyncBegin (32): generation, stateBytes, waitSeconds, inputDelay, mode, isSettingsChange
-    ///   StatePayload(12+n): generation, raw state bytes
+    ///   StatePayload(17+n): generation, format(1: 0=raw 1=deflate), uncompressedLength, payload
     /// Decoders are tolerant (return false) — the control channel frames reliably, but a peer on a
     /// different build may still send shapes we don't understand.
     /// </summary>
     public static class ControlMessageCodec
     {
-        /// <summary>ControlChannel's frame cap minus the 12-byte generation prefix.</summary>
-        public const int MaxStateBytes = 64 * 1024 * 1024 - 12;
+        /// <summary>ControlChannel's frame cap minus the 12-byte generation prefix and the 5-byte
+        /// state header (format + uncompressed length), so a maximal RAW payload still fits a frame.</summary>
+        public const int MaxStateBytes = 64 * 1024 * 1024 - 17;
 
         /// <summary>Upper bound on a declared reconnect wait — anything bigger is a bogus frame.</summary>
         public const int MaxResyncWaitSeconds = 300;
@@ -153,15 +154,25 @@ namespace BizHawkNetplay.Core.Session
                 && inputDelay >= 1 && inputDelay <= HandshakeCodec.MaxInputDelay;
         }
 
+        /// <summary>
+        /// The authoritative state for a resync or a rejoin: the generation it belongs to, then the
+        /// state framed by <see cref="StateCompression"/>.
+        ///
+        /// The size announced in RESYNC BEGIN stays the UNCOMPRESSED length, deliberately. Every
+        /// receiver-side length check and both transfer deadlines are written against the state's real
+        /// size, and leaving them there means compression can only make those deadlines more generous
+        /// than they already were — it can never cause a premature timeout on a link that was fine.
+        /// </summary>
         public static byte[] EncodeStatePayload(SessionGeneration generation, byte[] state)
         {
             if (state == null) throw new ArgumentNullException(nameof(state));
             if (state.Length > MaxStateBytes)
                 throw new ArgumentException("Resync state exceeds control-frame cap", nameof(state));
             var generationBody = HandshakeCodec.EncodeGeneration(generation); // validates the generation
-            var body = new byte[generationBody.Length + state.Length];
+            var packed = StateCompression.Pack(state);
+            var body = new byte[generationBody.Length + packed.Length];
             Buffer.BlockCopy(generationBody, 0, body, 0, generationBody.Length);
-            Buffer.BlockCopy(state, 0, body, generationBody.Length, state.Length);
+            Buffer.BlockCopy(packed, 0, body, generationBody.Length, packed.Length);
             return body;
         }
 
@@ -169,11 +180,10 @@ namespace BizHawkNetplay.Core.Session
         {
             generation = default;
             state = Array.Empty<byte>();
-            if (body == null || body.Length < GenerationSize) return false;
+            if (body == null || body.Length < GenerationSize + StateCompression.HeaderSize) return false;
             if (!TryReadGeneration(body, 0, out generation)) return false;
-            state = new byte[body.Length - GenerationSize];
-            Buffer.BlockCopy(body, GenerationSize, state, 0, state.Length);
-            return true;
+            return StateCompression.TryUnpack(body, GenerationSize, body.Length - GenerationSize,
+                MaxStateBytes, out state);
         }
 
         // ---- pre-GO mesh measurement -------------------------------------------------

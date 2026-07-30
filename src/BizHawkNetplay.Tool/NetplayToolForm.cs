@@ -38,7 +38,7 @@ namespace BizHawkNetplay.Tool
         // phantom desync every interval.
         // 12: the lobby now measures every UDP mesh edge and the host publishes the settled delay in its
         // own control frame (MeshRtt / InputDelay), which an older build neither sends nor expects.
-        private const int Protocol = 12;
+        private const int Protocol = 13;  // v13: resync/reconnect states are deflated on the wire
         private const int DefaultPort = 47800;
         private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

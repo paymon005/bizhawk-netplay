@@ -342,7 +342,9 @@ namespace BizHawkNetplay.Core.Session
             SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
         {
             HostSendAssignment(channel, assignedPort, playerCount, inputDelay, mode, generation, peerRoutes);
-            channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
+            // Framed and deflated: this is the transfer a joiner sits through before the game starts,
+            // and on a heavy core it was the whole savestate raw over whatever link they have.
+            channel.Send(ControlMessageType.State, StateCompression.Pack(state ?? Array.Empty<byte>()));
         }
 
         /// <summary>
@@ -493,7 +495,8 @@ namespace BizHawkNetplay.Core.Session
                 if (type == ControlMessageType.State)
                 {
                     if (initialState != null) throw new HandshakeException("host sent STATE more than once");
-                    initialState = body;
+                    if (!StateCompression.TryUnpack(body, ControlMessageCodec.MaxStateBytes, out initialState))
+                        throw new HandshakeException("host sent a malformed or oversized initial state");
                     continue;
                 }
                 if (type == ControlMessageType.MeshRtt)

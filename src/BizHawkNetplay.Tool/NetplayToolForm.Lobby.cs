@@ -117,6 +117,9 @@ namespace BizHawkNetplay.Tool
                 {
                     _mesh = MeshUdpTransport.Bind(port); _transport = WrapSimLatency(_mesh);
                     var state = _adapter.ExportState();
+                    // Not reporting the compressed size here: it would mean deflating the whole state a
+                    // second time on the UI thread just to print a percentage. The resync line reports
+                    // the ratio, and it is the same state.
                     Log($"exported {state.Length / 1024}KiB initial state; hosting {players} players");
                     StartThread(() => HostThread(port, id, prefs, state, _mesh.LocalPort, players,
                         autoDelay, autoDelayMax, lobbyFrameMs, _simLatencyMs, attempt));

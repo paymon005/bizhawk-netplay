@@ -23,9 +23,10 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 > **Everyone must be on the same version.** The network protocol is versioned and the handshake
 > refuses a mismatch, so when you update, your friends must update to the same release too. The
 > protocol version numbers in the table below are historical — each says what that release changed.
-> **`main` is currently on protocol 12**, which is a break from the last release: the lobby measures
-> every UDP mesh edge before choosing input delay, and the host can change netcode or delay
-> mid-session.
+> **`main` is currently on protocol 13**, which is a break from the last release: the lobby measures
+> every UDP mesh edge before choosing input delay, the host can change netcode or delay mid-session,
+> and every savestate transfer — the initial join, a resync, a rejoin, a settings change — is
+> deflated on the wire instead of being sent raw.
 
 ## Status
 
@@ -222,6 +223,7 @@ Loading a state is about keeping the workload *still*, not about it being dearer
 
 # To Do
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
+- **State transfers are compressed (v13), but rollback's savestates are not.** Every whole-state transfer over the control channel — initial join, resync, rejoin, live settings change — is deflated, which is where the multi-second freezes on heavy cores came from. That is the *network* copy only. The rollback ring still saves and loads raw, deliberately: those are on the frame path, where the memcpy is the budget and compressing would cost more than it saves.
 - **Rollback depth on heavy cores:** N64 runs rollback ~3 frames deep at native — enough for a nearby opponent, not a distant one. Sparse keyframes (snapshotting every *other* predicted frame; see below) is in and buys a frame of that. Beyond it the wall is arithmetic: the savestate is **74%** of what a repaired frame costs, and a 16.7 MiB state moves at memory bandwidth — 2.9 GB/s written, measured identically across ten games, both plugins and every resolution. Making the state smaller or incremental would be the real win and needs core support BizHawk doesn't expose.
 - **The depth verdict is ~15% optimistic.** The probe's [repair line](#the-repair-line) says so on every stationary run, and the cause is known: `load=` is timed in isolation and the load defers work onto the frame that follows it, so the once-per-repair cost is nearer 3.8 ms than the 1.6 ms reported. Feeding the repair-derived terms to the solver is the fix; it moves the reported depth at native from 3 to what sparse keyframes now earns honestly.
 - **A repair spends up to `MaxFramesPerTick` frame periods, and the catch-up path can run exactly that many back per tick.** The two are now tied rather than chosen alongside each other, so raising either alone can no longer leave repairs running up arrears the pacing rebase quietly discards.

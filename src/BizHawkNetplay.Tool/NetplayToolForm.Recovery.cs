@@ -109,6 +109,21 @@ namespace BizHawkNetplay.Tool
         /// operation: both need every peer to land on one state, at one generation, under one set of
         /// parameters. The only difference is what gets said and what gets counted.
         /// </summary>
+        /// <summary>
+        /// What actually goes on the wire versus what was captured. Worth a line because the freeze
+        /// every player sits through is proportional to the first number, not the second, and until
+        /// now they were the same number — so a slow rebuild on a heavy core had no way to show
+        /// whether the link or the state size was responsible.
+        /// </summary>
+        private static string DescribeStateTransfer(int stateBytes, int wireBytes)
+        {
+            if (stateBytes <= 0) return $"{wireBytes} B on the wire";
+            int pct = (int)Math.Round(100.0 * wireBytes / stateBytes);
+            return pct >= 98
+                ? $"{wireBytes / 1024}KiB on the wire (incompressible)"
+                : $"{wireBytes / 1024}KiB on the wire ({pct}% of it)";
+        }
+
         private void ShipAuthoritativeState(string label, bool isSettingsChange)
         {
             int attempt = CurrentConnectionAttempt;
@@ -125,8 +140,9 @@ namespace BizHawkNetplay.Tool
                 var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
                 Status($"{label}: sending epoch {generation.Epoch} " +
                     $"({state.Length / 1024}KiB) to {peerCount} peer(s)…", Color.DarkOrange);
-                Log($"{label}: captured {state.Length / 1024}KiB for epoch " +
-                    $"{generation.Epoch}; waiting for every peer to import it");
+                Log($"{label}: captured {state.Length / 1024}KiB for epoch {generation.Epoch}, " +
+                    $"{DescribeStateTransfer(state.Length, stateBody.Length)}; " +
+                    "waiting for every peer to import it");
 
                 if (peerCount == 0)
                 {
