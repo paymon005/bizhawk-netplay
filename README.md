@@ -257,11 +257,15 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
   (2026-07-30, logs kept): host on broadband, three joiners behind mobile carrier-grade NAT, all 12
   mesh paths answered. Six injected desyncs each recovered to `back in sync — recovery confirmed`,
   seven live delay/netcode changes rebuilt the session without dropping anyone, and protocol 13's
-  compression moved a 421KiB state as 85KiB — 20% — arriving byte-exact every time. What remains
-  open is **drop and rejoin**, which needs an ungraceful break (kill the process) rather than
-  Disconnect, since a deliberate leave ends the session by design. 4-player rollback was measured in July 2026 on four instances of one
-  machine, absorbing a simulated 400ms round-trip at input delay 2 without stalling and hitting its
-  ring cap at 600ms. Numbers and caveats in `KNOWN-ISSUES.md` KI-8 and KI-11.
+  compression moved a 421KiB state as 85KiB — 20% — arriving byte-exact every time.
+- **Drop and rejoin is proven too** (same day, same setup). The network was pulled from a joiner
+  mid-session; the host held the seat, froze the survivors at an epoch boundary, and the returning
+  player re-joined into `epoch 2, 421KiB baseline synchronized` with all four agreeing on checksums
+  afterwards. **The hold covers one missing player at a time** — a second drop during a pending
+  reconnect ends the session by design, so peers sharing a single connection can't be recovered
+  (pull that link and they all go at once). 4-player rollback was measured in July 2026 on four
+  instances of one machine, absorbing a simulated 400ms round-trip at input delay 2 without stalling
+  and hitting its ring cap at 600ms. Numbers and caveats in `KNOWN-ISSUES.md` KI-8 and KI-11.
 - **The N64 Rice video plugin renders some games incorrectly.** A BizHawk plugin issue rather than a
   netplay one, but it looks like a netplay fault from the chair. Every peer must run the same plugin
   in any case — the handshake compares the core's sync-settings blob and refuses a mismatch up front.

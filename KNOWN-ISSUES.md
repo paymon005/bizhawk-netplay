@@ -7,8 +7,8 @@ v0.10.1 release notes.
 
 ## Open
 
-**KI-8 (validation) — REDUCED. The session path has real 3-player internet play; the RECOVERY path
-still has not been watched.**
+**KI-8 (validation) — CLOSED 2026-07-30. Both recovery paths have now been watched in real play at
+four players over the internet: resync after a desync, and drop-and-rejoin after an ungraceful break.**
 
 *Superseded evidence (2026-07-30):* three players, three separate machines, over the open internet,
 across several sessions of 20–30 minutes each:
@@ -39,14 +39,34 @@ broadband, three joiners behind mobile carrier-grade NAT, SNES/Snes9x, rollback 
   consistent 20–22%. Every transfer arrived intact; the post-resync `checksum frame 0` agreed each
   time, so decompression is byte-exact on a real link.
 
-That settles the half of KI-8 about resync: session generations, the authoritative state transfer,
-the bounded deadlines and the generation gating all work at four players over the internet.
+That settles resync: session generations, the authoritative state transfer, the bounded deadlines
+and the generation gating all work at four players over the internet.
 
-*What stays open:* **drop and rejoin.** It could not be exercised, and the reason is worth writing
-down — a *graceful* leave (Disconnect, or closing the tool) is handled at `Peers.cs` by ending the
-session outright, deliberately, because the peer meant to go. The 60-second reconnect wait is for an
-unexpected break, so testing it requires killing EmuHawk from Task Manager or pulling the network,
-not pressing Disconnect.
+**Drop and rejoin is proven too (2026-07-30, same setup, logs kept).** The network was pulled from a
+joiner mid-session — an ungraceful break, which is the only thing that reaches this path: a
+*graceful* leave (Disconnect, or closing the tool) is handled at `Peers.cs` by ending the session
+outright, deliberately, because the peer meant to go. What the host logged, in order:
+
+```
+P4 dropped (An existing connection was forcibly closed…) — holding the session; waiting up to 60s…
+P3 applied resync epoch 2
+P2 applied resync epoch 2
+P4 reconnected — epoch 2, 421KiB baseline synchronized; resuming
+checksum frame 0: all 4 agree
+```
+
+Survivors froze at the epoch boundary instead of timing out their UDP input, the returning player
+re-joined over TCP into its held seat, and play continued with all four agreeing at frames 0, 300
+and 600. The rejoiner's own log shows it as a normal Join — the seat is what the host holds, so the
+player just clicks Join again.
+
+*The limitation that surfaced while testing this, worth stating plainly:* **the hold covers exactly
+one missing player.** A second drop while a reconnect is pending ends the session
+(`RecoveryPolicy.OnPeerLost` → `EndSessionSecondDropDuringReconnect`), because advancing the epoch
+again would make the reconnect boundary skip an epoch for survivors still on the prior one. That is
+deliberate, but it means **peers sharing one connection cannot be recovered** — pull the link behind
+two joiners and both go, so the host is freezing a survivor that is already gone. The message for
+that case now names the peer rather than reporting the step that failed.
 
 **The Rice plugin renders some games incorrectly** (visible on the N64 titles above). That is a
 BizHawk video-plugin issue, not a netplay one — but it is the first real entry in the N64

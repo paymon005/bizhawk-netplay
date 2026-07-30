@@ -86,7 +86,16 @@ public sealed partial class NetplayToolForm
             {
                 if (!QueueControl(survivor, ControlMessageType.ResyncBegin, begin))
                 {
-                    EndSession("could not freeze survivors for reconnect");
+                    // Nearly always the rest of a shared outage arriving: peers behind one
+                    // connection drop together, so the survivor we are freezing is already gone.
+                    // Name it and say which of QueueControl's two refusals this was — the old
+                    // wording reported the step that failed and left the cause to be guessed at.
+                    EndSession(survivor.WriterRunning
+                        ? $"could not hold the session for a rejoin — {survivor.Label}'s control " +
+                          "channel is backed up"
+                        : $"could not hold the session for a rejoin — {survivor.Label} is gone too " +
+                          "(peers sharing one connection drop together; only one seat at a time " +
+                          "can be held open)");
                     return;
                 }
             }
