@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -634,6 +635,84 @@ namespace BizHawkNetplay.Core.Tests
 
                 var ex = Assert.Throws<HandshakeException>(() => client.GetAwaiter().GetResult());
                 Assert.Contains("after READY", ex.Message);
+            }
+            finally { dispose(); }
+        }
+
+        // ---- surviving someone else's departure -----------------------------------------
+
+        /// <summary>
+        /// A joiner that is already READY keeps its seat when a DIFFERENT joiner leaves before GO. The
+        /// host reissues the assignment, and this one re-prepares against the new parameters rather than
+        /// having the whole lobby fail around it. Observed the other way round: a healthy P2 lost its
+        /// session because P3 closed its window mid-handshake.
+        /// </summary>
+        [Fact]
+        public void ARepeatedWelcomeRestartsTheLobbyWithoutReshippingTheState()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var generation = Generation(0x5150UL, epoch: 1);
+                var hostState = new byte[4096];
+                new Random(7).NextBytes(hostState);
+                var prepared = new List<(int port, int players, int delay)>();
+
+                var client = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh, Id(), new SessionPreferences(1, false), 51001,
+                    beforeReady: ready => prepared.Add((ready.LocalPort, ready.PlayerCount, ready.InputDelay))));
+
+                Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
+
+                // First attempt: a 4-player lobby, this joiner is P3 (port 2).
+                Handshake.HostSendStart(hostCh, assignedPort: 2, playerCount: 4, inputDelay: 2,
+                    SyncMode.Lockstep, hostState, generation);
+                Handshake.HostRequestReady(hostCh, generation);
+                Handshake.HostWaitReady(hostCh, generation);
+
+                // P2 vanishes. The survivor moves up a port, the lobby refills, and the delay settles
+                // somewhere else — all of which reaches it as a bare WELCOME with no state behind it.
+                Handshake.HostSendAssignment(hostCh, assignedPort: 1, playerCount: 4, inputDelay: 2,
+                    SyncMode.Lockstep, generation);
+                Handshake.HostSendInputDelay(hostCh, generation, 5);
+                Handshake.HostRequestReady(hostCh, generation);
+                Handshake.HostWaitReady(hostCh, generation);
+                Handshake.HostSendGo(hostCh, generation);
+
+                var session = client.GetAwaiter().GetResult();
+
+                // It prepared twice, and the second preparation is the one that starts.
+                Assert.Equal(2, prepared.Count);
+                Assert.Equal((2, 4, 2), prepared[0]);
+                Assert.Equal((1, 4, 5), prepared[1]);
+                Assert.Equal(1, session.LocalPort);
+                Assert.Equal(5, session.InputDelay);
+
+                // The state it holds is the one shipped the first time round — the restart cost a
+                // control frame, not another 4KiB (or several MiB on a real core).
+                Assert.Equal(hostState, session.InitialState);
+            }
+            finally { dispose(); }
+        }
+
+        [Fact]
+        public void ARestartedLobbyStillRefusesASecondStateTransfer()
+        {
+            var (hostCh, clientCh, dispose) = TcpPair();
+            try
+            {
+                var generation = Generation(0x5151UL, epoch: 1);
+                var client = Task.Run(() => Handshake.RunClientMulti(
+                    clientCh, Id(), new SessionPreferences(1, false), 51001));
+
+                Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
+                Handshake.HostSendStart(hostCh, 1, 2, 2, SyncMode.Lockstep, new byte[16], generation);
+                // A restart reissues the assignment only. A host that ships state twice has lost track
+                // of what this joiner holds, and quietly taking the second copy would hide that.
+                Handshake.HostSendStart(hostCh, 1, 2, 2, SyncMode.Lockstep, new byte[16], generation);
+
+                var ex = Assert.Throws<HandshakeException>(() => client.GetAwaiter().GetResult());
+                Assert.Contains("STATE more than once", ex.Message);
             }
             finally { dispose(); }
         }

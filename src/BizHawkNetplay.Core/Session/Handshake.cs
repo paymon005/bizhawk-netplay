@@ -335,10 +335,22 @@ namespace BizHawkNetplay.Core.Session
             ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
             SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
         {
-            channel.Send(ControlMessageType.Welcome,
-                HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes));
+            HostSendAssignment(channel, assignedPort, playerCount, inputDelay, mode, generation, peerRoutes);
             channel.Send(ControlMessageType.State, state ?? Array.Empty<byte>());
         }
+
+        /// <summary>
+        /// The assignment alone — a WELCOME with no state behind it. Sent on its own when the lobby
+        /// changes after a joiner already holds the state: another joiner left before GO, their seat was
+        /// refilled, and the survivors need corrected ports and routes. The joiner treats a repeated
+        /// WELCOME as a restart and keeps the state it has, which is what makes recovering from someone
+        /// else's fumbled join cost a frame of control traffic instead of another full state transfer.
+        /// </summary>
+        public static void HostSendAssignment(
+            ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode,
+            SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
+            => channel.Send(ControlMessageType.Welcome,
+                HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes));
 
         /// <summary>Ask this joiner to apply everything it has been sent and acknowledge READY.</summary>
         public static void HostRequestReady(ControlChannel channel, SessionGeneration generation)
@@ -449,7 +461,13 @@ namespace BizHawkNetplay.Core.Session
                 }
                 if (type == ControlMessageType.Welcome)
                 {
-                    if (haveWelcome) throw new HandshakeException("host sent WELCOME more than once");
+                    // A repeat is a lobby restart, not a protocol error: someone else left before GO,
+                    // the host refilled their seat, and every remaining joiner needs the corrected
+                    // assignment and routes. Everything derived from the previous WELCOME is discarded
+                    // — including a READY already acknowledged, since the parameters that acknowledgement
+                    // stood for have just changed. The state survives, because the host has not stepped
+                    // the core since it exported it and re-shipping megabytes to prove that would make
+                    // recovering from a fumbled join cost more than the join.
                     try
                     {
                         (assignedPort, playerCount, delay, mode, generation, peerRoutes) =
@@ -460,6 +478,8 @@ namespace BizHawkNetplay.Core.Session
                         throw new HandshakeException("invalid WELCOME: " + ex.Message);
                     }
                     haveWelcome = true;
+                    readySent = false;
+                    session = null;
                     continue;
                 }
                 if (type == ControlMessageType.State)

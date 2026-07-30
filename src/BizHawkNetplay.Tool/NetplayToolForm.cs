@@ -149,6 +149,8 @@ namespace BizHawkNetplay.Tool
             public System.IO.Stream? ControlStream; // punched links: the reliable stream under Control
             public ControlChannel Control = null!;
             public int RemotePort;            // the controller port this peer owns (host peer = 0)
+            public Handshake.JoinerGreeting? Greeting; // what this peer asked for; lobby-only
+            public bool HoldsState;           // has already been sent the initial savestate (lobby-only)
             public IPEndPoint UdpEndpoint = null!;      // LAN/observed endpoint (from TCP source + reported port)
             public IPEndPoint? ReflexiveEndpoint;       // public (STUN) endpoint, for NAT traversal; null until reported
             public Thread? Reader;
@@ -1439,70 +1441,101 @@ namespace BizHawkNetplay.Tool
                 TryPublishHostAddress(port, attempt);
 
                 var links = new List<PeerLink>();
-                var greetings = new List<Handshake.JoinerGreeting>();
-                while (links.Count < need)
+                // One generation for the whole lobby, including any restart: a joiner that survives
+                // someone else's fumbled join keeps the state and the timeline it already has.
+                var generation = new SessionGeneration(SessionAuth.NewSessionId(), 1);
+                int finalDelay;
+                SyncMode mode;
+
+                // Fill the lobby, then try to start it. A joiner that dies between the greet and GO used
+                // to throw straight out of here and take the whole session down: a healthy P2 lost its
+                // lobby because P3 closed its window mid-handshake, and the host had to re-host from
+                // scratch. That blast radius is wrong on its own and gets likelier with every extra
+                // player, so a casualty now costs its own seat and nothing else — the door reopens and
+                // the survivors wait for a replacement.
+                while (true)
                 {
+                    while (links.Count < need)
+                    {
+                        if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener)) return;
+
+                        // A punched joiner admitted from the UI (a pasted connect code) enters this SAME
+                        // lobby as a TCP accept would: same greet, same WELCOME/READY/GO — no TCP on its
+                        // link. This is what makes punch admission N-player for free.
+                        if (_punchAdmissions.TryDequeue(out var admission))
+                        {
+                            GreetPunchedJoiner(admission, id, prefs, udpLocalPort, links, need, attempt);
+                            continue;
+                        }
+                        if (!hostListener.Pending()) { Thread.Sleep(50); continue; }
+
+                        TcpClient tcp;
+                        try { tcp = hostListener.AcceptTcpClient(); }
+                        catch when (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener))
+                        { return; } // teardown stopped the listener, not a failure
+                        if (!IsConnectionAttemptCurrent(attempt)) { try { tcp.Close(); } catch { } return; }
+
+                        try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
+                        try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // bound a silent joiner's HELLO
+                        if (!TrackHandshakeClient(tcp, attempt)) { try { tcp.Close(); } catch { } return; }
+                        _greetingTcp = tcp; // so Disconnect/teardown can abort a joiner stuck mid-handshake
+                        var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
+                        var channel = new ControlChannel(tcp.GetStream());
+
+                        Handshake.JoinerGreeting greet;
+                        try
+                        {
+                            greet = WithAbsoluteSocketDeadline(tcp, HandshakeReceiveTimeoutMs,
+                                () => Handshake.HostGreet(channel, id, prefs, udpLocalPort));
+                        }
+                        catch (Exception ex)
+                        {
+                            // One joiner failing the greet — wrong session password, wrong ROM/core, a HELLO
+                            // that never arrived — is that joiner's problem, not the session's. Refusing them
+                            // used to take the whole host down with it, so a typo'd password meant re-hosting;
+                            // drop just this connection and keep the door open (same policy as a rejoin).
+                            if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
+                            UntrackHandshakeClient(tcp);
+                            try { tcp.Close(); } catch { }
+                            if (!IsConnectionAttemptCurrent(attempt)
+                                || !ReferenceEquals(_listener, hostListener)) return;
+                            UiConnLog($"refused a join from {remoteIp}: {ex.Message} — still hosting, " +
+                                      $"waiting for {need - links.Count} player(s)", Color.Firebrick);
+                            continue;
+                        }
+
+                        if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
+                        try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
+                        int assignedPort = links.Count + 1;
+                        links.Add(new PeerLink
+                        {
+                            Tcp = tcp,
+                            Control = channel,
+                            RemotePort = assignedPort,
+                            Greeting = greet,
+                            UdpEndpoint = new IPEndPoint(remoteIp, greet.UdpPort),
+                            Label = $"P{assignedPort + 1} ({remoteIp})",
+                        });
+                        UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);
+                    }
                     if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener)) return;
 
-                    // A punched joiner admitted from the UI (a pasted connect code) enters this SAME
-                    // lobby as a TCP accept would: same greet, same WELCOME/READY/GO — no TCP on its
-                    // link. This is what makes punch admission N-player for free.
-                    if (_punchAdmissions.TryDequeue(out var admission))
-                    {
-                        GreetPunchedJoiner(admission, id, prefs, udpLocalPort, links, greetings, need, attempt);
-                        continue;
-                    }
-                    if (!hostListener.Pending()) { Thread.Sleep(50); continue; }
+                    // The host decides the authoritative delay (max anyone asked) and the sync mode, both
+                    // from whoever is actually in the lobby right now — a replacement's preferences count
+                    // exactly as much as the player they replaced.
+                    finalDelay = prefs.InputDelay;
+                    foreach (var link in links)
+                        finalDelay = Math.Max(finalDelay, link.Greeting!.Prefs.InputDelay);
+                    mode = ChooseSyncMode(links, id, prefs);
 
-                    TcpClient tcp;
-                    try { tcp = hostListener.AcceptTcpClient(); }
-                    catch when (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener))
-                    { return; } // teardown stopped the listener, not a failure
-                    if (!IsConnectionAttemptCurrent(attempt)) { try { tcp.Close(); } catch { } return; }
-
-                    try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
-                    try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // bound a silent joiner's HELLO
-                    if (!TrackHandshakeClient(tcp, attempt)) { try { tcp.Close(); } catch { } return; }
-                    _greetingTcp = tcp; // so Disconnect/teardown can abort a joiner stuck mid-handshake
-                    var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
-                    var channel = new ControlChannel(tcp.GetStream());
-
-                    Handshake.JoinerGreeting greet;
-                    try
-                    {
-                        greet = WithAbsoluteSocketDeadline(tcp, HandshakeReceiveTimeoutMs,
-                            () => Handshake.HostGreet(channel, id, prefs, udpLocalPort));
-                    }
-                    catch (Exception ex)
-                    {
-                        // One joiner failing the greet — wrong session password, wrong ROM/core, a HELLO
-                        // that never arrived — is that joiner's problem, not the session's. Refusing them
-                        // used to take the whole host down with it, so a typo'd password meant re-hosting;
-                        // drop just this connection and keep the door open (same policy as a rejoin).
-                        if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
-                        UntrackHandshakeClient(tcp);
-                        try { tcp.Close(); } catch { }
-                        if (!IsConnectionAttemptCurrent(attempt)
-                            || !ReferenceEquals(_listener, hostListener)) return;
-                        UiConnLog($"refused a join from {remoteIp}: {ex.Message} — still hosting, " +
-                                  $"waiting for {need - links.Count} player(s)", Color.Firebrick);
-                        continue;
-                    }
-
-                    if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
-                    try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
-                    int assignedPort = links.Count + 1;
-                    links.Add(new PeerLink
-                    {
-                        Tcp = tcp,
-                        Control = channel,
-                        RemotePort = assignedPort,
-                        UdpEndpoint = new IPEndPoint(remoteIp, greet.UdpPort),
-                        Label = $"P{assignedPort + 1} ({remoteIp})",
-                    });
-                    greetings.Add(greet);
-                    UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);
+                    if (TryStartLobby(links, state, players, need, generation, mode, autoDelay, autoDelayMax,
+                            lobbyFrameMs, simulatedOneWayMs, attempt, ref finalDelay))
+                        break;
+                    if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener)) return;
                 }
+
+                // Everyone is READY. Close the door only now — until this point a replacement may still
+                // have been needed.
                 try { hostListener.Stop(); } catch { }
                 if (ReferenceEquals(_listener, hostListener)) _listener = null;
                 // A code pasted just as the lobby filled has no seat — close its stream cleanly.
@@ -1514,111 +1547,12 @@ namespace BizHawkNetplay.Tool
                 }
                 if (!IsConnectionAttemptCurrent(attempt)) return;
 
-                // The host decides the authoritative delay (max anyone asked) once everyone's in.
-                int finalDelay = prefs.InputDelay;
-                foreach (var g in greetings) finalDelay = Math.Max(finalDelay, g.Prefs.InputDelay);
-
-                // The host is authoritative on sync mode. Lockstep/Rollback force it; Automatic grants
-                // rollback only if every joiner pairwise negotiates to rollback (opted in + cleared the
-                // probe depth threshold), else lockstep.
-                SyncMode mode;
-                if (_netcodeChoice == NetcodeChoice.Lockstep)
-                {
-                    mode = SyncMode.Lockstep;
-                }
-                else if (_netcodeChoice == NetcodeChoice.Rollback && !_replayDeterministic)
-                {
-                    // The Rollback pick overrides the probe's PERFORMANCE recommendation. It does not
-                    // override a core that provably cannot replay: that is not a matter of taste, and
-                    // honouring it would guarantee the desyncs rollback exists to avoid.
-                    mode = SyncMode.Lockstep;
-                    UiLog("rollback was forced, but this core failed the probe's replay check — using " +
-                          "lockstep, which never reloads state. Forcing it would desync on every correction.");
-                }
-                else if (_netcodeChoice == NetcodeChoice.Rollback)
-                {
-                    Handshake.JoinerGreeting? incapable = null;
-                    foreach (var g in greetings)
-                    {
-                        if (!g.Prefs.WantRollback || g.Id.MaxRollbackDepth < ProbeResult.RollbackDepthThreshold)
-                        { incapable = g; break; }
-                    }
-                    if (incapable != null)
-                    {
-                        mode = SyncMode.Lockstep;
-                        UiLog("rollback was forced locally, but a joiner reported rollback unavailable; using lockstep");
-                    }
-                    else
-                    {
-                        mode = SyncMode.Rollback; // bypass only this host's local recommendation
-                        UiLog("netcode forced to rollback — bypassing only the host's local probe recommendation");
-                    }
-                }
-                else // Automatic
-                {
-                    bool allRollback = greetings.Count >= 1;
-                    foreach (var g in greetings)
-                        if (SessionNegotiator.Negotiate(id, g.Id, prefs, g.Prefs).Mode != SyncMode.Rollback)
-                        { allRollback = false; break; }
-                    mode = allRollback ? SyncMode.Rollback : SyncMode.Lockstep;
-                }
-
-                double worstRttMs = -1;
-                double worstJitterMs = 0;
-                if (autoDelay)
-                {
-                    UiConnLog($"measuring lobby ping ({LobbyProbeSamples} samples per player)…",
-                        Color.DarkSlateBlue);
-                    foreach (var link in links)
-                    {
-                        if (!IsConnectionAttemptCurrent(attempt)) return;
-                        var sample = ProbeLobbyRtt(link);
-                        if (sample.MedianMs > worstRttMs) worstRttMs = sample.MedianMs;
-                        // Worst median and worst jitter are tracked independently: one session-wide
-                        // delay has to cover every link on both counts, so the safe figure is the
-                        // worst of each even when they come from different players.
-                        if (sample.JitterMs > worstJitterMs) worstJitterMs = sample.JitterMs;
-                    }
-                }
-
-                // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
-                // (it reaches the host at the address it connected to, so the host is left off the list).
-                var generation = new SessionGeneration(SessionAuth.NewSessionId(), 1);
-                // Trust the negotiated endpoints before asking clients to prepare their drivers: their
-                // pre-READY neutral windows can then queue instead of being rejected as foreign UDP.
-                _mesh!.SetPeerRoutes(RoutesExcept(links, null));
-                // WELCOME + state, but NOT the READY request: the routes WELCOME carries are what every
-                // joiner needs before it can punch and measure the edges this machine cannot see, and
-                // READY is the point of no return for the delay each driver gets built with.
-                foreach (var link in links)
-                {
-                    ConfigureStateTransferTimeouts(link, state.Length);
-                    Handshake.HostSendStart(link.Control, link.RemotePort, players, finalDelay, mode, state,
-                        generation, RoutesExcept(links, link));
-                }
-
-                if (autoDelay)
-                {
-                    MeasureLobbyMesh(links, generation, players, attempt, ref worstRttMs, ref worstJitterMs);
-                    finalDelay = SelectLobbyDelay(finalDelay, autoDelayMax, mode, worstRttMs,
-                        lobbyFrameMs, simulatedOneWayMs, players, worstJitterMs);
-                }
-                if (!IsConnectionAttemptCurrent(attempt)) return;
-
-                // Publish the settled figure before anyone builds a driver. Sent unconditionally, so the
-                // delay every peer runs is one number decided in one place rather than each end's own
-                // reading of WELCOME.
-                foreach (var link in links) Handshake.HostSendInputDelay(link.Control, generation, finalDelay);
-                foreach (var link in links) Handshake.HostRequestReady(link.Control, generation);
-
-                // Nobody is released while the host is still synchronously shipping a large state to
-                // another joiner. Once every control link acknowledges that all start data arrived,
-                // prepare the host's own generation-bound driver, then send GO to the whole group.
-                foreach (var link in links) Handshake.HostWaitReady(link.Control, generation);
+                int agreedDelay = finalDelay;
+                SyncMode agreedMode = mode;
                 InvokeUiBlocking(() =>
                 {
                     if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
-                    PrepareSessionHost(links, players, finalDelay, mode, generation);
+                    PrepareSessionHost(links, players, agreedDelay, agreedMode, generation);
                 });
                 foreach (var link in links) Handshake.HostSendGo(link.Control, generation);
                 foreach (var link in links) RestoreSessionControlTimeouts(link);
@@ -1654,11 +1588,209 @@ namespace BizHawkNetplay.Tool
             }
         }
 
+        /// <summary>
+        /// The host is authoritative on sync mode. Lockstep/Rollback force it; Automatic grants rollback
+        /// only if every joiner pairwise negotiates to rollback (opted in + cleared the probe depth
+        /// threshold), else lockstep. Decided from whoever is in the lobby at the moment it starts, so a
+        /// replacement joiner's answer counts like anyone else's.
+        /// </summary>
+        private SyncMode ChooseSyncMode(List<PeerLink> links, PeerIdentity id, SessionPreferences prefs)
+        {
+            if (_netcodeChoice == NetcodeChoice.Lockstep) return SyncMode.Lockstep;
+
+            if (_netcodeChoice == NetcodeChoice.Rollback && !_replayDeterministic)
+            {
+                // The Rollback pick overrides the probe's PERFORMANCE recommendation. It does not
+                // override a core that provably cannot replay: that is not a matter of taste, and
+                // honouring it would guarantee the desyncs rollback exists to avoid.
+                UiLog("rollback was forced, but this core failed the probe's replay check — using " +
+                      "lockstep, which never reloads state. Forcing it would desync on every correction.");
+                return SyncMode.Lockstep;
+            }
+
+            if (_netcodeChoice == NetcodeChoice.Rollback)
+            {
+                foreach (var link in links)
+                {
+                    var g = link.Greeting!;
+                    if (!g.Prefs.WantRollback || g.Id.MaxRollbackDepth < ProbeResult.RollbackDepthThreshold)
+                    {
+                        UiLog("rollback was forced locally, but a joiner reported rollback unavailable; using lockstep");
+                        return SyncMode.Lockstep;
+                    }
+                }
+                UiLog("netcode forced to rollback — bypassing only the host's local probe recommendation");
+                return SyncMode.Rollback; // bypass only this host's local recommendation
+            }
+
+            // Automatic
+            if (links.Count == 0) return SyncMode.Lockstep;
+            foreach (var link in links)
+            {
+                var g = link.Greeting!;
+                if (SessionNegotiator.Negotiate(id, g.Id, prefs, g.Prefs).Mode != SyncMode.Rollback)
+                    return SyncMode.Lockstep;
+            }
+            return SyncMode.Rollback;
+        }
+
+        /// <summary>
+        /// Everything between a full lobby and GO: the control-link ping probe, WELCOME + state, the
+        /// mesh round, the settled delay, and the READY barrier.
+        ///
+        /// Returns true once every joiner has acknowledged READY. Returns false if any of them died on
+        /// the way — those links are closed and removed, the survivors keep their seats and the state
+        /// they already hold, and the caller reopens the lobby for a replacement. Also returns false if
+        /// the whole attempt was torn down, which the caller distinguishes by its own token check.
+        /// </summary>
+        private bool TryStartLobby(List<PeerLink> links, byte[] state, int players, int need,
+            SessionGeneration generation, SyncMode mode, bool autoDelay, int autoDelayMax,
+            double lobbyFrameMs, int simulatedOneWayMs, int attempt, ref int finalDelay)
+        {
+            var casualties = new List<PeerLink>();
+            int delay = finalDelay;   // a ref parameter cannot be captured by the lambdas below
+            double worstRttMs = -1;
+            double worstJitterMs = 0;
+
+            if (autoDelay)
+            {
+                UiConnLog($"measuring lobby ping ({LobbyProbeSamples} samples per player)…",
+                    Color.DarkSlateBlue);
+                RunStartPhase(links, casualties, attempt, "we measured its lobby ping", link =>
+                {
+                    var sample = ProbeLobbyRtt(link);
+                    if (sample.MedianMs > worstRttMs) worstRttMs = sample.MedianMs;
+                    // Worst median and worst jitter are tracked independently: one session-wide
+                    // delay has to cover every link on both counts, so the safe figure is the
+                    // worst of each even when they come from different players.
+                    if (sample.JitterMs > worstJitterMs) worstJitterMs = sample.JitterMs;
+                });
+                if (!DropCasualties(links, casualties, need, attempt)) return false;
+            }
+
+            // Each joiner gets every OTHER joiner's UDP endpoint so it can build a direct mesh
+            // (it reaches the host at the address it connected to, so the host is left off the list).
+            // Trust the negotiated endpoints before asking clients to prepare their drivers: their
+            // pre-READY neutral windows can then queue instead of being rejected as foreign UDP.
+            _mesh!.SetPeerRoutes(RoutesExcept(links, null));
+            // WELCOME + state, but NOT the READY request: the routes WELCOME carries are what every
+            // joiner needs before it can punch and measure the edges this machine cannot see, and
+            // READY is the point of no return for the delay each driver gets built with.
+            RunStartPhase(links, casualties, attempt, "we sent it the session start data", link =>
+            {
+                ConfigureStateTransferTimeouts(link, state.Length);
+                if (link.HoldsState)
+                {
+                    // A survivor of a restart already has the state, and the host has not stepped the
+                    // core since exporting it — only the assignment and the routes have changed.
+                    Handshake.HostSendAssignment(link.Control, link.RemotePort, players, delay, mode,
+                        generation, RoutesExcept(links, link));
+                    return;
+                }
+                Handshake.HostSendStart(link.Control, link.RemotePort, players, delay, mode, state,
+                    generation, RoutesExcept(links, link));
+                link.HoldsState = true;
+            });
+            if (!DropCasualties(links, casualties, need, attempt)) return false;
+
+            if (autoDelay)
+            {
+                MeasureLobbyMesh(links, casualties, generation, players, attempt,
+                    ref worstRttMs, ref worstJitterMs);
+                if (!DropCasualties(links, casualties, need, attempt)) return false;
+                delay = SelectLobbyDelay(delay, autoDelayMax, mode, worstRttMs,
+                    lobbyFrameMs, simulatedOneWayMs, players, worstJitterMs);
+            }
+
+            // Publish the settled figure before anyone builds a driver. Sent unconditionally, so the
+            // delay every peer runs is one number decided in one place rather than each end's own
+            // reading of WELCOME.
+            RunStartPhase(links, casualties, attempt, "we published the session's input delay", link =>
+            {
+                Handshake.HostSendInputDelay(link.Control, generation, delay);
+                Handshake.HostRequestReady(link.Control, generation);
+            });
+
+            // Nobody is released while the host is still synchronously shipping a large state to
+            // another joiner. Only once every control link acknowledges that all start data arrived
+            // does the caller prepare its own driver and send GO to the whole group.
+            //
+            // Deliberately no early exit above: a casualty in the phase above does not un-ask everyone
+            // else for READY, and their acknowledgements are already in flight. Leaving one unread
+            // would put the next start attempt's ping probe in front of a stale READY and cost a
+            // healthy player their seat for a mistake made on another connection entirely.
+            RunStartPhase(links, casualties, attempt, "we waited for it to finish preparing", link =>
+                Handshake.HostWaitReady(link.Control, generation));
+            if (!DropCasualties(links, casualties, need, attempt)) return false;
+
+            finalDelay = delay;
+            return true;
+        }
+
+        /// <summary>Run one step of the start sequence against every surviving link, recording the ones
+        /// whose control link died rather than letting the first casualty end the lobby.</summary>
+        private void RunStartPhase(List<PeerLink> links, List<PeerLink> casualties, int attempt,
+            string phase, Action<PeerLink> step)
+        {
+            foreach (var link in links)
+            {
+                if (!IsConnectionAttemptCurrent(attempt)) return;
+                if (casualties.Contains(link)) continue;
+                try { step(link); }
+                catch (Exception ex)
+                {
+                    if (!IsConnectionAttemptCurrent(attempt)) return; // teardown, not this joiner's doing
+                    casualties.Add(link);
+                    UiConnLog($"{link.Label} dropped out while {phase}: {ex.Message}", Color.Firebrick);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Close and forget the joiners that died during a start attempt, renumber the survivors into
+        /// the freed ports, and reopen the lobby. Returns true when nobody died and the start sequence
+        /// may continue; false when the caller must go back and refill.
+        /// </summary>
+        private bool DropCasualties(List<PeerLink> links, List<PeerLink> casualties, int need, int attempt)
+        {
+            if (!IsConnectionAttemptCurrent(attempt)) return false;
+            if (casualties.Count == 0) return true;
+
+            foreach (var link in casualties)
+            {
+                links.Remove(link);
+                UntrackHandshakeResources(link);
+                try { link.Tcp?.Close(); } catch { }
+                if (link.ControlStream != null)
+                {
+                    try { link.ControlStream.Dispose(); } catch { }
+                    _mesh?.CloseControl(link.UdpEndpoint); // punched link: release its reliable stream
+                }
+            }
+            casualties.Clear();
+
+            // Ports are positional, so a survivor behind a departed joiner moves up. Nobody has been
+            // released yet — the next WELCOME carries the corrected assignment — so this is safe here
+            // and only here.
+            for (int i = 0; i < links.Count; i++)
+            {
+                var link = links[i];
+                int assignedPort = i + 1;
+                if (link.RemotePort == assignedPort) continue;
+                link.RemotePort = assignedPort;
+                link.Label = $"P{assignedPort + 1} ({link.UdpEndpoint.Address})";
+            }
+
+            UiConnLog($"still hosting — the remaining player(s) keep their place while we wait for " +
+                      $"{need - links.Count} more to fill the lobby again.", Color.DarkSlateBlue);
+            return false;
+        }
+
         /// <summary>Greet a punched joiner exactly like a TCP accept — over the reliable control
         /// stream on the mesh socket, bounded by its read timeout instead of a socket deadline. A
         /// refused greet (wrong password/ROM/core) costs only that joiner, same as the TCP policy.</summary>
         private void GreetPunchedJoiner(PunchAdmission admission, PeerIdentity id, SessionPreferences prefs,
-            int udpLocalPort, List<PeerLink> links, List<Handshake.JoinerGreeting> greetings, int need, int attempt)
+            int udpLocalPort, List<PeerLink> links, int need, int attempt)
         {
             var channel = new ControlChannel(admission.Control);
             Handshake.JoinerGreeting greet;
@@ -1685,10 +1817,10 @@ namespace BizHawkNetplay.Tool
                 ControlStream = admission.Control,
                 Control = channel,
                 RemotePort = assignedPort,
+                Greeting = greet,
                 UdpEndpoint = admission.Endpoint, // the punched path IS the peer's working endpoint
                 Label = $"P{assignedPort + 1} ({admission.Endpoint.Address})",
             });
-            greetings.Add(greet);
             UiConnLog($"P{assignedPort + 1} joined via UDP punch from {admission.Endpoint.Address} " +
                       $"({links.Count}/{need})", Color.DarkGreen);
         }
@@ -1703,8 +1835,9 @@ namespace BizHawkNetplay.Tool
         /// to the delay decision, which is exactly the path that then stalls lockstep or deepens every
         /// rollback repair — and it was invisible in the one topology where it matters most.
         /// </summary>
-        private void MeasureLobbyMesh(List<PeerLink> links, SessionGeneration generation, int players,
-            int attempt, ref double worstRttMs, ref double worstJitterMs)
+        private void MeasureLobbyMesh(List<PeerLink> links, List<PeerLink> casualties,
+            SessionGeneration generation, int players, int attempt,
+            ref double worstRttMs, ref double worstJitterMs)
         {
             var mesh = _mesh;
             if (mesh == null || links.Count == 0) return;
@@ -1714,12 +1847,13 @@ namespace BizHawkNetplay.Tool
             // Everyone bursts at once: a joiner-to-joiner edge only opens when both ends are knocking,
             // so the host's own burst and the requests below have to overlap, not queue.
             mesh.BeginRttBurst(MeshProbeWindowMs);
-            foreach (var link in links) Handshake.HostRequestMeshRtt(link.Control, generation);
+            RunStartPhase(links, casualties, attempt, "we asked it to measure its UDP paths",
+                link => Handshake.HostRequestMeshRtt(link.Control, generation));
 
             int measuredEdges = 0, totalEdges = 0;
-            foreach (var link in links)
+            double rtt = worstRttMs, jitter = worstJitterMs; // ref params cannot be captured below
+            RunStartPhase(links, casualties, attempt, "we waited for its mesh measurement", link =>
             {
-                if (!IsConnectionAttemptCurrent(attempt)) return;
                 var report = Handshake.HostWaitMeshRtt(link.Control, generation);
                 totalEdges += report.TotalEdges;
                 measuredEdges += report.MeasuredEdges;
@@ -1728,10 +1862,13 @@ namespace BizHawkNetplay.Tool
                     UiConnLog($"{link.Label} could not measure any of its {report.TotalEdges} UDP edge(s) — " +
                               "its direct paths have not opened yet, so the delay below covers only the " +
                               "edges that did answer.", Color.DarkOrange);
-                    continue;
+                    return;
                 }
-                Fold(report.Rtt, ref worstRttMs, ref worstJitterMs);
-            }
+                Fold(report.Rtt, ref rtt, ref jitter);
+            });
+            worstRttMs = rtt;
+            worstJitterMs = jitter;
+            if (casualties.Count > 0 || !IsConnectionAttemptCurrent(attempt)) return;
 
             // The host's own edges, on UDP this time. Its burst ran while it was blocked above.
             if (mesh.TryGetWorstRttStats(out double hostMedianMs, out double hostHighMs,
@@ -1879,8 +2016,13 @@ namespace BizHawkNetplay.Tool
                 {
                     try
                     {
+                        int preparations = 0;
                         sp = Handshake.RunClientMulti(channel, id, prefs, udpLocalPort, beforeReady: ready =>
                         {
+                            if (++preparations > 1)
+                                UiConnLog($"the host restarted the lobby — someone else dropped out before " +
+                                          $"the start. Re-preparing as P{ready.LocalPort + 1} of " +
+                                          $"{ready.PlayerCount}; your connection is fine.", Color.DarkOrange);
                             InvokeUiBlocking(() =>
                             {
                                 if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
