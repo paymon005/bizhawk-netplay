@@ -7,16 +7,41 @@ v0.10.1 release notes.
 
 ## Open
 
-**KI-8 (validation) — the v0.10.x recovery machinery is untested in real play.**
-Session generations, rollback gap retransmission, mesh route failover, bounded state transfers,
-and the lobby auto-delay are all unit-tested and loopback-tested but have never seen a real
-internet path. Worth one deliberate two-player session (ideally with an induced mid-game drop and
-rejoin) before trusting them; rollback with 3+ players and symmetric NAT remain untested generally.
-*First attempt (2026-07-27, PC host + hotspot laptop, direct join, rollback @ 72 ms):* handshake,
-punch, lobby RTT probe, and auto-delay (4) all worked; the session then hit the mutual soft-cap
-freeze fixed in v0.10.2 (see Fixed below). Retest on v0.10.2.
+**KI-8 (validation) — REDUCED. The session path has real 3-player internet play; the RECOVERY path
+still has not been watched.**
 
-**KI-11 (validation) — 4-player rollback is measured, but on one machine.**
+*Superseded evidence (2026-07-30):* three players, three separate machines, over the open internet,
+across several sessions of 20–30 minutes each:
+
+| game | core / plugin | netcode | delay | outcome |
+|---|---|---|---|---|
+| Gauntlet II (SNES) | Snes9x | **rollback** | low (exact not recorded) | played fine |
+| Mario Golf (N64) | various video plugins, incl. Rice | **lockstep** | — | played fine |
+| Pokémon Stadium (N64) | Rice | **rollback** | ~5 | worked well |
+
+That settles, on real hardware over a real internet path, at three players: the handshake, NAT
+traversal, the full mesh, auto-delay, pacing, and **rollback on a heavy core** — the last of which
+the To Do list had been pessimistic about, on the arithmetic that N64 sustains only ~3 frames of
+depth. At delay 5 over the internet it was reported as working well. Note the register: this is a
+player's judgement, not telemetry. No logs were captured from these sessions, so there are no
+numbers here and none should be inferred.
+
+*What it does NOT settle, and why this stays open:* nobody was watching for desyncs, so whether a
+**resync or a drop/rejoin actually fired and recovered** is unknown. That machinery — session
+generations, gap retransmission, mesh route failover, bounded state transfers — is precisely what
+KI-8 was opened for, and playing without incident is not evidence that recovery works; it is
+evidence that it wasn't needed. Still wanted: one session with the log kept, ideally with a
+deliberate mid-game drop and rejoin, and a forced desync via the diagnostic checkbox.
+
+**The Rice plugin renders some games incorrectly** (visible on the N64 titles above). That is a
+BizHawk video-plugin issue, not a netplay one — but it is the first real entry in the N64
+settings profile 1.0 needs, and worth knowing before blaming the netcode for something on screen.
+Peers must run the same plugin regardless: the handshake compares the core's sync-settings blob and
+refuses a mismatch up front.
+
+**KI-11 (validation) — FOUR-player is what's left; three-player is done on real hardware.**
+See KI-8 for the 3-player internet sessions (SNES rollback, N64 lockstep and rollback, separate
+machines). The single-machine caveat below applies to the **4-player** measurements only.
 4-player **lockstep** was verified on hardware in July 2025. As of 2026-07-30 v0.20.0, 4-player
 **rollback** has been run and measured too — four EmuHawk instances on one machine, Snes9x, PAL
 (20ms frame period), delay 2, with simulated one-way UDP latency raised across five runs. Numbers
@@ -40,8 +65,10 @@ advice asked for 17). Checksums agreed across all runs.
 *What that does and does not settle.* It settles that the sync layer, the repair loop and the
 savestate pool hold up at four players on a light core, well past any plausible internet link. It
 does not settle: four **separate machines** (this was one CPU, one GPU, one scheduler, and a
-loopback mesh with no NAT); a **heavy core**, where a repair costs 6-9ms per frame instead of 0.6
-and the same depths would be an order of magnitude dearer; or four players over a **real internet
+loopback mesh with no NAT); a **heavy core** *at four players*, where a repair costs 6-9ms per frame
+instead of 0.6 and the same depths would be an order of magnitude dearer — though N64 rollback has
+since been played at three players over the internet at delay 5 without complaint (KI-8), which is
+the first evidence against the pessimistic reading; or four players over a **real internet
 path**, where the joiner-to-joiner edges are the ones nothing else can measure.
 
 *What to read off a four-machine session when one happens:*

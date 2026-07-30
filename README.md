@@ -38,9 +38,9 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | Core sync logic | Input serialization (digital **+ analog axes**), layout negotiation, input pipeline / confirmed-frontier, **lockstep + rollback** strategies — unit-tested |
 | **M1 — 2-player lockstep** | ✅ Verified on hardware (two EmuHawk instances, Genesis/GPGX + N64): real-time pacing, working audio, desync detection (host saves quick-slot 10 on mismatch), configurable delay + packet redundancy |
 | **M2 — hardening** | ✅ Live ping/RTT + delay hints, **desync auto-recovery** (mismatch → resync from an authoritative state instead of ending), alt-tab audio resilience |
-| **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input **full mesh** — every peer sends straight to every other, so input is always one hop from its author and the host coordinates without relaying — with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). **2P and 4P lockstep verified on hardware** in July 2025 (3P runs the same N-player path); rollback above 2P is simulated only, and no performance figure in this project was measured above 2 players. |
-| **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). *Untested on hardware.* |
-| **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. *Untested on real internet NAT (no second machine).* |
+| **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input **full mesh** — every peer sends straight to every other, so input is always one hop from its author and the host coordinates without relaying — with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). **2P and 4P lockstep verified on hardware** in July 2025. **3P verified on three separate machines over the internet** in July 2026 — SNES rollback, N64 lockstep, and N64 rollback at delay 5 — see KNOWN-ISSUES KI-8. 4P remains measured on one machine only. |
+| **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). **Verified in real 3-player internet play** in July 2026 on SNES (Gauntlet II, low delay) and N64 (Pokemon Stadium, delay 5). |
+| **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. **The 3P mesh legs were punched over the real internet** in July 2026 across three separate machines; whether the connect-code UDP Punch admission path specifically was exercised there is not recorded. |
 | **Session passwords** (v0.8.0) | ✅ Nonce challenge-response with a slow KDF — the password never crosses the wire and a captured proof can't be replayed. A refused joiner loses only its own connection; the host keeps hosting. **Protocol v4 — everyone must update.** |
 | **Latency & liveness** (v0.9.0) | ✅ Audio cushion halved (a permanent 80ms video→audio offset, now 40ms); RTT measured on the UDP path input actually rides rather than the TCP control link; rollback time-syncs on a real **frame advantage** exchange, so the peer genuinely ahead yields instead of both guessing from a symmetric RTT; delay advice is mode-aware. Per-link drop detection no longer goes blind during a resync. *Protocol unchanged — mixes with v0.8.0 peers.* |
 | **Punch admission** (v0.11.0) | ✅ Hosting and UDP punch are one flow, RemotePlay-style: the host just clicks **Start Hosting**; a joiner who can't reach it enters the host's IP and clicks **UDP Punch**, sends the code it gets, and the host pastes it to admit them — into the same 2–4 player lobby as TCP joiners, over a reliable control stream on the session's own UDP socket. One code per NAT'd joiner; no port-forwarding on their side. |
@@ -243,13 +243,20 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
   for playing with people you trust; not a hostile-network guarantee.
 - **The session password** is verified by a nonce challenge-response (`SessionAuth`): the password is never sent (not even hashed), a captured proof can't be replayed to another session, and role-tagging blocks a reflection attack. An empty password means an open session. A refused joiner (wrong password, wrong ROM/core, a HELLO that never arrives) only loses its own connection — the host logs it and keeps listening, so a typo doesn't cost you the lobby. Still not a fortress — it's a shared secret over a plaintext control channel with no forward secrecy — but it's a real gate, not an echo-able hash.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
-- **Symmetric NAT is untested** over a real internet path, and so is anything above 2 players **on
-  separate machines**. 4-player lockstep was verified on hardware in July 2025; 4-player rollback was
-  measured in July 2026 on four instances of one machine, where it absorbed a simulated 400ms
-  round-trip at input delay 2 without stalling and hit its ring cap at 600ms. What that leaves open
-  is four *separate* machines, a heavy core (a repair there costs ~10x what it does on SNES), and a
-  real internet path. Numbers and caveats in `KNOWN-ISSUES.md` KI-11. Everything below the socket
-  layer is unit-tested.
+- **Symmetric NAT is untested** over a real internet path — though the tool now detects and names it
+  (see the NAT bullet above) rather than failing silently.
+- **Three players works on real hardware over the internet.** Several 20–30 minute sessions on three
+  separate machines: Gauntlet II (SNES) on **rollback** at low delay, Mario Golf (N64) on
+  **lockstep**, and Pokémon Stadium (N64) on **rollback at delay 5**, all reported as playing well.
+  No logs were kept, so those are players' judgements rather than measurements. What remains open is
+  **four** players on separate machines, and whether **desync recovery and drop/rejoin** actually
+  fire and recover in real play — nobody was watching for them, and an uneventful session is not
+  evidence that recovery works. 4-player rollback was measured in July 2026 on four instances of one
+  machine, absorbing a simulated 400ms round-trip at input delay 2 without stalling and hitting its
+  ring cap at 600ms. Numbers and caveats in `KNOWN-ISSUES.md` KI-8 and KI-11.
+- **The N64 Rice video plugin renders some games incorrectly.** A BizHawk plugin issue rather than a
+  netplay one, but it looks like a netplay fault from the chair. Every peer must run the same plugin
+  in any case — the handshake compares the core's sync-settings blob and refuses a mismatch up front.
 
 ## License
 
