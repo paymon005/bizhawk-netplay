@@ -1553,12 +1553,10 @@ namespace BizHawkNetplay.Tool
                 }
                 if (!IsConnectionAttemptCurrent(attempt)) return;
 
-                int agreedDelay = finalDelay;
-                SyncMode agreedMode = mode;
                 InvokeUiBlocking(() =>
                 {
                     if (!IsConnectionAttemptCurrent(attempt)) throw new OperationCanceledException();
-                    PrepareSessionHost(links, players, agreedDelay, agreedMode, generation);
+                    PrepareSessionHost(links, players, finalDelay, mode, generation);
                 });
                 foreach (var link in links) Handshake.HostSendGo(link.Control, generation);
                 foreach (var link in links) RestoreSessionControlTimeouts(link);
