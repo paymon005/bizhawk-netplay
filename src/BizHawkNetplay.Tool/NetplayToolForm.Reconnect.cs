@@ -465,6 +465,7 @@ public sealed partial class NetplayToolForm
 
         _netcodeLabel.Text = "Netcode in use: —";
         _netcodeLabel.ForeColor = Color.DimGray;
+        SetLobbyPhase("", Color.DimGray); // back to "Not connected", and stop flashing
         RefreshPlayersList(); // session inactive now → clears the list
         ResetPunchUi();
 

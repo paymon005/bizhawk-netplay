@@ -207,19 +207,38 @@ public sealed partial class NetplayToolForm
         // carries the full diagnostic firehose, which is the wrong place to learn that your password
         // was wrong — only connection-lifecycle events land here, color-coded (red = refused/failed,
         // green = connected). See ConnLog.
-        var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 348) };
-        _connLog = new RichTextBox
+        // Lobby status sits ABOVE the connection log, because the two answer different questions:
+        // this one is "what is happening right now", the log is "what happened". Full width rather
+        // than the old 300px, since the states it has to carry ("waiting for the host to fill the
+        // lobby", "holding the seat for a rejoin") are sentences and not labels.
+        //
+        // Two lines in one box: the state on top, and beneath it the netcode and delay the session
+        // actually settled on — which is the follow-up question every time the top line changes.
+        var lobbyLabel = new Label { Text = "Lobby status:", AutoSize = true, Location = new Point(12, 348) };
+        _lobbyPanel = new Panel
         {
-            Location = new Point(12, 366), Size = new Size(544, 92),
-            ReadOnly = true, BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
-            ScrollBars = RichTextBoxScrollBars.Vertical, TabStop = false, DetectUrls = false,
+            Location = new Point(12, 366), Size = new Size(544, 48),
+            BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White,
         };
-
+        _lobbyStateLabel = new Label
+        {
+            Text = "Not connected.", Location = new Point(6, 5), Size = new Size(530, 18),
+            TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.DimGray,
+            Font = new Font(SystemFonts.DefaultFont, FontStyle.Bold),
+        };
         _netcodeLabel = new Label
         {
-            Text = "Netcode in use: —", Location = new Point(12, 466), Width = 300, Height = 24,
-            BorderStyle = BorderStyle.FixedSingle, TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(6, 0, 0, 0), ForeColor = Color.DimGray,
+            Text = "Netcode in use: —", Location = new Point(6, 25), Size = new Size(530, 18),
+            TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.DimGray,
+        };
+        _lobbyPanel.Controls.AddRange([_lobbyStateLabel, _netcodeLabel]);
+
+        var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 424) };
+        _connLog = new RichTextBox
+        {
+            Location = new Point(12, 442), Size = new Size(544, 92),
+            ReadOnly = true, BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
+            ScrollBars = RichTextBoxScrollBars.Vertical, TabStop = false, DetectUrls = false,
         };
 
         page.Controls.AddRange(
@@ -229,7 +248,7 @@ public sealed partial class NetplayToolForm
             autoDelayMaxLabel, _autoDelayMaxBox,
             netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
             _goButton, _disconnectButton, _pubAddrButton, _applyLiveButton,
-            connLogLabel, _connLog, _netcodeLabel, BuildPunchGroup(),
+            lobbyLabel, _lobbyPanel, connLogLabel, _connLog, BuildPunchGroup(),
         ]);
         return page;
     }

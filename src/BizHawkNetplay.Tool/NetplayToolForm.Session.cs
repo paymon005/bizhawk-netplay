@@ -126,6 +126,85 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
+    /// What the lobby/join path knows and no session state records: that we are dialling out, or how
+    /// many seats are still empty. Cleared with an empty string once a session takes over, after
+    /// which <see cref="UpdateLobbyStatus"/> derives everything itself.
+    /// </summary>
+    private void SetLobbyPhase(string text, Color color)
+    {
+        _lobbyPhaseText = text ?? "";
+        _lobbyPhaseColor = color;
+        UpdateLobbyStatus();
+    }
+
+    /// <summary>
+    /// Re-derive the lobby status box. Called on a timer rather than from the frame loop, because
+    /// every state worth flashing is one where frames are not running.
+    ///
+    /// The flash is the point: "frozen" has several causes that look identical from the chair — a
+    /// peer's input has not arrived, the session is rebuilding around a resync, a seat is being held
+    /// for someone who dropped, or the lobby simply has not filled yet. All of them stop the picture,
+    /// and previously all of them looked like the tool having hung. A flashing line says the tool
+    /// knows, and names which one it is.
+    /// </summary>
+    private void UpdateLobbyStatus()
+    {
+        if (_lobbyStateLabel == null || _lobbyStateLabel.IsDisposed) return;
+
+        string text;
+        Color color;
+        bool flash;
+
+        if (_phase.AwaitingRejoin)
+        {
+            int seat = _reconnectPort + 1;
+            text = $"P{seat} dropped — holding their seat, waiting up to {ReconnectTimeoutSeconds:F0}s for a rejoin…";
+            color = Color.DarkOrange;
+            flash = true;
+        }
+        else if (_phase.IsRebuilding)
+        {
+            text = "Resynchronizing — sharing an authoritative state with every player…";
+            color = Color.DarkOrange;
+            flash = true;
+        }
+        else if (_phase.IsActive)
+        {
+            bool stalled = _driver?.IsStalled == true;
+            text = stalled
+                ? "Waiting for input from another player…"
+                : $"Lobby live — game running with {_playerCount} player(s).";
+            color = stalled ? Color.DarkOrange : Color.DarkGreen;
+            flash = stalled;
+        }
+        else if (_lobbyPhaseText.Length > 0)
+        {
+            text = _lobbyPhaseText;
+            color = _lobbyPhaseColor;
+            flash = true;   // nothing is running yet, by definition
+        }
+        else
+        {
+            text = "Not connected — pick Host or Join, then Start.";
+            color = Color.DimGray;
+            flash = false;
+        }
+
+        _lobbyStateColor = color;
+        _lobbyShouldFlash = flash;
+        if (!string.Equals(_lobbyStateLabel.Text, text, StringComparison.Ordinal))
+            _lobbyStateLabel.Text = text;
+        // Pulse between the state's colour and a washed-out version of it rather than blinking to
+        // invisible: it reads as "still working" instead of as a fault light, and the text stays
+        // legible on both halves of the cycle.
+        _lobbyStateLabel.ForeColor = flash && !_lobbyFlashOn ? Fade(color, _lobbyPanel.BackColor) : color;
+    }
+
+    /// <summary>Halfway between two colours — the dimmed half of the status flash.</summary>
+    private static Color Fade(Color c, Color toward) => Color.FromArgb(
+        (c.R + toward.R) / 2, (c.G + toward.G) / 2, (c.B + toward.B) / 2);
+
+    /// <summary>
     /// Netcode and input delay stay editable for the HOST while a session runs; "Apply changes" is
     /// what actually pushes them, so spinning the delay box does not ship a savestate per click. A
     /// joiner's copies stay read-only for the same reason they are in the lobby: these are the
@@ -178,6 +257,10 @@ public sealed partial class NetplayToolForm
     private void BeginSessionCommon(SyncMode mode, string remoteLabel)
     {
         if (!DriverPreparedFor(CurrentGeneration, mode)) PrepareSessionDriver(mode);
+
+        // The lobby's own account of itself stops here; from now on the status is derived from the
+        // session, which knows more than the lobby thread could.
+        _lobbyPhaseText = "";
 
         ApplyBackgroundConfig(true); // don't let EmuHawk pause/ignore input when unfocused
         try { APIs.EmuClient.EnableRewind(false); } catch { } // rewind would jump the frame count -> desync

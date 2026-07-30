@@ -256,6 +256,10 @@ public sealed partial class NetplayToolForm
     /// <summary>Thread-safe <see cref="ConnLog"/> for the accept/join/reconnect background threads.</summary>
     private void UiConnLog(string message, Color color) => BeginInvokeUi(() => ConnLog(message, color));
 
+    /// <summary>Set the lobby status line from the lobby/join threads. Same marshalling as
+    /// <see cref="UiConnLog"/> — these call sites are almost always the ones already logging.</summary>
+    private void UiLobbyPhase(string text, Color color) => BeginInvokeUi(() => SetLobbyPhase(text, color));
+
     private void InvokeUiBlocking(Action action)
     {
         if (IsDisposed) throw new ObjectDisposedException(nameof(NetplayToolForm));

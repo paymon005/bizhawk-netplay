@@ -173,6 +173,8 @@ public sealed partial class NetplayToolForm
             int need = players - 1;
             UiConnLog($"hosting a {players}-player session on TCP+UDP {port} — you are P1, " +
                       $"waiting for {need} more to join…", Color.DarkSlateBlue);
+            UiLobbyPhase($"Hosting on port {port} — waiting for {need} more player(s) to join…",
+                Color.DarkSlateBlue);
 
             // Best-effort NAT reachability (UPnP forward + public-address report). Non-fatal.
             TryPublishHostAddress(port, attempt);
@@ -257,6 +259,10 @@ public sealed partial class NetplayToolForm
                         Label = $"P{assignedPort + 1} ({remoteIp})",
                     });
                     UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);
+                    UiLobbyPhase(links.Count >= need
+                            ? "All players in — starting the session…"
+                            : $"Hosting — {links.Count} of {need} joined, waiting for {need - links.Count} more…",
+                        Color.DarkSlateBlue);
                 }
                 if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_listener, hostListener)) return;
 
@@ -756,6 +762,7 @@ public sealed partial class NetplayToolForm
         try
         {
             UiConnLog($"connecting to {ip}:{port}…", Color.DarkSlateBlue);
+            UiLobbyPhase($"Establishing connection to {ip}:{port}…", Color.DarkSlateBlue);
             tcp = new TcpClient();
             _joiningTcp = tcp;          // so Disconnect can close a connect that's still blocking
             if (!IsConnectionAttemptCurrent(attempt)) { tcp.Close(); return; }
@@ -815,6 +822,8 @@ public sealed partial class NetplayToolForm
                         UiConnLog("connected and authenticated — waiting for the host to fill the " +
                                   "lobby and start. This can take a while in a 3-4 player session; " +
                                   "Disconnect still cancels.", Color.DarkGreen);
+                        UiLobbyPhase("Connected — waiting for the host to fill the lobby and start…",
+                            Color.DarkGreen);
                     }, measureMesh: (hostUdpPort, peerRoutes) =>
                         MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes),
                        localReflexive: AwaitLocalReflexive());

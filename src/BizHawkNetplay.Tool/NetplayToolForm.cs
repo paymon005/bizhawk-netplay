@@ -77,10 +77,13 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // spans x=12..556 inside an 8px page padding, so anything under ~572 clips it horizontally. The
     // old minimum was 520 — narrower than the content it was meant to protect — which let the window
     // be dragged (or restored by BizHawk at a remembered size) into clipping the boxes on the right.
+    // Height follows the Connection tab's content, which now ends at y=534 (the connection log,
+    // pushed down by the lobby status box above it). Same reasoning as the width: a minimum that
+    // does not cover the content it is meant to protect just lets the window clip it.
     private const int DesignClientWidth = 600;
-    private const int DesignClientHeight = 620;
+    private const int DesignClientHeight = 660;
     private const int MinClientWidth = 580;
-    private const int MinClientHeight = 560;
+    private const int MinClientHeight = 600;
 
     public ApiContainer? _apiContainer { get; set; }
     private ApiContainer APIs => _apiContainer!;
@@ -105,6 +108,18 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private ComboBox _netcodeCombo = null!;
     private ComboBox _inputSourceCombo = null!;
     private Label _netcodeLabel = null!;
+    // The lobby status box: state on top (flashes whenever the game is not advancing), netcode and
+    // delay beneath. See UpdateLobbyStatus.
+    private Panel _lobbyPanel = null!;
+    private Label _lobbyStateLabel = null!;
+    private System.Windows.Forms.Timer _lobbyTimer = null!;
+    private bool _lobbyFlashOn;                       // which half of the flash cycle we are in
+    private bool _lobbyShouldFlash;                   // whether the current state is a frozen one
+    private Color _lobbyStateColor = Color.DimGray;   // the un-dimmed colour of the current state
+    // Set by the lobby/join paths, which know things no session state records — that we are dialling
+    // out, or how many seats are still empty. Empty once a session is running or nothing is going on.
+    private string _lobbyPhaseText = "";
+    private Color _lobbyPhaseColor = Color.DimGray;
     private Button _applyLiveButton = null!;
     private RichTextBox _connLog = null!;
     private CheckBox _simUnresponsiveCheck = null!;
@@ -388,6 +403,14 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
             FrameTick();
         };
 
+        // Drives the lobby status box: re-derives the state and advances the flash. Deliberately
+        // independent of the frame clock — the states most worth showing (dialling out, waiting on
+        // the host, holding a seat for a rejoin) are exactly the ones where no frames are running,
+        // so a status driven by the frame tick would freeze precisely when it had something to say.
+        _lobbyTimer = new System.Windows.Forms.Timer { Interval = 450 };
+        _lobbyTimer.Tick += (_, __) => { _lobbyFlashOn = !_lobbyFlashOn; UpdateLobbyStatus(); };
+        _lobbyTimer.Start();
+
         LoadAndApplySettings();
         UpdateEnabled();
     }
@@ -426,6 +449,9 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         // Closing the tool is also a Disconnect, including the pre-session lobby/state-transfer
         // phase. Otherwise accepted sockets and the paused emulator outlive the disposed form.
         try { EndSession("tool closed"); } catch { try { TeardownNetwork(); } catch { } }
+        // Not parented to the form, so nothing else would ever stop it — a running timer whose Tick
+        // touches disposed labels is the classic way a closed tool keeps throwing.
+        try { _lobbyTimer.Stop(); _lobbyTimer.Dispose(); } catch { }
         try { _tips.Dispose(); } catch { }
         base.OnFormClosed(e);
     }
