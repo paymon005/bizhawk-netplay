@@ -31,6 +31,10 @@ namespace BizHawkNetplay.Tool
         private readonly string[][] _bindings; // [port][buttonIndex] -> host-input binding string
         private readonly AnalogBind?[][] _analogBinds; // [port][axisIndex] -> host analog binding (null if unbound)
         private readonly bool[][] _axisReversed;      // [port][axisIndex] -> core axis IsReversed flag
+        // The N64 stick gate. EmuHawk applies this right after latching physical input; see
+        // ApplyAxisConstraints for what its absence did to analog magnitude.
+        private readonly bool _useCircularAnalogConstraint;
+        private readonly Dictionary<string, int>? _constraintScratch;
 
         // Raw main-memory access for the periodic desync checksum, resolved lazily (see HashMainMemory).
         private IMemoryDomains? _memoryDomains;
@@ -72,6 +76,9 @@ namespace BizHawkNetplay.Tool
             _bindings = BuildBindings();
             _analogBinds = BuildAnalogBinds();
             _axisReversed = BuildAxisReversed();
+            _useCircularAnalogConstraint = ReadCircularAnalogConstraintSetting();
+            if (_useCircularAnalogConstraint)
+                _constraintScratch = new Dictionary<string, int>(StringComparer.Ordinal);
         }
 
         /// <summary>True if we found the user's controller bindings (needed to capture input).</summary>
@@ -282,6 +289,7 @@ namespace BizHawkNetplay.Tool
                 catch { hostAxes = null; } // ResolveAxis treats null as "no live axes" (neutral)
                 for (int j = 0; j < axes.Length; j++)
                     axes[j] = ResolveAxis(_analogBinds[axSrc][j], layout.Axes[j], _axisReversed[port][j], hostAxes, pressed);
+                ApplyAxisConstraints(layout, axes);
             }
             return new PortInput(buttons, axes);
         }
@@ -780,6 +788,26 @@ namespace BizHawkNetplay.Tool
             return result;
         }
 
+        /// <summary>
+        /// EmuHawk's <c>N64UseCircularAnalogConstraint</c>, the setting that decides whether the stick
+        /// gate is applied at all. Read by name off the same config object the analog binds come from,
+        /// because it is not on any interface we are handed. Defaults to TRUE when it cannot be read:
+        /// that is both EmuHawk's own default and the safer direction, since applying the gate can only
+        /// bring a value back inside what the hardware could produce.
+        /// </summary>
+        private bool ReadCircularAnalogConstraintSetting()
+        {
+            try
+            {
+                var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                if (config == null) return true;
+                var prop = config.GetType().GetProperty("N64UseCircularAnalogConstraint");
+                if (prop?.GetValue(config) is bool b) return b;
+            }
+            catch { }
+            return true;
+        }
+
         /// <summary>The core's IsReversed flag per axis (BizHawk applies it when mapping host -> core).</summary>
         private bool[][] BuildAxisReversed()
         {
@@ -794,6 +822,38 @@ namespace BizHawkNetplay.Tool
                 result[p] = arr;
             }
             return result;
+        }
+
+        /// <summary>
+        /// The step that follows LatchFromPhysical in EmuHawk's own input path, and that this adapter
+        /// was missing: the N64's stick is round, and its gate clamps the (X,Y) VECTOR to radius 127.
+        ///
+        /// Without it a diagonal reaches magnitude √(127² + 127²) ≈ 180 — 42% past anything the real
+        /// hardware can produce. A game that reads the stick's magnitude (throw power, run speed, a
+        /// charge meter) then saturates its top bucket at about 70% deflection, and with a 0.1 deadzone
+        /// eating the bottom there is no travel left in between: every input reads as minimum or
+        /// maximum. That is precisely the symptom this was found from, on a game whose throw distance
+        /// is chosen by how far the stick is flicked.
+        ///
+        /// It runs on capture rather than on injection so the value that goes on the wire is the value
+        /// the core will see, which keeps a peer's view of an input identical to its author's.
+        ///
+        /// Uses BizHawk's own <see cref="ControllerDefinition.ApplyAxisConstraints"/> rather than
+        /// reimplementing the clamp. Reimplementing the analog-bind math above was already a standing
+        /// risk of silent drift; there was no reason to take it twice.
+        /// </summary>
+        private void ApplyAxisConstraints(CoreLayout layout, int[] axes)
+        {
+            if (!_useCircularAnalogConstraint) return;
+            var scratch = _constraintScratch;
+            if (scratch == null) return;
+
+            scratch.Clear();
+            for (int j = 0; j < axes.Length; j++) scratch[layout.Axes[j].Name] = axes[j];
+            try { _emulator.ControllerDefinition.ApplyAxisConstraints("Natural Circle", scratch); }
+            catch { return; }   // a core without constraints must not cost anyone their input
+            for (int j = 0; j < axes.Length; j++)
+                if (scratch.TryGetValue(layout.Axes[j].Name, out int v)) axes[j] = v;
         }
 
         /// <summary>
