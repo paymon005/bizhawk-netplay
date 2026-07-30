@@ -652,16 +652,9 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void MaybeHintStalling(double nowMs)
         {
-            if (_stallHintShown || _mode != SyncMode.Lockstep || _lastPacing.Ticks == 0) return;
-            if (_lastPacing.StallTickPct <= StallHintPct)
-            {
-                _stallHintSinceMs = double.NegativeInfinity; // a single bad window isn't a problem
-                return;
-            }
-            if (double.IsNegativeInfinity(_stallHintSinceMs)) { _stallHintSinceMs = nowMs; return; }
-            if (nowMs - _stallHintSinceMs < StallHintSustainMs) return;
+            if (_mode != SyncMode.Lockstep || _lastPacing.Ticks == 0) return;
+            if (!_stallHint.ShouldFire(_lastPacing.StallTickPct > StallHintPct, nowMs)) return;
 
-            _stallHintShown = true;
             ConnLog($"stalling {_lastPacing.StallTickPct:F0}% of the time waiting on remote input. " +
                 $"Either input delay ({_sessionDelay}) isn't covering the link's worst moments — a ping " +
                 "that looks fine on average still stalls if it swings — or the other machine can't hold " +
@@ -670,55 +663,6 @@ namespace BizHawkNetplay.Tool
                 Color.DarkOrange);
         }
 
-        /// <summary>
-        /// What to actually change to get a higher input delay, right now.
-        ///
-        /// Both delay warnings used to end in "raise the host's Auto max or manual floor" no matter
-        /// the state of the controls, and that is wrong advice more often than right: with <em>Auto
-        /// from ping</em> unticked, Auto max is inert — the one knob the message named could not
-        /// change the outcome however far it was turned. Measured on a ~74ms link left at delay 2,
-        /// a session stalled 30-70% of its ticks from start to finish while the log repeatedly
-        /// advised that knob; ticking the box (or setting the delay by hand) took the next run on the
-        /// same link to 0% stall at a full 60fps. The advice was the difference between a session
-        /// that worked and one that did not, so it has to name the control that is actually live.
-        ///
-        /// Every branch used to end in "then reconnect; the running delay stays fixed". That stopped
-        /// being true when the host gained Apply changes, and it stayed in the log for a release —
-        /// telling players to end a session that a button press now fixes. The remedy is therefore the
-        /// same in every case and nobody reconnects; what still differs is why the LOBBY did not pick
-        /// this number itself, which is worth saying because it decides what the next session starts
-        /// on. Auto from ping and Auto max remain lobby-only and disabled during a session, so reading
-        /// them here reports exactly what this session was started with.
-        /// </summary>
-        /// <summary>The one action that changes a running session's delay, addressed to whoever can
-        /// actually take it. A joiner cannot touch the control, so it is told what to ask for.</summary>
-        private string ApplyDelayAdvice(int suggested) => _isHost
-            ? $"Set Input delay to {suggested} and press \"Apply changes\" — everyone stays connected " +
-              "through a brief pause."
-            : $"Ask the host to set Input delay to {suggested} and press \"Apply changes\" — everyone " +
-              "stays connected through a brief pause, nobody rejoins.";
-
-        private string DelayRemedy(int suggested)
-        {
-            string apply = ApplyDelayAdvice(suggested);
-
-            // A joiner cannot see the host's auto-delay settings, so the rest would be noise to it.
-            if (!_isHost) return apply;
-
-            if (!_autoDelayCheck.Checked)
-                return $"{apply} \"Auto from ping\" is off, which is why nothing measured this for you " +
-                    "at the start; tick it and the next session will.";
-
-            int cap = (int)_autoDelayMaxBox.Value;
-            if (suggested > cap)
-                return $"{apply} \"Auto from ping\" is on but capped at {cap}, so it could never have " +
-                    $"chosen {suggested} — raise Auto max for the next session.";
-
-            // Auto was on and had room: the lobby measurement simply caught the link at a better
-            // moment than the session went on to see.
-            return $"{apply} \"Auto from ping\" measured a faster link at connect than this session has " +
-                "seen, which is why it started lower.";
-        }
 
         /// <summary>
         /// Say once when the core is keeping up but the picture isn't.
@@ -737,16 +681,9 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void MaybeHintPresentation(double nowMs)
         {
-            if (_presentHintShown || _lastPacing.Ticks == 0 || _lastPacing.AdvancedFps <= 0) return;
-            if (_lastPacing.PresentedShare >= PresentShareHintFloor)
-            {
-                _presentHintSinceMs = double.NegativeInfinity; // a single bad window isn't a problem
-                return;
-            }
-            if (double.IsNegativeInfinity(_presentHintSinceMs)) { _presentHintSinceMs = nowMs; return; }
-            if (nowMs - _presentHintSinceMs < StallHintSustainMs) return;
+            if (_lastPacing.Ticks == 0 || _lastPacing.AdvancedFps <= 0) return;
+            if (!_presentHint.ShouldFire(_lastPacing.PresentedShare < PresentShareHintFloor, nowMs)) return;
 
-            _presentHintShown = true;
             var p = _lastPacing;
             ConnLog($"emulating {p.AdvancedFps:F0} fps but only drawing the picture {p.PresentedFps:F0} " +
                 $"times a second. A frame is drawn once per timer callback, and callbacks are landing " +

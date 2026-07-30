@@ -291,10 +291,10 @@ namespace BizHawkNetplay.Tool
         private readonly PacingStats _pacing = new PacingStats();
         private PacingSummary _lastPacing;
         private double _lastPacingLogMs = double.NegativeInfinity;
-        private double _stallHintSinceMs = double.NegativeInfinity;
-        private bool _stallHintShown; // one-time "your link is stalling" hint per session
-        private double _presentHintSinceMs = double.NegativeInfinity;
-        private bool _presentHintShown; // one-time "the picture is coarser than the emulation" hint
+        // One-shot session advisories: say it when the problem is real, say it once, and not for a
+        // single bad second. The policy is SustainedTrigger; these only hold the thresholds.
+        private readonly SustainedTrigger _stallHint = new SustainedTrigger(StallHintSustainMs);
+        private readonly SustainedTrigger _presentHint = new SustainedTrigger(StallHintSustainMs);
         private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
         private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
         private double _lastPresentClockMs = -1; // ...and of the previous present, for judder stats

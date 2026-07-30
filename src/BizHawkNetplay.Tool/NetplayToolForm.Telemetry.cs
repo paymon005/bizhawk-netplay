@@ -314,6 +314,13 @@ namespace BizHawkNetplay.Tool
                 choice.WasCapped ? Color.DarkOrange : Color.DarkGreen);
             return choice.Frames;
         }
+        /// <summary>Session-shaped wrappers over <see cref="DelayAdvice"/>: the controls it needs are
+        /// this form's, the wording and the branching are not.</summary>
+        private string ApplyDelayAdvice(int suggested) => DelayAdvice.ApplyNow(_isHost, suggested);
+
+        private string DelayRemedy(int suggested) => DelayAdvice.Remedy(
+            _isHost, suggested, _autoDelayCheck.Checked, (int)_autoDelayMaxBox.Value);
+
 
         /// <summary>
         /// Once ping is stable, if the negotiated input delay is lower than the worst link's round-trip

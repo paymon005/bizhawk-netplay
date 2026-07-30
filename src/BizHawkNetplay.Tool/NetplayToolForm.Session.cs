@@ -255,11 +255,9 @@ namespace BizHawkNetplay.Tool
             _fpsClock.Restart(); _fpsCount = 0; _actualFps = -1;
             _pacing.Reset(); _lastPacing = default;
             _lastPacingLogMs = double.NegativeInfinity;
-            _stallHintSinceMs = double.NegativeInfinity;
-            _stallHintShown = false;
+            _stallHint.Reset();
             _audioDevWasUp = true;   // a fresh session starts assuming sound is up; the edge reports otherwise
-            _presentHintSinceMs = double.NegativeInfinity;
-            _presentHintShown = false;
+            _presentHint.Reset();
             _hashDiagLogged = false;
             _lastTickClockMs = -1;
             _lastPresentClockMs = -1;

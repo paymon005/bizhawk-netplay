@@ -389,8 +389,8 @@ namespace BizHawkNetplay.Tool
             // and counting them would show a stall rate the running session never had.
             _pacing.Reset();
             _lastPacing = default;
-            _stallHintSinceMs = double.NegativeInfinity;
-            _presentHintSinceMs = double.NegativeInfinity;
+            _stallHint.RestartWindow();
+            _presentHint.RestartWindow();
         }
 
         private SessionGeneration CurrentGeneration
