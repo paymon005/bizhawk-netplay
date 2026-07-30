@@ -26,7 +26,7 @@ public class LockstepIntegrationTests
     {
         var b = new bool[8];
         b[0] = pressed;
-        return new PortInput(b, Array.Empty<int>());
+        return new PortInput(b, []);
     }
 
     private sealed class Instance

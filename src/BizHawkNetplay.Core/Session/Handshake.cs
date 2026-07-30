@@ -344,7 +344,7 @@ public static class Handshake
         HostSendAssignment(channel, assignedPort, playerCount, inputDelay, mode, generation, peerRoutes);
         // Framed and deflated: this is the transfer a joiner sits through before the game starts,
         // and on a heavy core it was the whole savestate raw over whatever link they have.
-        channel.Send(ControlMessageType.State, StateCompression.Pack(state ?? Array.Empty<byte>()));
+        channel.Send(ControlMessageType.State, StateCompression.Pack(state ?? []));
     }
 
     /// <summary>

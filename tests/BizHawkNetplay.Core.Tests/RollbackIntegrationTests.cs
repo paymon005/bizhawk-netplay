@@ -32,17 +32,17 @@ public class RollbackIntegrationTests
         var arr = new bool[8];
         arr[0] = a;
         arr[1] = b;
-        return new PortInput(arr, Array.Empty<int>());
+        return new PortInput(arr, []);
     }
 
     private static PortInput Neutral() => Btn(false, false);
 
     // Distinct, frequently-changing input scripts so predictions are often contradicted under delay.
     private static readonly Func<int, PortInput>[] Scripts =
-    {
+    [
         frame => Btn((frame % 7) < 3, (frame % 11) == 0),
         frame => Btn((frame % 5) == 0, (frame % 13) < 4),
-    };
+    ];
 
     /// <summary>Shared wall clock (in ticks) the latency links compare delivery times against.</summary>
     private sealed class Clock { public long Tick; }

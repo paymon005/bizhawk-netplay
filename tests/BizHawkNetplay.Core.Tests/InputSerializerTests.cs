@@ -45,8 +45,8 @@ public class InputSerializerTests
         var layout = NesLayout();
         var ser = new InputSerializer(layout);
         var input = new PortInput(
-            new[] { true, false, false, true, true, false, false, true },
-            Array.Empty<int>());
+            [true, false, false, true, true, false, false, true],
+            []);
 
         var bytes = ser.Serialize(input);
         var back = ser.Deserialize(bytes);
@@ -60,8 +60,8 @@ public class InputSerializerTests
         var layout = AnalogLayout();
         var ser = new InputSerializer(layout);
         var input = new PortInput(
-            new[] { true, false },
-            new[] { -128, 65535, 999_999 });
+            [true, false],
+            [-128, 65535, 999_999]);
 
         var bytes = ser.Serialize(input);
         Assert.Equal(layout.PayloadByteWidth, bytes.Length);
@@ -78,7 +78,7 @@ public class InputSerializerTests
     {
         var layout = AnalogLayout();
         var ser = new InputSerializer(layout);
-        var input = new PortInput(new[] { false, false }, new[] { 999, -5, 2_000_000 });
+        var input = new PortInput([false, false], [999, -5, 2_000_000]);
 
         var back = ser.Deserialize(ser.Serialize(input));
 
@@ -114,8 +114,8 @@ public class InputSerializerTests
     public void DeserializeAtOffset_ReadsOnePayloadOutOfAPackedRun()
     {
         var ser = new InputSerializer(AnalogLayout());
-        var first = new PortInput(new[] { true, false }, new[] { -100, 60000, 999_999 });
-        var second = new PortInput(new[] { false, true }, new[] { 42, 7, 0 });
+        var first = new PortInput([true, false], [-100, 60000, 999_999]);
+        var second = new PortInput([false, true], [42, 7, 0]);
 
         // Lay the two payloads out back to back, the way a datagram carries a redundant window.
         var packed = ser.Serialize(first).Concat(ser.Serialize(second)).ToArray();

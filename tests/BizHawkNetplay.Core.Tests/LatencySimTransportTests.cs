@@ -27,7 +27,7 @@ public class LatencySimTransportTests
         var inner = new QueueTransport();
         var sim = new LatencySimTransport(inner, delayMs: 50, () => now);
 
-        inner.Deliver(new byte[] { 7 });        // "arrives" at now=0 -> deliverable at 50
+        inner.Deliver([7]);        // "arrives" at now=0 -> deliverable at 50
         Assert.False(sim.TryReceive(out _));     // buffered, not yet due
         now = 49;
         Assert.False(sim.TryReceive(out _));
@@ -46,10 +46,10 @@ public class LatencySimTransportTests
         var inner = new QueueTransport();
         var sim = new LatencySimTransport(inner, delayMs: 20, () => now);
 
-        inner.Deliver(new byte[] { 1 });         // observed at now=0 -> due at 20
+        inner.Deliver([1]);         // observed at now=0 -> due at 20
         Assert.False(sim.TryReceive(out _));
         now = 10;
-        inner.Deliver(new byte[] { 2 });         // observed at now=10 -> due at 30
+        inner.Deliver([2]);         // observed at now=10 -> due at 30
         Assert.False(sim.TryReceive(out _));
 
         now = 20;

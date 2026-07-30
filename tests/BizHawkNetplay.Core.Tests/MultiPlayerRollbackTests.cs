@@ -27,7 +27,7 @@ public class MultiPlayerRollbackTests
         var arr = new bool[8];
         arr[0] = a;
         arr[1] = b;
-        return new PortInput(arr, Array.Empty<int>());
+        return new PortInput(arr, []);
     }
 
     private static PortInput Neutral() => Btn(false, false);
@@ -45,7 +45,7 @@ public class MultiPlayerRollbackTests
         private readonly Clock _clock;
         private readonly int _latency;
         private readonly Queue<(long at, byte[] data)> _inbound = new();
-        private LatencyHub[] _others = Array.Empty<LatencyHub>();
+        private LatencyHub[] _others = [];
 
         private LatencyHub(Clock clock, int latency) { _clock = clock; _latency = latency; }
 
@@ -57,7 +57,7 @@ public class MultiPlayerRollbackTests
             {
                 var others = new List<LatencyHub>();
                 for (int j = 0; j < n; j++) if (j != i) others.Add(hubs[j]);
-                hubs[i]._others = others.ToArray();
+                hubs[i]._others = [.. others];
             }
             return hubs;
         }

@@ -437,7 +437,7 @@ public sealed partial class NetplayToolForm
         {
             var bye = new CountdownEvent(_peers.Count);
             foreach (var link in _peers)
-                QueueControl(link, ControlMessageType.Bye, Array.Empty<byte>(), _ => { try { bye.Signal(); } catch { } });
+                QueueControl(link, ControlMessageType.Bye, [], _ => { try { bye.Signal(); } catch { } });
             try { bye.Wait(50); } catch { }
             try { bye.Dispose(); } catch { }
         }

@@ -29,7 +29,7 @@ namespace BizHawkNetplay.Core.Net;
 /// </summary>
 public sealed class MeshUdpTransport : ITransport, IDisposable
 {
-    private static readonly byte[] Magic = { (byte)'B', (byte)'H', (byte)'N', (byte)'P' };
+    private static readonly byte[] Magic = [(byte)'B', (byte)'H', (byte)'N', (byte)'P'];
     private const byte Version = 2; // bumped: datagrams now carry a type byte (input vs punch)
     private const int HeaderSize = 6; // MAGIC(4) + version(1) + type(1)
 
@@ -69,6 +69,8 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// <summary>An immutable routing snapshot, atomically replaced when rendezvous data changes.</summary>
     private sealed class RouteTable
     {
+        // Spelled out rather than `new([], [])`: with both the type and the element types elided
+        // there is nothing left on the line to say what is being constructed.
         public static readonly RouteTable Empty =
             new(Array.Empty<PeerRoute>(), Array.Empty<IPEndPoint>());
 
@@ -233,7 +235,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             normalized[i] = new PeerRoute(port, candidatesByPort[port]);
         }
 
-        _routeTable = new RouteTable(normalized, endpoints.ToArray());
+        _routeTable = new RouteTable(normalized, [.. endpoints]);
 
         // Forget telemetry for candidates no longer in the set (a rejoin can change addresses).
         var keep = new HashSet<IPEndPoint>(endpoints);
@@ -641,7 +643,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
                 // Echo the probe's timestamp back untouched so the sender can time the round trip.
                 // A peer on an older build sends an empty probe and gets an empty ack — the RTT is
                 // simply never measured there, and the caller falls back to the control-channel ping.
-                var echo = n >= HeaderSize + 8 ? new byte[8] : Array.Empty<byte>();
+                var echo = n >= HeaderSize + 8 ? new byte[8] : [];
                 if (echo.Length == 8) Buffer.BlockCopy(buffer, HeaderSize, echo, 0, 8);
                 SendFramed(Frame(TPunchAck, echo), known); // answer so the peer confirms us too
                 continue;

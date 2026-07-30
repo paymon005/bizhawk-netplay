@@ -48,7 +48,7 @@ public class FrameDriverDelayTests
     {
         var arr = new bool[8];
         arr[0] = pressed;
-        return new PortInput(arr, Array.Empty<int>());
+        return new PortInput(arr, []);
     }
 
     [Theory]
@@ -118,7 +118,7 @@ public class FrameDriverDelayTests
         driver.ResendLocalInputIfDue();
         Assert.Equal(2, transport.Sends); // immediate 2ms-style retry is rate-limited
 
-        for (int i = 0; i < 200; i++) transport.Enqueue(new byte[] { 0xFF });
+        for (int i = 0; i < 200; i++) transport.Enqueue([0xFF]);
         driver.PumpNetwork();
         Assert.Equal(128, driver.LastPacketsDrained);
         Assert.Equal(72, transport.Pending);

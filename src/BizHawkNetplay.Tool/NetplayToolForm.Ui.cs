@@ -177,12 +177,12 @@ public sealed partial class NetplayToolForm
 
         var netcodeSelLabel = new Label { Text = "Netcode:", AutoSize = true, Location = new Point(366, 110) };
         _netcodeCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(426, 107), Width = 120 };
-        _netcodeCombo.Items.AddRange(new object[] { "Automatic", "Rollback", "Lockstep" });
+        _netcodeCombo.Items.AddRange(["Automatic", "Rollback", "Lockstep"]);
         _netcodeCombo.SelectedIndex = 0; // Automatic: rollback if the core qualifies, else lockstep
 
         var inputSrcLabel = new Label { Text = "My controls:", AutoSize = true, Location = new Point(12, 142) };
         _inputSourceCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Location = new Point(90, 139), Width = 130 };
-        _inputSourceCombo.Items.AddRange(new object[] { "Use P1 pad", "Use P2 pad", "Use P3 pad", "Use P4 pad", "Assigned port" });
+        _inputSourceCombo.Items.AddRange(["Use P1 pad", "Use P2 pad", "Use P3 pad", "Use P4 pad", "Assigned port"]);
         _inputSourceCombo.SelectedIndex = 0; // default: read your normal P1 controls, whatever port you're assigned
 
         _upnpCheck = new CheckBox { Text = "Auto-forward host port (UPnP)", AutoSize = true, Checked = true, Location = new Point(240, 141) };
@@ -222,15 +222,15 @@ public sealed partial class NetplayToolForm
             Padding = new Padding(6, 0, 0, 0), ForeColor = Color.DimGray,
         };
 
-        page.Controls.AddRange(new Control[]
-        {
+        page.Controls.AddRange(
+        [
             _hostRadio, _joinRadio, ipLabel, _ipBox, portLabel, _portBox, playersLabel, _playersBox, _playersHint,
             passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox, _autoDelayCheck,
             autoDelayMaxLabel, _autoDelayMaxBox,
             netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
             _goButton, _disconnectButton, _pubAddrButton, _applyLiveButton,
             connLogLabel, _connLog, _netcodeLabel, BuildPunchGroup(),
-        });
+        ]);
         return page;
     }
 
@@ -277,11 +277,11 @@ public sealed partial class NetplayToolForm
             Text = "", AutoSize = true, Location = new Point(12, 104), ForeColor = Color.DimGray,
         };
 
-        _punchGroup.Controls.AddRange(new Control[]
-        {
+        _punchGroup.Controls.AddRange(
+        [
             _punchInstructions, _punchButton, _myCodeLabel, _myCodeBox, _copyCodeButton,
             _peerCodeLabel, _peerCodeBox, _connectButton, _punchStatus,
-        });
+        ]);
         UpdatePunchUiForRole();
         return _punchGroup;
     }
@@ -340,11 +340,11 @@ public sealed partial class NetplayToolForm
                     : "resumed responding to pings");
         };
 
-        page.Controls.AddRange(new Control[]
-        {
+        page.Controls.AddRange(
+        [
             _probeButton, _testInputButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
             simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
-        });
+        ]);
         return page;
     }
 

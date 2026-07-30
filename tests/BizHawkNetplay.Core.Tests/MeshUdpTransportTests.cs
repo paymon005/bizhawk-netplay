@@ -43,7 +43,7 @@ public class MeshUdpTransportTests
             b.SetPeers(new[] { Loop(a.LocalPort), Loop(c.LocalPort) });
             c.SetPeers(new[] { Loop(a.LocalPort), Loop(b.LocalPort) });
 
-            a.Send(new byte[] { 42 }); // one send should reach BOTH other peers
+            a.Send([42]); // one send should reach BOTH other peers
 
             Assert.Equal(new byte[] { 42 }, WaitRecv(b));
             Assert.Equal(new byte[] { 42 }, WaitRecv(c));
@@ -68,7 +68,7 @@ public class MeshUdpTransportTests
             });
             receiver.SetPeers(new[] { Loop(sender.LocalPort) });
 
-            sender.Send(new byte[] { 7 });
+            sender.Send([7]);
             Assert.Equal(new byte[] { 7 }, WaitRecv(receiver));
             AssertNoRecv(receiver);
         }
@@ -119,7 +119,7 @@ public class MeshUdpTransportTests
             Assert.True(sender.TryGetWorstRttMs(out double worst));
             Assert.InRange(Math.Abs(worst - otherRtt), 0, 0.001); // max(min(fast, backup), other)
 
-            sender.Send(new byte[] { 10 });
+            sender.Send([10]);
             Assert.Equal(new byte[] { 10 }, WaitRecv(fast));
             Assert.Equal(new byte[] { 10 }, WaitRecv(otherPeer));
             AssertNoRecv(backup); // one send for P1, through its lowest-RTT live candidate
@@ -133,7 +133,7 @@ public class MeshUdpTransportTests
                          && sender.IsEndpointAlive(otherEndpoint),
                 "live backup route was not selected after repunch");
 
-            sender.Send(new byte[] { 11 });
+            sender.Send([11]);
             Assert.Equal(new byte[] { 11 }, WaitRecv(backup));
             Assert.Equal(new byte[] { 11 }, WaitRecv(otherPeer));
             Assert.True(sender.TryGetWorstRttMs(out worst));
@@ -180,7 +180,7 @@ public class MeshUdpTransportTests
                 sender.RecordRtt(backupEndpoint, 50);
             }
 
-            sender.Send(new byte[] { 32 });
+            sender.Send([32]);
             Assert.Equal(new byte[] { 32 }, WaitRecv(fast));
             AssertNoRecv(backup);
 
@@ -192,7 +192,7 @@ public class MeshUdpTransportTests
             bool failedOver = false;
             while (sw.ElapsedMilliseconds < 4500 && !failedOver)
             {
-                sender.Send(new byte[] { 33 });
+                sender.Send([33]);
                 if (backup.TryReceive(out var got) && got.Length == 1 && got[0] == 33) failedOver = true;
                 else Thread.Sleep(100);
             }
@@ -221,7 +221,7 @@ public class MeshUdpTransportTests
             reachable.SetPeers(new[] { Loop(sender.LocalPort) });
 
             // Send immediately — deliberately BEFORE waiting for any liveness confirmation.
-            sender.Send(new byte[] { 50 });
+            sender.Send([50]);
             Assert.Equal(new byte[] { 50 }, WaitRecv(reachable));
         }
         finally { sender.Dispose(); unreachableFirst.Dispose(); reachable.Dispose(); }
@@ -247,11 +247,11 @@ public class MeshUdpTransportTests
             working.SetPeers(new[] { senderEndpoint });
             WaitUntil(() => sender.IsEndpointAlive(workingEndpoint), "working path never confirmed");
 
-            sender.Send(new byte[] { 40 });
+            sender.Send([40]);
             Assert.Equal(new byte[] { 40 }, WaitRecv(working));
 
             sender.RequestRepunch(1);
-            sender.Send(new byte[] { 41 }); // liveness just cleared — must still reach the peer
+            sender.Send([41]); // liveness just cleared — must still reach the peer
             Assert.Equal(new byte[] { 41 }, WaitRecv(working));
         }
         finally { sender.Dispose(); unreachableFirst.Dispose(); working.Dispose(); }
@@ -337,7 +337,7 @@ public class MeshUdpTransportTests
         {
             a.SetPeers(new[] { Loop(b.LocalPort) }); // a trusts only b
             stranger.SetPeers(new[] { Loop(a.LocalPort) });
-            stranger.Send(new byte[] { 9, 9 });
+            stranger.Send([9, 9]);
 
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < 300)
@@ -400,7 +400,7 @@ public class MeshUdpTransportTests
     {
         var arr = new bool[8];
         arr[0] = pressed;
-        return new PortInput(arr, Array.Empty<int>());
+        return new PortInput(arr, []);
     }
 
     [Fact]

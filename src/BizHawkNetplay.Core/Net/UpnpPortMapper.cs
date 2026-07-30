@@ -52,11 +52,11 @@ public static class UpnpPortMapper
 {
     private const int LeaseSeconds = 7200; // 2h; a crash that skips the clean unmap just lets it lapse
     private static readonly string[] SearchTargets =
-    {
+    [
         "urn:schemas-upnp-org:device:InternetGatewayDevice:2",
         "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
-    };
-    private static readonly string[] WanServices = { "WANIPConnection", "WANPPPConnection" };
+    ];
+    private static readonly string[] WanServices = ["WANIPConnection", "WANPPPConnection"];
 
     /// <summary>
     /// Ask a UPnP router to forward <paramref name="port"/> (TCP+UDP) to <paramref name="lanIp"/>.

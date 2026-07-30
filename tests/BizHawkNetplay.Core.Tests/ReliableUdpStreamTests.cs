@@ -121,7 +121,7 @@ public class ReliableUdpStreamTests
         var gotB = Task.Run(() => ReadExactly(b, msgA.Length));
         var gotA = Task.Run(() => ReadExactly(a, msgB.Length));
 
-        Assert.True(Task.WaitAll(new[] { wa, wb, gotA, gotB }, TimeSpan.FromSeconds(60)));
+        Assert.True(Task.WaitAll([wa, wb, gotA, gotB], TimeSpan.FromSeconds(60)));
         Assert.Equal(msgA, gotB.Result);
         Assert.Equal(msgB, gotA.Result);
     }

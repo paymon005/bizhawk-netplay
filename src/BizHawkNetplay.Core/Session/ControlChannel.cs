@@ -68,7 +68,7 @@ public sealed class ControlChannel
 
     public void Send(ControlMessageType type, byte[] body)
     {
-        if (body == null) body = Array.Empty<byte>();
+        if (body == null) body = [];
         if (body.Length > MaxFrameLength)
             throw new ArgumentException($"Frame body {body.Length} exceeds cap");
         var header = new byte[5];
@@ -90,7 +90,7 @@ public sealed class ControlChannel
         int len = ReadInt32BE(header, 1);
         if (len < 0 || len > MaxFrameLength)
             throw new InvalidDataException($"Frame length {len} out of range");
-        var body = len == 0 ? Array.Empty<byte>() : ReadBody(len);
+        var body = len == 0 ? [] : ReadBody(len);
         return (type, body);
     }
 

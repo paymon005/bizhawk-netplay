@@ -23,17 +23,17 @@ public class MultiPlayerLockstepTests
     {
         var b = new bool[8];
         b[0] = pressed;
-        return new PortInput(b, Array.Empty<int>());
+        return new PortInput(b, []);
     }
 
     /// <summary>In-memory full-delivery hub: what any instance sends, every other instance receives.</summary>
     private sealed class HubTransport : ITransport
     {
         private readonly ConcurrentQueue<byte[]> _inbound = new();
-        private ConcurrentQueue<byte[]>[] _others = Array.Empty<ConcurrentQueue<byte[]>>();
+        private ConcurrentQueue<byte[]>[] _others = [];
 
         public void Connect(HubTransport[] all) =>
-            _others = all.Where(t => !ReferenceEquals(t, this)).Select(t => t._inbound).ToArray();
+            _others = [.. all.Where(t => !ReferenceEquals(t, this)).Select(t => t._inbound)];
 
         public void Send(byte[] datagram)
         {

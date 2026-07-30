@@ -79,7 +79,7 @@ public static class ConnectCode
         if (outPos != 7) return null;                       // wrong length
         if (raw[6] != Checksum(raw, 6)) return null;        // typo caught
 
-        var ip = new IPAddress(new[] { raw[0], raw[1], raw[2], raw[3] });
+        var ip = new IPAddress([raw[0], raw[1], raw[2], raw[3]]);
         int port = (raw[4] << 8) | raw[5];
         return new IPEndPoint(ip, port);
     }

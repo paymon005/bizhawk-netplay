@@ -35,7 +35,7 @@ public class InputGenerationTests
     {
         var frames = new List<KeyValuePair<int, byte[]>>(values.Length);
         for (int i = 0; i < values.Length; i++)
-            frames.Add(new KeyValuePair<int, byte[]>(firstFrame + i, new[] { values[i] }));
+            frames.Add(new KeyValuePair<int, byte[]>(firstFrame + i, [values[i]]));
         return frames;
     }
 
@@ -45,7 +45,7 @@ public class InputGenerationTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new SessionGeneration(0, 0));
         Assert.Throws<ArgumentOutOfRangeException>(() => new SessionGeneration(1, -1));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new InputPacketCodec(new[] { 1 }, default(SessionGeneration)));
+            new InputPacketCodec([1], default(SessionGeneration)));
 
         var initial = new SessionGeneration(0x123456789abcdef0UL, 4);
         Assert.Equal(new SessionGeneration(initial.SessionId, 5), initial.Next());
@@ -56,19 +56,19 @@ public class InputGenerationTests
     public void Codec_RejectsWrongSessionAndEpoch()
     {
         var expected = new SessionGeneration(0x0102030405060708UL, 7);
-        var packet = new InputPacketCodec(new[] { 1, 1 }, expected)
+        var packet = new InputPacketCodec([1, 1], expected)
             .EncodeInput(1, Window(3, 0x5a));
 
-        var matching = new InputPacketCodec(new[] { 1, 1 }, expected);
+        var matching = new InputPacketCodec([1, 1], expected);
         Assert.True(matching.TryDecodeInput(packet, out var frames));
         Assert.Single(frames);
         Assert.Equal(3, frames[0].Frame);
 
         var wrongSession = new InputPacketCodec(
-            new[] { 1, 1 }, new SessionGeneration(0x1112131415161718UL, expected.Epoch));
+            [1, 1], new SessionGeneration(0x1112131415161718UL, expected.Epoch));
         Assert.False(wrongSession.TryDecodeInput(packet, out _));
 
-        var wrongEpoch = new InputPacketCodec(new[] { 1, 1 }, expected.Next());
+        var wrongEpoch = new InputPacketCodec([1, 1], expected.Next());
         Assert.False(wrongEpoch.TryDecodeInput(packet, out _));
     }
 
@@ -76,7 +76,7 @@ public class InputGenerationTests
     public void Codec_GapRequest_RoundTripsAndRejectsOtherGenerations()
     {
         var generation = new SessionGeneration(0x0102030405060708UL, 7);
-        var codec = new InputPacketCodec(new[] { 1, 1 }, generation);
+        var codec = new InputPacketCodec([1, 1], generation);
         var request = codec.EncodeRequest(1, 42);
 
         Assert.True(codec.TryDecodeRequest(request, out var port, out var fromFrame));
@@ -88,7 +88,7 @@ public class InputGenerationTests
         Assert.False(codec.TryDecodeRequest(codec.EncodeInput(1, Window(3, 0x5a)), out _, out _));
 
         // Stale-generation requests are dropped like stale input.
-        var older = new InputPacketCodec(new[] { 1, 1 }, generation.Next());
+        var older = new InputPacketCodec([1, 1], generation.Next());
         Assert.False(older.TryDecodeRequest(request, out _, out _));
     }
 
@@ -102,8 +102,8 @@ public class InputGenerationTests
         var newGeneration = oldGeneration.Next();
         var transport = new QueueTransport();
 
-        var newCodec = new InputPacketCodec(new[] { 1, 1 }, newGeneration);
-        var oldCodec = new InputPacketCodec(new[] { 1, 1 }, oldGeneration);
+        var newCodec = new InputPacketCodec([1, 1], newGeneration);
+        var oldCodec = new InputPacketCodec([1, 1], oldGeneration);
 
         var emu = new FakeEmuAdapter(portCount: 2);
         var driver = new FrameDriver(
@@ -156,13 +156,13 @@ public class InputGenerationTests
 
         // Sender's port 2 serializes 3 bytes per frame (say, a multitap layout); the receiver
         // computes 1 for that port because its peripheral configuration differs.
-        var sender = new InputPacketCodec(new[] { 1, 1, 3 }, generation);
-        var receiver = new InputPacketCodec(new[] { 1, 1, 1 }, generation);
+        var sender = new InputPacketCodec([1, 1, 3], generation);
+        var receiver = new InputPacketCodec([1, 1, 1], generation);
 
         var packet = sender.EncodeInput(2, new[]
         {
-            new KeyValuePair<int, byte[]>(10, new byte[] { 1, 2, 3 }),
-            new KeyValuePair<int, byte[]>(11, new byte[] { 4, 5, 6 }),
+            new KeyValuePair<int, byte[]>(10, [1, 2, 3]),
+            new KeyValuePair<int, byte[]>(11, [4, 5, 6]),
         });
 
         Assert.False(receiver.TryDecodeInput(packet, out var frames));
@@ -176,7 +176,7 @@ public class InputGenerationTests
         Assert.Equal(3, receiver.LastSizeMismatchObserved);
 
         // A matching peer is unaffected and counts nothing.
-        var agreeing = new InputPacketCodec(new[] { 1, 1, 3 }, generation);
+        var agreeing = new InputPacketCodec([1, 1, 3], generation);
         Assert.True(agreeing.TryDecodeInput(packet, out var ok));
         Assert.Equal(2, ok.Count);
         Assert.Equal(0, agreeing.RejectedTotal);
@@ -190,13 +190,13 @@ public class InputGenerationTests
     public void Decode_DoesNotCountRequestsOrForeignGenerationsAsTheSameThing()
     {
         var generation = new SessionGeneration(0x2727272727272727UL, 1);
-        var codec = new InputPacketCodec(new[] { 1, 1 }, generation);
+        var codec = new InputPacketCodec([1, 1], generation);
 
         Assert.False(codec.TryDecodeInput(codec.EncodeRequest(1, 42), out _));
         Assert.Equal(0, codec.RejectedTotal);   // a request is not a refusal
 
-        var foreign = new InputPacketCodec(new[] { 1, 1 }, generation.Next());
-        var stale = foreign.EncodeInput(1, new[] { new KeyValuePair<int, byte[]>(5, new byte[] { 9 }) });
+        var foreign = new InputPacketCodec([1, 1], generation.Next());
+        var stale = foreign.EncodeInput(1, new[] { new KeyValuePair<int, byte[]>(5, [9]) });
         Assert.False(codec.TryDecodeInput(stale, out _));
         Assert.Equal(1, codec.RejectedGeneration);
         Assert.Equal(0, codec.RejectedPayloadSize);
@@ -207,12 +207,12 @@ public class InputGenerationTests
     public void DecodeWindow_DescribesTheSameFramesTheCopyingDecodeProduces()
     {
         var generation = new SessionGeneration(0x9191919191919191UL, 2);
-        var codec = new InputPacketCodec(new[] { 1, 3 }, generation);
+        var codec = new InputPacketCodec([1, 3], generation);
         var packet = codec.EncodeInput(1, new[]
         {
-            new KeyValuePair<int, byte[]>(40, new byte[] { 1, 2, 3 }),
-            new KeyValuePair<int, byte[]>(41, new byte[] { 4, 5, 6 }),
-            new KeyValuePair<int, byte[]>(42, new byte[] { 7, 8, 9 }),
+            new KeyValuePair<int, byte[]>(40, [1, 2, 3]),
+            new KeyValuePair<int, byte[]>(41, [4, 5, 6]),
+            new KeyValuePair<int, byte[]>(42, [7, 8, 9]),
         });
 
         Assert.True(codec.TryDecodeInputWindow(packet, out var window));
@@ -237,12 +237,12 @@ public class InputGenerationTests
     public void DecodeWindow_RefusesAndCountsExactlyWhatTheCopyingDecodeDoes()
     {
         var generation = new SessionGeneration(0x3131313131313131UL, 1);
-        var sender = new InputPacketCodec(new[] { 1, 1, 3 }, generation);
+        var sender = new InputPacketCodec([1, 1, 3], generation);
         var packet = sender.EncodeInput(2,
-            new[] { new KeyValuePair<int, byte[]>(10, new byte[] { 1, 2, 3 }) });
+            new[] { new KeyValuePair<int, byte[]>(10, [1, 2, 3]) });
 
-        var viaWindow = new InputPacketCodec(new[] { 1, 1, 1 }, generation);
-        var viaCopy = new InputPacketCodec(new[] { 1, 1, 1 }, generation);
+        var viaWindow = new InputPacketCodec([1, 1, 1], generation);
+        var viaCopy = new InputPacketCodec([1, 1, 1], generation);
         Assert.False(viaWindow.TryDecodeInputWindow(packet, out _));
         Assert.False(viaCopy.TryDecodeInput(packet, out _));
 
@@ -313,9 +313,9 @@ public class InputGenerationTests
     public void DecodeWindow_AllocatesNothing()
     {
         var generation = new SessionGeneration(0x7373737373737373UL, 4);
-        var codec = new InputPacketCodec(new[] { 1, 2 }, generation);
+        var codec = new InputPacketCodec([1, 2], generation);
         var frames = new List<KeyValuePair<int, byte[]>>();
-        for (int f = 0; f < 9; f++) frames.Add(new KeyValuePair<int, byte[]>(100 + f, new byte[] { 1, 2 }));
+        for (int f = 0; f < 9; f++) frames.Add(new KeyValuePair<int, byte[]>(100 + f, [1, 2]));
         var packet = codec.EncodeInput(1, frames);
 
         Assert.True(codec.TryDecodeInputWindow(packet, out _)); // warm any first-call cost

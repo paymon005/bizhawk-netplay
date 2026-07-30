@@ -537,8 +537,8 @@ public sealed partial class NetplayToolForm
             var tools = mf.GetType().GetField("Tools", AnyInstance)?.GetValue(mf)
                      ?? mf.GetType().GetProperty("Tools", AnyInstance)?.GetValue(mf);
             if (tools == null) return 0;
-            var isLoaded = tools.GetType().GetMethod("IsLoaded", new[] { typeof(Type) });
-            if (!(isLoaded?.Invoke(tools, new object[] { luaConsoleType }) as bool? ?? false)) return 0; // closed
+            var isLoaded = tools.GetType().GetMethod("IsLoaded", [typeof(Type)]);
+            if (!(isLoaded?.Invoke(tools, [luaConsoleType]) as bool? ?? false)) return 0; // closed
             var console = tools.GetType().GetProperty("LuaConsole", AnyInstance)?.GetValue(tools);
             var luaImp = console?.GetType().GetField("LuaImp", AnyInstance)?.GetValue(console)
                       ?? console?.GetType().GetProperty("LuaImp", AnyInstance)?.GetValue(console);

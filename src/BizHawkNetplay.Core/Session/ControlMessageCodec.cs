@@ -179,7 +179,7 @@ public static class ControlMessageCodec
     public static bool TryDecodeStatePayload(byte[] body, out SessionGeneration generation, out byte[] state)
     {
         generation = default;
-        state = Array.Empty<byte>();
+        state = [];
         if (body == null || body.Length < GenerationSize + StateCompression.HeaderSize) return false;
         if (!TryReadGeneration(body, 0, out generation)) return false;
         return StateCompression.TryUnpack(body, GenerationSize, body.Length - GenerationSize,

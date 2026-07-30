@@ -11,11 +11,11 @@ public class StunClientTests
     //   203.0.113.5 = CB 00 71 05 ; XOR cookie 2112A442 -> EA 12 D5 47
     //   51000 = C738 ; XOR (cookie>>16=2112) -> E62A
     private static byte[] XorMappedResponse(byte[] txn) => Concat(
-        new byte[] { 0x01, 0x01, 0x00, 0x0C },          // type=Binding Success, msg length=12
-        new byte[] { 0x21, 0x12, 0xA4, 0x42 },          // magic cookie
+        [0x01, 0x01, 0x00, 0x0C],          // type=Binding Success, msg length=12
+        [0x21, 0x12, 0xA4, 0x42],          // magic cookie
         txn,                                            // 12-byte transaction id
-        new byte[] { 0x00, 0x20, 0x00, 0x08 },          // attr XOR-MAPPED-ADDRESS, length 8
-        new byte[] { 0x00, 0x01, 0xE6, 0x2A, 0xEA, 0x12, 0xD5, 0x47 }); // reserved, IPv4, xport, xaddr
+        [0x00, 0x20, 0x00, 0x08],          // attr XOR-MAPPED-ADDRESS, length 8
+        [0x00, 0x01, 0xE6, 0x2A, 0xEA, 0x12, 0xD5, 0x47]); // reserved, IPv4, xport, xaddr
 
     [Fact]
     public void BuildRequest_HasCorrectHeader()
@@ -53,7 +53,7 @@ public class StunClientTests
     public void RejectsNonStunGarbage()
     {
         var txn = new byte[12];
-        Assert.Null(StunClient.ParseResponse(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF }, txn));
+        Assert.Null(StunClient.ParseResponse([0xDE, 0xAD, 0xBE, 0xEF], txn));
         Assert.Null(StunClient.ParseResponse(new byte[100], txn)); // right length, wrong type/cookie
     }
 
@@ -61,6 +61,6 @@ public class StunClientTests
     {
         var list = new List<byte>();
         foreach (var p in parts) list.AddRange(p);
-        return list.ToArray();
+        return [.. list];
     }
 }

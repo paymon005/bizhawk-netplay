@@ -110,7 +110,7 @@ public class ControlMessageCodecTests
         Assert.Equal(state, decoded);
 
         Assert.True(ControlMessageCodec.TryDecodeStatePayload(
-            ControlMessageCodec.EncodeStatePayload(Gen, Array.Empty<byte>()), out _, out var empty));
+            ControlMessageCodec.EncodeStatePayload(Gen, []), out _, out var empty));
         Assert.Empty(empty);
 
         Assert.False(ControlMessageCodec.TryDecodeStatePayload(new byte[11], out _, out _)); // shorter than a generation

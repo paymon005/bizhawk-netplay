@@ -19,11 +19,11 @@ public static class StunClient
 
     /// <summary>Public STUN servers (Binding Request over UDP), tried in order until one answers.</summary>
     public static readonly (string host, int port)[] Servers =
-    {
+    [
         ("stun.l.google.com", 19302),
         ("stun1.l.google.com", 19302),
         ("stun.cloudflare.com", 3478),
-    };
+    ];
 
     /// <summary>Resolve a STUN server host to its first IPv4 endpoint, or null.</summary>
     public static IPEndPoint? ResolveV4(string host, int port)
@@ -200,5 +200,5 @@ public static class StunClient
     private static void WriteU32(byte[] b, int o, uint v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
     private static int ReadU16(byte[] b, int o) => (b[o] << 8) | b[o + 1];
     private static uint ReadU32(byte[] b, int o) => ((uint)b[o] << 24) | ((uint)b[o + 1] << 16) | ((uint)b[o + 2] << 8) | b[o + 3];
-    private static byte[] ToNetworkBytes(uint v) => new[] { (byte)(v >> 24), (byte)(v >> 16), (byte)(v >> 8), (byte)v };
+    private static byte[] ToNetworkBytes(uint v) => [(byte)(v >> 24), (byte)(v >> 16), (byte)(v >> 8), (byte)v];
 }

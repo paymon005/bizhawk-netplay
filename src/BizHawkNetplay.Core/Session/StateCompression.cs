@@ -58,7 +58,7 @@ public static class StateCompression
     /// </summary>
     public static bool TryUnpack(byte[] body, int offset, int count, int maxBytes, out byte[] state)
     {
-        state = Array.Empty<byte>();
+        state = [];
         if (body == null || offset < 0 || count < HeaderSize || offset + count > body.Length)
             return false;
 

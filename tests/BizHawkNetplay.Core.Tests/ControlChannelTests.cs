@@ -80,8 +80,8 @@ public class ControlChannelTests
     {
         var stream = new SocketLikeStream();
         stream.Enqueue(Header(ControlMessageType.State, 6));
-        stream.Enqueue(new byte[] { 1, 2, 3 });
-        stream.Enqueue(new byte[] { 4, 5, 6 });
+        stream.Enqueue([1, 2, 3]);
+        stream.Enqueue([4, 5, 6]);
 
         var channel = new ControlChannel(stream) { BodyReadTimeoutMs = len => 1234 };
         var (type, body) = channel.Receive();
@@ -143,7 +143,7 @@ public class ControlChannelTests
         // Loopback/test streams (MemoryStream pairs) report CanTimeout=false; the hook must be
         // inert there rather than throwing on ReadTimeout access.
         var frame = new List<byte>(Header(ControlMessageType.Checksum, 3)) { 7, 8, 9 };
-        var channel = new ControlChannel(new MemoryStream(frame.ToArray()))
+        var channel = new ControlChannel(new MemoryStream([.. frame]))
         {
             BodyReadTimeoutMs = len => 5,
         };

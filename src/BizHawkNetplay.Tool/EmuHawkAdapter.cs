@@ -39,7 +39,7 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     // Raw main-memory access for the periodic desync checksum, resolved lazily (see HashMainMemory).
     private IMemoryDomains? _memoryDomains;
     private bool _memoryDomainsResolved;
-    private byte[] _hashScratch = Array.Empty<byte>();
+    private byte[] _hashScratch = [];
     private PropertyInfo? _domainDataProp;
     private bool _domainDataResolved;
 
@@ -49,14 +49,14 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     private ISoundOutput? _outputDevice;             // EmuHawk's host audio device, driven directly
     private ISoundProvider? _coreSound;
     private NetplaySoundBuffer? _soundBuffer;
-    private short[] _pumpScratch = Array.Empty<short>();
+    private short[] _pumpScratch = [];
     private int _soundChannels = 2;
     // Standing audio cushion in ms — a permanent video→audio offset, so keep it as small as the
     // pump jitter allows (see EnableAudio). ~2.5 frames at 60fps.
     private const int AudioPrimeMs = 40;
     private bool _audioReady;
     private bool _coreSyncSound = true;              // drain via GetSamplesSync (else GetSamplesAsync)
-    private short[] _asyncScratch = Array.Empty<short>();
+    private short[] _asyncScratch = [];
     // Diagnostics so a single test round shows where the audio pipeline breaks.
     private long _audioFrames, _audioPairs, _audioPumps;
     // Restart bookkeeping for a device that stopped under us — see PumpAudio's revival path.

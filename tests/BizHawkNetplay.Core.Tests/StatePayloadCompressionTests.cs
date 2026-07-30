@@ -64,7 +64,7 @@ public class StatePayloadCompressionTests
     [Fact]
     public void AnEmptyStateIsStillAValidPayload()
     {
-        Assert.Empty(RoundTrip(Array.Empty<byte>()));
+        Assert.Empty(RoundTrip([]));
     }
 
     [Fact]

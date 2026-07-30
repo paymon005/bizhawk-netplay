@@ -26,7 +26,7 @@ public sealed partial class NetplayToolForm
     /// EmuHawk's UI thread. A per-peer writer preserves ControlChannel ordering.</summary>
     private bool QueueControl(PeerLink link, ControlMessageType type, byte[] body, Action<bool>? completed = null)
     {
-        if (body == null) body = Array.Empty<byte>();
+        if (body == null) body = [];
         if (!link.WriterRunning) { completed?.Invoke(false); return false; }
         long bytes = body.LongLength + 5;
         long queued = Interlocked.Add(ref link.QueuedBytes, bytes);

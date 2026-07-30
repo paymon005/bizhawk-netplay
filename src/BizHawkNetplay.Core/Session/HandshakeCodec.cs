@@ -234,7 +234,7 @@ public static class HandshakeCodec
 
         var layouts = map.TryGetValue("layouts", out var l) && l.Length > 0
             ? l.Split(',')
-            : Array.Empty<string>();
+            : [];
 
         var id = new PeerIdentity(
             GetInt(map, "proto", 0),
