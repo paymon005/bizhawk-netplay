@@ -126,7 +126,7 @@ namespace BizHawkNetplay.Tool
         private void UpdateNetcodeLabel()
         {
             bool rollback = _mode == SyncMode.Rollback;
-            _netcodeLabel.Text = _sessionActive
+            _netcodeLabel.Text = _phase.IsActive
                 ? $"Netcode in use: {(rollback ? "Rollback" : "Lockstep")}, delay {_sessionDelay}"
                 : "Netcode in use: " + (rollback ? "Rollback" : "Lockstep");
             _netcodeLabel.ForeColor = rollback ? Color.DarkGreen : Color.DarkSlateBlue;
@@ -140,7 +140,7 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void RefreshLiveSettingsUi()
         {
-            bool liveHost = _sessionActive && _isHost;
+            bool liveHost = _phase.IsActive && _isHost;
             if (liveHost)
             {
                 _netcodeCombo.Enabled = true;
@@ -165,7 +165,7 @@ namespace BizHawkNetplay.Tool
             else _delayBoxSyncedTo = -1;
             // Refused while another rebuild is in flight: two authoritative baselines racing each other
             // is the one way this could desync a session it exists to keep running.
-            _applyLiveButton.Enabled = liveHost && !_resyncInProgress && !_awaitingReconnect;
+            _applyLiveButton.Enabled = liveHost && !_phase.IsRebuilding && !_phase.AwaitingRejoin;
         }
 
         /// <summary>Construct and seed the exact generation-bound driver before READY. It may publish
@@ -192,8 +192,6 @@ namespace BizHawkNetplay.Tool
             _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
             _resyncCount = 0;
             _desyncTrend.Reset();
-            _resyncInProgress = false;
-            _resyncReleaseQueued = false;
             _reconnectState = null;
             _reconnectGeneration = default;
             _pendingReconnectLink = null;
@@ -204,7 +202,7 @@ namespace BizHawkNetplay.Tool
             _driver!.Start(); // idempotent; normally seeded before READY
             _driver.ResetRemoteInputLiveness();
             _sessionDriverPrepared = false;
-            _sessionActive = true;
+            _phase.Start(); // GO: active, not rebuilding, nobody's seat empty
             _preJoinRestoreState = null; // GO committed the imported baseline
 
             // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
@@ -380,7 +378,7 @@ namespace BizHawkNetplay.Tool
                 BeginInvokeUi(() =>
                 {
                     if (IsConnectionAttemptCurrent(attempt) && ReferenceEquals(_mesh, mesh)
-                        && _sessionActive && _peers.Count > 0)
+                        && _phase.IsActive && _peers.Count > 0)
                         QueueControl(_peers[0], ControlMessageType.Candidate,
                             HandshakeCodec.EncodeEndpoints(new[] { endpoint }));
                 });
@@ -391,7 +389,7 @@ namespace BizHawkNetplay.Tool
         /// <summary>Host: record a joiner's reflexive endpoint and re-share the candidate lists.</summary>
         private void OnJoinerCandidate(PeerLink link, IPEndPoint reflexive)
         {
-            if (!_sessionActive || !_isHost || _awaitingReconnect) return;
+            if (!_phase.IsActive || !_isHost || _phase.AwaitingRejoin) return;
             if (!_peers.Contains(link)) return;                                  // dropped meanwhile
             if (reflexive.Equals(link.ReflexiveEndpoint)) return;               // unchanged
             link.ReflexiveEndpoint = reflexive;

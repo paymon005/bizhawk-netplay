@@ -29,7 +29,7 @@ namespace BizHawkNetplay.Tool
         {
             if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
             if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
-            if (_sessionActive) { Log("Can't probe during a session."); return; }
+            if (_phase.IsActive) { Log("Can't probe during a session."); return; }
 
             Log("=== capability probe ===");
             string? restore = null;

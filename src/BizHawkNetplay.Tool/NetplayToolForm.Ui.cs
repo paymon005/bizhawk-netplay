@@ -336,7 +336,7 @@ namespace BizHawkNetplay.Tool
                 if (!_forceDesyncCheck.Checked) return;
                 _forceDesyncOnce = true;
                 _forceDesyncCheck.Checked = false;
-                Log(_sessionActive ? "will inject a fake desync at the next checksum (tests resync)"
+                Log(_phase.IsActive ? "will inject a fake desync at the next checksum (tests resync)"
                                    : "arm this during a session to test resync");
             };
 
@@ -346,7 +346,7 @@ namespace BizHawkNetplay.Tool
             _simUnresponsiveCheck.CheckedChanged += (_, __) =>
             {
                 _simUnresponsive = _simUnresponsiveCheck.Checked;
-                if (_sessionActive)
+                if (_phase.IsActive)
                     Log(_simUnresponsive
                         ? "simulating an unresponsive peer — we've stopped answering pings; the other side should drop us in ~3s"
                         : "resumed responding to pings");
@@ -402,7 +402,7 @@ namespace BizHawkNetplay.Tool
             if (_playersList.IsDisposed) return;
             _playersList.BeginUpdate();
             _playersList.Items.Clear();
-            if (_sessionActive)
+            if (_phase.IsActive)
             {
                 var me = new ListViewItem($"P{_localPort + 1} (you)");
                 me.SubItems.Add(_isHost ? "this machine (host)" : "this machine");
@@ -449,7 +449,7 @@ namespace BizHawkNetplay.Tool
         {
             // ROM load / tool re-init: also tear down a lobby, join, or state transfer. Those phases
             // have already paused the emulator and captured an adapter for the old core even though
-            // _sessionActive is still false.
+            // _phase.IsActive is still false.
             EndSession("emulator restarted");
             // Invalidate the cached probe depth — the core/ROM may have changed, and a stale (deeper)
             // measurement from a lighter core could wrongly grant rollback to a heavier one.

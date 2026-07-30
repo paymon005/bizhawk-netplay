@@ -183,7 +183,9 @@ namespace BizHawkNetplay.Tool
         private byte[]? _preJoinRestoreState; // restored if pre-READY import never reaches GO
         private readonly List<PeerLink> _peers = new List<PeerLink>();
         private readonly System.Windows.Forms.Timer _frameTimer;
-        private volatile bool _sessionActive;
+        // Session lifecycle as one object; see SessionPhase for why rebuilding and awaiting-a-rejoin
+        // are independent rather than two values of one enum.
+        private readonly SessionPhase _phase = new SessionPhase();
         private bool _isHost;      // host is authoritative for desync detection + resync
         private int _playerCount = 2;
         private int _localPort;    // our controller port, for rebuilding the driver on resync
@@ -201,8 +203,6 @@ namespace BizHawkNetplay.Tool
         // time for shallower visual corrections; in lockstep it also prevents routine network stalls.
         private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session
         private double _lastStallLogMs = double.NegativeInfinity;
-        private bool _resyncInProgress;
-        private bool _resyncReleaseQueued;
         private readonly object _generationLock = new object();
         private SessionGeneration _generation = SessionGeneration.Legacy;
         private readonly FrameAdvantageTracker _frameAdvantage = new FrameAdvantageTracker();
@@ -222,7 +222,6 @@ namespace BizHawkNetplay.Tool
         // Reconnect: when a joiner unexpectedly drops, the host freezes the session and waits for it to
         // rejoin (into the same port, with the current state) instead of ending. Host-side only — a
         // joiner that loses the host ends and the user rejoins manually. One outstanding drop at a time.
-        private volatile bool _awaitingReconnect;
         private byte[]? _reconnectState; // authoritative baseline captured at the instant the peer drops
         private SessionGeneration _reconnectGeneration;
         private PeerLink? _pendingReconnectLink; // READY, but held outside _peers until every survivor applies

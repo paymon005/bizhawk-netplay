@@ -142,7 +142,7 @@ namespace BizHawkNetplay.Tool
             // that is ~3200/s against a 16.688ms frame, so a frame lands within about 0.3ms of when it
             // is due. WM_TIMER, by contrast, is capped near 100/s by its 10ms floor no matter how fast
             // the loop spins, and measured 64.
-            if (!_sessionActive || _driver == null) return;
+            if (!_phase.IsActive || _driver == null) return;
             double nowMs = _paceClock.Elapsed.TotalMilliseconds;
             if (!_schedule.ShouldWake(nowMs, FineClockWakeMarginMs)) return;
             if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
@@ -207,7 +207,7 @@ namespace BizHawkNetplay.Tool
 
         private void FrameTick()
         {
-            if (!_sessionActive || _driver == null) return;
+            if (!_phase.IsActive || _driver == null) return;
             if (_frameTickRunning) return;
 
             // Deliberately NOT stopping the timer here. Stopping on entry and restarting in the finally
@@ -297,9 +297,9 @@ namespace BizHawkNetplay.Tool
 
                 // Frozen while a dropped peer is being waited on — don't advance until the rejoin
                 // resyncs everyone. Sticky pause and drift validation above must still run here.
-                if (_awaitingReconnect)
+                if (_phase.AwaitingRejoin)
                 {
-                    if (_resyncInProgress) _driver.ResendLocalInputIfDue();
+                    if (_phase.IsRebuilding) _driver.ResendLocalInputIfDue();
                     MaybeSendPing();
                     CheckLinkTimeouts();
                     return;
@@ -312,7 +312,7 @@ namespace BizHawkNetplay.Tool
 
                 // State capture/import stays on this thread, but whole-state transfer runs on each
                 // peer's writer thread. Hold the new baseline while that transfer is in flight.
-                if (_resyncInProgress)
+                if (_phase.IsRebuilding)
                 {
                     // Every peer may rebuild at a different instant. Keep publishing this epoch's
                     // neutral/start window so an early sender is not lost by peers still rejecting
@@ -481,13 +481,13 @@ namespace BizHawkNetplay.Tool
                 MaybeSendPing();
                 CheckLinkTimeouts();
                 CheckUdpInputProgress();
-                if (!_sessionActive || _driver == null) return;
+                if (!_phase.IsActive || _driver == null) return;
 
                 // Joiner: the host clears its resync counter once checksums re-agree, but a joiner gets no
                 // such signal. Decay ours after running well past the last resync without another one —
                 // otherwise a run of successful recoveries would eventually trip the "persistent desync"
                 // give-up limit on a perfectly healthy joiner.
-                if (!_isHost && _resyncCount > 0 && !_awaitingReconnect
+                if (!_isHost && _resyncCount > 0 && !_phase.AwaitingRejoin
                     && MonotonicElapsedSeconds(_lastResyncStamp) > ResyncRecoverySeconds)
                 {
                     _resyncCount = 0;
@@ -517,7 +517,7 @@ namespace BizHawkNetplay.Tool
                 tickWatch.Stop();
                 double elapsed = tickWatch.Elapsed.TotalMilliseconds;
                 double clockMs = _paceClock.Elapsed.TotalMilliseconds;
-                if (_sessionActive && elapsed >= Math.Max(12.0, _frameMs * 0.75)
+                if (_phase.IsActive && elapsed >= Math.Max(12.0, _frameMs * 0.75)
                     && clockMs - _lastSlowTickLogMs >= 1000)
                 {
                     _lastSlowTickLogMs = clockMs;

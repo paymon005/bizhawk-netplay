@@ -56,7 +56,7 @@ namespace BizHawkNetplay.Tool
 
         private void CheckUdpInputProgress()
         {
-            if (_driver == null || _awaitingReconnect || _resyncInProgress) return;
+            if (_driver == null || _phase.AwaitingRejoin || _phase.IsRebuilding) return;
             // KI-9 backstop, checked BEFORE the silence gate below: a frozen peer's redundant
             // resends keep arrival-silence near zero, so an unrepairable input hole never trips the
             // silence-based watchdog. If gap retransmission has failed to fill a beyond-window hole
@@ -257,7 +257,7 @@ namespace BizHawkNetplay.Tool
             // Guard against the completion race: the reader clears ResyncReceiving/epoch/deadline as
             // separate writes, so a scan can catch ResyncReceiving still true with the deadline
             // already zeroed — a spurious "expired" with epoch 0. Route that through the ordinary
-            // drop path (whose _sessionActive/_peers guards make it a no-op for a healthy link)
+            // drop path (whose _phase.IsActive/_peers guards make it a no-op for a healthy link)
             // instead of unconditionally ending the session.
             if (verdict == LinkVerdict.ResyncReceiveDeadlineExpired && incompleteEpoch != 0)
                 EndSession($"{dead.Label} did not finish sending resync epoch {incompleteEpoch} before its deadline");

@@ -87,7 +87,7 @@ namespace BizHawkNetplay.Tool
                     try { pending.Completed?.Invoke(false); } catch { }
                 }
                 int attempt = link.Attempt;
-                if (failure != null && _sessionActive && IsConnectionAttemptCurrent(attempt))
+                if (failure != null && _phase.IsActive && IsConnectionAttemptCurrent(attempt))
                     BeginInvokeUi(() =>
                     {
                         if (IsConnectionAttemptCurrent(attempt))
@@ -101,7 +101,7 @@ namespace BizHawkNetplay.Tool
         {
             try
             {
-                while (_sessionActive && IsConnectionAttemptCurrent(link.Attempt))
+                while (_phase.IsActive && IsConnectionAttemptCurrent(link.Attempt))
                 {
                     var (type, body) = link.Control.Receive();
                     Interlocked.Exchange(ref link.LastRecvTicks, MonotonicNow()); // liveness heartbeat
@@ -200,8 +200,9 @@ namespace BizHawkNetplay.Tool
                             link.ResyncReceiving = true; // publish only after the deadline fields are complete
                             BeginInvokePeer(link, () =>
                             {
-                                if (!_sessionActive || generation != CurrentGeneration.Next()) return;
-                                _resyncInProgress = true;
+                                if (!_phase.IsActive || generation != CurrentGeneration.Next()) return;
+                                _phase.BeginRebuild(settingsChange
+                                    ? RebuildReason.SettingsChange : RebuildReason.Desync);
                                 Status($"receiving authoritative resync epoch {generation.Epoch} state…",
                                     Color.DarkOrange);
                             });
@@ -256,7 +257,7 @@ namespace BizHawkNetplay.Tool
             catch (Exception ex)
             {
                 int attempt = link.Attempt;
-                if (_sessionActive && IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
+                if (_phase.IsActive && IsConnectionAttemptCurrent(attempt)) BeginInvokeUi(() =>
                 {
                     if (IsConnectionAttemptCurrent(attempt)) OnPeerLinkLost(link, ex.Message);
                 });

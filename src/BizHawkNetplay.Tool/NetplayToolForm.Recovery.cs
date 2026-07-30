@@ -28,7 +28,7 @@ namespace BizHawkNetplay.Tool
             ChecksumOutcome outcome;
             lock (_hashLock)
             {
-                if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_isHost
+                if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_isHost
                     || generation != CurrentGeneration) return;
                 outcome = _checksums.Record(generation, sourcePort, frame, hash, _playerCount);
             }
@@ -63,7 +63,7 @@ namespace BizHawkNetplay.Tool
 
         private void OnHostDesync(int frame)
         {
-            if (_resyncInProgress) return;
+            if (_phase.IsRebuilding) return;
             if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // just resynced; give it time
             Log($"DESYNC at frame {frame} — peers disagree");
             // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
@@ -94,8 +94,8 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void PerformResyncAsHost()
         {
-            if (!_sessionActive || !_isHost) return;
-            var gate = RecoveryPolicy.GateResync(_resyncInProgress,
+            if (!_phase.IsActive || !_isHost) return;
+            var gate = RecoveryPolicy.GateResync(_phase.IsRebuilding,
                 MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds, _resyncCount + 1, MaxResyncs);
             if (gate == ResyncGate.AlreadyInProgress || gate == ResyncGate.Debounced) return;
             _resyncCount++;
@@ -124,8 +124,7 @@ namespace BizHawkNetplay.Tool
             {
                 var state = _adapter!.ExportState();
                 var generation = AdvanceGeneration();
-                _resyncInProgress = true;
-                _resyncReleaseQueued = false;
+                _phase.BeginRebuild(isSettingsChange ? RebuildReason.SettingsChange : RebuildReason.Desync);
                 RebuildDriver();
                 RefreshLiveSettingsUi();
                 int peerCount = _peers.Count;
@@ -139,7 +138,7 @@ namespace BizHawkNetplay.Tool
 
                 if (peerCount == 0)
                 {
-                    _resyncInProgress = false;
+                    _phase.EndRebuild();
                     RebaseFrameSchedule();
                     RefreshLiveSettingsUi();
                     return;
@@ -154,7 +153,7 @@ namespace BizHawkNetplay.Tool
                         {
                             if (!ok) BeginInvokeUi(() =>
                             {
-                                if (IsConnectionAttemptCurrent(attempt) && _sessionActive
+                                if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
                                     && CurrentGeneration == generation)
                                     EndSession("resync state transfer failed");
                             });
@@ -176,8 +175,8 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void ApplyLiveSettingsAsHost()
         {
-            if (!_sessionActive || !_isHost) return;
-            if (_resyncInProgress || _awaitingReconnect)
+            if (!_phase.IsActive || !_isHost) return;
+            if (_phase.IsRebuilding || _phase.AwaitingRejoin)
             {
                 ConnLog("the session is already rebuilding — try the settings change again once it settles.",
                     Color.DarkOrange);
@@ -236,7 +235,7 @@ namespace BizHawkNetplay.Tool
         private void ApplyResyncAsJoiner(SessionGeneration generation, byte[] state,
             int inputDelay, SyncMode mode, bool isSettingsChange)
         {
-            if (!_sessionActive || _isHost || generation != CurrentGeneration.Next()) return;
+            if (!_phase.IsActive || _isHost || generation != CurrentGeneration.Next()) return;
             int attempt = CurrentConnectionAttempt;
             // A deliberate change is not evidence of a determinism bug, so it must not spend the budget
             // that exists to catch one — otherwise six delay tweaks would end the session.
@@ -247,7 +246,7 @@ namespace BizHawkNetplay.Tool
             }
             try
             {
-                _resyncInProgress = true;
+                _phase.BeginRebuild(isSettingsChange ? RebuildReason.SettingsChange : RebuildReason.Desync);
                 if (isSettingsChange && (inputDelay != _sessionDelay || mode != _mode))
                     ConnLog($"the host changed the session to {DescribeMode(mode)} at input delay " +
                             $"{inputDelay} — staying connected through the rebuild.", Color.DarkSlateBlue);
@@ -265,7 +264,7 @@ namespace BizHawkNetplay.Tool
                     {
                         if (!ok) BeginInvokeUi(() =>
                         {
-                            if (IsConnectionAttemptCurrent(attempt) && _sessionActive
+                            if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
                                 && CurrentGeneration == generation)
                                 EndSession("could not acknowledge applied resync state");
                         });
@@ -282,7 +281,7 @@ namespace BizHawkNetplay.Tool
 
         private void OnPeerResyncApplied(PeerLink link, SessionGeneration generation)
         {
-            if (!_sessionActive || !_isHost || generation != CurrentGeneration || !_peers.Contains(link)) return;
+            if (!_phase.IsActive || !_isHost || generation != CurrentGeneration || !_peers.Contains(link)) return;
             if (link.AwaitingAppliedEpoch != generation.Epoch) return; // stale or duplicate acknowledgement
 
             link.AwaitingAppliedEpoch = 0;
@@ -301,16 +300,15 @@ namespace BizHawkNetplay.Tool
 
         private void ReleaseResyncAsHost(SessionGeneration generation)
         {
-            if (_resyncReleaseQueued || generation != CurrentGeneration) return;
-            _resyncReleaseQueued = true;
+            if (generation != CurrentGeneration || !_phase.TryQueueResume()) return;
             int attempt = CurrentConnectionAttempt;
             QueueResyncResumeToPeers(generation, ok => BeginInvokeUi(() =>
             {
-                if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive
+                if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive
                     || CurrentGeneration != generation) return;
                 if (!ok) { EndSession("resync resume transfer failed"); return; }
                 _driver?.ResetRemoteInputLiveness();
-                _resyncInProgress = false;
+                _phase.EndRebuild();
                 RebaseFrameSchedule();
                 RefreshLiveSettingsUi();
                 Status($"in session — {DescribeMode(_mode)}, you are P{_localPort + 1}/{_playerCount}, " +
@@ -321,9 +319,9 @@ namespace BizHawkNetplay.Tool
 
         private void ResumeResyncAsJoiner(SessionGeneration generation)
         {
-            if (!_sessionActive || _isHost || generation != CurrentGeneration || !_resyncInProgress) return;
+            if (!_phase.IsActive || _isHost || generation != CurrentGeneration || !_phase.IsRebuilding) return;
             _driver?.ResetRemoteInputLiveness();
-            _resyncInProgress = false;
+            _phase.EndRebuild();
             RebaseFrameSchedule();
             RefreshLiveSettingsUi();
             Status($"in session — {DescribeMode(_mode)}, you are P{_localPort + 1}/{_playerCount}, " +

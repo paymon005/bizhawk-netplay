@@ -32,7 +32,7 @@ namespace BizHawkNetplay.Tool
         /// </summary>
         private void OnPeerLinkLost(PeerLink link, string why)
         {
-            if (!_sessionActive) return;
+            if (!_phase.IsActive) return;
             if (!_peers.Contains(link)) return; // reader/writer can both report the same broken link
 
             // A punched link has no TCP to re-accept a rejoin on — the reconnect wait can't help it,
@@ -44,7 +44,7 @@ namespace BizHawkNetplay.Tool
             }
 
             // What losing a peer means in each recovery phase is decided in Core: RecoveryPolicy.
-            switch (RecoveryPolicy.OnPeerLost(_isHost, _resyncInProgress, _awaitingReconnect))
+            switch (RecoveryPolicy.OnPeerLost(_isHost, _phase.IsRebuilding, _phase.AwaitingRejoin))
             {
                 case PeerLossAction.EndSessionJoinerLostHost:
                     EndSession($"lost connection to {link.Label}: {why} — click Join to reconnect");
@@ -60,7 +60,7 @@ namespace BizHawkNetplay.Tool
                     return;
             }
 
-            _awaitingReconnect = true;
+            _phase.BeginAwaitingRejoin();
             _reconnectPort = link.RemotePort;
             _reconnectStartedStamp = MonotonicNow();
             RefreshLiveSettingsUi(); // no settings change while a seat is empty and waiting
@@ -80,8 +80,7 @@ namespace BizHawkNetplay.Tool
                 var generation = AdvanceGeneration();
                 _reconnectState = state;
                 _reconnectGeneration = generation;
-                _resyncInProgress = true;
-                _resyncReleaseQueued = false;
+                _phase.BeginRebuild(RebuildReason.PeerLoss);
                 RebuildDriver();
                 RedistributeMesh(); // remove the dead endpoint from host and survivor route tables
 
@@ -173,13 +172,13 @@ namespace BizHawkNetplay.Tool
             {
                 listener = new TcpListener(IPAddress.Any, _hostTcpPort);
                 listener.Start();
-                while (_sessionActive && _awaitingReconnect && IsConnectionAttemptCurrent(attempt))
+                while (_phase.IsActive && _phase.AwaitingRejoin && IsConnectionAttemptCurrent(attempt))
                 {
                     if (MonotonicElapsedSeconds(_reconnectStartedStamp) > ReconnectTimeoutSeconds)
                     {
                         BeginInvokeUi(() =>
                         {
-                            if (IsConnectionAttemptCurrent(attempt) && _awaitingReconnect)
+                            if (IsConnectionAttemptCurrent(attempt) && _phase.AwaitingRejoin)
                                 EndSession("no rejoin within the timeout");
                         });
                         return;
@@ -229,7 +228,7 @@ namespace BizHawkNetplay.Tool
             {
                 BeginInvokeUi(() =>
                 {
-                    if (IsConnectionAttemptCurrent(attempt) && _awaitingReconnect)
+                    if (IsConnectionAttemptCurrent(attempt) && _phase.AwaitingRejoin)
                         EndSession("reconnect listener failed: " + ex.Message);
                 });
             }
@@ -243,7 +242,7 @@ namespace BizHawkNetplay.Tool
         private void CompleteReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp,
             IPEndPoint udpEp, int freedPort, Handshake.JoinerGreeting greet, int attempt)
         {
-            if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
+            if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_phase.AwaitingRejoin)
             { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
             try
             {
@@ -282,7 +281,7 @@ namespace BizHawkNetplay.Tool
                         UntrackHandshakeClient(tcp);
                         BeginInvokeUi(() =>
                         {
-                            if (IsConnectionAttemptCurrent(attempt) && _sessionActive)
+                            if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive)
                                 EndSession("reconnect state transfer failed: " + ex.Message);
                         });
                     }
@@ -295,7 +294,7 @@ namespace BizHawkNetplay.Tool
             IPEndPoint udpEp, int freedPort, byte[] state, SessionGeneration generation,
             Handshake.JoinerGreeting greet, int attempt)
         {
-            if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
+            if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_phase.AwaitingRejoin)
             { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
             if (generation != CurrentGeneration)
             { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
@@ -332,7 +331,7 @@ namespace BizHawkNetplay.Tool
                         {
                             if (!ok) BeginInvokeUi(() =>
                             {
-                                if (IsConnectionAttemptCurrent(attempt) && _sessionActive
+                                if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
                                     && CurrentGeneration == generation)
                                     EndSession("reconnect resync transfer failed");
                             });
@@ -348,8 +347,7 @@ namespace BizHawkNetplay.Tool
 
         private void ReleaseReconnectedPeer(PeerLink link, int stateLength, SessionGeneration generation)
         {
-            if (_resyncReleaseQueued || generation != CurrentGeneration) return;
-            _resyncReleaseQueued = true;
+            if (generation != CurrentGeneration || !_phase.TryQueueResume()) return;
             int attempt = CurrentConnectionAttempt;
 
             // Survivors leave their resync wait only after all of them — and the rejoiner waiting in
@@ -357,7 +355,7 @@ namespace BizHawkNetplay.Tool
             // the rejoiner's handshake off-thread before its live reader starts consuming the channel.
             QueueResyncResumeToPeers(generation, resumesOk => BeginInvokeUi(() =>
             {
-                if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
+                if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_phase.AwaitingRejoin)
                 {
                     UntrackHandshakeClient(link.Tcp);
                     try { link.Tcp?.Close(); } catch { }
@@ -372,8 +370,8 @@ namespace BizHawkNetplay.Tool
                         Handshake.HostSendGo(link.Control, generation);
                         BeginInvokeUi(() =>
                         {
-                            if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive
-                                || !_awaitingReconnect || generation != CurrentGeneration)
+                            if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive
+                                || !_phase.AwaitingRejoin || generation != CurrentGeneration)
                             { UntrackHandshakeClient(link.Tcp); try { link.Tcp?.Close(); } catch { } return; }
                             _peers.Add(link);
                             UntrackHandshakeClient(link.Tcp);
@@ -386,8 +384,8 @@ namespace BizHawkNetplay.Tool
                             UpdateMeshPeers();
                             StartPeerIo(link);
                             _driver?.ResetRemoteInputLiveness();
-                            _awaitingReconnect = false;
-                            _resyncInProgress = false;
+                            _phase.EndAwaitingRejoin();
+                            _phase.EndRebuild();
                             _reconnectPort = -1;
                             _resyncCount = 0;
                             RebaseFrameSchedule();
@@ -403,7 +401,7 @@ namespace BizHawkNetplay.Tool
                         UntrackHandshakeClient(link.Tcp);
                         BeginInvokeUi(() =>
                         {
-                            if (IsConnectionAttemptCurrent(attempt) && _sessionActive)
+                            if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive)
                                 EndSession("reconnect GO failed: " + ex.Message);
                         });
                     }
@@ -413,13 +411,11 @@ namespace BizHawkNetplay.Tool
 
         private void FailSession(string reason)
         {
-            bool wasActive = _sessionActive;
+            bool wasActive = _phase.IsActive;
             _pendingJoinIp = null; // a failed connect shouldn't land in the recent-IPs list
             ConnLog("connection failed: " + reason, Color.Firebrick);
             StopFramePacing();
-            _sessionActive = false;
-            _resyncInProgress = false;
-            _resyncReleaseQueued = false;
+            _phase.Stop();
             try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
             TeardownNetwork();
             if (!wasActive) RestorePreJoinState();
@@ -433,17 +429,17 @@ namespace BizHawkNetplay.Tool
 
         private void EndSession(string reason)
         {
-            if (!_sessionActive && _listener == null && _joiningTcp == null && _greetingTcp == null
+            if (!_phase.IsActive && _listener == null && _joiningTcp == null && _greetingTcp == null
                 && _peers.Count == 0
                 && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
             { SetBusy(false); return; }
-            bool wasActive = _sessionActive;
+            bool wasActive = _phase.IsActive;
             StopFramePacing();
 
             // Preserve a clean "friend left" signal without doing socket I/O on the UI thread. Give
             // the per-peer writers one very short opportunity; a state transfer or dead link is closed
             // immediately after the deadline instead of making Disconnect appear frozen.
-            if (_sessionActive && _peers.Count > 0)
+            if (_phase.IsActive && _peers.Count > 0)
             {
                 var bye = new CountdownEvent(_peers.Count);
                 foreach (var link in _peers)
@@ -452,9 +448,7 @@ namespace BizHawkNetplay.Tool
                 try { bye.Dispose(); } catch { }
             }
 
-            _sessionActive = false;
-            _resyncInProgress = false;
-            _resyncReleaseQueued = false;
+            _phase.Stop();
             _simUnresponsive = false; _simUnresponsiveCheck.Checked = false; // clear the diagnostic
             try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
 
@@ -500,7 +494,7 @@ namespace BizHawkNetplay.Tool
                 { IsBackground = true, Name = "BizHawkNetplay-upnp" }.Start();
 
             // Stop any in-flight reconnect wait first; its loop exits once these flags clear.
-            _awaitingReconnect = false;
+            _phase.EndAwaitingRejoin();
             _reconnectState = null;
             _reconnectGeneration = default;
             _pendingReconnectLink = null;
