@@ -3152,7 +3152,7 @@ namespace BizHawkNetplay.Tool
         }
 
         /// <summary>
-        /// What to actually change to get a higher input delay next session.
+        /// What to actually change to get a higher input delay, right now.
         ///
         /// Both delay warnings used to end in "raise the host's Auto max or manual floor" no matter
         /// the state of the controls, and that is wrong advice more often than right: with <em>Auto
@@ -3163,30 +3163,42 @@ namespace BizHawkNetplay.Tool
         /// same link to 0% stall at a full 60fps. The advice was the difference between a session
         /// that worked and one that did not, so it has to name the control that is actually live.
         ///
-        /// Both controls are host-only and disabled for the duration of a session, so reading them
-        /// here reports exactly what this session was started with.
+        /// Every branch used to end in "then reconnect; the running delay stays fixed". That stopped
+        /// being true when the host gained Apply changes, and it stayed in the log for a release —
+        /// telling players to end a session that a button press now fixes. The remedy is therefore the
+        /// same in every case and nobody reconnects; what still differs is why the LOBBY did not pick
+        /// this number itself, which is worth saying because it decides what the next session starts
+        /// on. Auto from ping and Auto max remain lobby-only and disabled during a session, so reading
+        /// them here reports exactly what this session was started with.
         /// </summary>
+        /// <summary>The one action that changes a running session's delay, addressed to whoever can
+        /// actually take it. A joiner cannot touch the control, so it is told what to ask for.</summary>
+        private string ApplyDelayAdvice(int suggested) => _isHost
+            ? $"Set Input delay to {suggested} and press \"Apply changes\" — everyone stays connected " +
+              "through a brief pause."
+            : $"Ask the host to set Input delay to {suggested} and press \"Apply changes\" — everyone " +
+              "stays connected through a brief pause, nobody rejoins.";
+
         private string DelayRemedy(int suggested)
         {
-            const string fixedTail = "the running delay stays fixed.";
+            string apply = ApplyDelayAdvice(suggested);
 
-            // A joiner cannot see the host's auto-delay settings, let alone change them.
-            if (!_isHost)
-                return $"Ask the host for input delay {suggested}, then reconnect; {fixedTail}";
+            // A joiner cannot see the host's auto-delay settings, so the rest would be noise to it.
+            if (!_isHost) return apply;
 
             if (!_autoDelayCheck.Checked)
-                return $"\"Auto from ping\" is off, so Auto max does nothing here — tick it, or set " +
-                    $"Input delay to {suggested}, then reconnect; {fixedTail}";
+                return $"{apply} \"Auto from ping\" is off, which is why nothing measured this for you " +
+                    "at the start; tick it and the next session will.";
 
             int cap = (int)_autoDelayMaxBox.Value;
             if (suggested > cap)
-                return $"\"Auto from ping\" is on but capped at {cap} — raise Auto max to {suggested} " +
-                    $"or more, then reconnect; {fixedTail}";
+                return $"{apply} \"Auto from ping\" is on but capped at {cap}, so it could never have " +
+                    $"chosen {suggested} — raise Auto max for the next session.";
 
             // Auto was on and had room: the lobby measurement simply caught the link at a better
             // moment than the session went on to see.
-            return $"\"Auto from ping\" measured a faster link at connect than this session has seen — " +
-                $"reconnect to re-measure, or set Input delay to {suggested} by hand; {fixedTail}";
+            return $"{apply} \"Auto from ping\" measured a faster link at connect than this session has " +
+                "seen, which is why it started lower.";
         }
 
         /// <summary>
@@ -3642,7 +3654,9 @@ namespace BizHawkNetplay.Tool
                 double excessMs = (_sessionDelay - suggested) * _frameMs;
                 ConnLog($"worst link ping ~{effWorst:F0}ms{simNote}: this link only needs input delay {suggested}, and " +
                     $"the session is running {_sessionDelay} — about {excessMs:F0}ms of extra response time. " +
-                    "Lower the host's floor/max for the next session if responsiveness matters more.",
+                    // Not DelayRemedy: its tail explains why the lobby chose too LOW a number, which is
+                    // the opposite problem and would read as nonsense here.
+                    $"{ApplyDelayAdvice(suggested)}",
                     Color.DarkOrange);
             }
             else
