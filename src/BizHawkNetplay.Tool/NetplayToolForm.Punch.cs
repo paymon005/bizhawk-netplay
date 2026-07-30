@@ -98,6 +98,7 @@ namespace BizHawkNetplay.Tool
             _punchButton.Enabled = false;
             _punchStatus.Text = "finding your public address…";
             _punchStatus.ForeColor = Color.DimGray;
+            ClassifyNatInBackground(attempt); // says WHY, in the case where punching cannot work
             var id = _punchId!;
             var prefs = _punchPrefs!;
 
@@ -297,6 +298,36 @@ namespace BizHawkNetplay.Tool
 
         // ------------------------------------------------------------------ NAT / reachability
 
+        /// <summary>
+        /// Classify this machine's NAT off-thread and report it, without blocking whatever asked.
+        ///
+        /// Deliberately advisory rather than a gate. A verdict costs two STUN round-trips and can be
+        /// wrong in the player's favour — a router that looked symmetric to two servers may still be
+        /// punchable — so it never refuses a connection. It exists because the failure it names is
+        /// otherwise indistinguishable from an ordinary bad link: the punch is sent, nothing answers,
+        /// and the session times out with a message about the network. The player retries, changes
+        /// nothing that could matter, and retries again. One line at the moment they press the button
+        /// turns that into a decision they can act on.
+        /// </summary>
+        private void ClassifyNatInBackground(int attempt, bool reportUnknown = false)
+        {
+            new Thread(() =>
+            {
+                var report = StunClient.ClassifyMapping(TimeSpan.FromSeconds(3));
+                BeginInvokeUi(() =>
+                {
+                    if (attempt >= 0 && !IsConnectionAttemptCurrent(attempt)) return;
+                    // Mid-connect, a non-verdict is noise on top of a busy log; asked for directly, it
+                    // is the answer to the question and has to be said.
+                    if (report.Mapping == NatMapping.Unknown && !reportUnknown) return;
+                    Log(report.Describe());
+                    if (report.IsSymmetric)
+                        Status("symmetric NAT — punching can't open a path; see the log.", Color.Firebrick);
+                });
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-nat" }.Start();
+        }
+
         /// <summary>Look up and log our public (reflexive) address via STUN, plus our LAN IP. Off-thread
         /// (STUN does a UDP round-trip to a public server).</summary>
         private void ShowPublicAddress()
@@ -309,6 +340,9 @@ namespace BizHawkNetplay.Tool
             _pubAddrButton.Text = "Looking up…";
             Status("looking up your public address…", Color.DimGray);
             Log("looking up your public address…");
+            // Whoever presses this is asking "can people reach me?", and the mapping type is half of
+            // that answer — the half a public IP alone looks like it settles and doesn't.
+            ClassifyNatInBackground(attempt: -1, reportUnknown: true);
             new Thread(() =>
             {
                 var pub = StunClient.DiscoverPublicAddress(TimeSpan.FromSeconds(2.5));

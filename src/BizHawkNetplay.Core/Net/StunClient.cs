@@ -126,6 +126,76 @@ namespace BizHawkNetplay.Core.Net
             return null;
         }
 
+        /// <summary>
+        /// Ask two different STUN servers what this socket's public endpoint is, from the same socket,
+        /// and compare. A NAT that hands out one mapping per destination gives two different answers.
+        /// </summary>
+        /// <remarks>
+        /// Worth the two round-trips because symmetric NAT is the one failure this tool cannot work
+        /// around and currently cannot name. Punching opens a path by having both sides send to the
+        /// mapping the other observed; under a per-destination mapping the address a peer was told to
+        /// aim at was only ever valid for the STUN server, so every candidate is dead on arrival. The
+        /// session then fails the way an ordinary bad network fails — silence, then a timeout — and
+        /// the player has no way to tell "your router cannot do this" from "try again".
+        /// </remarks>
+        public static NatReport ClassifyMapping(TimeSpan timeout)
+        {
+            try
+            {
+                using var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                sock.Bind(new IPEndPoint(IPAddress.Any, 0));
+                sock.ReceiveTimeout = Math.Max(400, (int)(timeout.TotalMilliseconds / 2));
+
+                // Distinct destination ADDRESSES, not just distinct hostnames: two names behind one
+                // anycast address would probe the same mapping twice and call every NAT cone.
+                var targets = new System.Collections.Generic.List<IPEndPoint>();
+                foreach (var (host, port) in Servers)
+                {
+                    var ep = ResolveV4(host, port);
+                    if (ep == null) continue;
+                    bool seen = false;
+                    foreach (var t in targets) if (t.Address.Equals(ep.Address)) { seen = true; break; }
+                    if (!seen) targets.Add(ep);
+                    if (targets.Count == 2) break;
+                }
+                if (targets.Count < 2) return default;
+
+                var first = QueryOnce(sock, targets[0]);
+                var second = QueryOnce(sock, targets[1]);
+                return new NatReport(Classify(first, second), first, second);
+            }
+            catch { return default; }
+        }
+
+        /// <summary>
+        /// The verdict, given two observations. Separate from the I/O so the reasoning is testable:
+        /// one unanswered probe means unknown, never "cone", because failing open here would tell a
+        /// player their router is fine on the evidence of a timeout.
+        /// </summary>
+        public static NatMapping Classify(IPEndPoint? first, IPEndPoint? second)
+        {
+            if (first == null || second == null) return NatMapping.Unknown;
+            return first.Port == second.Port && first.Address.Equals(second.Address)
+                ? NatMapping.EndpointIndependent
+                : NatMapping.Symmetric;
+        }
+
+        private static IPEndPoint? QueryOnce(Socket sock, IPEndPoint server)
+        {
+            try
+            {
+                var req = BuildRequest(out var txn);
+                sock.SendTo(req, server);
+                var buf = new byte[512];
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                int n = sock.ReceiveFrom(buf, ref from);
+                var resp = new byte[n];
+                Buffer.BlockCopy(buf, 0, resp, 0, n);
+                return ParseResponse(resp, txn);
+            }
+            catch { return null; }
+        }
+
         private static void WriteU16(byte[] b, int o, int v) { b[o] = (byte)(v >> 8); b[o + 1] = (byte)v; }
         private static void WriteU32(byte[] b, int o, uint v) { b[o] = (byte)(v >> 24); b[o + 1] = (byte)(v >> 16); b[o + 2] = (byte)(v >> 8); b[o + 3] = (byte)v; }
         private static int ReadU16(byte[] b, int o) => (b[o] << 8) | b[o + 1];
