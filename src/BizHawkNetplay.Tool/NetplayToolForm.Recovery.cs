@@ -181,6 +181,23 @@ public sealed partial class NetplayToolForm
     /// parameters, which is exactly what a desync resync already does. Costs a brief pause and one
     /// savestate transfer.
     /// </summary>
+    /// <summary>Session-shaped wrapper over <see cref="LobbyDelayPolicy.DelayForModeChange"/> — it
+    /// holds the reasoning and the measurements; this supplies the live link figure and says what it
+    /// did. Never lowers what the host asked for.</summary>
+    private int DelayFloorForModeChange(SyncMode requestedMode, int requestedDelay)
+    {
+        double worst = WorstPingMs(out _);
+        int raised = LobbyDelayPolicy.DelayForModeChange(_mode, requestedMode, requestedDelay,
+            worst, _frameMs);
+        if (raised == requestedDelay) return requestedDelay;
+
+        ConnLog($"{DescribeMode(requestedMode)} needs more input delay than {DescribeMode(_mode)} on " +
+                $"this link (~{worst:F0}ms): raising {requestedDelay} → {raised} with the change, or it " +
+                "would stall waiting for input it cannot get in time. Lower it afterwards if it feels " +
+                "over-delayed.", Color.DarkSlateBlue);
+        return raised;
+    }
+
     private void ApplyLiveSettingsAsHost()
     {
         if (!_phase.IsActive || !_isHost) return;
@@ -210,6 +227,7 @@ public sealed partial class NetplayToolForm
         }
         var identity = BuildIdentity(_adapter, prefs.WantRollback);
         var requestedMode = ChooseSyncMode(_peers, identity, prefs);
+        requestedDelay = DelayFloorForModeChange(requestedMode, requestedDelay);
 
         if (requestedDelay == _sessionDelay && requestedMode == _mode)
         {

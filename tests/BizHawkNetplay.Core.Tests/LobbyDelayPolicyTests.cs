@@ -129,4 +129,52 @@ public class LobbyDelayPolicyTests
         Assert.Equal(5, fiftyHz.Frames); // ceil(75/20) + one frame = 4 + 1
         Assert.Equal(6, sixtyHz.Frames); // ceil(75/16.67) + one frame = 5 + 1
     }
+
+    // --- mid-session netcode change ------------------------------------------------------------
+
+    [Fact]
+    public void SwitchingToLockstepRaisesADelayChosenForRollback()
+    {
+        // The measured case: 4 players, 65ms link, PAL 20ms frames. Rollback ran clean at delay 2;
+        // the same link as lockstep at delay 2 stalled 94-100% of ticks for ~1600 frames because the
+        // live settings change never re-asked what the new mode needed.
+        int raised = LobbyDelayPolicy.DelayForModeChange(SyncMode.Rollback, SyncMode.Lockstep,
+            requestedDelay: 2, roundTripMs: 65, frameMs: 20);
+
+        Assert.True(raised > 2, $"lockstep on a 65ms link needs more than delay 2, got {raised}");
+        Assert.Equal(LobbyDelayPolicy.Choose(65, 20, SyncMode.Lockstep, 1,
+            HandshakeCodec.MaxInputDelay).Frames, raised);
+    }
+
+    [Fact]
+    public void ItNeverLowersWhatTheHostAskedFor()
+    {
+        // Going the other way, rollback needs less — but the delay is the player's preference and a
+        // netcode change is not permission to spend it. Only raising is ours to do.
+        int kept = LobbyDelayPolicy.DelayForModeChange(SyncMode.Lockstep, SyncMode.Rollback,
+            requestedDelay: 8, roundTripMs: 65, frameMs: 20);
+        Assert.Equal(8, kept);
+    }
+
+    [Fact]
+    public void ADelayOnlyChangeIsLeftAlone()
+    {
+        // Same mode either side: the host is adjusting delay deliberately and must not be overridden,
+        // in either direction.
+        foreach (var mode in new[] { SyncMode.Rollback, SyncMode.Lockstep })
+        {
+            Assert.Equal(1, LobbyDelayPolicy.DelayForModeChange(mode, mode, 1, 200, 20));
+            Assert.Equal(9, LobbyDelayPolicy.DelayForModeChange(mode, mode, 9, 5, 20));
+        }
+    }
+
+    [Fact]
+    public void WithNothingMeasuredItInventsNothing()
+    {
+        // Before any ping lands, WorstPingMs reports -1. Guessing a floor from that would be worse
+        // than leaving the host's number alone.
+        foreach (double rtt in new[] { -1.0, double.NaN, double.PositiveInfinity })
+            Assert.Equal(3, LobbyDelayPolicy.DelayForModeChange(SyncMode.Rollback, SyncMode.Lockstep,
+                requestedDelay: 3, roundTripMs: rtt, frameMs: 20));
+    }
 }

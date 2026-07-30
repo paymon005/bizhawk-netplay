@@ -116,6 +116,35 @@ public static class LobbyDelayPolicy
             wasCapped: automatic > automaticMaximum && final < automatic);
     }
 
+    /// <summary>
+    /// The delay a MID-SESSION netcode change should run at, given what the host asked for.
+    ///
+    /// This exists because <see cref="Choose"/> was only ever consulted in the lobby. The live
+    /// settings change took the delay straight from the UI and the mode from the dropdown, so
+    /// switching netcode handed the new mode a number chosen for the old one — and lockstep pays the
+    /// whole round trip on every frame where rollback hides most of it. A 4-player session on a 65ms
+    /// link measured the gap exactly: rollback at delay 2 stalled 0% of ticks, and the same link as
+    /// lockstep at delay 2 stalled 94-100% for some 1600 frames. Delay 4 was still 25-67%. 6 was clean.
+    ///
+    /// Only ever raises, and only when the mode is actually changing. A player who picks a netcode
+    /// asked for a netcode, not for a latency budget, and refusing to give them a playable one because
+    /// the box still holds the old mode's number is unhelpfully literal. Lowering is a different
+    /// matter — that is a preference, and it stays the player's.
+    /// </summary>
+    /// <param name="roundTripMs">Worst measured round trip, or negative when nothing is measured yet —
+    /// in which case the request passes through untouched rather than inventing a figure.</param>
+    public static int DelayForModeChange(SyncMode currentMode, SyncMode requestedMode,
+        int requestedDelay, double roundTripMs, double frameMs)
+    {
+        if (requestedMode == currentMode) return requestedDelay;
+        if (double.IsNaN(roundTripMs) || double.IsInfinity(roundTripMs) || roundTripMs < 0)
+            return requestedDelay;
+
+        var floor = Choose(roundTripMs, frameMs, requestedMode,
+            manualFloor: 1, automaticMaximum: HandshakeCodec.MaxInputDelay);
+        return floor.HasEstimate && floor.Frames > requestedDelay ? floor.Frames : requestedDelay;
+    }
+
     private static int Clamp(int value, int minimum, int maximum) =>
         value < minimum ? minimum : value > maximum ? maximum : value;
 }
