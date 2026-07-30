@@ -10,8 +10,8 @@ namespace BizHawkNetplay.Core.Emu
     ///
     /// Two hard rules the real implementation must honour:
     ///   1. Input interception is absolute. The physical controller never reaches the core
-    ///      directly; <see cref="SetInputs"/> overrides all ports every frame. Any leak is
-    ///      an instant, silent desync.
+    ///      directly — every port's input for a frame comes from the merged
+    ///      <see cref="InputSet"/> the session decided. Any leak is an instant, silent desync.
     ///   2. The tool verifies configuration, it does not trust it. Deterministic construction
     ///      and matching sync settings/core versions are checked at handshake and the session
     ///      is refused on mismatch.
@@ -46,7 +46,18 @@ namespace BizHawkNetplay.Core.Emu
         /// <summary>Read the local player's current physical input for one port (source feeding the pipeline).</summary>
         PortInput ReadLocalInput(int port);
 
-        /// <summary>Override every port for the current frame. The only path by which input reaches the core.</summary>
+        /// <summary>
+        /// Hand the merged inputs to the adapter ahead of a frame it will advance itself. This is the
+        /// simple driving model, used by <see cref="Sync.FrameDriver.OnPreFrame"/> and by the test
+        /// harness: set the inputs, then step.
+        ///
+        /// EmuHawk cannot be driven that way — a core reads its input from the
+        /// <c>IController</c> passed INTO <c>FrameAdvance</c>, so the real adapter carries the merged
+        /// set across in <see cref="AdvanceFrame"/> instead and implements this as a no-op. Neither
+        /// model is dead: production uses <c>AdvanceFrame</c>, the suite drives
+        /// <c>OnPreFrame</c>/<c>OnPostFrame</c>. What would be wrong is believing this method is how
+        /// input reaches a real core.
+        /// </summary>
         void SetInputs(InputSet inputs);
 
         // --- State (rollback + session sync) ------------------------------------------
@@ -58,10 +69,12 @@ namespace BizHawkNetplay.Core.Emu
         void LoadStateFromMemory(StateHandle handle);
 
         /// <summary>
-        /// Free an in-memory state the rollback ring no longer needs. On BizHawk each
-        /// <see cref="SaveStateToMemory"/> allocates a GUID-keyed blob (~hundreds of KiB) that
-        /// persists until deleted; the rollback strategy saves one per frame, so releasing evicted
-        /// ring entries is mandatory to avoid unbounded growth. Idempotent / safe on unknown handles.
+        /// Return an in-memory state the rollback ring no longer needs. Each
+        /// <see cref="SaveStateToMemory"/> holds a whole-core buffer (~hundreds of KiB to tens of MiB)
+        /// and the rollback strategy takes one per frame, so releasing evicted ring entries is
+        /// mandatory to avoid unbounded growth. The BizHawk adapter pools the returned buffers rather
+        /// than freeing them, which is what keeps a 60Hz ring off the large object heap — so a handle
+        /// read AFTER release is reading someone else's state. Idempotent / safe on unknown handles.
         /// </summary>
         void ReleaseState(StateHandle handle);
 

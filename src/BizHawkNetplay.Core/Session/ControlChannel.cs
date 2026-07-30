@@ -38,7 +38,7 @@ namespace BizHawkNetplay.Core.Session
     /// The reliable control channel (§3.3): length-prefixed framing over any duplex
     /// <see cref="Stream"/> (a TCP <c>NetworkStream</c> in production, a paired memory stream in
     /// tests). Carries the handshake, initial state transfer, and periodic checksums — everything
-    /// that must not be lost. The unreliable input hot path stays on <see cref="Net.UdpTransport"/>.
+    /// that must not be lost. The unreliable input hot path stays on <see cref="Net.MeshUdpTransport"/>.
     ///
     /// Frame: <c>[type:1][length:int32 big-endian][body:length]</c>. A hard cap on length keeps a
     /// malicious or corrupt peer from driving a huge allocation.

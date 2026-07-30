@@ -469,7 +469,7 @@ namespace BizHawkNetplay.Core.Tests
                     // Each peer is told what is actually true of it: how far ahead of the slowest
                     // player it is running, tagged with a fresh sample id so the report counts once.
                     inst[i].Rollback.OnPacingReport(
-                        new PacingInfo(roundTripMs: 2 * worstOneWay[i] * frameMs, clockOffsetMs: 0,
+                        new PacingInfo(roundTripMs: 2 * worstOneWay[i] * frameMs,
                             frameAdvantage: frame - slowest, hasFrameAdvantage: true, sampleSequence: sequence));
                 }
                 if (stuck == players) simultaneousFreezes++;

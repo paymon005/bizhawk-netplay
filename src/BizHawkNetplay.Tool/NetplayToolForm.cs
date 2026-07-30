@@ -2855,7 +2855,7 @@ namespace BizHawkNetplay.Tool
                         timeSyncThisTick = timeSync;
                         if (timeSync)
                         {
-                            // Advantage debt is denominated in emulated frames, not 2ms timer callbacks.
+                            // Advantage debt is denominated in emulated frames, not timer callbacks.
                             _nextFrameDueMs += _frameMs;
                         }
                         if (Verbose && nowMs - _lastStallLogMs >= 1000)
@@ -3067,7 +3067,7 @@ namespace BizHawkNetplay.Tool
             double ping = WorstPingMs(out bool udpMeasured);
             double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
             int advantage = ComputeFrameAdvantage(out bool haveAdvantage, out int revision, out bool freshAdvantage);
-            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, 0, advantage,
+            _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, advantage,
                 haveAdvantage && freshAdvantage, revision));
 
             string pingStr = ping < 0 ? ""

@@ -6,26 +6,24 @@ namespace BizHawkNetplay.Core.Net
     /// </summary>
     public readonly struct PacingInfo
     {
-        public PacingInfo(double roundTripMs, double clockOffsetMs, int frameAdvantage)
-            : this(roundTripMs, clockOffsetMs, frameAdvantage, hasFrameAdvantage: false,
+        public PacingInfo(double roundTripMs, int frameAdvantage)
+            : this(roundTripMs, frameAdvantage, hasFrameAdvantage: false,
                 sampleSequence: 0, hasSampleSequence: false) { }
 
-        public PacingInfo(double roundTripMs, double clockOffsetMs, int frameAdvantage, bool hasFrameAdvantage)
-            : this(roundTripMs, clockOffsetMs, frameAdvantage, hasFrameAdvantage,
+        public PacingInfo(double roundTripMs, int frameAdvantage, bool hasFrameAdvantage)
+            : this(roundTripMs, frameAdvantage, hasFrameAdvantage,
                 sampleSequence: 0, hasSampleSequence: false) { }
 
         /// <summary>Construct a report tied to one received wire sample. Reusing the same sequence is
         /// idempotent: pacing consumers must not charge the same measured advantage twice.</summary>
-        public PacingInfo(double roundTripMs, double clockOffsetMs, int frameAdvantage,
-            bool hasFrameAdvantage, int sampleSequence)
-            : this(roundTripMs, clockOffsetMs, frameAdvantage, hasFrameAdvantage,
+        public PacingInfo(double roundTripMs, int frameAdvantage, bool hasFrameAdvantage, int sampleSequence)
+            : this(roundTripMs, frameAdvantage, hasFrameAdvantage,
                 sampleSequence, hasSampleSequence: true) { }
 
-        private PacingInfo(double roundTripMs, double clockOffsetMs, int frameAdvantage,
+        private PacingInfo(double roundTripMs, int frameAdvantage,
             bool hasFrameAdvantage, int sampleSequence, bool hasSampleSequence)
         {
             RoundTripMs = roundTripMs;
-            ClockOffsetMs = clockOffsetMs;
             FrameAdvantage = frameAdvantage;
             HasFrameAdvantage = hasFrameAdvantage;
             SampleSequence = sampleSequence;
@@ -34,9 +32,6 @@ namespace BizHawkNetplay.Core.Net
 
         /// <summary>Smoothed round-trip time in milliseconds.</summary>
         public double RoundTripMs { get; }
-
-        /// <summary>Shared-clock offset from the NTP-style session sync.</summary>
-        public double ClockOffsetMs { get; }
 
         /// <summary>Frames we are ahead of the remote (may be negative). Only meaningful when
         /// <see cref="HasFrameAdvantage"/>; 0 otherwise, which is also a legitimate measured value.</summary>

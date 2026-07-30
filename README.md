@@ -21,7 +21,11 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 [Building](#building) — the Release build produces the exact same files.
 
 > **Everyone must be on the same version.** The network protocol is versioned and the handshake
-> refuses a mismatch, so when you update, your friends must update to the same release too.
+> refuses a mismatch, so when you update, your friends must update to the same release too. The
+> protocol version numbers in the table below are historical — each says what that release changed.
+> **`main` is currently on protocol 12**, which is a break from the last release: the lobby measures
+> every UDP mesh edge before choosing input delay, and the host can change netcode or delay
+> mid-session.
 
 ## Status
 
@@ -33,7 +37,7 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | Core sync logic | Input serialization (digital **+ analog axes**), layout negotiation, input pipeline / confirmed-frontier, **lockstep + rollback** strategies — unit-tested |
 | **M1 — 2-player lockstep** | ✅ Verified on hardware (two EmuHawk instances, Genesis/GPGX + N64): real-time pacing, working audio, desync detection (host saves quick-slot 10 on mismatch), configurable delay + packet redundancy |
 | **M2 — hardening** | ✅ Live ping/RTT + delay hints, **desync auto-recovery** (mismatch → resync from an authoritative state instead of ending), alt-tab audio resilience |
-| **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input mesh with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). **2P and 4P verified on hardware** (3P runs the same N-player path). |
+| **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input **full mesh** — every peer sends straight to every other, so input is always one hop from its author and the host coordinates without relaying — with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). **2P and 4P lockstep verified on hardware** in July 2025 (3P runs the same N-player path); rollback above 2P is simulated only, and no performance figure in this project was measured above 2 players. |
 | **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). *Untested on hardware.* |
 | **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. *Untested on real internet NAT (no second machine).* |
 | **Session passwords** (v0.8.0) | ✅ Nonce challenge-response with a slow KDF — the password never crosses the wire and a captured proof can't be replayed. A refused joiner loses only its own connection; the host keeps hosting. **Protocol v4 — everyone must update.** |
@@ -230,7 +234,11 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
   for playing with people you trust; not a hostile-network guarantee.
 - **The session password** is verified by a nonce challenge-response (`SessionAuth`): the password is never sent (not even hashed), a captured proof can't be replayed to another session, and role-tagging blocks a reflection attack. An empty password means an open session. A refused joiner (wrong password, wrong ROM/core, a HELLO that never arrives) only loses its own connection — the host logs it and keeps listening, so a typo doesn't cost you the lobby. Still not a fortress — it's a shared secret over a plaintext control channel with no forward secrecy — but it's a real gate, not an echo-able hash.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
-- **Symmetric NAT is untested** over a real internet path, as is rollback with more than 2 players (3–4P forces lockstep). 2P and 4P sessions are verified working; everything below the socket layer is unit-tested.
+- **Symmetric NAT is untested** over a real internet path. So is **rollback above 2 players** — it is
+  implemented and simulated (four peers, asymmetric per-edge latency, loss, reordering and clock
+  skew), not played. 4-player **lockstep** was verified on hardware in July 2025; nothing since,
+  including every performance decision in the tool, has been measured above 2 players. See
+  `KNOWN-ISSUES.md` KI-11. Everything below the socket layer is unit-tested.
 
 ## License
 

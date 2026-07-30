@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Windows on purpose: the shipping tool targets net48, the tests bind real loopback UDP
+    # sockets, and this is the platform every one of these tests has ever been validated on.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tool is pinned to the .NET 5 SDK (C# 9) because it has to load inside BizHawk 2.11's
+      # .NET Framework 4.8 host. 5.0 is out of support; moving the TEST project to a current LTS is
+      # tracked as a deliberate decision, not an oversight — it needs a newer SDK installed on the
+      # developer's machine too, or `dotnet test` stops working locally.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '5.0.x'
+
+      # Core + the test project only. BizHawkNetplay.Tool compiles against assemblies from a local
+      # BizHawk install (see Directory.Build.props / BizHawkHome), which no runner has — so the
+      # solution as a whole is deliberately not built here.
+      - name: Test
+        run: dotnet test tests/BizHawkNetplay.Core.Tests --nologo -c Release

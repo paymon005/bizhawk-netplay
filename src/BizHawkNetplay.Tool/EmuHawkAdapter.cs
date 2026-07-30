@@ -290,6 +290,11 @@ namespace BizHawkNetplay.Tool
 
         // The real session injects inputs by stepping the core with a controller built from the
         // merged InputSet (AdvanceFrame), not via Joypad.Set — so this is unused.
+        /// <summary>
+        /// Deliberately empty. A BizHawk core reads its input from the <c>IController</c> handed INTO
+        /// <c>FrameAdvance</c>, so there is no "set them now, step later" state to hold — the merged
+        /// set travels with the frame in <see cref="AdvanceFrame"/>. See <see cref="IEmuAdapter.SetInputs"/>.
+        /// </summary>
         public void SetInputs(InputSet inputs) { }
 
         /// <summary>

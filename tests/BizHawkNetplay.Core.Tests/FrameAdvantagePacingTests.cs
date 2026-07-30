@@ -52,7 +52,7 @@ namespace BizHawkNetplay.Core.Tests
             Assert.Equal(0, RunFrames(s, pipe, emu, 0, 5)); // healthy baseline: no stalls
 
             // We are 6 frames ahead. Half of that, capped, is handed back over the next frames.
-            s.OnPacingReport(new PacingInfo(20, 0, frameAdvantage: 6, hasFrameAdvantage: true));
+            s.OnPacingReport(new PacingInfo(20, frameAdvantage: 6, hasFrameAdvantage: true));
             int stalls = RunFrames(s, pipe, emu, 5, 10);
 
             Assert.InRange(stalls, 1, 3);
@@ -64,7 +64,7 @@ namespace BizHawkNetplay.Core.Tests
         {
             var s = NewStrategy(out var emu, out var pipe);
             // Negative advantage = we are the slow one. Yielding here would make the gap worse.
-            s.OnPacingReport(new PacingInfo(20, 0, frameAdvantage: -6, hasFrameAdvantage: true));
+            s.OnPacingReport(new PacingInfo(20, frameAdvantage: -6, hasFrameAdvantage: true));
             Assert.Equal(0, RunFrames(s, pipe, emu, 0, 10));
             Assert.Equal(0, s.TimeSyncStalls);
         }
@@ -74,7 +74,7 @@ namespace BizHawkNetplay.Core.Tests
         {
             var s = NewStrategy(out var emu, out var pipe);
             // One frame apart is normal on any link; stalling for it would oscillate.
-            s.OnPacingReport(new PacingInfo(20, 0, frameAdvantage: 1, hasFrameAdvantage: true));
+            s.OnPacingReport(new PacingInfo(20, frameAdvantage: 1, hasFrameAdvantage: true));
             Assert.Equal(0, RunFrames(s, pipe, emu, 0, 10));
             Assert.Equal(0, s.TimeSyncStalls);
         }
@@ -85,7 +85,7 @@ namespace BizHawkNetplay.Core.Tests
             // A peer on an older build never reports, so HasFrameAdvantage stays false and the value is
             // meaningless — it must not be mistaken for "dead even" or, worse, acted on.
             var s = NewStrategy(out var emu, out var pipe);
-            s.OnPacingReport(new PacingInfo(20, 0, frameAdvantage: 6)); // 3-arg ctor => not measured
+            s.OnPacingReport(new PacingInfo(20, frameAdvantage: 6)); // 3-arg ctor => not measured
             Assert.Equal(0, RunFrames(s, pipe, emu, 0, 10));
             Assert.Equal(0, s.TimeSyncStalls);
         }
@@ -96,7 +96,7 @@ namespace BizHawkNetplay.Core.Tests
             // A huge reported advantage must not stall us into a hole: the peer is closing the gap from
             // its side too, so handing back everything at once overshoots and starts a tug-of-war.
             var s = NewStrategy(out var emu, out var pipe);
-            s.OnPacingReport(new PacingInfo(20, 0, frameAdvantage: 100, hasFrameAdvantage: true));
+            s.OnPacingReport(new PacingInfo(20, frameAdvantage: 100, hasFrameAdvantage: true));
             int stalls = RunFrames(s, pipe, emu, 0, 20);
             Assert.InRange(stalls, 1, 3);
         }
@@ -106,7 +106,7 @@ namespace BizHawkNetplay.Core.Tests
         {
             var s = NewStrategy(out var emu, out var pipe);
             for (int i = 0; i < 5; i++)
-                s.OnPacingReport(new PacingInfo(20, 0, frameAdvantage: 4, hasFrameAdvantage: true));
+                s.OnPacingReport(new PacingInfo(20, frameAdvantage: 4, hasFrameAdvantage: true));
 
             // Five reports of the same skew owe the same debt, not five times it.
             int stalls = RunFrames(s, pipe, emu, 0, 20);
@@ -119,7 +119,7 @@ namespace BizHawkNetplay.Core.Tests
             var s = NewStrategy(out var emu, out var pipe);
             var neutral = PortInput.Neutral(emu.GetControllerLayout(1));
             pipe.Add(1, 0, neutral);
-            var sample = new PacingInfo(20, 0, frameAdvantage: 4, hasFrameAdvantage: true, sampleSequence: 7);
+            var sample = new PacingInfo(20, frameAdvantage: 4, hasFrameAdvantage: true, sampleSequence: 7);
 
             s.OnPacingReport(sample);
             Assert.True(s.BeginFrame(0).Stall);
@@ -134,7 +134,7 @@ namespace BizHawkNetplay.Core.Tests
             s.EndFrame(1);
 
             // The same measured value from a genuinely new exchange may create fresh debt.
-            s.OnPacingReport(new PacingInfo(20, 0, 4, true, sampleSequence: 8));
+            s.OnPacingReport(new PacingInfo(20, 4, true, sampleSequence: 8));
             pipe.Add(1, 2, neutral);
             Assert.True(s.BeginFrame(2).Stall);
         }
@@ -144,7 +144,7 @@ namespace BizHawkNetplay.Core.Tests
         {
             var s = NewStrategy(out var emu, out var pipe);
             var neutral = PortInput.Neutral(emu.GetControllerLayout(1));
-            s.OnPacingReport(new PacingInfo(0, 0, frameAdvantage: 4,
+            s.OnPacingReport(new PacingInfo(0, frameAdvantage: 4,
                 hasFrameAdvantage: true, sampleSequence: 1)); // soft cap 3, debt 2
 
             // With no remote frontier, frame 4 is beyond the soft cap. That stall must pay debt too.

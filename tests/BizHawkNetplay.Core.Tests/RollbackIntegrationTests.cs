@@ -642,8 +642,8 @@ namespace BizHawkNetplay.Core.Tests
             var a = BuildRollback(ta, 0, frameMs);
             var b = BuildRollback(tb, 1, frameMs);
             // Lobby-measured RTT narrows both soft caps, exactly like the real session.
-            a.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
-            b.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
+            a.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0));
+            b.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0));
 
             long tick = 0;
             for (int i = 0; i < 15; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
@@ -686,8 +686,8 @@ namespace BizHawkNetplay.Core.Tests
                 dropB: d => suppressRequests && d.Length == 18 && d[0] == 2);
             var a = BuildRollback(ta, 0, frameMs);
             var b = BuildRollback(tb, 1, frameMs);
-            a.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
-            b.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0, 0));
+            a.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0));
+            b.Rollback.OnPacingReport(new PacingInfo(2 * k * frameMs, 0));
 
             long tick = 0;
             for (int i = 0; i < 15; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
@@ -906,8 +906,8 @@ namespace BizHawkNetplay.Core.Tests
                 var b = BuildRollback(tb, 1, timeSync ? frameMs : 0);
                 if (timeSync)
                 {
-                    a.Rollback.OnPacingReport(new PacingInfo(rtt, 0, 0));
-                    b.Rollback.OnPacingReport(new PacingInfo(rtt, 0, 0));
+                    a.Rollback.OnPacingReport(new PacingInfo(rtt, 0));
+                    b.Rollback.OnPacingReport(new PacingInfo(rtt, 0));
                 }
                 for (int i = 0; i < 400; i++)
                 {

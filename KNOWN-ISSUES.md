@@ -16,14 +16,32 @@ rejoin) before trusting them; rollback with 3+ players and symmetric NAT remain 
 punch, lobby RTT probe, and auto-delay (4) all worked; the session then hit the mutual soft-cap
 freeze fixed in v0.10.2 (see Fixed below). Retest on v0.10.2.
 
-**KI-11 (validation) — nothing above two players has run on real hardware.**
-Every performance decision in the tool was measured on 2-player Genesis. Four players is a
-different shape: six mesh edges instead of one, three remote ports to predict instead of one, and
-three times the input traffic per peer. Simulation now covers four peers on an asymmetric, lossy,
-clock-skewed mesh (`MultiPlayerRollbackTests`), including the 4-player form of the mutual soft-cap
-freeze fixed in v0.10.2 — but a simulated core costs nothing to re-simulate and a real one does.
-Worth one deliberate 4-player session (SNES is the near-term target) watching the stall %, the
-rollback depth, and the joiner-to-joiner path readings the lobby now prints.
+**KI-11 (validation) — no 4-player session has been *measured*, and none at all on this build.**
+4-player **lockstep** was verified working on hardware in July 2025, so the N-player path is not
+untried. What has never happened is a 4-player session anyone took numbers from: every performance
+decision in this tool — the tick budget, the repair budget, keyframe spacing, the savestate pool
+sizing — was measured on 2-player Genesis. Four players is a different shape: six mesh edges instead
+of one, three remote ports to predict instead of one, three times the input traffic per peer, and a
+correction from any of them rolls everyone back. Rollback above 2 players has never been played at
+all, on any build.
+
+Simulation now covers four peers on an asymmetric, lossy, reordering, clock-skewed mesh
+(`MultiPlayerRollbackTests`), including the 4-player form of the mutual soft-cap freeze fixed in
+v0.10.2 — but a simulated core costs nothing to save, load or re-simulate, and a real one costs
+everything. That is the gap, and only hardware closes it.
+
+*What to read off one deliberate 4-player session (SNES is the near-term target):*
+- **`mesh measured: X of Y direct path(s) answered`** in the connection log, at start. Anything short
+  of X = Y means the delay figure below it covers only part of the mesh — and on a real internet path
+  that is the joiner-to-joiner edges, which are exactly the ones nothing else can see.
+- **The `Auto delay` line** — whether the delay it picked is above what the host's own links alone
+  would have suggested. If it isn't, the mesh round found nothing and the feature is a no-op.
+- **`stall N%`** per peer. High on one peer only means that peer's worst edge; high on everyone means
+  the delay is under-covering the link.
+- **Rollback depth and `present N`** on the two heaviest machines. Four players means more frequent
+  corrections at the same depth — this is where a simulated core and a real one diverge most.
+- Whether the **checksum agreement** line appears at all with Verbose on (it is the input to the
+  systematic-mismatch advisory, which was misfiring before this build).
 
 ## Fixed (2026-07-27, v0.11.3)
 

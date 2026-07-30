@@ -4,6 +4,12 @@
 
 **Design principle:** Lockstep and rollback are the *same system* with one swappable component. Everything else — transport, session, input serialization, determinism enforcement, desync detection — is shared and built once. Rollback is an optimization of lockstep, not a fork of it.
 
+> **Status of this document.** It is the original design, kept because the reasoning is still the
+> reasoning. Where the built system diverged from it, the divergence is called out inline as a
+> revision rather than quietly edited away — a design doc that has been retconned to match the code
+> can no longer tell you which decisions were deliberate. For what actually shipped, and what remains
+> unvalidated, read `README.md` and `KNOWN-ISSUES.md`; where the three disagree, the code wins.
+
 ---
 
 ## 1. Requirements
@@ -132,7 +138,19 @@ Reused/adapted from RemotePlay's UDP stack, minus the entire media path:
 - **Control channel:** lightweight reliability layer (ack + retransmit) over the same socket for handshake, state transfer, checksums, pacing reports, chat.
 - **Clock/quality:** periodic ping + "frame advantage" reports (how far ahead of the remote's confirmed frontier am I running). Consumed by the pacing logic in both strategies.
 
-Topology: direct P2P for 2 players (halves latency versus any relay). For 3+ players, host-relay star — the host rebroadcasts inputs — because P2P full-mesh input agreement complicates the confirmed-frontier logic for marginal benefit at retro-game player counts. The InputPipeline doesn't know which topology is in use; it just sees confirmed inputs per port.
+Topology: **direct full mesh at every player count.** Each peer sends its own input straight to every
+other, so an input is always one hop from its author regardless of who is hosting. The host is the
+control and resync authority — handshake, checksums, state transfers, lobby coordination — but never
+an input relay.
+
+> This is a **revision of the original plan**, which called for direct P2P at 2 players and a
+> host-relay star at 3+, on the reasoning that full-mesh input agreement complicated the
+> confirmed-frontier logic. It did not: `InputPipeline` tracks confirmation per port and never knew
+> which topology delivered a frame, so the mesh dropped in without touching it. What the star would
+> have cost is a second hop on every joiner-to-joiner input — the one that matters most under
+> rollback, since a late correction from any peer rolls everyone back. The mesh's real price is paid
+> elsewhere: N−1 sends per peer per frame (180 datagrams/sec each way at four players — bandwidth is
+> still trivial), and NAT traversal on every edge rather than only toward the host.
 
 ### 3.4 SessionManager
 
@@ -253,7 +271,7 @@ Publish in handshake. Rollback is offered only if `max_rollback_depth ≥ 6` on 
 
 - **M0 — Probe harness** (1–2 weekends): EmuAdapter + capability probe as a standalone external tool. Deliverable: the per-core feasibility table **plus** answers to the three API experiments: (a) can a tool callback reentrantly frame-advance? (b) does invisibleemulation work on current BizHawk, or is DispSpeedupFeatures the path? (c) speedmode modulation behavior under throttle. De-risks everything downstream and settles risks 1–4 empirically.
 - **M1 — 2-player lockstep, one core** (2–3 weekends): NESHawk, direct IP, fixed delay, handshake + initial state transfer + checksum. Deliverable: two machines playing a NES co-op game.
-- **M2 — Hardening + generality** (2–4 weekends): generic ControllerDefinition serialization across cores, configurable delay, packet redundancy, desync resync flow, 3–4 player host-relay, slot UI, soak-test qualification of the core list.
+- **M2 — Hardening + generality** (2–4 weekends): generic ControllerDefinition serialization across cores, configurable delay, packet redundancy, desync resync flow, 3–4 player support (shipped as a full mesh, not the host-relay planned here), slot UI, soak-test qualification of the core list.
 - **M3 — RollbackStrategy** (3–5 weekends): ring buffer, prediction, repair loop, pacing valve, capability gating. Only for cores M0 approved.
 - **M4 — QoL**: spectators (input stream is already a perfect replay feed), session chat, NAT traversal if direct IP proves annoying (RemotePlay experience applies directly).
 
@@ -268,7 +286,7 @@ Checkpoints at each M-boundary: demo criteria above must pass before starting th
 | Baseline sync | Delayed lockstep | Input delay felt by all; in exchange: works on every deterministic core, simplest failure modes (Dolphin-proven) |
 | Rollback scope | Per-core, probe-gated | No rollback on heavy cores ever via this path; avoids shipping a mode that stutters |
 | Rollback input delay | D ≥ 1 even in rollback | 1 frame of felt delay buys materially shallower average rollbacks |
-| Topology | P2P (2p), host-relay (3+) | Relay adds one hop for 3+; buys simple frontier logic |
+| Topology | Direct full mesh at all player counts | *Revised from "P2P (2p), host-relay (3+)": the frontier logic the relay was meant to simplify turned out to be topology-blind, so the relay bought nothing and cost a hop on every joiner-to-joiner input. Price is N−1 sends per peer per frame and NAT traversal on every edge.* |
 | Input channel | Unreliable UDP + R-frame redundancy | ~8× input payload size (still trivial); buys loss-immunity without retransmit latency |
 | State auth | No authority — full symmetry + checksums | Desync = detect and resync/abort, never silent divergence; no host-authoritative complexity |
 | BizHawk coupling | External tool only, no fork | UI-thread residency and API-surface limits; buys zero maintenance burden tracking upstream |
