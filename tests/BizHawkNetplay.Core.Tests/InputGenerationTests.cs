@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using BizHawkNetplay.Core.Input;
 using BizHawkNetplay.Core.Net;
+using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
 using BizHawkNetplay.Core.Tests.Fakes;
 using Xunit;
@@ -254,6 +256,51 @@ namespace BizHawkNetplay.Core.Tests
             var request = viaWindow.EncodeRequest(1, 7);
             Assert.False(viaWindow.TryDecodeInputWindow(request, out _));
             Assert.Equal(viaCopy.RejectedTotal, viaWindow.RejectedTotal); // still not a refusal
+        }
+
+        /// <summary>
+        /// A session whose datagrams would not survive the path is refused at construction, with the
+        /// delay that WOULD work in the message — rather than starting, looking healthy, and reporting
+        /// "no UDP input from P2" forever because every packet that port sends is dropped for its size.
+        /// </summary>
+        [Fact]
+        public void ADelayThatWouldOversizeTheDatagramIsRefusedWithTheDelayThatFits()
+        {
+            // 60 buttons and four 4-byte axes = 8 + 16 = 24 bytes per frame for this port.
+            var wide = new ControllerLayout(
+                Array.ConvertAll(new int[60], _ => "B"),
+                new[]
+                {
+                    new AxisSpec("X", 0, 1_000_000, 0), new AxisSpec("Y", 0, 1_000_000, 0),
+                    new AxisSpec("Z", 0, 1_000_000, 0), new AxisSpec("W", 0, 1_000_000, 0),
+                });
+            Assert.Equal(24, wide.PayloadByteWidth);
+
+            int allowed = InputPacketCodec.MaxInputDelayFor(wide.PayloadByteWidth);
+            Assert.InRange(allowed, 1, HandshakeCodec.MaxInputDelay);
+
+            var emu = new FakeEmuAdapter(portCount: 2) { Layout = wide };
+            // One over the limit is refused...
+            var ex = Assert.Throws<ArgumentOutOfRangeException>(() => new FrameDriver(
+                emu, new QueueTransport(), p => new LockstepStrategy(p),
+                localPort: 0, delay: allowed + 1));
+            Assert.Contains($"input delay of {allowed} or less", ex.Message);
+
+            // ...and the delay it names actually works.
+            using var ok = new FrameDriver(emu, new QueueTransport(), p => new LockstepStrategy(p),
+                localPort: 0, delay: allowed);
+            Assert.Equal(0, ok.CurrentFrame);
+        }
+
+        [Fact]
+        public void TheDatagramLimitLeavesOrdinaryControllersFarMoreDelayThanTheUiOffers()
+        {
+            // The cap must bite only on exotic layouts. A SNES pad is 2 bytes, an N64 pad with two
+            // analog axes is 4 — both should clear the UI's maximum of 20 with room to spare.
+            Assert.True(InputPacketCodec.MaxInputDelayFor(2) >= HandshakeCodec.MaxInputDelay);
+            Assert.True(InputPacketCodec.MaxInputDelayFor(4) >= HandshakeCodec.MaxInputDelay);
+            Assert.True(InputPacketCodec.MaxInputDelayFor(16) > 20);
+            Assert.Equal(0, InputPacketCodec.MaxFramesPerDatagram(0)); // no layout, no frames
         }
 
         /// <summary>

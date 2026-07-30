@@ -245,6 +245,10 @@ namespace BizHawkNetplay.Tool
         private EmuHawkAdapter? _adapter;
         private ITransport? _transport;        // the FrameDriver's input channel (see below)
         private MeshUdpTransport? _mesh;       // direct peer-to-peer UDP: host and joiners both send to all peers
+        // Our own public UDP endpoint, discovered once per session and reused. Volatile: written by the
+        // STUN thread, read by the join thread building its HELLO and by the post-GO share.
+        private volatile IPEndPoint? _localReflexive;
+        private readonly ManualResetEventSlim _reflexiveKnown = new ManualResetEventSlim(false);
         private List<PeerRoute> _meshOthers = new List<PeerRoute>(); // joiner: grouped routes to non-host peers
 
         // UDP-punch path (2-player, no port-forwarding): one socket does STUN + hole-punch, then carries
@@ -280,6 +284,9 @@ namespace BizHawkNetplay.Tool
         // ends of a joiner-to-joiner path to punch through NAT and then leave a usable sample set,
         // short enough to vanish into a lobby that already took seconds to ship a savestate.
         private const int MeshProbeWindowMs = 1500;
+        // How long a joiner will hold its HELLO waiting for its own public endpoint. STUN normally
+        // answers in well under a second; a blocked server must cost this and not the session.
+        private const int ReflexiveWaitMs = 3000;
         // How long a started punch keeps knocking. Long on purpose: the asymmetric flow means one
         // side starts minutes before the other finishes reading a text message.
         private const int PunchPatienceSeconds = 300;
@@ -299,8 +306,7 @@ namespace BizHawkNetplay.Tool
         private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
         // Tells "the emulation drifted once" apart from "these two machines were never comparing the
         // same thing": a real drift agrees for a while first, a systematic mismatch never agrees at all.
-        private bool _agreedSinceResync;
-        private int _desyncsWithoutAgreement;
+        private readonly DesyncTrend _desyncTrend = new DesyncTrend();
         private string? _videoDiagnostic; // resolution/plugin line, quoted back if desyncs turn systematic
         private long _lastResyncStamp; // monotonic timestamp; debounces near-simultaneous resync triggers
         private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
@@ -1150,6 +1156,10 @@ namespace BizHawkNetplay.Tool
                 else
                 {
                     _mesh = MeshUdpTransport.Bind(0); _transport = WrapSimLatency(_mesh);
+                    // Start finding our public endpoint NOW, so the HELLO can carry it and the host can
+                    // put it in the routes it hands every other joiner. It runs while the TCP connect
+                    // and the lobby wait happen, so it usually costs nothing at all.
+                    StartReflexiveDiscovery(_mesh, attempt);
                     string ip = joinIp!.ToString(); // parsed above, before the pause
                     // Remember the address WITH its port: the dropdown's whole job is to let you rejoin
                     // the same host, which a bare IP can't do once the port isn't the default any more.
@@ -1257,6 +1267,7 @@ namespace BizHawkNetplay.Tool
                     try { reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(3)); }
                     catch { /* best-effort; the LAN fallback below still works on one router */ }
                     if (!IsConnectionAttemptCurrent(attempt)) return;
+                    PublishLocalReflexive(reflexive); // also our HELLO's mesh candidate
                     IPEndPoint? lanEp = null;
                     try { lanEp = new IPEndPoint(IPAddress.Parse(UpnpPortMapper.PrimaryLanIp()), mesh.LocalPort); }
                     catch { }
@@ -1312,6 +1323,7 @@ namespace BizHawkNetplay.Tool
                         });
                         initialStateApplied = true;
                     }, measureMesh: (_, peerRoutes) => MeasureJoinerMesh(host, peerRoutes),
+                       localReflexive: AwaitLocalReflexive(),
                        afterGreet: () =>
                     {
                         // Auth done. The lobby wait is legitimately unbounded (the host may wait
@@ -1536,6 +1548,9 @@ namespace BizHawkNetplay.Tool
                             RemotePort = assignedPort,
                             Greeting = greet,
                             UdpEndpoint = new IPEndPoint(remoteIp, greet.UdpPort),
+                            // Known before WELCOME now, so the routes handed to every OTHER joiner
+                            // carry a real punchable candidate rather than a port-preservation guess.
+                            ReflexiveEndpoint = greet.Reflexive,
                             Label = $"P{assignedPort + 1} ({remoteIp})",
                         });
                         UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);
@@ -1843,6 +1858,7 @@ namespace BizHawkNetplay.Tool
                 RemotePort = assignedPort,
                 Greeting = greet,
                 UdpEndpoint = admission.Endpoint, // the punched path IS the peer's working endpoint
+                ReflexiveEndpoint = greet.Reflexive,
                 Label = $"P{assignedPort + 1} ({admission.Endpoint.Address})",
             });
             UiConnLog($"P{assignedPort + 1} joined via UDP punch from {admission.Endpoint.Address} " +
@@ -2097,7 +2113,8 @@ namespace BizHawkNetplay.Tool
                                       "lobby and start. This can take a while in a 3-4 player session; " +
                                       "Disconnect still cancels.", Color.DarkGreen);
                         }, measureMesh: (hostUdpPort, peerRoutes) =>
-                            MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes));
+                            MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes),
+                           localReflexive: AwaitLocalReflexive());
                     }
                     catch (Exception ex) when (greetDeadline.Expired)
                     {
@@ -2293,8 +2310,7 @@ namespace BizHawkNetplay.Tool
             APIs.EmuClient.Pause(); // we own the clock now
             _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
             _resyncCount = 0;
-            _agreedSinceResync = false;
-            _desyncsWithoutAgreement = 0;
+            _desyncTrend.Reset();
             _resyncInProgress = false;
             _resyncReleaseQueued = false;
             _reconnectState = null;
@@ -2400,42 +2416,97 @@ namespace BizHawkNetplay.Tool
             // host, which shares it so peers can reach us across NAT. Additive to the LAN candidates, so
             // LAN/localhost play is unaffected whether or not this succeeds. The host is reached at the
             // address joiners connected to, so it doesn't report one.
-            if (!_isHost) StartReflexiveDiscovery();
+            if (!_isHost) ShareReflexiveWithHost();
         }
 
-        /// <summary>Joiner: off-thread, STUN-discover our mesh socket's public endpoint and send it to the host.</summary>
-        private void StartReflexiveDiscovery()
+        /// <summary>
+        /// Record our public UDP endpoint and release anyone waiting on it. Called from whichever path
+        /// discovered it first — the lobby pre-HELLO discovery, the punch flow, or the post-GO refresh.
+        /// </summary>
+        private void PublishLocalReflexive(IPEndPoint? reflexive)
         {
-            var mesh = _mesh;
-            if (mesh == null) return;
-            int attempt = CurrentConnectionAttempt;
+            if (reflexive != null) _localReflexive = reflexive;
+            _reflexiveKnown.Set(); // "the answer is in", including when the answer is "STUN is blocked"
+        }
+
+        /// <summary>
+        /// Joiner: STUN-discover this mesh socket's public endpoint BEFORE the handshake, so the HELLO
+        /// can carry it. The host puts every joiner's candidates into the routes it hands out in
+        /// WELCOME, and those routes are what the pre-GO mesh probe punches at — so discovering this
+        /// after GO, as this used to, meant every joiner-to-joiner route in the lobby was the
+        /// <c>(public IP, local port)</c> guess alone. That guess holds only where the NAT preserves
+        /// the source port; where it does not, the edges the delay probe exists to measure never opened
+        /// in time and the delay quietly fell back to the host's own TCP reading.
+        /// </summary>
+        private void StartReflexiveDiscovery(MeshUdpTransport mesh, int attempt)
+        {
             new Thread(() =>
             {
-                IPEndPoint? reflexive;
+                IPEndPoint? reflexive = null;
                 try { reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(2.5)); }
                 catch when (!IsConnectionAttemptCurrent(attempt)) { return; }
                 catch (Exception ex)
                 {
                     if (IsConnectionAttemptCurrent(attempt))
                         UiLog("(note) UDP address discovery failed: " + ex.Message);
+                    PublishLocalReflexive(null); // never leave the handshake waiting on a dead answer
                     return;
                 }
-                if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh)) return;
+                if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh))
+                { PublishLocalReflexive(null); return; }
+                PublishLocalReflexive(reflexive);
                 if (reflexive == null)
                 {
                     UiLog("(note) couldn't determine our public UDP endpoint (STUN blocked) — internet peers may be unreachable");
                     return;
                 }
                 UiLog($"our public UDP endpoint is {reflexive} — sharing it for NAT traversal");
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-stun-mesh" }.Start();
+        }
+
+        /// <summary>
+        /// Block briefly for the discovery started at bind time. Bounded, because a blocked STUN server
+        /// must cost a joiner a moment rather than the session: with no answer the HELLO simply carries
+        /// no candidate and the mesh falls back to observed addresses, exactly as it did before.
+        /// </summary>
+        private IPEndPoint? AwaitLocalReflexive()
+        {
+            try { _reflexiveKnown.Wait(ReflexiveWaitMs); } catch { }
+            return _localReflexive;
+        }
+
+        /// <summary>Joiner, post-GO: re-share the public endpoint over the live control link. Reuses
+        /// the lobby's discovery when it succeeded — the endpoint is a property of the socket, which
+        /// has not changed, so re-running STUN would only add a second round trip and a second answer
+        /// to disagree with.</summary>
+        private void ShareReflexiveWithHost()
+        {
+            var mesh = _mesh;
+            if (mesh == null) return;
+            int attempt = CurrentConnectionAttempt;
+            new Thread(() =>
+            {
+                var reflexive = _localReflexive;
+                if (reflexive == null)
+                {
+                    try { reflexive = mesh.DiscoverReflexive(TimeSpan.FromSeconds(2.5)); }
+                    catch { return; }
+                    if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh)) return;
+                    if (reflexive == null) return;
+                    PublishLocalReflexive(reflexive);
+                    UiLog($"our public UDP endpoint is {reflexive} — sharing it for NAT traversal");
+                }
+                var endpoint = reflexive;
                 BeginInvokeUi(() =>
                 {
                     if (IsConnectionAttemptCurrent(attempt) && ReferenceEquals(_mesh, mesh)
                         && _sessionActive && _peers.Count > 0)
                         QueueControl(_peers[0], ControlMessageType.Candidate,
-                            HandshakeCodec.EncodeEndpoints(new[] { reflexive }));
+                            HandshakeCodec.EncodeEndpoints(new[] { endpoint }));
                 });
             })
-            { IsBackground = true, Name = "BizHawkNetplay-stun-mesh" }.Start();
+            { IsBackground = true, Name = "BizHawkNetplay-stun-share" }.Start();
         }
 
         /// <summary>Host: record a joiner's reflexive endpoint and re-share the candidate lists.</summary>
@@ -3837,24 +3908,32 @@ namespace BizHawkNetplay.Tool
                 outcome = _checksums.Record(generation, sourcePort, frame, hash, _playerCount);
             }
             if (outcome == ChecksumOutcome.Pending) return;
-            if (outcome == ChecksumOutcome.Mismatch) BeginInvokeUi(() =>
+            if (outcome == ChecksumOutcome.Mismatch)
             {
-                if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
-                    OnHostDesync(frame);
-            });
-            else if (_resyncCount != 0)
-                BeginInvokeUi(() =>
-                {
-                    if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation && _resyncCount != 0)
-                    { _resyncCount = 0; Log("back in sync — recovery confirmed"); }
-                });
-            else if (Verbose)
                 BeginInvokeUi(() =>
                 {
                     if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
-                        Log($"checksum frame {frame}: all {_playerCount} agree");
-                        _agreedSinceResync = true;
+                        OnHostDesync(frame);
                 });
+                return;
+            }
+
+            // Every agreement goes through ONE branch, and recording it is unconditional. It used to sit
+            // inside the `Verbose` logging branch — and Verbose is off by default — so an ordinary
+            // session never recorded a single agreement and the second desync of the run was announced
+            // as a systematic mismatch that resyncing could not clear. The logging is what varies here;
+            // the bookkeeping never does.
+            BeginInvokeUi(() =>
+            {
+                if (!IsConnectionAttemptCurrent(attempt) || CurrentGeneration != generation) return;
+                _desyncTrend.RecordAgreement();
+                if (_resyncCount != 0)
+                {
+                    _resyncCount = 0;
+                    Log("back in sync — recovery confirmed");
+                }
+                else if (Verbose) Log($"checksum frame {frame}: all {_playerCount} agree");
+            });
         }
 
         private void OnHostDesync(int frame)
@@ -3869,9 +3948,7 @@ namespace BizHawkNetplay.Tool
             // those bytes come from the GPU rather than the emulated core, so they differ per machine
             // and land inside the region the checksum reads. Resyncing cannot fix that, and will keep
             // shipping a 16MiB state every interval until it gives up.
-            if (!_agreedSinceResync) _desyncsWithoutAgreement++;
-            _agreedSinceResync = false;
-            if (_desyncsWithoutAgreement == 2)
+            if (_desyncTrend.RecordDesync())
                 ConnLog("every checksum since this session began has disagreed, with none agreeing in " +
                     "between — that is a systematic mismatch, not emulation drift, and resyncing will " +
                     "not clear it. On N64 the usual cause is running the video plugin above native " +
@@ -4718,7 +4795,8 @@ namespace BizHawkNetplay.Tool
                 var link = new PeerLink
                 {
                     Tcp = tcp, Control = channel, RemotePort = freedPort, Greeting = greet,
-                    UdpEndpoint = udpEp, Label = $"P{freedPort + 1} ({remoteIp})",
+                    UdpEndpoint = udpEp, ReflexiveEndpoint = greet.Reflexive,
+                    Label = $"P{freedPort + 1} ({remoteIp})",
                 };
                 // Bring each survivor up to date: refresh its mesh with the rejoiner's endpoint, then
                 // resync it to the same state. Do not release the rejoiner with GO until those queued
@@ -4944,6 +5022,9 @@ namespace BizHawkNetplay.Tool
             try { (_transport as IDisposable)?.Dispose(); } catch { }
             try { _driver?.Dispose(); } catch { } // release the rollback ring's savestates
             _transport = null; _mesh = null;
+            // The endpoint belonged to that socket; the next session binds a new one.
+            _localReflexive = null;
+            try { _reflexiveKnown.Reset(); } catch { }
             _lobbyPunchTargets.Clear();
             while (_punchAdmissions.TryDequeue(out var admission))
             {

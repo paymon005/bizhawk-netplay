@@ -23,7 +23,16 @@ namespace BizHawkNetplay.Core.Session
 
         private static int ClampDelay(int d) => d < 1 ? 1 : d > MaxInputDelay ? MaxInputDelay : d;
 
-        public static byte[] Encode(PeerIdentity id, SessionPreferences prefs, int udpPort, byte[] nonce)
+        /// <param name="reflexive">
+        /// This peer's public (STUN-discovered) UDP endpoint, if it knows one yet. It travels in the
+        /// HELLO rather than as a separate message after GO because the host distributes mesh routes in
+        /// WELCOME, and a route that lists only <c>(public IP, local port)</c> is a guess that holds
+        /// only where the NAT preserves the source port. Without this the joiner-to-joiner edges — the
+        /// ones the host cannot measure and the lobby delay probe exists to cover — have no reliable
+        /// candidate to punch at until the session has already started.
+        /// </param>
+        public static byte[] Encode(PeerIdentity id, SessionPreferences prefs, int udpPort, byte[] nonce,
+            IPEndPoint? reflexive = null)
         {
             var sb = new StringBuilder();
             sb.Append("proto=").Append(id.ProtocolVersion).Append('\n');
@@ -40,6 +49,12 @@ namespace BizHawkNetplay.Core.Session
             // response proof exchanged afterward (see SessionAuth). Empty nonce is tolerated (open session).
             sb.Append("nonce=").Append(nonce == null ? "" : SessionAuth.ToHex(nonce)).Append('\n');
             sb.Append("udpport=").Append(udpPort).Append('\n');
+            if (reflexive != null)
+            {
+                sb.Append("refl=");
+                AppendEndpoint(sb, reflexive);
+                sb.Append('\n');
+            }
             return Encoding.UTF8.GetBytes(sb.ToString());
         }
 
@@ -212,7 +227,8 @@ namespace BizHawkNetplay.Core.Session
             return new SessionGeneration(sessionId, (int)epoch);
         }
 
-        public static (PeerIdentity id, SessionPreferences prefs, int udpPort, byte[]? nonce) Decode(byte[] body)
+        public static (PeerIdentity id, SessionPreferences prefs, int udpPort, byte[]? nonce,
+            IPEndPoint? reflexive) Decode(byte[] body)
         {
             var map = ParseLines(body);
 
@@ -236,7 +252,10 @@ namespace BizHawkNetplay.Core.Session
             var prefs = new SessionPreferences(ClampDelay(GetInt(map, "delay", 1)), Get(map, "rollback") == "1");
             int udpPort = GetInt(map, "udpport", 0);
             byte[]? nonce = SessionAuth.FromHex(Get(map, "nonce")); // null if missing/malformed
-            return (id, prefs, udpPort, nonce);
+            // Absent or malformed is simply "not discovered" — STUN can be blocked, and a peer that
+            // cannot name its public endpoint still plays over whatever candidates do work.
+            IPEndPoint? reflexive = TryParseEndpoint(Get(map, "refl"), out var parsed) ? parsed : null;
+            return (id, prefs, udpPort, nonce, reflexive);
         }
 
         private static Dictionary<string, string> ParseLines(byte[] body)

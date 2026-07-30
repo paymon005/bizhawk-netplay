@@ -32,6 +32,37 @@ namespace BizHawkNetplay.Core.Net
         private const int HeaderSize = 19;
         private const int RequestSize = 18;
 
+        /// <summary>
+        /// Largest input datagram this codec will produce, so a session can never build one the network
+        /// silently eats.
+        ///
+        /// A datagram carries R = max(redundancy, 2·delay+1) frames of one port's layout, and nothing
+        /// used to bound the product. Past the path MTU an IP-fragmented UDP datagram is dropped
+        /// outright by many NATs and firewalls, and past the receive buffer the socket raises a
+        /// size error that the mesh's receive loop can only skip — so the port's input would stop
+        /// arriving entirely, forever, and present as "no UDP input from PN": a network fault, on a
+        /// network that was working.
+        ///
+        /// 1200 is the conservative figure QUIC and WebRTC use for exactly this reason: it survives
+        /// PPPoE, VPN and tunnel overhead rather than assuming 1500. The mesh envelope adds 6 bytes on
+        /// top, keeping the wire packet under the 1280-byte IPv6 minimum MTU — and well under
+        /// <c>MeshUdpTransport</c>'s receive buffer, which must stay larger than this.
+        /// </summary>
+        public const int MaxDatagramBytes = 1200;
+
+        /// <summary>
+        /// How many consecutive frames of a <paramref name="payloadSize"/>-byte port fit in one
+        /// datagram. Zero for a port with no serializable layout. Capped at 255 because the count is
+        /// one byte on the wire.
+        /// </summary>
+        public static int MaxFramesPerDatagram(int payloadSize) =>
+            payloadSize <= 0 ? 0 : Math.Min(byte.MaxValue, (MaxDatagramBytes - HeaderSize) / payloadSize);
+
+        /// <summary>The largest input delay a <paramref name="payloadSize"/>-byte port can be run at,
+        /// since the redundant window is at least 2·delay+1 frames wide.</summary>
+        public static int MaxInputDelayFor(int payloadSize) =>
+            Math.Max(0, (MaxFramesPerDatagram(payloadSize) - 1) / 2);
+
         private readonly int[] _payloadSizes; // indexed by port
         private readonly SessionGeneration _generation;
 
@@ -85,6 +116,13 @@ namespace BizHawkNetplay.Core.Net
             if (window.Count == 0) throw new ArgumentException("Empty window", nameof(window));
             if (window.Count > byte.MaxValue) throw new ArgumentException("Window too large", nameof(window));
             int payloadSize = _payloadSizes[port];
+            // Unreachable in a session the driver accepted — it refuses the configuration up front so
+            // this cannot fire mid-play — but an oversized datagram would be dropped somewhere out on
+            // the path, silently, so it is worth refusing loudly at the only place that builds one.
+            if (HeaderSize + window.Count * payloadSize > MaxDatagramBytes)
+                throw new ArgumentException(
+                    $"Window of {window.Count} frames × {payloadSize} bytes exceeds the " +
+                    $"{MaxDatagramBytes}-byte datagram limit for port {port}", nameof(window));
 
             int baseFrame = window[0].Key;
             var buffer = new byte[HeaderSize + window.Count * payloadSize];

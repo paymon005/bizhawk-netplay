@@ -104,7 +104,7 @@ namespace BizHawkNetplay.Core.Session
             var (type, body) = channel.Receive();
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from joiner, got {type}");
-            var (clientId, clientPrefs, clientUdpPort, joinNonce) = HandshakeCodec.Decode(body);
+            var (clientId, clientPrefs, clientUdpPort, joinNonce, _) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(hostId, clientId, hostPrefs, clientPrefs);
             if (!result.Accepted)
@@ -159,7 +159,7 @@ namespace BizHawkNetplay.Core.Session
                 throw new HandshakeException(Encoding.UTF8.GetString(body));
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from host, got {type}");
-            var (hostId, hostPrefs, hostUdpPort, hostNonce) = HandshakeCodec.Decode(body);
+            var (hostId, hostPrefs, hostUdpPort, hostNonce, _) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
             if (!result.Accepted)
@@ -223,13 +223,19 @@ namespace BizHawkNetplay.Core.Session
         /// <summary>Info a host records about one joiner after the HELLO exchange.</summary>
         public sealed class JoinerGreeting
         {
-            public JoinerGreeting(PeerIdentity id, SessionPreferences prefs, int udpPort)
+            public JoinerGreeting(PeerIdentity id, SessionPreferences prefs, int udpPort,
+                IPEndPoint? reflexive = null)
             {
-                Id = id; Prefs = prefs; UdpPort = udpPort;
+                Id = id; Prefs = prefs; UdpPort = udpPort; Reflexive = reflexive;
             }
             public PeerIdentity Id { get; }
             public SessionPreferences Prefs { get; }
             public int UdpPort { get; }
+
+            /// <summary>The joiner's public UDP endpoint, if STUN found one before it connected. Null
+            /// means the mesh has only this peer's observed address to punch at — which is a guess
+            /// about port preservation, not a candidate.</summary>
+            public IPEndPoint? Reflexive { get; }
         }
 
         /// <summary>
@@ -246,7 +252,7 @@ namespace BizHawkNetplay.Core.Session
             var (type, body) = channel.Receive();
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from joiner, got {type}");
-            var (joinerId, joinerPrefs, joinerUdpPort, joinNonce) = HandshakeCodec.Decode(body);
+            var (joinerId, joinerPrefs, joinerUdpPort, joinNonce, joinerReflexive) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(hostId, joinerId, hostPrefs, joinerPrefs);
             if (!result.Accepted)
@@ -259,7 +265,7 @@ namespace BizHawkNetplay.Core.Session
             // the host commits it a port / includes it in the delay + mode decisions.
             VerifyPassword(channel, hostPrefs.Password, hostNonce, joinNonce, isHost: true);
 
-            return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort);
+            return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort, joinerReflexive);
         }
 
         /// <summary>
@@ -409,17 +415,19 @@ namespace BizHawkNetplay.Core.Session
         public static SessionParams RunClientMulti(
             ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
             Action<SessionParams>? beforeReady = null, Action? afterGreet = null,
-            Func<int, IReadOnlyList<PeerRoute>, LobbyMeshSample>? measureMesh = null)
+            Func<int, IReadOnlyList<PeerRoute>, LobbyMeshSample>? measureMesh = null,
+            IPEndPoint? localReflexive = null)
         {
             var joinNonce = SessionAuth.NewNonce();
-            channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
+            channel.Send(ControlMessageType.Hello,
+                HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce, localReflexive));
 
             var (type, body) = channel.Receive();
             if (type == ControlMessageType.Error)
                 throw new HandshakeException(Encoding.UTF8.GetString(body));
             if (type != ControlMessageType.Hello)
                 throw new HandshakeException($"expected HELLO from host, got {type}");
-            var (hostId, hostPrefs, hostUdpPort, hostNonce) = HandshakeCodec.Decode(body);
+            var (hostId, hostPrefs, hostUdpPort, hostNonce, _) = HandshakeCodec.Decode(body);
 
             var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
             if (!result.Accepted)

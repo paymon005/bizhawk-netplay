@@ -580,6 +580,12 @@ namespace BizHawkNetplay.Core.Net
 
         private void ReceiveLoop()
         {
+            // Must stay above InputPacketCodec.MaxDatagramBytes + HeaderSize (1206) and above the
+            // reliable stream's segment size. A datagram larger than this buffer does not truncate: the
+            // socket raises a size error, the loop below can only skip it, and the OS has already
+            // discarded the data — so the sender's input would vanish permanently while every other
+            // signal said the network was fine. The codec's own cap is what makes that unreachable;
+            // this is the second wall behind it.
             var buffer = new byte[2048];
             EndPoint from = new IPEndPoint(IPAddress.Any, 0);
             while (_running)

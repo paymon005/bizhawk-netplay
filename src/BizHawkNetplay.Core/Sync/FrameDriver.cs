@@ -151,6 +151,22 @@ namespace BizHawkNetplay.Core.Sync
                 _serializers[p] = new InputSerializer(adapter.GetControllerLayout(p));
                 payloadSizes[p] = _serializers[p].PayloadSize;
             }
+            // Refuse a configuration whose datagrams would not survive the path, here, where it is still
+            // a startup error with a number in it. Left unchecked the session starts, looks healthy,
+            // and then reports "no UDP input from PN" forever — because every packet that port sends is
+            // dropped for its size, on a network that is working perfectly.
+            for (int p = 0; p < ports; p++)
+            {
+                if (payloadSizes[p] <= 0) continue; // no serializable layout; caught by the codec's counters
+                int fits = InputPacketCodec.MaxFramesPerDatagram(payloadSizes[p]);
+                if (_redundancy <= fits) continue;
+                int allowed = InputPacketCodec.MaxInputDelayFor(payloadSizes[p]);
+                throw new ArgumentOutOfRangeException(nameof(delay),
+                    $"Input delay {delay} needs a {_redundancy}-frame redundant window, and port {p}'s " +
+                    $"{payloadSizes[p]}-byte layout makes that a datagram larger than the " +
+                    $"{InputPacketCodec.MaxDatagramBytes}-byte limit. Use an input delay of {allowed} " +
+                    "or less for this controller configuration.");
+            }
             _codec = new InputPacketCodec(payloadSizes, _generation);
             _strategy = strategyFactory(_pipeline);
 

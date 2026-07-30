@@ -639,6 +639,92 @@ namespace BizHawkNetplay.Core.Tests
             finally { dispose(); }
         }
 
+        /// <summary>
+        /// A joiner's public endpoint reaches the OTHER joiners in WELCOME, before anyone has started
+        /// playing. The mesh routes handed out in the lobby are what the pre-GO delay probe punches at,
+        /// and until this the only candidate they carried was (public IP, local port) — a guess that
+        /// holds only where the NAT preserves the source port. Where it doesn't, the joiner-to-joiner
+        /// edges never opened in time and the delay silently fell back to the host's own TCP reading.
+        /// </summary>
+        [Fact]
+        public void AJoinersPublicEndpointReachesTheOtherJoinersInWelcome()
+        {
+            var (hostCh1, clientCh1, d1) = TcpPair();
+            var (hostCh2, clientCh2, d2) = TcpPair();
+            try
+            {
+                var generation = Generation(0x4A01UL, epoch: 1);
+                var j1Public = new IPEndPoint(IPAddress.Parse("203.0.113.11"), 40011);
+                var j2Public = new IPEndPoint(IPAddress.Parse("198.51.100.22"), 40022);
+
+                var c1 = Task.Run(() => Handshake.RunClientMulti(clientCh1, Id(),
+                    new SessionPreferences(1, false), 51001, localReflexive: j1Public));
+                // The second joiner's STUN was blocked — it must still be admitted, just without a
+                // candidate of its own.
+                var c2 = Task.Run(() => Handshake.RunClientMulti(clientCh2, Id(),
+                    new SessionPreferences(1, false), 51002));
+
+                var hostPrefs = new SessionPreferences(1, false);
+                var g1 = Handshake.HostGreet(hostCh1, Id(), hostPrefs, 47800);
+                var g2 = Handshake.HostGreet(hostCh2, Id(), hostPrefs, 47800);
+
+                Assert.Equal(j1Public, g1.Reflexive);
+                Assert.Null(g2.Reflexive);
+
+                // What the host would build from those greetings: the observed endpoint first (it is
+                // right on a LAN and costs nothing to try), the public one behind it.
+                var j1Route = new PeerRoute(1, new[] { new IPEndPoint(IPAddress.Loopback, g1.UdpPort), j1Public });
+                var j2Route = new PeerRoute(2, new[] { new IPEndPoint(IPAddress.Loopback, g2.UdpPort) });
+
+                Handshake.HostSendStart(hostCh1, 1, 3, 2, SyncMode.Lockstep, new byte[8], generation,
+                    new[] { j2Route });
+                Handshake.HostSendStart(hostCh2, 2, 3, 2, SyncMode.Lockstep, new byte[8], generation,
+                    new[] { j1Route });
+                Handshake.HostRequestReady(hostCh1, generation);
+                Handshake.HostRequestReady(hostCh2, generation);
+                Handshake.HostWaitReady(hostCh1, generation);
+                Handshake.HostWaitReady(hostCh2, generation);
+                Handshake.HostSendGo(hostCh1, generation);
+                Handshake.HostSendGo(hostCh2, generation);
+
+                var p1 = c1.GetAwaiter().GetResult();
+                var p2 = c2.GetAwaiter().GetResult();
+
+                // P2 can punch at P1's public address from the lobby onward — the whole point.
+                var routeToJ1 = Assert.Single(p2.PeerRoutes);
+                Assert.Equal(1, routeToJ1.RemotePort);
+                Assert.Contains(j1Public, routeToJ1.Candidates);
+                Assert.Equal(2, routeToJ1.Candidates.Count);
+
+                // And a peer with no candidate of its own is described honestly rather than guessed at.
+                var routeToJ2 = Assert.Single(p1.PeerRoutes);
+                Assert.Equal(2, routeToJ2.RemotePort);
+                Assert.Single(routeToJ2.Candidates);
+            }
+            finally { d1(); d2(); }
+        }
+
+        [Fact]
+        public void AMalformedOrAbsentPublicEndpointIsNotFatalToTheHandshake()
+        {
+            // The HELLO is peer-supplied and STUN can be blocked, so "no candidate" and "nonsense
+            // candidate" must both land as null rather than refusing a joiner who can still play.
+            var nonce = SessionAuth.NewNonce();
+            var body = HandshakeCodec.Encode(Id(), new SessionPreferences(2, true), 51000, nonce,
+                new IPEndPoint(IPAddress.Parse("203.0.113.9"), 40009));
+            var mangled = System.Text.Encoding.UTF8.GetString(body).Replace("refl=203.0.113.9:40009", "refl=not-an-endpoint");
+
+            var (_, _, udpPort, decodedNonce, reflexive) =
+                HandshakeCodec.Decode(System.Text.Encoding.UTF8.GetBytes(mangled));
+            Assert.Equal(51000, udpPort);
+            Assert.Equal(nonce, decodedNonce);
+            Assert.Null(reflexive);
+
+            var (_, _, _, _, missing) = HandshakeCodec.Decode(
+                HandshakeCodec.Encode(Id(), new SessionPreferences(2, true), 51000, nonce));
+            Assert.Null(missing);
+        }
+
         // ---- surviving someone else's departure -----------------------------------------
 
         /// <summary>

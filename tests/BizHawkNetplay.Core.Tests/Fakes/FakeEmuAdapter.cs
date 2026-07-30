@@ -12,7 +12,7 @@ namespace BizHawkNetplay.Core.Tests.Fakes
     /// </summary>
     public sealed class FakeEmuAdapter : IEmuAdapter
     {
-        private readonly ControllerLayout _layout;
+        private ControllerLayout _layout;
         private byte[] _memory;
         private int _frame;
 
@@ -49,6 +49,15 @@ namespace BizHawkNetplay.Core.Tests.Fakes
         public bool VerifyDeterministicMode() => true;
 
         public int PortCount { get; }
+
+        /// <summary>Override the default 8-button pad — for the cases where the SIZE of a layout is
+        /// the thing under test, such as the datagram limit.</summary>
+        public ControllerLayout Layout
+        {
+            get => _layout;
+            set => _layout = value ?? throw new ArgumentNullException(nameof(value));
+        }
+
         public ControllerLayout GetControllerLayout(int port) => _layout;
 
         /// <summary>Scripted local controller, keyed by the current sim frame; neutral if unset.</summary>
