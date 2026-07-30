@@ -7,8 +7,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # The BizHawk the shipping tool is compiled against. Bump both together — the workflow refuses to
+  # build if they disagree, which is the point of having the hash here at all.
+  BIZHAWK_VERSION: '2.11.1'
+  BIZHAWK_SHA256: 'dd7cbd5e205b09c5bce6afabc4f8aa525acc0bbeb9753b198a8db3fe6a5e5717'
+
 jobs:
-  test:
+  build:
     # Windows on purpose: the shipping tool targets net48, the tests bind real loopback UDP
     # sockets, and this is the platform every one of these tests has ever been validated on.
     runs-on: windows-latest
@@ -30,11 +36,57 @@ jobs:
       # runtime it actually ships on; testing only on net10.0 left the production runtime
       # unexercised. Not hypothetical: the savestate path runs DeflateStream, whose implementation
       # differs between .NET Framework and .NET Core. windows-latest carries the 4.8 dev pack.
-      #
-      # BizHawkNetplay.Tool is still NOT built here. It compiles against assemblies from a local
-      # BizHawk install (Directory.Build.props / BizHawkHome) that no runner has. Fixing that —
-      # fetching a pinned BizHawk 2.11.1 and building the shipping DLL — is the top open CI item,
-      # and it matters more now that the Tool is compiled at C# 12, a language version Microsoft
-      # considers unsupported on net48 (which defaults to 7.3).
       - name: Test
         run: dotnet test tests/BizHawkNetplay.Core.Tests --nologo -c Release
+
+      # The tool binds EmuHawk's own assemblies, so it cannot be built against nothing — and until
+      # now it was not built here at all, which meant the DLL people actually install was the one
+      # artifact with no CI behind it. It is fetched rather than vendored (we compile against
+      # BizHawk's assemblies and never redistribute them) and PINNED by version and SHA-256: a
+      # silently different BizHawk would change what the shipping DLL was compiled against without
+      # changing a line of this repo, and that is exactly the failure this step exists to catch.
+      #
+      # Deliberately not cached. The zip is ~98MB off GitHub's own CDN and extracts to ~148MB, so a
+      # cache round-trip is a wash against just fetching it, and the hash is what makes the fetch
+      # safe either way. tar (bsdtar, in-box on the runner) rather than Expand-Archive, which is
+      # minutes slower on an archive this size.
+      - name: Fetch BizHawk ${{ env.BIZHAWK_VERSION }}
+        shell: pwsh
+        run: |
+          $url = "https://github.com/TASEmulators/BizHawk/releases/download/$env:BIZHAWK_VERSION/BizHawk-$env:BIZHAWK_VERSION-win-x64.zip"
+          $zip = Join-Path $env:RUNNER_TEMP 'bizhawk.zip'
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          $got = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:BIZHAWK_SHA256) {
+            throw "BizHawk $env:BIZHAWK_VERSION SHA-256 mismatch.`n  expected $env:BIZHAWK_SHA256`n  got      $got"
+          }
+          # Not $home — that is a read-only automatic variable in PowerShell.
+          $bizhawk = Join-Path $env:RUNNER_TEMP 'bizhawk'
+          New-Item -ItemType Directory -Force -Path $bizhawk | Out-Null
+          tar -xf $zip -C $bizhawk
+          # The release zip is flat — dll\ and EmuHawk.exe sit at the root, which is what
+          # BizHawkHome is expected to point at. Assert it rather than failing later in MSBuild
+          # with a reference-not-found that reads like a source problem.
+          foreach ($p in 'dll\BizHawk.Client.Common.dll', 'dll\BizHawk.Emulation.Common.dll', 'EmuHawk.exe') {
+            if (-not (Test-Path (Join-Path $bizhawk $p))) { throw "BizHawk layout changed: $p missing under $bizhawk" }
+          }
+
+      # -c Release because that is what ships. DeployToExternalTools is off: the extracted release
+      # HAS an ExternalTools folder, so the target would fire and copy into a tree we throw away.
+      # dist\ is where the two shipping DLLs land — the same folder a release is cut from.
+      #
+      # This is also the only place C# 12 on net48 is proven. Microsoft treats that pairing as
+      # unsupported (net48 defaults to 7.3), so "it compiled on the maintainer's machine" was the
+      # entire evidence base for the language version until this step existed.
+      - name: Build the shipping tool
+        run: >
+          dotnet build src/BizHawkNetplay.Tool --nologo -c Release
+          -p:BizHawkHome="${{ runner.temp }}\bizhawk"
+          -p:DeployToExternalTools=false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BizHawkNetplay-${{ github.sha }}
+          path: dist/*.dll
+          if-no-files-found: error

@@ -81,7 +81,8 @@ src/
     InputSetController.cs  InputSet -> IController for invisible frame advance
     NetplaySettings.cs    persisted UI prefs (UPnP, port, delay, netcode, input source, recent IPs)
 tests/
-  BizHawkNetplay.Core.Tests/  net5.0 xUnit — no EmuHawk required (run: dotnet test)
+  BizHawkNetplay.Core.Tests/  xUnit, multi-targeted net10.0 + net48 — no EmuHawk required
+                          (run: dotnet test); net48 is the runtime the tool actually ships on
 ```
 
 ## Building
@@ -102,6 +103,14 @@ dotnet build src/BizHawkNetplay.Tool -p:BizHawkHome="X:\path\to\BizHawk"
 
 A successful Tool build copies `BizHawkNetplay.Tool.dll` + `BizHawkNetplay.Core.dll` into
 `<BizHawkHome>\ExternalTools\`. Disable with `-p:DeployToExternalTools=false`.
+
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the suite on both target
+frameworks *and* builds the shipping tool, against a **BizHawk pinned by version and SHA-256** that
+it downloads per run — so the DLL people install is compiled on every push, not only on a
+maintainer's machine, and a silently different BizHawk fails the build instead of quietly changing
+what that DLL was compiled against. Both DLLs are uploaded as a build artifact. Moving to a new
+BizHawk means bumping `BIZHAWK_VERSION` **and** `BIZHAWK_SHA256` together; the workflow refuses to
+build if they disagree.
 
 **Cutting a release:** build Release, then attach the two DLLs to a GitHub Release — that's all a release is. Binaries are never committed; they live on the Releases page.
 
