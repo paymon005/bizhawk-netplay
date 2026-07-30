@@ -127,5 +127,42 @@ namespace BizHawkNetplay.Core.Tests
             Assert.True(p.TryGet(0, 9, out _));
             Assert.Equal(10, p.ConfirmedFrontier(0)); // frontier is a watermark, unaffected by prune
         }
+
+        [Fact]
+        public void PruneBefore_SweepsFramesStrandedBelowAHole()
+        {
+            // The incremental walk this now does could only ever be safe if a hole in the map does not
+            // hide everything under it forever. Frames 0-3 sit below a gap at 4; a boundary that steps
+            // past them must still drop them, or a lossy remote port leaks for the whole session.
+            var p = new InputPipeline(1);
+            for (int f = 0; f <= 3; f++) p.Add(0, f, Btn(false));
+            for (int f = 6; f <= 9; f++) p.Add(0, f, Btn(false));   // 4 and 5 never arrived
+
+            for (int boundary = 1; boundary <= 8; boundary++) p.PruneBefore(boundary);
+
+            for (int f = 0; f <= 3; f++) Assert.False(p.TryGet(0, f, out _));
+            Assert.False(p.TryGet(0, 7, out _));
+            Assert.True(p.TryGet(0, 8, out _));
+        }
+
+        [Fact]
+        public void PruneBefore_HandlesABoundaryThatJumpsOrGoesBackwards()
+        {
+            // A resync or a rejoin moves the frame counter in one step, and a rollback repair moves it
+            // backwards. Neither may leave the watermark ahead of the map, or everything between the
+            // old boundary and the new one is never visited again.
+            var p = new InputPipeline(1);
+            for (int f = 0; f <= 40; f++) p.Add(0, f, Btn(false));
+
+            p.PruneBefore(2);
+            p.PruneBefore(1);        // backwards: nothing new to drop, watermark follows
+            p.PruneBefore(400);      // a jump far past anything held
+            for (int f = 0; f <= 40; f++) Assert.False(p.TryGet(0, f, out _));
+
+            // And the pipeline still works afterwards.
+            p.Add(0, 500, Btn(true));
+            p.PruneBefore(500);
+            Assert.True(p.TryGet(0, 500, out _));
+        }
     }
 }

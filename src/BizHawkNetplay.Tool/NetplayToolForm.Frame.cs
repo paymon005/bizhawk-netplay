@@ -606,6 +606,26 @@ namespace BizHawkNetplay.Tool
         /// fast peer waits for a slow one, so a CPU-bound machine at the other end produces exactly
         /// the same reading — and raising delay would do nothing for it. The message names both.
         /// </summary>
+        /// <summary>
+        /// Say once when this machine cannot repair even the minimum depth inside its frame budget.
+        ///
+        /// The cost cap has a floor of two frames, so below it rollback does not shrink to nothing —
+        /// it carries on committing to work already measured as unaffordable, and the result reaches
+        /// the player as judder with no stated cause. Rollback is the wrong choice at that point and
+        /// the two things that are the right choice both belong to the host, so name them.
+        /// </summary>
+        private void MaybeHintRollbackUnaffordable(RollbackStrategy rb)
+        {
+            if (!rb.BudgetExceededByFloor) return;
+            if (!_rollbackCostHint.ShouldFire(true, MonotonicNow())) return;
+
+            ConnLog($"this machine needs {rb.FloorRepairPerFrameMs:F1}ms to re-simulate a single frame, " +
+                $"which does not fit the repair budget — rollback is running below the depth it can " +
+                $"afford, and the judder that causes is not the network. Lockstep at a higher input " +
+                $"delay is the honest trade for this core on this CPU. " +
+                $"{ApplyDelayAdvice(_sessionDelay + 2)}", Color.DarkOrange);
+        }
+
         private void MaybeHintStalling(double nowMs)
         {
             if (_mode != SyncMode.Lockstep || _lastPacing.Ticks == 0) return;
@@ -692,6 +712,7 @@ namespace BizHawkNetplay.Tool
             string rbStr = "";
             if (_driver?.Strategy is RollbackStrategy rb)
             {
+                MaybeHintRollbackUnaffordable(rb);
                 long rollbacks = _pacingRollbacks.Observe(rb.RollbackCount);
                 long resim = _pacingResim.Observe(rb.FramesResimulated);
                 // Snapshots actually taken versus elided. The elision rule turns rollback's steady

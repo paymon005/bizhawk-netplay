@@ -294,6 +294,9 @@ namespace BizHawkNetplay.Tool
         // single bad second. The policy is SustainedTrigger; these only hold the thresholds.
         private readonly SustainedTrigger _stallHint = new SustainedTrigger(StallHintSustainMs);
         private readonly SustainedTrigger _presentHint = new SustainedTrigger(StallHintSustainMs);
+        // One-shot "rollback costs more than it can afford here" advisory; fires as soon as the
+        // measured cost latches, since it is a property of the core and CPU, not a passing condition.
+        private readonly SustainedTrigger _rollbackCostHint = new SustainedTrigger(0);
         private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
         private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
         private double _lastPresentClockMs = -1; // ...and of the previous present, for judder stats

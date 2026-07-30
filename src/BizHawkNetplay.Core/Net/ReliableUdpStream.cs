@@ -47,7 +47,14 @@ namespace BizHawkNetplay.Core.Net
         // Receiver state (guarded by _gate).
         private readonly SortedDictionary<uint, byte[]> _reorder = new SortedDictionary<uint, byte[]>();
         private uint _rcvBase;                // next in-order seq to deliver
-        private readonly Queue<byte> _readable = new Queue<byte>();
+        // Reassembled bytes waiting for Read, held as the 1KiB SEGMENTS they arrived in rather than as
+        // individual bytes. A Queue<byte> meant one enqueue per byte and one dequeue per byte: shipping
+        // a multi-megabyte savestate through it was millions of operations plus repeated doubling of a
+        // backing array well past the large-object threshold — all to move bytes that arrived in
+        // ready-made blocks. This queues the blocks and block-copies out of the head.
+        private readonly Queue<byte[]> _readable = new Queue<byte[]>();
+        private int _readableHeadOffset;   // bytes already handed out of the block at the head
+        private int _readableBytes;        // total bytes across the queue, minus the head offset
         private bool _finReceived;
         private uint _rcvFinSeq;
 
@@ -138,11 +145,26 @@ namespace BizHawkNetplay.Core.Net
             {
                 while (true)
                 {
-                    if (_readable.Count > 0)
+                    if (_readableBytes > 0)
                     {
-                        int n = Math.Min(count, _readable.Count);
-                        for (int k = 0; k < n; k++) buffer[offset + k] = _readable.Dequeue();
-                        return n;
+                        // Copies out of however many queued blocks the request spans, leaving a
+                        // partly-consumed head block in place rather than splitting it.
+                        int written = 0;
+                        while (written < count && _readable.Count > 0)
+                        {
+                            var head = _readable.Peek();
+                            int chunk = Math.Min(count - written, head.Length - _readableHeadOffset);
+                            Buffer.BlockCopy(head, _readableHeadOffset, buffer, offset + written, chunk);
+                            written += chunk;
+                            _readableHeadOffset += chunk;
+                            if (_readableHeadOffset == head.Length)
+                            {
+                                _readable.Dequeue();
+                                _readableHeadOffset = 0;
+                            }
+                        }
+                        _readableBytes -= written;
+                        return written;
                     }
                     if (_finReceived && _rcvBase >= _rcvFinSeq) return 0; // clean EOF
                     ThrowIfBroken();
@@ -218,7 +240,7 @@ namespace BizHawkNetplay.Core.Net
             while (_reorder.TryGetValue(_rcvBase, out var p))
             {
                 _reorder.Remove(_rcvBase);
-                for (int k = 0; k < p.Length; k++) _readable.Enqueue(p[k]);
+                if (p.Length > 0) { _readable.Enqueue(p); _readableBytes += p.Length; }
                 _rcvBase++;
             }
             Monitor.PulseAll(_gate); // wake a blocked Read

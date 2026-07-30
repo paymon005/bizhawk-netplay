@@ -55,6 +55,12 @@ namespace BizHawkNetplay.Core.Net
 
         private readonly Socket _socket;
         private readonly ConcurrentQueue<byte[]> _inbound = new ConcurrentQueue<byte[]>();
+        /// <summary>Backlog ceiling: ~8s of four-player input, far above anything a healthy session
+        /// reaches, and low enough that the memory behind it stays bounded. See EnqueueInput.</summary>
+        private const int MaxInboundBacklog = 1024;
+        private int _inboundDepth;
+        private int _inboundPeak;
+        private long _inboundDropped;
         private readonly Thread _rxThread;
         private readonly Thread _punchThread;
         private volatile bool _running = true;
@@ -261,7 +267,20 @@ namespace BizHawkNetplay.Core.Net
             }
         }
 
-        public bool TryReceive(out byte[] datagram) => _inbound.TryDequeue(out datagram!);
+        public bool TryReceive(out byte[] datagram)
+        {
+            if (!_inbound.TryDequeue(out datagram!)) return false;
+            Interlocked.Decrement(ref _inboundDepth);
+            return true;
+        }
+
+        /// <summary>Deepest the inbound backlog has been this session — the number that says whether
+        /// the cap is anywhere near being reached on real links.</summary>
+        public int InboundPeakDepth => _inboundPeak;
+
+        /// <summary>Input datagrams discarded because the backlog was full. Any nonzero value here is
+        /// worth a line in the log: it means the frame loop stopped draining for long enough to matter.</summary>
+        public long InboundDropped => Interlocked.Read(ref _inboundDropped);
 
         /// <summary>True if this candidate endpoint has answered a probe or sent input recently — i.e. a
         /// direct UDP path to it is currently open.</summary>
@@ -655,7 +674,36 @@ namespace BizHawkNetplay.Core.Net
                 if (type != TInput) continue; // unknown type from a future build — ignore
                 var payload = new byte[n - HeaderSize];
                 Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
-                _inbound.Enqueue(payload);
+                EnqueueInput(payload);
+            }
+        }
+
+        /// <summary>
+        /// Hand a received input datagram to the frame loop, dropping the OLDEST if the backlog is at
+        /// its cap.
+        ///
+        /// The queue had no cap, and the frame loop drains at most 128 datagrams per pump. In ordinary
+        /// play that is not close: four players produce about 180 datagrams a second against a drain
+        /// ceiling near 7,700, so a backlog from a long pause clears in a fraction of a second. What
+        /// was missing is a ceiling at all — a machine that sleeps, a peer that floods, a session left
+        /// paused — where the only bound was available memory, and the work waiting on the other side
+        /// was guaranteed stale.
+        ///
+        /// Dropping the oldest is the right end to drop from precisely because it is stale: every
+        /// datagram already carries a window of recent frames, so a newer one usually contains what an
+        /// older one was carrying, and gap retransmission exists for what it does not. Dropping the
+        /// newest would discard the only copy of the newest frames and then ask for them back.
+        /// </summary>
+        private void EnqueueInput(byte[] payload)
+        {
+            _inbound.Enqueue(payload);
+            int depth = Interlocked.Increment(ref _inboundDepth);
+            if (depth > _inboundPeak) _inboundPeak = depth;   // stat only; a torn read costs nothing
+
+            while (depth > MaxInboundBacklog && _inbound.TryDequeue(out _))
+            {
+                depth = Interlocked.Decrement(ref _inboundDepth);
+                Interlocked.Increment(ref _inboundDropped);
             }
         }
 

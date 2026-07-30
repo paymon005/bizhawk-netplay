@@ -154,6 +154,16 @@ namespace BizHawkNetplay.Core.Sync
         public int CostCap => _costCap;
         /// <summary>Conservative rolling estimate of what one re-simulated frame costs, in ms.</summary>
         public double RepairPerFrameMs => _repairPerFrameMs;
+        /// <summary>
+        /// True once the measured repair cost has been high enough that the cost cap had to be held up
+        /// by its floor — that is, this machine cannot repair even the minimum depth inside its frame
+        /// budget, and rollback is running on a promise it has measured itself unable to keep. The
+        /// session should raise input delay or switch to lockstep rather than carry on.
+        /// </summary>
+        public bool BudgetExceededByFloor { get; private set; }
+        /// <summary>The per-frame repair cost when <see cref="BudgetExceededByFloor"/> first latched,
+        /// so the advice can name the measurement rather than assert the conclusion.</summary>
+        public double FloorRepairPerFrameMs { get; private set; }
         /// <summary>Checksums answered from the anchor rather than by visiting the state again.</summary>
         public int ChecksumsFromAnchor { get; private set; }
         /// <summary>Checksums that had to save, load, hash and load back — the pre-anchor cost.</summary>
@@ -603,7 +613,21 @@ namespace BizHawkNetplay.Core.Sync
             // d + N-1 frames. Charging the walk-back here is what stops the cheaper per-frame cost from
             // being read as more depth than the budget can actually pay for.
             int cap = (int)Math.Floor(_repairBudgetMs / _repairPerFrameMs) - (_keyframeInterval - 1);
-            if (cap < MinCostCap) cap = MinCostCap;
+            // Below the floor, rollback is hiding no latency and is paying for the privilege. The floor
+            // is still applied — collapsing to zero would be lockstep with extra steps — but the fact
+            // that it had to be applied is now recorded rather than silently absorbed. Forcing two
+            // frames of repair after measuring that one does not fit means committing, every time, to
+            // work this machine has already demonstrated it cannot finish inside the frame. The honest
+            // answer is a higher input delay or lockstep, and only the session above can choose that.
+            if (cap < MinCostCap)
+            {
+                cap = MinCostCap;
+                if (!BudgetExceededByFloor)
+                {
+                    BudgetExceededByFloor = true;
+                    FloorRepairPerFrameMs = _repairPerFrameMs;
+                }
+            }
             if (cap > _maxRollback) cap = _maxRollback;
             _costCap = cap;
         }

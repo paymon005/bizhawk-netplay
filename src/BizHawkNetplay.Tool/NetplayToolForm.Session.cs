@@ -247,6 +247,7 @@ namespace BizHawkNetplay.Tool
             _pacing.Reset(); _lastPacing = default;
             _lastPacingLogMs = double.NegativeInfinity;
             _stallHint.Reset();
+            _rollbackCostHint.Reset();
             _audioDevWasUp = true;   // a fresh session starts assuming sound is up; the edge reports otherwise
             _presentHint.Reset();
             _hashDiagLogged = false;
