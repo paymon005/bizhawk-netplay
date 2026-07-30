@@ -110,6 +110,8 @@ namespace BizHawkNetplay.Tool
         private ComboBox _netcodeCombo = null!;
         private ComboBox _inputSourceCombo = null!;
         private Label _netcodeLabel = null!;
+        private Button _applyLiveButton = null!;
+        private int _delayBoxSyncedTo = -1;   // last session delay pushed into _delayBox; see RefreshLiveSettingsUi
         private RichTextBox _connLog = null!;
         private CheckBox _simUnresponsiveCheck = null!;
         private CheckBox _upnpCheck = null!;
@@ -166,6 +168,10 @@ namespace BizHawkNetplay.Tool
             public volatile bool ResyncReceiving; // large inbound state frame is allowed to exceed ping timeout
             public int ReceivingResyncEpoch;      // expected generation while ResyncReceiving is true
             public int ReceivingResyncBytes;      // declared state size, checked against the completed frame
+            // Parameters the announced state must be rebuilt under, taken from its ResyncBegin.
+            public int ReceivingResyncDelay;
+            public SyncMode ReceivingResyncMode;
+            public bool ReceivingResyncIsSettingsChange;
             public long ResyncReceiveDeadlineTicks; // bounds BEGIN-without-a-complete-state stalls
             public long TimeoutGraceUntilTicks;   // we sent this peer a whole state: its reader is busy consuming
                                                   // that frame and can't pong until it lands (Interlocked)
@@ -749,8 +755,9 @@ namespace BizHawkNetplay.Tool
                 "Fixed input delay, or the minimum when Auto is enabled.\r\n" +
                 "Each frame reduces typical rollback correction but adds one frame of local response time.");
             _tips.SetToolTip(_autoDelayCheck,
-                "Host only: measure every player's lobby ping and choose delay before play starts.\r\n" +
-                "The chosen delay stays fixed for the entire session.");
+                "Host only: measure every direct UDP path and choose delay before play starts.\r\n" +
+                "It picks once, at the start. To change delay later, edit the box and press\r\n" +
+                "Apply changes — the host can do that without ending the session.");
             _tips.SetToolTip(_autoDelayMaxBox,
                 "Largest delay Auto may choose. Explicit player delay requests are still honored.");
 
@@ -772,6 +779,15 @@ namespace BizHawkNetplay.Tool
             _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
             _pubAddrButton = new Button { Text = "My public address", Location = new Point(292, 172), Width = 150 };
             _pubAddrButton.Click += (_, __) => ShowPublicAddress();
+            _applyLiveButton = new Button
+            {
+                Text = "Apply changes", Location = new Point(452, 172), Width = 104, Enabled = false,
+            };
+            _applyLiveButton.Click += (_, __) => ApplyLiveSettingsAsHost();
+            _tips.SetToolTip(_applyLiveButton,
+                "Host, during a session: push the Netcode and Input delay above to everyone.\r\n" +
+                "Nobody disconnects — the session pauses briefly while one savestate is shared,\r\n" +
+                "the same way a desync recovery does. Costs more on a heavy core with a big state.");
 
             // Connection log: the did-I-get-in answer, on the tab you're already looking at. The Log tab
             // carries the full diagnostic firehose, which is the wrong place to learn that your password
@@ -798,7 +814,7 @@ namespace BizHawkNetplay.Tool
                 passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox, _autoDelayCheck,
                 autoDelayMaxLabel, _autoDelayMaxBox,
                 netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
-                _goButton, _disconnectButton, _pubAddrButton,
+                _goButton, _disconnectButton, _pubAddrButton, _applyLiveButton,
                 connLogLabel, _connLog, _netcodeLabel, BuildPunchGroup(),
             });
             return page;
@@ -1616,8 +1632,12 @@ namespace BizHawkNetplay.Tool
             {
                 foreach (var link in links)
                 {
-                    var g = link.Greeting!;
-                    if (!g.Prefs.WantRollback || g.Id.MaxRollbackDepth < ProbeResult.RollbackDepthThreshold)
+                    // No greeting means this peer's capability was never established — which is not the
+                    // same as it being capable. Rollback needs every peer to be able to replay; assuming
+                    // it of a peer we cannot ask would desync exactly the ones we know least about.
+                    var g = link.Greeting;
+                    if (g == null || !g.Prefs.WantRollback
+                        || g.Id.MaxRollbackDepth < ProbeResult.RollbackDepthThreshold)
                     {
                         UiLog("rollback was forced locally, but a joiner reported rollback unavailable; using lockstep");
                         return SyncMode.Lockstep;
@@ -1631,8 +1651,8 @@ namespace BizHawkNetplay.Tool
             if (links.Count == 0) return SyncMode.Lockstep;
             foreach (var link in links)
             {
-                var g = link.Greeting!;
-                if (SessionNegotiator.Negotiate(id, g.Id, prefs, g.Prefs).Mode != SyncMode.Rollback)
+                var g = link.Greeting;
+                if (g == null || SessionNegotiator.Negotiate(id, g.Id, prefs, g.Prefs).Mode != SyncMode.Rollback)
                     return SyncMode.Lockstep;
             }
             return SyncMode.Rollback;
@@ -2168,42 +2188,94 @@ namespace BizHawkNetplay.Tool
         private bool DriverPreparedFor(SessionGeneration generation, SyncMode mode) =>
             _sessionDriverPrepared && _driver != null && _driver.Generation == generation && _mode == mode;
 
+        /// <summary>
+        /// Size this peer's savestate ring and say what that costs. Called wherever rollback becomes the
+        /// running mode — at session start, and again when the host switches netcode mid-session, which
+        /// needs exactly the same measurement and deserves exactly the same warnings.
+        /// </summary>
+        private void ConfigureRollbackDepth()
+        {
+            // Ring depth = this peer's probe depth, clamped so resim cost + memory stay bounded.
+            // Each peer bounds its own ring independently; correctness never needs them equal.
+            // Floored at MinRollbackRing, NOT at the qualifying threshold. Flooring at the threshold
+            // meant a core the probe measured at 2 silently ran a ring of 3 — booking repair work
+            // the machine had just been told it could not afford, and then reporting the inflated
+            // number back to the user as if it had been measured.
+            int measured = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
+            _rollbackDepth = Math.Max(MinRollbackRing, Math.Min(measured, RollbackDepthCap));
+            if (_probeDepth >= 0 && _probeDepth < ProbeResult.RollbackDepthThreshold)
+                ConnLog($"rollback is overriding this machine's own measurement: the probe found a " +
+                    $"usable depth of {_probeDepth}, below the {ProbeResult.RollbackDepthThreshold} it " +
+                    "considers worthwhile, so every correction will cost more than a frame and the " +
+                    "picture will stutter whenever the link makes it predict. Netcode is on forced " +
+                    "Rollback — switch it to Automatic to let the probe decide, or Lockstep to stop " +
+                    "predicting entirely.", Color.Firebrick);
+            else if (_rollbackDepth <= ShallowRollbackDepth)
+                ConnLog($"rollback on a heavy core: this machine measured a usable depth of " +
+                    $"{_rollbackDepth} frames, so it can hide about {_rollbackDepth} frames of one-way " +
+                    "latency and no more — good for a nearby opponent, not a distant one. Corrections " +
+                    "cost a brief hitch here rather than the stall lockstep would have taken. Switch " +
+                    "Netcode to Lockstep if you prefer the steadier frame time.",
+                    Color.DarkSlateBlue);
+            if (_playerCount > 2)
+                ConnLog($"rollback with {_playerCount} players: every peer predicts the other " +
+                    $"{_playerCount - 1} ports, so a correction from any of them rolls everyone back — " +
+                    "expect rollbacks to fire more often than in a 2-player session (they are no deeper: " +
+                    "input goes peer-to-peer in one hop). Switch Netcode to Lockstep if it feels choppy.",
+                    Color.DarkSlateBlue);
+        }
+
+        private void UpdateNetcodeLabel()
+        {
+            bool rollback = _mode == SyncMode.Rollback;
+            _netcodeLabel.Text = _sessionActive
+                ? $"Netcode in use: {(rollback ? "Rollback" : "Lockstep")}, delay {_sessionDelay}"
+                : "Netcode in use: " + (rollback ? "Rollback" : "Lockstep");
+            _netcodeLabel.ForeColor = rollback ? Color.DarkGreen : Color.DarkSlateBlue;
+        }
+
+        /// <summary>
+        /// Netcode and input delay stay editable for the HOST while a session runs; "Apply changes" is
+        /// what actually pushes them, so spinning the delay box does not ship a savestate per click. A
+        /// joiner's copies stay read-only for the same reason they are in the lobby: these are the
+        /// host's to settle, and a control that looks live but is ignored is worse than a greyed one.
+        /// </summary>
+        private void RefreshLiveSettingsUi()
+        {
+            bool liveHost = _sessionActive && _isHost;
+            if (liveHost)
+            {
+                _netcodeCombo.Enabled = true;
+                _delayBox.Enabled = true;
+                // Show the delay the session is ACTUALLY on, not the floor that was asked for. With
+                // auto-delay the two differ — the lobby may have measured its way from 1 up to 4 — and
+                // a box reading 1 next to an Apply button would quietly halve the delay of a session
+                // the host only meant to switch the netcode of.
+                //
+                // Only when the session's delay CHANGED, though. This runs after a desync resync too,
+                // and overwriting the box there would throw away a number the host was halfway through
+                // typing. Behind the settings guard either way, so it never persists over the saved
+                // preference.
+                if (_delayBoxSyncedTo != _sessionDelay)
+                {
+                    _delayBoxSyncedTo = _sessionDelay;
+                    _loadingSettings = true;
+                    try { _delayBox.Value = Clamp(_sessionDelay, (int)_delayBox.Minimum, (int)_delayBox.Maximum); }
+                    finally { _loadingSettings = false; }
+                }
+            }
+            else _delayBoxSyncedTo = -1;
+            // Refused while another rebuild is in flight: two authoritative baselines racing each other
+            // is the one way this could desync a session it exists to keep running.
+            _applyLiveButton.Enabled = liveHost && !_resyncInProgress && !_awaitingReconnect;
+        }
+
         /// <summary>Construct and seed the exact generation-bound driver before READY. It may publish
         /// neutral input, but no frame clock or control reader is activated until GO.</summary>
         private void PrepareSessionDriver(SyncMode mode)
         {
             _mode = mode;
-            if (mode == SyncMode.Rollback)
-            {
-                // Ring depth = this peer's probe depth, clamped so resim cost + memory stay bounded.
-                // Each peer bounds its own ring independently; correctness never needs them equal.
-                // Floored at MinRollbackRing, NOT at the qualifying threshold. Flooring at the threshold
-                // meant a core the probe measured at 2 silently ran a ring of 3 — booking repair work
-                // the machine had just been told it could not afford, and then reporting the inflated
-                // number back to the user as if it had been measured.
-                int measured = _probeDepth > 0 ? _probeDepth : ProbeResult.RollbackDepthThreshold;
-                _rollbackDepth = Math.Max(MinRollbackRing, Math.Min(measured, RollbackDepthCap));
-                if (_probeDepth >= 0 && _probeDepth < ProbeResult.RollbackDepthThreshold)
-                    ConnLog($"rollback is overriding this machine's own measurement: the probe found a " +
-                        $"usable depth of {_probeDepth}, below the {ProbeResult.RollbackDepthThreshold} it " +
-                        "considers worthwhile, so every correction will cost more than a frame and the " +
-                        "picture will stutter whenever the link makes it predict. Netcode is on forced " +
-                        "Rollback — switch it to Automatic to let the probe decide, or Lockstep to stop " +
-                        "predicting entirely.", Color.Firebrick);
-                else if (_rollbackDepth <= ShallowRollbackDepth)
-                    ConnLog($"rollback on a heavy core: this machine measured a usable depth of " +
-                        $"{_rollbackDepth} frames, so it can hide about {_rollbackDepth} frames of one-way " +
-                        "latency and no more — good for a nearby opponent, not a distant one. Corrections " +
-                        "cost a brief hitch here rather than the stall lockstep would have taken. Switch " +
-                        "Netcode to Lockstep if you prefer the steadier frame time.",
-                        Color.DarkSlateBlue);
-                if (_playerCount > 2)
-                    ConnLog($"rollback with {_playerCount} players: every peer predicts the other " +
-                        $"{_playerCount - 1} ports, so a correction from any of them rolls everyone back — " +
-                        "expect rollbacks to fire more often than in a 2-player session (they are no deeper: " +
-                        "input goes peer-to-peer in one hop). Switch Netcode to Lockstep if it feels choppy.",
-                        Color.DarkSlateBlue);
-            }
+            if (mode == SyncMode.Rollback) ConfigureRollbackDepth();
             try { _driver?.Dispose(); } catch { }
             _driver = CreateDriver();
             _startEmuFrame = APIs.Emulation.FrameCount();
@@ -2315,10 +2387,10 @@ namespace BizHawkNetplay.Tool
             // remarks for why WM_TIMER cannot do this job however short its interval is set.
             _lastFineTickMs = double.NegativeInfinity;
 
-            Status($"in session — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
+            Status($"in session — {DescribeMode(mode)}, " +
                    $"you are P{_localPort + 1}/{_playerCount}, delay {_sessionDelay}", Color.Green);
-            _netcodeLabel.Text = "Netcode in use: " + (mode == SyncMode.Rollback ? "Rollback" : "Lockstep");
-            _netcodeLabel.ForeColor = mode == SyncMode.Rollback ? Color.DarkGreen : Color.DarkSlateBlue;
+            UpdateNetcodeLabel();
+            RefreshLiveSettingsUi();
             RefreshPlayersList();
             ConnLog($"session started vs {remoteLabel} — {(mode == SyncMode.Rollback ? "rollback" : "lockstep")}, " +
                     $"delay {_sessionDelay}", Color.DarkGreen);
@@ -3674,11 +3746,14 @@ namespace BizHawkNetplay.Tool
                     else if (type == ControlMessageType.ResyncBegin)
                     {
                         if (!_isHost && ControlMessageCodec.TryDecodeResyncBegin(body, out var generation, out int stateBytes,
-                            out int waitSeconds)
+                            out int waitSeconds, out int resyncDelay, out var resyncMode, out bool settingsChange)
                             && generation == CurrentGeneration.Next())
                         {
                             link.ReceivingResyncEpoch = generation.Epoch;
                             link.ReceivingResyncBytes = stateBytes;
+                            link.ReceivingResyncDelay = resyncDelay;
+                            link.ReceivingResyncMode = resyncMode;
+                            link.ReceivingResyncIsSettingsChange = settingsChange;
                             Interlocked.Exchange(ref link.ResyncReceiveDeadlineTicks,
                                 StateReceiveDeadlineTicks(stateBytes, waitSeconds));
                             link.ResyncReceiving = true; // publish only after the deadline fields are complete
@@ -3697,6 +3772,9 @@ namespace BizHawkNetplay.Tool
                         {
                             int expectedEpoch = link.ReceivingResyncEpoch;
                             int expectedBytes = link.ReceivingResyncBytes;
+                            int announcedDelay = link.ReceivingResyncDelay;
+                            var announcedMode = link.ReceivingResyncMode;
+                            bool announcedSettingsChange = link.ReceivingResyncIsSettingsChange;
                             link.ResyncReceiving = false;
                             link.ReceivingResyncEpoch = 0;
                             link.ReceivingResyncBytes = 0;
@@ -3704,7 +3782,8 @@ namespace BizHawkNetplay.Tool
                             if (ControlMessageCodec.TryDecodeStatePayload(body, out var generation, out var state)
                                 && generation.Epoch == expectedEpoch && generation == CurrentGeneration.Next()
                                 && state.Length == expectedBytes)
-                                BeginInvokePeer(link, () => ApplyResyncAsJoiner(generation, state));
+                                BeginInvokePeer(link, () => ApplyResyncAsJoiner(generation, state,
+                                    announcedDelay, announcedMode, announcedSettingsChange));
                             else
                                 BeginInvokePeer(link, () => EndSession("host sent an invalid or incomplete resync state"));
                         }
@@ -3818,13 +3897,27 @@ namespace BizHawkNetplay.Tool
                 MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds, _resyncCount + 1, MaxResyncs);
             if (gate == ResyncGate.AlreadyInProgress || gate == ResyncGate.Debounced) return;
             _resyncCount++;
-            int attempt = CurrentConnectionAttempt;
-
             if (gate == ResyncGate.GiveUp)
             {
                 EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
                 return;
             }
+            ShipAuthoritativeState($"resync #{_resyncCount}", isSettingsChange: false);
+        }
+
+        /// <summary>
+        /// Rebuild the whole session on a fresh generation from this host's current state and current
+        /// <see cref="_sessionDelay"/>/<see cref="_mode"/>: capture on the emulator thread, enqueue the
+        /// transfer to each peer's writer, and rebuild locally from the same baseline. Simulation stays
+        /// paused while the writers handle socket/flow-control waits, but WinForms remains responsive.
+        ///
+        /// Shared by desync recovery and by a deliberate settings change, because they are the same
+        /// operation: both need every peer to land on one state, at one generation, under one set of
+        /// parameters. The only difference is what gets said and what gets counted.
+        /// </summary>
+        private void ShipAuthoritativeState(string label, bool isSettingsChange)
+        {
+            int attempt = CurrentConnectionAttempt;
             try
             {
                 var state = _adapter!.ExportState();
@@ -3832,18 +3925,21 @@ namespace BizHawkNetplay.Tool
                 _resyncInProgress = true;
                 _resyncReleaseQueued = false;
                 RebuildDriver();
+                RefreshLiveSettingsUi();
                 int peerCount = _peers.Count;
-                var generationBody = ControlMessageCodec.EncodeResyncBegin(generation, state.Length);
+                var generationBody = ControlMessageCodec.EncodeResyncBegin(generation, state.Length,
+                    _sessionDelay, _mode, waitSeconds: 0, isSettingsChange: isSettingsChange);
                 var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
-                Status($"resync #{_resyncCount}: sending epoch {generation.Epoch} " +
+                Status($"{label}: sending epoch {generation.Epoch} " +
                     $"({state.Length / 1024}KiB) to {peerCount} peer(s)…", Color.DarkOrange);
-                Log($"resync #{_resyncCount}: captured {state.Length / 1024}KiB for epoch " +
+                Log($"{label}: captured {state.Length / 1024}KiB for epoch " +
                     $"{generation.Epoch}; waiting for every peer to import it");
 
                 if (peerCount == 0)
                 {
                     _resyncInProgress = false;
                     RebaseFrameSchedule();
+                    RefreshLiveSettingsUi();
                     return;
                 }
                 foreach (var link in _peers)
@@ -3870,13 +3966,79 @@ namespace BizHawkNetplay.Tool
             catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
         }
 
+        /// <summary>
+        /// Host: change the netcode and/or input delay of a running session. The session does not end
+        /// and nobody reconnects — everyone is rebuilt onto one state at a new generation under the new
+        /// parameters, which is exactly what a desync resync already does. Costs a brief pause and one
+        /// savestate transfer.
+        /// </summary>
+        private void ApplyLiveSettingsAsHost()
+        {
+            if (!_sessionActive || !_isHost) return;
+            if (_resyncInProgress || _awaitingReconnect)
+            {
+                ConnLog("the session is already rebuilding — try the settings change again once it settles.",
+                    Color.DarkOrange);
+                return;
+            }
+            if (_adapter == null) return;
+
+            _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
+            int requestedDelay = Clamp((int)_delayBox.Value, 1, HandshakeCodec.MaxInputDelay);
+            // The same decision the lobby makes, on the same evidence: this host's taste, this core's
+            // measured replay behaviour, and every peer's advertised capability. A peer that cannot roll
+            // back is not outvoted mid-session any more than it would be at the start.
+            var prefs = LocalPreferences(isHost: true);
+            // A session started on Lockstep never paid for the rollback probe, so asking for rollback
+            // now is the moment it gets measured. It save-states around itself, but it does step the
+            // core for a second or so — say that rather than letting the tool look hung.
+            if (prefs.WantRollback && _probeDepth < 0)
+            {
+                Status("measuring this machine's rollback depth…", Color.DarkOrange);
+                ConnLog("this session started on lockstep, so this machine has not measured its rollback " +
+                        "depth yet — doing that now. It costs about a second and the picture may jump.",
+                    Color.DarkSlateBlue);
+            }
+            var identity = BuildIdentity(_adapter, prefs.WantRollback);
+            var requestedMode = ChooseSyncMode(_peers, identity, prefs);
+
+            if (requestedDelay == _sessionDelay && requestedMode == _mode)
+            {
+                ConnLog($"nothing to change — the session is already running {DescribeMode(_mode)} at " +
+                        $"input delay {_sessionDelay}.", Color.DimGray);
+                return;
+            }
+
+            string what = requestedMode != _mode && requestedDelay != _sessionDelay
+                ? $"netcode {DescribeMode(_mode)} → {DescribeMode(requestedMode)} and input delay " +
+                  $"{_sessionDelay} → {requestedDelay}"
+                : requestedMode != _mode
+                    ? $"netcode {DescribeMode(_mode)} → {DescribeMode(requestedMode)}"
+                    : $"input delay {_sessionDelay} → {requestedDelay}";
+            ConnLog($"changing {what} — everyone stays connected through a brief pause while the new " +
+                    "baseline is shared.", Color.DarkSlateBlue);
+
+            _sessionDelay = requestedDelay;
+            _mode = requestedMode;
+            if (_mode == SyncMode.Rollback) ConfigureRollbackDepth();
+            ShipAuthoritativeState("settings change", isSettingsChange: true);
+            UpdateNetcodeLabel();
+        }
+
+        private static string DescribeMode(SyncMode mode) => mode == SyncMode.Rollback ? "rollback" : "lockstep";
+
         /// <summary>Joiner: adopt the host's authoritative state and acknowledge only after the
-        /// emulator import and generation-bound driver rebuild have both completed.</summary>
-        private void ApplyResyncAsJoiner(SessionGeneration generation, byte[] state)
+        /// emulator import and generation-bound driver rebuild have both completed. The parameters
+        /// come from the host's ResyncBegin, so a rebuild always lands on the delay and mode the host
+        /// just stated rather than whatever this peer happened to be running.</summary>
+        private void ApplyResyncAsJoiner(SessionGeneration generation, byte[] state,
+            int inputDelay, SyncMode mode, bool isSettingsChange)
         {
             if (!_sessionActive || _isHost || generation != CurrentGeneration.Next()) return;
             int attempt = CurrentConnectionAttempt;
-            if (++_resyncCount > MaxResyncs)
+            // A deliberate change is not evidence of a determinism bug, so it must not spend the budget
+            // that exists to catch one — otherwise six delay tweaks would end the session.
+            if (!isSettingsChange && ++_resyncCount > MaxResyncs)
             {
                 EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
                 return;
@@ -3884,11 +4046,18 @@ namespace BizHawkNetplay.Tool
             try
             {
                 _resyncInProgress = true;
+                if (isSettingsChange && (inputDelay != _sessionDelay || mode != _mode))
+                    ConnLog($"the host changed the session to {DescribeMode(mode)} at input delay " +
+                            $"{inputDelay} — staying connected through the rebuild.", Color.DarkSlateBlue);
                 Status($"applying {state.Length / 1024}KiB host resync epoch {generation.Epoch}…",
                     Color.DarkOrange);
                 _adapter!.ImportState(state);
                 SetGeneration(generation);
+                _sessionDelay = inputDelay;
+                _mode = mode;
+                if (_mode == SyncMode.Rollback) ConfigureRollbackDepth();
                 RebuildDriver();
+                UpdateNetcodeLabel();
                 if (_peers.Count == 0 || !QueueControl(_peers[0], ControlMessageType.ResyncApplied,
                     HandshakeCodec.EncodeGeneration(generation), ok =>
                     {
@@ -3941,7 +4110,10 @@ namespace BizHawkNetplay.Tool
                 _driver?.ResetRemoteInputLiveness();
                 _resyncInProgress = false;
                 RebaseFrameSchedule();
-                Log($"resync #{_resyncCount}: every peer applied epoch {generation.Epoch}; resuming");
+                RefreshLiveSettingsUi();
+                Status($"in session — {DescribeMode(_mode)}, you are P{_localPort + 1}/{_playerCount}, " +
+                       $"delay {_sessionDelay}", Color.Green);
+                Log($"every peer applied epoch {generation.Epoch}; resuming");
             }));
         }
 
@@ -3951,7 +4123,10 @@ namespace BizHawkNetplay.Tool
             _driver?.ResetRemoteInputLiveness();
             _resyncInProgress = false;
             RebaseFrameSchedule();
-            Log($"resync #{_resyncCount}: every peer applied epoch {generation.Epoch}; resuming");
+            RefreshLiveSettingsUi();
+            Status($"in session — {DescribeMode(_mode)}, you are P{_localPort + 1}/{_playerCount}, " +
+                   $"delay {_sessionDelay}", Color.Green);
+            Log($"every peer applied epoch {generation.Epoch}; resuming");
         }
 
         private void QueueResyncResumeToPeers(SessionGeneration generation, Action<bool> completed)
@@ -4302,6 +4477,7 @@ namespace BizHawkNetplay.Tool
             _awaitingReconnect = true;
             _reconnectPort = link.RemotePort;
             _reconnectStartedStamp = MonotonicNow();
+            RefreshLiveSettingsUi(); // no settings change while a seat is empty and waiting
 
             _peers.Remove(link);
             // The link leaves _peers here, so TeardownNetwork's reaping will never see it again —
@@ -4323,7 +4499,10 @@ namespace BizHawkNetplay.Tool
                 RebuildDriver();
                 RedistributeMesh(); // remove the dead endpoint from host and survivor route tables
 
-                var begin = ControlMessageCodec.EncodeResyncBegin(generation, state.Length, (int)ReconnectTimeoutSeconds);
+                // The session's parameters are unchanged by someone dropping — but they ride along all
+                // the same, so a survivor always rebuilds under what the host has just stated.
+                var begin = ControlMessageCodec.EncodeResyncBegin(generation, state.Length,
+                    _sessionDelay, _mode, waitSeconds: (int)ReconnectTimeoutSeconds);
                 foreach (var survivor in _peers)
                 {
                     if (!QueueControl(survivor, ControlMessageType.ResyncBegin, begin))
@@ -4446,7 +4625,7 @@ namespace BizHawkNetplay.Tool
                         BeginInvokeUi(() =>
                         {
                             if (IsConnectionAttemptCurrent(attempt))
-                                CompleteReconnect(tcp, channel, remoteIp, udpEp, freedPort, attempt);
+                                CompleteReconnect(tcp, channel, remoteIp, udpEp, freedPort, greet, attempt);
                             else { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } }
                         });
                         return; // one rejoin fills the slot
@@ -4476,7 +4655,7 @@ namespace BizHawkNetplay.Tool
         /// welcome/state transfer to a background thread. Simulation is already held for reconnect.
         /// </summary>
         private void CompleteReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp,
-            IPEndPoint udpEp, int freedPort, int attempt)
+            IPEndPoint udpEp, int freedPort, Handshake.JoinerGreeting greet, int attempt)
         {
             if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
             { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
@@ -4507,7 +4686,7 @@ namespace BizHawkNetplay.Tool
                         {
                             if (IsConnectionAttemptCurrent(attempt))
                                 FinishReconnect(tcp, channel, remoteIp, udpEp, freedPort, state,
-                                    generation, attempt);
+                                    generation, greet, attempt);
                             else { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } }
                         });
                     }
@@ -4527,7 +4706,8 @@ namespace BizHawkNetplay.Tool
         }
 
         private void FinishReconnect(TcpClient tcp, ControlChannel channel, IPAddress remoteIp,
-            IPEndPoint udpEp, int freedPort, byte[] state, SessionGeneration generation, int attempt)
+            IPEndPoint udpEp, int freedPort, byte[] state, SessionGeneration generation,
+            Handshake.JoinerGreeting greet, int attempt)
         {
             if (!IsConnectionAttemptCurrent(attempt) || !_sessionActive || !_awaitingReconnect)
             { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
@@ -4537,7 +4717,7 @@ namespace BizHawkNetplay.Tool
             {
                 var link = new PeerLink
                 {
-                    Tcp = tcp, Control = channel, RemotePort = freedPort,
+                    Tcp = tcp, Control = channel, RemotePort = freedPort, Greeting = greet,
                     UdpEndpoint = udpEp, Label = $"P{freedPort + 1} ({remoteIp})",
                 };
                 // Bring each survivor up to date: refresh its mesh with the rejoiner's endpoint, then
@@ -4624,6 +4804,7 @@ namespace BizHawkNetplay.Tool
                             _reconnectPort = -1;
                             _resyncCount = 0;
                             RebaseFrameSchedule();
+                            RefreshLiveSettingsUi();
                             ConnLog($"{link.Label} reconnected — epoch {generation.Epoch}, " +
                                 $"{stateLength / 1024}KiB baseline synchronized; resuming", Color.DarkGreen);
                             Status($"reconnected P{link.RemotePort + 1} — resuming", Color.Green);
@@ -5130,6 +5311,7 @@ namespace BizHawkNetplay.Tool
             _punchButton.Enabled = !busy;
             _disconnectButton.Enabled = busy;
             // _testInputButton stays enabled (useful to check bindings before and during a session)
+            RefreshLiveSettingsUi(); // re-opens netcode/delay for a host whose session is already running
         }
 
         private void Status(string text, Color color)

@@ -12,7 +12,7 @@ namespace BizHawkNetplay.Core.Session
     /// Layouts (offsets in bytes; generation = sessionId(8) + epoch(4)):
     ///   Pacing      (28): generation, sequence, acknowledges, frame, localAdvantage
     ///   Checksum    (20): generation, frame, hash(uint32)
-    ///   ResyncBegin (20): generation, stateBytes, waitSeconds
+    ///   ResyncBegin (32): generation, stateBytes, waitSeconds, inputDelay, mode, isSettingsChange
     ///   StatePayload(12+n): generation, raw state bytes
     /// Decoders are tolerant (return false) — the control channel frames reliably, but a peer on a
     /// different build may still send shapes we don't understand.
@@ -27,7 +27,7 @@ namespace BizHawkNetplay.Core.Session
 
         public const int PacingSize = 28;
         public const int ChecksumSize = 20;
-        public const int ResyncBeginSize = 20;
+        public const int ResyncBeginSize = 32;
         public const int GenerationSize = 12;
         public const int MeshRttSize = 28;
         public const int InputDelaySize = 16;
@@ -94,31 +94,63 @@ namespace BizHawkNetplay.Core.Session
 
         // ---- resync -----------------------------------------------------------------
 
-        public static byte[] EncodeResyncBegin(SessionGeneration generation, int stateBytes, int waitSeconds = 0)
+        /// <summary>
+        /// Announce an incoming authoritative state, and the parameters the receiver must rebuild its
+        /// driver with once it lands.
+        ///
+        /// The delay and mode ride along on EVERY resync, not just the ones that change them. A resync
+        /// already tears the timeline down and stands it back up at a new generation, which is exactly
+        /// what changing the input delay or the netcode needs — so carrying the settled parameters here
+        /// makes a deliberate mid-session change and a desync recovery the same operation, rather than a
+        /// second, less-tested path that does the same thing. It also means no peer can come out of a
+        /// resync running parameters the host did not just state.
+        ///
+        /// <paramref name="isSettingsChange"/> is only ever about what to say and what to count: a
+        /// deliberate change is not evidence of a determinism bug and must not spend the resync budget
+        /// that exists to catch one.
+        /// </summary>
+        public static byte[] EncodeResyncBegin(SessionGeneration generation, int stateBytes,
+            int inputDelay, SyncMode mode, int waitSeconds = 0, bool isSettingsChange = false)
         {
             if (stateBytes < 0 || stateBytes > MaxStateBytes)
                 throw new ArgumentOutOfRangeException(nameof(stateBytes));
             if (waitSeconds < 0 || waitSeconds > MaxResyncWaitSeconds)
                 throw new ArgumentOutOfRangeException(nameof(waitSeconds));
+            if (inputDelay < 1 || inputDelay > HandshakeCodec.MaxInputDelay)
+                throw new ArgumentOutOfRangeException(nameof(inputDelay));
             var body = new byte[ResyncBeginSize];
             WriteGeneration(body, 0, generation);
             WriteInt32(body, 12, stateBytes);
             WriteInt32(body, 16, waitSeconds);
+            WriteInt32(body, 20, inputDelay);
+            WriteInt32(body, 24, mode == SyncMode.Rollback ? 1 : 0);
+            WriteInt32(body, 28, isSettingsChange ? 1 : 0);
             return body;
         }
 
         public static bool TryDecodeResyncBegin(byte[] body, out SessionGeneration generation,
-            out int stateBytes, out int waitSeconds)
+            out int stateBytes, out int waitSeconds, out int inputDelay, out SyncMode mode,
+            out bool isSettingsChange)
         {
             generation = default;
             stateBytes = 0;
             waitSeconds = 0;
+            inputDelay = 0;
+            mode = SyncMode.Lockstep;
+            isSettingsChange = false;
             if (body == null || body.Length != ResyncBeginSize || !TryReadGeneration(body, 0, out generation))
                 return false;
             stateBytes = ReadInt32(body, 12);
             waitSeconds = ReadInt32(body, 16);
+            inputDelay = ReadInt32(body, 20);
+            int modeCode = ReadInt32(body, 24);
+            int settingsCode = ReadInt32(body, 28);
+            if (modeCode < 0 || modeCode > 1 || settingsCode < 0 || settingsCode > 1) return false;
+            mode = modeCode == 1 ? SyncMode.Rollback : SyncMode.Lockstep;
+            isSettingsChange = settingsCode == 1;
             return stateBytes >= 0 && stateBytes <= MaxStateBytes
-                && waitSeconds >= 0 && waitSeconds <= MaxResyncWaitSeconds;
+                && waitSeconds >= 0 && waitSeconds <= MaxResyncWaitSeconds
+                && inputDelay >= 1 && inputDelay <= HandshakeCodec.MaxInputDelay;
         }
 
         public static byte[] EncodeStatePayload(SessionGeneration generation, byte[] state)

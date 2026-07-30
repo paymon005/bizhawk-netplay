@@ -51,24 +51,53 @@ namespace BizHawkNetplay.Core.Tests
         [Fact]
         public void ResyncBegin_RoundTrips_AndBoundsItsFields()
         {
-            var body = ControlMessageCodec.EncodeResyncBegin(Gen, 4096, 60);
+            var body = ControlMessageCodec.EncodeResyncBegin(Gen, 4096, inputDelay: 3,
+                SyncMode.Rollback, waitSeconds: 60, isSettingsChange: true);
             Assert.True(ControlMessageCodec.TryDecodeResyncBegin(body, out var generation,
-                out int stateBytes, out int waitSeconds));
+                out int stateBytes, out int waitSeconds, out int inputDelay, out var mode,
+                out bool isSettingsChange));
             Assert.Equal(Gen, generation);
             Assert.Equal(4096, stateBytes);
             Assert.Equal(60, waitSeconds);
+            Assert.Equal(3, inputDelay);
+            Assert.Equal(SyncMode.Rollback, mode);
+            Assert.True(isSettingsChange);
+
+            // A plain recovery says so, and says lockstep is lockstep.
+            var recovery = ControlMessageCodec.EncodeResyncBegin(Gen, 8, 1, SyncMode.Lockstep);
+            Assert.True(ControlMessageCodec.TryDecodeResyncBegin(recovery, out _, out _, out _,
+                out int recoveryDelay, out var recoveryMode, out bool recoveryIsChange));
+            Assert.Equal(1, recoveryDelay);
+            Assert.Equal(SyncMode.Lockstep, recoveryMode);
+            Assert.False(recoveryIsChange);
 
             // Encode refuses out-of-range fields outright…
-            Assert.Throws<ArgumentOutOfRangeException>(() => ControlMessageCodec.EncodeResyncBegin(Gen, -1));
             Assert.Throws<ArgumentOutOfRangeException>(() =>
-                ControlMessageCodec.EncodeResyncBegin(Gen, ControlMessageCodec.MaxStateBytes + 1));
+                ControlMessageCodec.EncodeResyncBegin(Gen, -1, 1, SyncMode.Lockstep));
             Assert.Throws<ArgumentOutOfRangeException>(() =>
-                ControlMessageCodec.EncodeResyncBegin(Gen, 0, ControlMessageCodec.MaxResyncWaitSeconds + 1));
+                ControlMessageCodec.EncodeResyncBegin(Gen, ControlMessageCodec.MaxStateBytes + 1, 1, SyncMode.Lockstep));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                ControlMessageCodec.EncodeResyncBegin(Gen, 0, 1, SyncMode.Lockstep,
+                    ControlMessageCodec.MaxResyncWaitSeconds + 1));
+            // A delay of zero would build a driver that cannot exist; it must never reach the wire.
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                ControlMessageCodec.EncodeResyncBegin(Gen, 0, 0, SyncMode.Lockstep));
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                ControlMessageCodec.EncodeResyncBegin(Gen, 0, HandshakeCodec.MaxInputDelay + 1, SyncMode.Lockstep));
 
             // …and decode treats a hostile out-of-range frame as garbage, not a huge allocation cue.
-            var bogus = ControlMessageCodec.EncodeResyncBegin(Gen, 4096, 60);
+            var bogus = ControlMessageCodec.EncodeResyncBegin(Gen, 4096, 2, SyncMode.Lockstep, 60);
             bogus[12] = 0x7F; // stateBytes ≈ int.MaxValue, far past MaxStateBytes
-            Assert.False(ControlMessageCodec.TryDecodeResyncBegin(bogus, out _, out _, out _));
+            Assert.False(ControlMessageCodec.TryDecodeResyncBegin(bogus, out _, out _, out _, out _, out _, out _));
+
+            // A peer that invents a delay or a mode code cannot make us build a driver for it: this
+            // frame decides what every peer rebuilds as, so an unrecognised value is a refusal.
+            var badDelay = ControlMessageCodec.EncodeResyncBegin(Gen, 16, 2, SyncMode.Lockstep);
+            WriteBigEndian(badDelay, 20, 0);
+            Assert.False(ControlMessageCodec.TryDecodeResyncBegin(badDelay, out _, out _, out _, out _, out _, out _));
+            var badMode = ControlMessageCodec.EncodeResyncBegin(Gen, 16, 2, SyncMode.Lockstep);
+            WriteBigEndian(badMode, 24, 2);
+            Assert.False(ControlMessageCodec.TryDecodeResyncBegin(badMode, out _, out _, out _, out _, out _, out _));
         }
 
         [Fact]

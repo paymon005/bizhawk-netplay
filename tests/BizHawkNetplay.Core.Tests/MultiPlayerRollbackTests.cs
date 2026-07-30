@@ -498,5 +498,127 @@ namespace BizHawkNetplay.Core.Tests
             Assert.True(leader - laggard <= MaxRollback + Delay,
                 $"the 3%-fast peer ran {leader - laggard} frames ahead of the 3%-slow one");
         }
+
+        /// <summary>
+        /// The sync-layer half of changing netcode or input delay without ending the session: every peer
+        /// tears its driver down and stands a new one up with a different mode AND a different delay, on
+        /// a new generation, seeded from one shared state — which is what the tool orchestrates when the
+        /// host presses Apply, and structurally what a desync resync already did.
+        ///
+        /// Two things have to hold. The new timeline must be correct from its own frame 0, verified
+        /// against the same analytic oracle the rest of this file uses. And the old timeline's datagrams
+        /// — which are still in flight at the moment of the switch, carrying frame numbers around where
+        /// the new timeline is about to be, and encoding a DIFFERENT delay — must be refused rather than
+        /// mixed in.
+        /// </summary>
+        [Fact]
+        public void SwitchingModeAndDelayMidSessionRebuildsOntoACorrectNewTimeline()
+        {
+            const int players = 3;
+            const int firstPhase = 300;
+            const int secondPhase = 500;
+            // The change a host actually makes: lockstep needs delay to cover the link, rollback hides
+            // it by predicting instead — so switching netcode is normally also a delay cut, and the new
+            // timeline has to survive being mispredicted from its very first frames.
+            const int firstDelay = 5;
+            const int secondDelay = 2;
+            const int k = 3;
+
+            var clock = new Clock();
+            var hubs = LatencyHub.Mesh(clock, players, latency: k);
+            var generation = new SessionGeneration(0xA11CE, 1);
+
+            // Phase 1: lockstep at delay 2, the way a cautious host starts.
+            var emus = new FakeEmuAdapter[players];
+            var inst = new Instance[players];
+            for (int i = 0; i < players; i++)
+            {
+                emus[i] = new FakeEmuAdapter(portCount: players) { LocalInputScript = Script(i) };
+                int port = i;
+                var driver = new FrameDriver(emus[i], hubs[i], p => new LockstepStrategy(p),
+                    localPort: port, delay: firstDelay, redundancy: Redundancy, generation: generation);
+                inst[i] = new Instance { Emu = emus[i], Driver = driver };
+                driver.Start();
+            }
+            for (int it = 0; it < firstPhase; it++)
+            {
+                clock.Tick = it;
+                for (int i = 0; i < players; i++) inst[i].Step();
+            }
+            for (int i = 0; i < players; i++)
+                Assert.True(inst[i].Driver.CurrentFrame > firstPhase / 2, $"player {i} never got going");
+
+            // The switch. Peer 0 is the host: its state is authoritative, everyone else adopts it, and
+            // every peer rebuilds for rollback at delay 5 on the next generation. Nothing is drained
+            // from the hubs — the phase-1 datagrams still in flight are exactly what must be refused.
+            var authoritative = emus[0].ExportState();
+            int baseFrame = BitConverter.ToInt32(authoritative, 0);
+            var rebuilt = generation.Next();
+            for (int i = 0; i < players; i++)
+            {
+                inst[i].Driver.Dispose();
+                if (i != 0) emus[i].ImportState(authoritative);
+                int port = i;
+                var driver = new FrameDriver(emus[i], hubs[i],
+                    p => new RollbackStrategy(p, emus[port], port, MaxRollback),
+                    localPort: port, delay: secondDelay, redundancy: Redundancy,
+                    rollbackWindow: MaxRollback, generation: rebuilt);
+                inst[i] = new Instance
+                {
+                    Emu = emus[i],
+                    Driver = driver,
+                    Rollback = (RollbackStrategy)driver.Strategy,
+                };
+                driver.Start();
+            }
+
+            for (int it = 0; it < secondPhase; it++)
+            {
+                clock.Tick = firstPhase + it;
+                for (int i = 0; i < players; i++) inst[i].Step();
+            }
+
+            int minFrame = int.MaxValue;
+            long refused = 0;
+            int rollbacks = 0;
+            for (int i = 0; i < players; i++)
+            {
+                Assert.True(inst[i].Driver.CurrentFrame > secondPhase / 2,
+                    $"player {i} only reached frame {inst[i].Driver.CurrentFrame} after the switch");
+                if (inst[i].Driver.CurrentFrame < minFrame) minFrame = inst[i].Driver.CurrentFrame;
+                refused += inst[i].Driver.Codec.RejectedGeneration;
+                rollbacks += inst[i].Rollback.RollbackCount;
+            }
+
+            // The netcode really did change: the new timeline mispredicts and repairs, which the old
+            // one could not do at all. Without this the test would pass on a session that merely
+            // rebuilt itself and then never exercised the mode it rebuilt into.
+            Assert.True(rollbacks > 0, "the rebuilt rollback timeline never had to repair a prediction");
+
+            // The in-flight old-timeline packets arrived and were refused for their generation. Without
+            // this the test would be asserting correctness on a mesh that simply had nothing stale left
+            // in it, which proves nothing about the switch.
+            Assert.True(refused > 0, "no stale-generation datagrams were refused after the rebuild");
+
+            // Every finalized frame of the NEW timeline applied the analytic truth at the NEW delay.
+            // The adapter's frame counter carries across the rebuild (it is the emulator's, not the
+            // timeline's), so the oracle reads at baseFrame + the new driver's frame.
+            int upTo = minFrame - k - secondDelay - MaxRollback - 5;
+            Assert.True(upTo > 100, $"not enough finalized progress after the switch (upTo={upTo})");
+            for (int i = 0; i < players; i++)
+                for (int g = 0; g < upTo; g++)
+                {
+                    Assert.True(inst[i].Emu.LastInputByFrame.TryGetValue(baseFrame + g, out var applied),
+                        $"player {i} never ran rebuilt frame {g}");
+                    for (int p = 0; p < players; p++)
+                    {
+                        var expected = g < secondDelay
+                            ? Neutral()
+                            : Script(p)(baseFrame + g - secondDelay);
+                        Assert.True(expected.ValueEquals(applied!.Ports[p]),
+                            $"player {i}: rebuilt-timeline input mismatch at frame {g} port {p}");
+                    }
+                }
+        }
     }
 }
