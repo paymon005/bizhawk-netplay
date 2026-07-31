@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.24.0 | **14** | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
+| v0.24.0 – v0.25.0 | **14** | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
 | v0.21.0 – v0.23.0 | 13 | Resync and reconnect states are deflated on the wire. |
 | v0.20.0 | 12 | The lobby measures every UDP mesh edge and the host publishes the settled delay in its own control frame (`MeshRtt` / `InputDelay`), which an older build neither sends nor expects. |
 | — | 11 | Changed what the advertised rollback depth *means* — measured against the model the session actually runs, with snapshots elided on confirmed frames — and the threshold peers compare it against. Both ends must agree on both, or one could negotiate rollback while the other negotiated lockstep. |
@@ -20,6 +20,40 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.25.0 — a relay that was never installed, and a lighter frame
+
+**Plays with v0.24.0.** Protocol 14 is unchanged: no wire format moved, and the two mix freely.
+
+- **The host relay never actually carried anyone.** It was decided in the lobby and resolved against
+  the peer list, which is not filled until later — so it was always handed nothing, while the log
+  said it was relaying for N players. The peer it exists to rescue stalled instead, and the session
+  died eight seconds later blaming the UDP path: the exact failure the relay was written to prevent.
+  The decision still happens in the lobby; resolving it now waits for the peer list, and the log says
+  how many routes actually resulted so a zero cannot hide again.
+- **Pasting a connect code no longer undoes the joiner already in the lobby.** Admitting a punch
+  target replaced the whole route table, discarding the routes the lobby had just installed and
+  every endpoint's liveness and round-trip history with them. It merges now.
+- **One bad packet could end a healthy session.** A corrupted frame number was recorded before the
+  check that would have rejected it, and nothing ever lowered it — so a single datagram could leave
+  the session asking forever for a frame that was never missing, and give up eight seconds later.
+- **A throw on the UDP receive path no longer takes the network with it silently.** It ended the one
+  thread that delivers input while everything else still reported healthy, so a fault in this tool
+  arrived looking exactly like a fault in the network. It is now caught, counted, and named in the
+  log next to the packet-refusal note — a full backlog, a refused packet, a thrown handler and a
+  genuinely quiet peer are four different things and now read as four different things.
+- **The socket keeps a real receive buffer** (256 KiB rather than Windows' 8 KiB) and stops treating
+  an ICMP port-unreachable — which routine hole-punching provokes — as a receive error.
+- **A savestate the core refuses to reload is now fatal and says so**, instead of leaving the
+  emulator standing on the wrong frame under a generic session error.
+- **Less work per frame.** The pad is read straight off the controller BizHawk resolves rather than
+  from a dictionary rebuilt for it sixty times a second; sent input lives in one ring instead of five
+  objects a frame; the controller only writes the buttons that changed; and the layout stopped
+  recomputing constants. The audio ring copies in blocks rather than one sample at a time.
+- **Changing netcode or delay no longer freezes EmuHawk** while the state is compressed — only the
+  capture needs the emulator thread, and on a heavy core that was several hundred milliseconds.
+- Removed a good deal of code nothing called, and a diagnostic checkbox whose question had been
+  answered and acted on.
 
 ### v0.24.0 — symmetric NAT, named mismatches, sendable logs
 
