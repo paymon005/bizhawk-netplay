@@ -298,8 +298,10 @@ public sealed partial class NetplayToolForm
                 "and those bytes come from the GPU — which disagrees between machines even when both " +
                 "players have identical settings, and shows up as a desync at every checksum.");
 
-        string? stickWarning = _adapter.DigitalStickOverrideDiagnostic();
-        if (stickWarning != null) ConnLog(stickWarning, Color.DarkOrange);
+        // The digital-stick-override note deliberately does NOT go here. It fires for any N64 setup
+        // using BizHawk's default XInput binds, and measurement showed the override usually does not
+        // fire at all — so at session start it is an unsolicited warning about a non-problem, which
+        // is worse than silence. It lives in the input test, where someone is already asking.
 
         // One reader and one serialized outbound writer per control link. The writer is what keeps
         // checksums, pings, and especially whole-state resync transfers off EmuHawk's UI thread.

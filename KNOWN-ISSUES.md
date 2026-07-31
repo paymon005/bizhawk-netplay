@@ -91,6 +91,34 @@ Quick Load ending the session is the designed trade, not a defect: savestates ar
 claimed so that *saving* works, which leaves loading detected rather than prevented. See the To Do
 note about making a host-side load resync everyone instead.
 
+**The N64 "analog stick" problem was never netplay's — CLOSED 2026-07-30.** A game whose throw
+distance is chosen by how far the stick is flicked would give light throws and far throws but never
+a medium one. It was investigated as a netplay fault across several sessions. It is not one: it
+reproduces identically **with the tool not loaded at all**.
+
+What the investigation did establish, and what is worth keeping:
+
+- **Capture is clean.** `Diagnostics > Watch Analog` measured 66 distinct values spanning the full
+  −127..127 per axis, raw host ±10000, linear, no plateau. The stick reaches the core intact.
+- **Not the analog math.** That was a hand-copy of BizHawk's bind arithmetic and had genuinely
+  drifted, but the dumps show it agreeing with BizHawk on every reading. Capture now uses
+  `Joypad.Get` — the end of EmuHawk's own controller chain — so there is nothing left to drift.
+- **Not the N64 digital-direction override.** `N64Input.GetStickValues` really does let a pressed
+  `A Left`/`A Right` win over the axis and force full deflection, and BizHawk's default XInput
+  layout really does bind those to the stick. It was diagnosed confidently as the cause. It is not:
+  those binds do not fire here, and the "gap" cited as evidence was sampling noise from a detector
+  whose threshold was far too low.
+- **Not the circular constraint**, which BizHawk applies upstream of anything we read.
+
+The one thing netplay *was* doing wrong to input is fixed and unrelated: this window had focus,
+so BizHawk swallowed all pad input (`IExternalToolForm => AllowInput.None`). See below.
+
+**Focusing the netplay window used to stop your controller — fixed 2026-07-30.** BizHawk decides
+whether to accept host input from the active form's type, and the rule for external tools was
+unconditional. With this window focused, pad axis values froze at whatever they last held. Fixed by
+overriding `BlocksInputWhenFocused`, the same escape TAStudio uses, conditionally so that typing in
+an editable field still goes only to that field.
+
 **The Rice plugin renders some games incorrectly** (visible on the N64 titles above). That is a
 BizHawk video-plugin issue, not a netplay one — but it is the first real entry in the N64
 settings profile 1.0 needs, and worth knowing before blaming the netcode for something on screen.
