@@ -119,18 +119,29 @@ public sealed partial class NetplayToolForm
               .Append("   (raw host ").Append(rawLo[kv.Key]).Append("..").Append(rawHi[kv.Key]).Append(")\n");
             sb.Append("      ").Append(string.Join(", ", values)).Append('\n');
 
-            // The tell. A stick that travels produces a spread; one whose digital directions are
-            // bound produces a cluster near neutral, then a jump straight to the rail.
+            // The tell for a digital override is a PLATEAU: a cluster of small values and then a jump
+            // straight to the rail, with the middle of the range never appearing.
+            //
+            // The threshold has to be well clear of sampling noise. This samples ~100 times across a
+            // 255-value range while you sweep, so ordinary gaps of 10-15 are expected and mean
+            // nothing — an earlier version flagged those and sent a real investigation down a blind
+            // alley. A genuine override leaves most of one half of the range empty, so require both
+            // a large gap AND that it ends at the extreme, which is where the override pins it.
             int biggestGap = 0, gapFrom = 0, gapTo = 0, prev = int.MinValue;
             foreach (int v in values)
             {
                 if (prev != int.MinValue && v - prev > biggestGap) { biggestGap = v - prev; gapFrom = prev; gapTo = v; }
                 prev = v;
             }
-            if (biggestGap > 8)
-                sb.Append("      !! biggest jump is ").Append(gapFrom).Append(" -> ").Append(gapTo)
-                  .Append(" (").Append(biggestGap).Append(" wide) — nothing in that band ever reached the core. ")
-                  .Append("If the four A Up/Down/Left/Right binds are still set, that gap is them.\n");
+            bool endsAtRail = gapTo >= values.Max - 2 || gapFrom <= values.Min + 2;
+            if (biggestGap >= 40 && endsAtRail)
+                sb.Append("      !! ").Append(gapFrom).Append(" -> ").Append(gapTo)
+                  .Append(" is a ").Append(biggestGap).Append("-wide jump straight to the extreme, with ")
+                  .Append("nothing in between — that is what a digital override looks like. If the four ")
+                  .Append("A Up/Down/Left/Right binds are set, clear them and run this again.\n");
+            else
+                sb.Append("      the range is covered smoothly (largest gap ").Append(biggestGap)
+                  .Append(", which at this sample rate is normal) — the stick is reaching the core intact.\n");
         }
         if (seen.Count == 0) sb.Append("  (no axes sampled)\n");
         Log(sb.ToString());

@@ -1082,13 +1082,15 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
                 if (_analogBinds[0][j] is { } b && !string.IsNullOrEmpty(b.Value)) analogBound = true;
             if (!analogBound) return null;
 
-            return $"P1 has BOTH the analog stick and the digital stick directions bound " +
-                   $"({string.Join(", ", bound)}). The N64 core lets the digital ones win: press one " +
-                   "and the stick is forced to full deflection and the analog value is discarded — so " +
-                   "the stick gives you minimum or maximum and nothing in between. If your pad's " +
-                   "stick is bound to both (BizHawk's default XInput layout does exactly that), clear " +
-                   "the four A Up/Down/Left/Right binds in Config > Controllers. This is a BizHawk " +
-                   "controller-config issue, not a netplay one — local play behaves the same way.";
+            return $"P1 has both the analog stick and the digital stick directions bound " +
+                   $"({string.Join(", ", bound)}). Worth knowing, but not necessarily a problem: the " +
+                   "N64 core lets a digital direction win outright when it fires, forcing the stick to " +
+                   "full deflection and discarding the analog value. Whether it fires at all depends " +
+                   "on what those four are bound TO. Use Diagnostics > Watch Analog to check — if the " +
+                   "stick covers its range smoothly there, this is not affecting you; if the values " +
+                   "jump from small ones straight to the extreme, clear these four in " +
+                   "Config > Controllers. Either way it is a BizHawk controller-config matter rather " +
+                   "than a netplay one, and local play behaves the same.";
         }
         catch { return null; }
     }
