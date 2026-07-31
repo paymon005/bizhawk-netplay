@@ -68,6 +68,29 @@ deliberate, but it means **peers sharing one connection cannot be recovered** �
 two joiners and both go, so the host is freezing a survivor that is already gone. The message for
 that case now names the peer rather than reporting the step that failed.
 
+**Host-command ownership is verified by hand (2026-07-30, GPGX/Genesis, 2 players).** The frontend
+commands that could move the timeline out from under a session were each tried, in the lobby and in
+play:
+
+| command | key | result |
+|---|---|---|
+| Frame Advance, while the lobby waited for a joiner | `F` | nothing happened |
+| Frame Advance, mid-session | `F` | nothing happened |
+| Rewind, mid-session | `Shift+R` | nothing happened |
+| Reboot Core | menu | refused, message shown, session continued |
+| Save state | — | **works** — deliberately not blocked |
+| Quick Load | `P` | session ends: `the core's frame count jumped back 15522 — a rewind/load-state hotkey fired?` |
+
+Both restore paths were checked too, which is where this had already broken twice: the emulator was
+**paused before hosting and still paused after disconnecting**; rewind **enabled** worked again after
+disconnecting; rewind **disabled** stayed disabled across a whole session. Frame Advance is the
+self-reporting one — had it not been blocked, the drift check would have ended the session with
+`EmuHawk advanced N extra frame(s)` rather than doing nothing.
+
+Quick Load ending the session is the designed trade, not a defect: savestates are deliberately not
+claimed so that *saving* works, which leaves loading detected rather than prevented. See the To Do
+note about making a host-side load resync everyone instead.
+
 **The Rice plugin renders some games incorrectly** (visible on the N64 titles above). That is a
 BizHawk video-plugin issue, not a netplay one — but it is the first real entry in the N64
 settings profile 1.0 needs, and worth knowing before blaming the netcode for something on screen.
