@@ -257,6 +257,12 @@ public sealed partial class NetplayToolForm
     /// <summary>The role-independent post-GO activation: audio, control I/O, and frame pacing.</summary>
     private void BeginSessionCommon(SyncMode mode, string remoteLabel)
     {
+        // A banner in the file only. One launch's log can hold several sessions plus the failed
+        // attempts between them, and someone reading a log they did not produce needs to find where
+        // the run they were told about begins. The window's own log gets this from ConnLog.
+        _logFile?.Write($"{Environment.NewLine}=== session start — {mode}, {_playerCount} player(s), " +
+                        $"P{_localPort + 1}, vs {remoteLabel}, delay {_sessionDelay} ==={Environment.NewLine}");
+
         if (!DriverPreparedFor(CurrentGeneration, mode)) PrepareSessionDriver(mode);
 
         // The lobby's own account of itself stops here; from now on the status is derived from the

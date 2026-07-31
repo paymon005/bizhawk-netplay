@@ -527,6 +527,8 @@ public sealed partial class NetplayToolForm
         ResetPunchUi();
 
         ConnLog("session ended: " + reason, Color.DimGray);
+        _logFile?.Write($"=== session end — {reason} ==={Environment.NewLine}");
+        _logFile?.Flush();
         Status("Idle.", Color.DimGray);
         SetBusy(false);
     }

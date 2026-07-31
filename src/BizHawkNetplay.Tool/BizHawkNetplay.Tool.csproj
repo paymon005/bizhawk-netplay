@@ -8,6 +8,11 @@
     <!-- We reference EmuHawk's assemblies but never ship copies of them. -->
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Stamped into the DLL and printed at the top of every log file. A log from someone else is
+         unreadable without knowing which build made it, and "which version are you on?" is a
+         question people answer wrongly. BUMP THIS WHEN CUTTING A RELEASE — a version that lies is
+         worse than none, so it is deliberately the same number as the git tag. -->
+    <Version>0.24.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

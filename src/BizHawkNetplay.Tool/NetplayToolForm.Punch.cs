@@ -28,6 +28,7 @@ public sealed partial class NetplayToolForm
         if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
         if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
         if (_phase.IsActive || _transport != null) { Log("Already connecting — Disconnect first."); return; }
+        StartLogFile(); // a punch attempt is worth a file whether or not it succeeds
         if (_hostRadio.Checked)
         {
             // Defensive: the button is hidden for hosts (they just Start Hosting and paste codes).

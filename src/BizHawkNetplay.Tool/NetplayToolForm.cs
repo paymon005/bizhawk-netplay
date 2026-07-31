@@ -9,6 +9,7 @@ using System.Windows.Forms;
 using BizHawk.Client.Common;
 using BizHawk.Client.EmuHawk;
 using BizHawk.Emulation.Common;
+using BizHawkNetplay.Core.Diag;
 using BizHawkNetplay.Core.Net;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
@@ -126,6 +127,7 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private Color _lobbyPhaseColor = Color.DimGray;
     private Button _applyLiveButton = null!;
     private RichTextBox _connLog = null!;
+    private Label _logFileLabel = null!;
     private CheckBox _simUnresponsiveCheck = null!;
     private CheckBox _skipPresentCheck = null!;
     private bool _skipOurPresent;   // diagnostic: leave presenting entirely to EmuHawk's Render()
@@ -369,12 +371,44 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     private double _lastFineTickMs = double.NegativeInfinity;
 
+    /// <summary>
+    /// This launch's log file, mirroring the Log tab so it can be sent to someone afterwards.
+    ///
+    /// Opened before any UI exists, because <see cref="Log"/> is reachable from the constructor
+    /// onward and the earliest lines — which core loaded, which ports it exposes — are the ones a
+    /// mismatch report needs. Null only if the file could not be created, which every call site
+    /// tolerates.
+    /// </summary>
+    private RotatingLogFile? _logFile;
 
+    /// <summary>This build's version, from the assembly stamp (see the csproj). Reported in the log
+    /// header so a log someone sends can be read against the code that produced it.</summary>
+    private static string ToolVersion
+    {
+        get
+        {
+            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                var info = (System.Reflection.AssemblyInformationalVersionAttribute?)Attribute
+                    .GetCustomAttribute(asm, typeof(System.Reflection.AssemblyInformationalVersionAttribute));
+                // The SDK appends "+<commit>" when the build knows one; the version is the part before it.
+                var text = info?.InformationalVersion ?? asm.GetName().Version?.ToString();
+                int plus = text?.IndexOf('+') ?? -1;
+                return plus > 0 ? text!.Substring(0, plus) : text ?? "unknown";
+            }
+            catch { return "unknown"; }
+        }
+    }
 
     protected override string WindowTitleStatic => "BizHawk Netplay";
 
     public NetplayToolForm()
     {
+        _logFile = SessionLog.Prepare(
+            $"BizHawk Netplay v{ToolVersion} — protocol {Protocol}{Environment.NewLine}" +
+            $"log opened {DateTime.Now:yyyy-MM-dd HH:mm:ss} (local time, UTC{DateTimeOffset.Now.Offset.Hours:+00;-00}:00)" +
+            Environment.NewLine);
         SuspendLayout();
         // Every control on every tab is positioned in hardcoded pixels, laid out against a 96-DPI
         // screen. Without an auto-scale mode WinForms leaves those coordinates alone while the OS
@@ -424,7 +458,15 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         // the host, holding a seat for a rejoin) are exactly the ones where no frames are running,
         // so a status driven by the frame tick would freeze precisely when it had something to say.
         _lobbyTimer = new System.Windows.Forms.Timer { Interval = 450 };
-        _lobbyTimer.Tick += (_, __) => { _lobbyFlashOn = !_lobbyFlashOn; UpdateLobbyStatus(); };
+        _lobbyTimer.Tick += (_, __) =>
+        {
+            _lobbyFlashOn = !_lobbyFlashOn;
+            UpdateLobbyStatus();
+            // Piggy-backs on a timer that already runs whether or not a session does, which is the
+            // property that matters: the log has to reach disk during a stalled session too, and the
+            // frame clock is precisely what stops in that case.
+            _logFile?.Flush();
+        };
         _lobbyTimer.Start();
 
         LoadAndApplySettings();
@@ -507,6 +549,9 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         try { _lobbyTimer.Stop(); _lobbyTimer.Dispose(); } catch { }
         StopAnalogWatch();
         try { _tips.Dispose(); } catch { }
+        // Last, so everything the teardown above logged is on disk before the handle goes.
+        try { _logFile?.Dispose(); } catch { }
+        _logFile = null;
         base.OnFormClosed(e);
     }
 

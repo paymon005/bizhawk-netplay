@@ -19,6 +19,8 @@ public sealed partial class NetplayToolForm
         if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
         if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
 
+        StartLogFile(); // from here on there is something worth keeping a file of
+
         WarnSessionHazards(); // non-blocking heads-up about movies/TAStudio/Lua
 
         try

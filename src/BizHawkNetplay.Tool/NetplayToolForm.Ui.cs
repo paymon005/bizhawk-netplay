@@ -474,8 +474,50 @@ public sealed partial class NetplayToolForm
             Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false,
             Dock = DockStyle.Fill, Font = new Font(FontFamily.GenericMonospace, 9f),
         };
-        page.Controls.Add(_log);
+
+        // Everything above is also being written to a file, and this is the row that says so. Put
+        // here rather than under Diagnostics because this is the tab someone is already looking at
+        // when they are asked for their log — a folder they cannot find is the same as no file.
+        var bar = new Panel { Dock = DockStyle.Top, Height = 30 };
+        var openFolder = new Button { Text = "Open log folder", Location = new Point(0, 3), Width = 120 };
+        openFolder.Click += (_, __) => OpenLogFolder();
+        _logFileLabel = new Label
+        {
+            AutoSize = true, Location = new Point(128, 8), ForeColor = Color.DimGray,
+            Text = "a file is written once you host or join",
+        };
+        _tips.SetToolTip(openFolder,
+            "Once you host or join, this log is written to a file as well as shown here.\r\n" +
+            "Send that file to whoever is helping you — it keeps the whole session,\r\n" +
+            "including the part this box has already scrolled past.\r\n" +
+            "Opening and closing the tool without connecting writes nothing.");
+        bar.Controls.AddRange([openFolder, _logFileLabel]);
+
+        page.Controls.Add(_log);   // added first so Fill takes what the docked bar leaves
+        page.Controls.Add(bar);
         return page;
+    }
+
+    /// <summary>Show the logs folder in Explorer, selecting this launch's file if there is one.</summary>
+    private void OpenLogFolder()
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(SessionLog.Folder);
+            // Explorer only understands /select, with the file quoted; without a file, open the
+            // folder itself rather than passing a switch with nothing after it.
+            var path = _logFile?.Path;
+            if (path != null && System.IO.File.Exists(path))
+                System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{path}\"");
+            else
+                System.Diagnostics.Process.Start("explorer.exe", $"\"{SessionLog.Folder}\"");
+        }
+        catch (Exception ex)
+        {
+            // Not fatal, and the path is the actually useful half of the answer — someone can paste
+            // it into a File Explorer address bar even if launching one from here is blocked.
+            Log($"couldn't open the log folder ({ex.Message}). It is: {SessionLog.Folder}");
+        }
     }
 
     public override void Restart()

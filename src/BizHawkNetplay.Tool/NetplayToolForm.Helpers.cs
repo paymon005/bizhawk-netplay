@@ -5,6 +5,7 @@ using System.Threading;
 using System.Windows.Forms;
 using BizHawk.Client.Common;
 using BizHawk.Emulation.Common;
+using BizHawkNetplay.Core.Diag;
 using BizHawkNetplay.Core.Session;
 
 namespace BizHawkNetplay.Tool;
@@ -286,10 +287,39 @@ public sealed partial class NetplayToolForm
     /// also owns the frame clock. Trimming rewrites the whole control, so it's amortized: it happens
     /// once every (LogMaxLines - LogKeepLines) appends, not on every line.
     /// </summary>
+    /// <summary>
+    /// Create this launch's log file, now that something has happened worth keeping.
+    ///
+    /// Called when a connection is ATTEMPTED, not when one succeeds: a refused password, a
+    /// handshake mismatch and a join that timed out are the logs most often asked for, and none of
+    /// them ever reaches a session. Everything logged before this point was buffered and goes into
+    /// the file too, so the run-up is not lost. Idempotent.
+    /// </summary>
+    private void StartLogFile()
+    {
+        if (_logFile == null || _logFile.IsOpen) return;
+        if (!_logFile.Activate())
+        {
+            Log("(note) couldn't write a log file — the session is unaffected, but there will be " +
+                $"nothing to send afterwards. Tried: {SessionLog.Folder}");
+            return;
+        }
+        Log($"logging this session to {_logFile.Path}");
+        if (!_logFileLabel.IsDisposed)
+            _logFileLabel.Text = "saving to " + System.IO.Path.GetFileName(_logFile.Path!);
+    }
+
     private void Log(string message)
     {
+        // Stamped like the connection box, and for the same reason: almost every question worth
+        // asking of a log is about ORDER and GAPS — how long the state transfer took, whether the
+        // stall came before or after the drop — and an unstamped line can answer neither. Only the
+        // first line of a multi-line message is prefixed; the continuation lines are one event.
+        string stamped = RotatingLogFile.Stamp() + "  " + message;
+
+        _logFile?.Write(stamped);
         if (_log.IsDisposed) return;
-        _log.AppendText(message + Environment.NewLine);
+        _log.AppendText(stamped + Environment.NewLine);
 
         _logLines += 1 + CountNewlines(message); // a single message can carry several lines (e.g. AudioStats)
         if (_logLines <= LogMaxLines) return;
@@ -333,6 +363,10 @@ public sealed partial class NetplayToolForm
     private void ConnLog(string message, Color color)
     {
         Log(message);
+        // These are the lines a log is read FOR, and they are rare — a handful per session. Getting
+        // them onto disk immediately is what makes the file useful after EmuHawk is killed or hangs,
+        // which is exactly the situation someone is being asked for their log about.
+        _logFile?.Flush();
         if (_connLog.IsDisposed) return;
 
         // Bound the history — a long session can rack up drops, rejoins and resyncs, and an unbounded
