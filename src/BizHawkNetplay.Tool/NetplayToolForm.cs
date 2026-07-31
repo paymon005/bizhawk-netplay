@@ -452,6 +452,43 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
             (int)Math.Ceiling(MinClientHeight * scale) + chromeH);
     }
 
+    /// <summary>
+    /// Stop this window from killing the controller whenever it has focus.
+    ///
+    /// BizHawk decides whether to accept host input from the ACTIVE FORM's type, and the rule for
+    /// ours is unconditional: "IExternalToolForm => AllowInput.None" (MainForm.cs:648). Not gated on
+    /// AcceptBackgroundInput, not gated on anything — click this window and Input.HandleAxis starts
+    /// swallowing every pad update, so the axis values freeze at whatever they last held. That is
+    /// why the input test returned the same reading twelve times running, and why the analog watch
+    /// saw a stick that never moved.
+    ///
+    /// It is not only a diagnostics problem. During a session it means clicking this window stops
+    /// your controller, which is a fair description of a bug reported here earlier and blamed on
+    /// several other things first.
+    ///
+    /// The switch is ordered, and FormBase with BlocksInputWhenFocused false is matched BEFORE the
+    /// external-tool case (line 644), so overriding this gets us AllowInput.All instead. TAStudio
+    /// does the same; VirtualPads does the conditional version this copies.
+    ///
+    /// Conditional, because AllowInput.All also routes keystrokes to EmuHawk's hotkeys: while an
+    /// editable field has focus we block, so typing an IP or a password goes to the box and nowhere
+    /// else. Read-only boxes — the log, the connection status — deliberately do NOT block, since
+    /// reading the log during a session must not cost you your controller.
+    /// </summary>
+    public override bool BlocksInputWhenFocused
+    {
+        get
+        {
+            // Form.ActiveControl is the active child of THIS container; the focused leaf may be
+            // several containers down (tab page -> panel -> box), so walk to it.
+            Control? focused = ActiveControl;
+            while (focused is IContainerControl container && container.ActiveControl != null)
+                focused = container.ActiveControl;
+            return focused is NumericUpDown or ComboBox
+                || (focused is TextBoxBase box && !box.ReadOnly);
+        }
+    }
+
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         // Closing the tool is also a Disconnect, including the pre-session lobby/state-transfer
