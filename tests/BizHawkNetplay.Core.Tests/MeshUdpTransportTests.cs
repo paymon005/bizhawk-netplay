@@ -14,6 +14,33 @@ using Xunit;
 namespace BizHawkNetplay.Core.Tests;
 
 /// <summary>
+/// Give a mesh one logical peer per endpoint.
+///
+/// This used to sit on <see cref="MeshUdpTransport"/> itself, as a compatibility shim for callers
+/// holding a flat endpoint list. Production has routed by seat — <c>SetPeerRoutes</c> — for a long
+/// time and never called it, so it now lives with the only code that does. Most of these tests do
+/// not care which seat an endpoint belongs to, only that a datagram reaches it.
+/// </summary>
+internal static class MeshPeerListExtensions
+{
+    public static void SetPeers(this MeshUdpTransport mesh, IEnumerable<IPEndPoint> peers)
+    {
+        if (peers == null) throw new ArgumentNullException(nameof(peers));
+        var routes = new List<PeerRoute>();
+        var seen = new HashSet<IPEndPoint>();
+        int remotePort = 0;
+        foreach (var endpoint in peers)
+        {
+            if (endpoint == null)
+                throw new ArgumentException("Peer endpoints cannot contain null", nameof(peers));
+            if (seen.Add(endpoint))
+                routes.Add(new PeerRoute(remotePort++, new[] { endpoint }));
+        }
+        mesh.SetPeerRoutes(routes);
+    }
+}
+
+/// <summary>
 /// The full-mesh UDP transport over the loopback interface: every peer sends directly to every
 /// other (no host relay). Proves delivery to all peers, endpoint pinning, and — end to end — a
 /// 3-player lockstep session running deterministically across three live meshed sockets.
@@ -393,7 +420,6 @@ public class MeshUdpTransportTests
                 if (!all) Thread.Sleep(20);
             }
             Assert.True(all, "active punch did not confirm all direct paths without input");
-            Assert.Equal(2, a.AliveEndpoints().Count);
         }
         finally { a.Dispose(); b.Dispose(); c.Dispose(); }
     }

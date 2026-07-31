@@ -5,7 +5,11 @@ adversarial review of the v0.10.0 rewrite (F1–F9, P1–P2, KI-1–KI-7) has be
 live in the git history (`git log --grep KI-`, `--grep "review finding"`) and in the v0.10.0 /
 v0.10.1 release notes.
 
-## Open
+## Status
+
+Entries below are a mix: some are open work (KI-11), some are validation records kept because the
+evidence is worth having. Each says which it is in its own opening line — this heading used to say
+"Open", directly above an entry whose first word was CLOSED.
 
 **KI-8 (validation) — CLOSED 2026-07-30. Both recovery paths have now been watched in real play at
 four players over the internet: resync after a desync, and drop-and-rejoin after an ungraceful break.**
@@ -101,8 +105,9 @@ What the investigation did establish, and what is worth keeping:
 - **Capture is clean.** `Diagnostics > Watch Analog` measured 66 distinct values spanning the full
   −127..127 per axis, raw host ±10000, linear, no plateau. The stick reaches the core intact.
 - **Not the analog math.** That was a hand-copy of BizHawk's bind arithmetic and had genuinely
-  drifted, but the dumps show it agreeing with BizHawk on every reading. Capture now uses
-  `Joypad.Get` — the end of EmuHawk's own controller chain — so there is nothing left to drift.
+  drifted, but the dumps show it agreeing with BizHawk on every reading. That copy is now deleted.
+  Capture reads the end of EmuHawk's own controller chain — the controller behind `Joypad.Get`,
+  asked directly rather than via the dictionary it builds — so there is nothing left to drift.
 - **Not the N64 digital-direction override.** `N64Input.GetStickValues` really does let a pressed
   `A Left`/`A Right` win over the axis and force full deflection, and BizHawk's default XInput
   layout really does bind those to the stick. It was diagnosed confidently as the cause. It is not:

@@ -139,7 +139,6 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
 
     public int MaxRollbackDepthSeen { get; private set; }
     public long FramesResimulated { get; private set; }
-    public int PredictionStalls { get; private set; }
     public int TimeSyncStalls { get; private set; }
     /// <summary>Frames yielded because the measured repair cost, not the clock skew, said to.</summary>
     public int CostStalls { get; private set; }
@@ -150,11 +149,8 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     /// sat behind it. Zero unless <see cref="RollbackTuning.KeyframeInterval"/> is above 1.</summary>
     public int LastRollbackWalkback { get; private set; }
     public long FramesWalkedBack { get; private set; }
-    public int SoftCap => _softCap;
     /// <summary>Prediction horizon the measured repair budget currently affords.</summary>
     public int CostCap => _costCap;
-    /// <summary>Conservative rolling estimate of what one re-simulated frame costs, in ms.</summary>
-    public double RepairPerFrameMs => _repairPerFrameMs;
     /// <summary>
     /// True once the measured repair cost has been high enough that the cost cap had to be held up
     /// by its floor — that is, this machine cannot repair even the minimum depth inside its frame
@@ -207,7 +203,6 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         //     target a frame already evicted from the ring — that would be an unrecoverable desync.
         if (horizon > _maxRollback)
         {
-            PredictionStalls++;
             IsStalled = true;
             return FrameDecision.StallDecision;
         }

@@ -86,8 +86,8 @@ interface IEmuAdapter
     bool   VerifyDeterministicMode();       // fail session if false
 
     // Input
-    ControllerLayout GetControllerLayout(); // from core's ControllerDefinition
-    void SetInputs(InputSet inputs);        // joypad override, ALL ports, every frame
+    ControllerLayout GetControllerLayout(int port); // from core's ControllerDefinition
+    void AdvanceFrame(InputSet inputs, bool renderVideo); // the merged set travels WITH the frame
 
     // State (rollback + session sync)
     StateHandle SaveStateToMemory();
@@ -107,19 +107,25 @@ interface IEmuAdapter
 
 Two hard rules enforced here:
 
-1. **Input interception is absolute.** The user's physical controller must never reach the core directly. Every frame, `SetInputs` overrides *all* ports — local ports get the delayed synchronized value, remote ports get the remote value. Local raw input is read only as the *source* feeding the pipeline. Any leak here is an instant, silent desync.
+1. **Input interception is absolute.** The user's physical controller must never reach the core directly. Every frame the merged set covers *all* ports — local ports get the delayed synchronized value, remote ports get the remote value — and it is handed to the core as the `IController` passed into `FrameAdvance`, which is the only thing a BizHawk core reads input from. Local raw input is read only as the *source* feeding the pipeline. Any leak here is an instant, silent desync.
 2. **The tool doesn't trust configuration; it verifies it.** Deterministic core construction, matching sync settings, matching core versions — checked at handshake, session refused on mismatch. This converts Dolphin's decade of "why did it desync" mystery-debugging into an upfront error message.
 
 ### 3.2 InputPipeline — generic over any core
 
 The "any game" property lives here. BizHawk cores expose a `ControllerDefinition` (buttons + axes per port). At session start, both peers exchange the layout and derive an identical compact serialization: buttons packed into a bitfield, axes as their native integer width. No per-game knowledge anywhere.
 
+A datagram carries one port's inputs for a contiguous run of frames. The receive path describes it
+in place rather than copying each frame out — most of them are redundant repeats already held — so
+what a decode yields is a window, not a list:
+
 ```csharp
-struct InputFrame
+readonly struct InputWindow
 {
-    int      Frame;       // simulation frame this applies to
-    byte     Port;
-    byte[]   Payload;     // packed per negotiated layout
+    byte Port;
+    int  BaseFrame;       // simulation frame of the first payload
+    int  Count;           // consecutive frames included
+    int  PayloadSize;     // packed per negotiated layout
+    int  OffsetOf(int i); // where frame BaseFrame+i's bytes start in the datagram
 }
 ```
 
@@ -177,7 +183,8 @@ void OnPreFrame()
     var decision = strategy.BeginFrame(currentFrame);
     if (decision.Stall) { emu.SetPaused(true); return; }   // retry next tick
     emu.SetPaused(false);
-    emu.SetInputs(decision.Inputs);
+    // The caller then steps the core with decision.Inputs — on EmuHawk via
+    // AdvanceFrame(inputs, renderVideo), which is what actually injects them.
 }
 
 void OnPostFrame()
@@ -192,7 +199,7 @@ interface ISyncStrategy
 {
     FrameDecision BeginFrame(int frame);   // inputs to apply, or Stall
     void EndFrame(int frame);
-    void OnRemoteInput(InputFrame input);  // called during queue drain, UI thread
+    void OnRemoteInput(int frame, int port); // called during queue drain, UI thread
     void OnPacingReport(PacingInfo info);
 }
 ```
@@ -205,7 +212,7 @@ interface ISyncStrategy
 
 **RollbackStrategy** (the drop-in, ~everything below is additive):
 - Ring buffer of `StateHandle` for the last W frames (W = max rollback window, from the capability probe). BBN3 used W = 90 (1.5 s) on a GBA core via the same memorysavestate API — validated scale.
-- `OnRemoteInput(f, input)`: if `input ≠ predicted[f]` → flag misprediction; keep the *deepest* divergence frame if multiple arrive in one drain (BBN3 does exactly this with its rollbackflag max-write).
+- `OnRemoteInput(f, port)`: if the arriving input for `f` differs from what was predicted → flag misprediction; keep the *deepest* divergence frame if multiple arrive in one drain (BBN3 does exactly this with its rollbackflag max-write).
 - Repair model — **catch-up mode**, not a synchronous burst. When `BeginFrame(N)` sees a flagged divergence at M < N:
   1. `LoadStateFromMemory(buffer[M-1])`; evict ring-buffer states for frames M..N-1 — they're stale and will be recreated during catch-up (BBN3 marks this eviction "very important"; it is — loading a stale state for the repaired range would desync).
   2. Enter CatchUp mode: hide display + throttle sound (`DispSpeedupFeatures = 0` / `SoundThrottle`, per BBN3 — see risk #3), uncap emulation speed (`limitframerate(false)`, `speedmode` high).
@@ -236,7 +243,7 @@ Adopted from BBN3's working implementation, which is smoother than pause-based s
 frame N tick:
   transport thread ──▶ queue ──▶ drain: frontier advances to ≥ N
   local pad read ──▶ stamp N+D ──▶ send (with last R redundant) ──▶ also self-enqueue
-  strategy: all ports confirmed @ N?  yes ──▶ SetInputs(merged @ N)
+  strategy: all ports confirmed @ N?  yes ──▶ AdvanceFrame(merged @ N)
   core runs frame N
   every K frames: HashMainMemory ──▶ control channel
 ```

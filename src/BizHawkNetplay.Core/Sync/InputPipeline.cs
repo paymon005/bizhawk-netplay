@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using BizHawkNetplay.Core.Input;
 
@@ -43,8 +43,6 @@ public sealed class InputPipeline
 
     /// <summary>Mark which ports this peer owns (drives local capture; informational for frontier).</summary>
     public void SetLocal(int port, bool isLocal) => _isLocal[port] = isLocal;
-
-    public bool IsLocal(int port) => _isLocal[port];
 
     /// <summary>Highest frame known contiguously for a port; -1 if nothing yet.</summary>
     public int ConfirmedFrontier(int port) => _frontier[port];

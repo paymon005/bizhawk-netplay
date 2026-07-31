@@ -15,7 +15,11 @@ public enum ControlMessageType : byte
     Ping = 8,      // RTT probe: opaque 8-byte token, echoed during lobby setup and live play
     Pong = 9,      // RTT echo: the ping's 8-byte token returned unchanged
     Resync = 10,   // host -> client: [generation][authoritative whole-core state]
-    ResyncRequest = 11, // client -> host: "I saw a desync, please resync us"
+    // Reserved, never shipped: nothing encodes or handles it. A joiner reports its checksum and the
+    // host decides, so there was never anything for a joiner to ask for. Kept rather than reused —
+    // the slot number is protocol surface, and silently giving 11 a new meaning is the one change
+    // that could make two builds disagree without either noticing.
+    ResyncRequest = 11,
     PeerList = 12, // host -> client: the other peers' UDP endpoints for the direct input mesh
     Candidate = 13, // client -> host: my reflexive (STUN) UDP endpoint, for NAT-traversal candidates
     Ready = 14,    // multi-peer start barrier request/ack after state import data is received

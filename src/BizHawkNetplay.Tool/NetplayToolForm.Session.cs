@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Net;
@@ -198,8 +198,6 @@ public sealed partial class NetplayToolForm
             flash = false;
         }
 
-        _lobbyStateColor = color;
-        _lobbyShouldFlash = flash;
         if (!string.Equals(_lobbyStateLabel.Text, text, StringComparison.Ordinal))
             _lobbyStateLabel.Text = text;
         // Pulse between the state's colour and a washed-out version of it rather than blinking to

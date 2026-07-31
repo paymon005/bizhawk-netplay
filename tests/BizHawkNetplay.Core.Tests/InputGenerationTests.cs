@@ -60,16 +60,16 @@ public class InputGenerationTests
             .EncodeInput(1, Window(3, 0x5a));
 
         var matching = new InputPacketCodec([1, 1], expected);
-        Assert.True(matching.TryDecodeInput(packet, out var frames));
-        Assert.Single(frames);
-        Assert.Equal(3, frames[0].Frame);
+        Assert.True(matching.TryDecodeInputWindow(packet, out var window));
+        Assert.Equal(1, window.Count);
+        Assert.Equal(3, window.BaseFrame);
 
         var wrongSession = new InputPacketCodec(
             [1, 1], new SessionGeneration(0x1112131415161718UL, expected.Epoch));
-        Assert.False(wrongSession.TryDecodeInput(packet, out _));
+        Assert.False(wrongSession.TryDecodeInputWindow(packet, out _));
 
         var wrongEpoch = new InputPacketCodec([1, 1], expected.Next());
-        Assert.False(wrongEpoch.TryDecodeInput(packet, out _));
+        Assert.False(wrongEpoch.TryDecodeInputWindow(packet, out _));
     }
 
     [Fact]
@@ -84,7 +84,7 @@ public class InputGenerationTests
         Assert.Equal(42, fromFrame);
 
         // A request is not an input window and vice versa.
-        Assert.False(codec.TryDecodeInput(request, out _));
+        Assert.False(codec.TryDecodeInputWindow(request, out _));
         Assert.False(codec.TryDecodeRequest(codec.EncodeInput(1, Window(3, 0x5a)), out _, out _));
 
         // Stale-generation requests are dropped like stale input.
@@ -165,8 +165,8 @@ public class InputGenerationTests
             new KeyValuePair<int, byte[]>(11, [4, 5, 6]),
         });
 
-        Assert.False(receiver.TryDecodeInput(packet, out var frames));
-        Assert.Empty(frames);
+        Assert.False(receiver.TryDecodeInputWindow(packet, out var window));
+        Assert.Equal(0, window.Count);
 
         // The point of the test: the refusal is attributable, not silent.
         Assert.Equal(1, receiver.RejectedPayloadSize);
@@ -177,7 +177,7 @@ public class InputGenerationTests
 
         // A matching peer is unaffected and counts nothing.
         var agreeing = new InputPacketCodec([1, 1, 3], generation);
-        Assert.True(agreeing.TryDecodeInput(packet, out var ok));
+        Assert.True(agreeing.TryDecodeInputWindow(packet, out var ok));
         Assert.Equal(2, ok.Count);
         Assert.Equal(0, agreeing.RejectedTotal);
     }
@@ -192,19 +192,19 @@ public class InputGenerationTests
         var generation = new SessionGeneration(0x2727272727272727UL, 1);
         var codec = new InputPacketCodec([1, 1], generation);
 
-        Assert.False(codec.TryDecodeInput(codec.EncodeRequest(1, 42), out _));
+        Assert.False(codec.TryDecodeInputWindow(codec.EncodeRequest(1, 42), out _));
         Assert.Equal(0, codec.RejectedTotal);   // a request is not a refusal
 
         var foreign = new InputPacketCodec([1, 1], generation.Next());
         var stale = foreign.EncodeInput(1, new[] { new KeyValuePair<int, byte[]>(5, [9]) });
-        Assert.False(codec.TryDecodeInput(stale, out _));
+        Assert.False(codec.TryDecodeInputWindow(stale, out _));
         Assert.Equal(1, codec.RejectedGeneration);
         Assert.Equal(0, codec.RejectedPayloadSize);
         Assert.Equal(-1, codec.LastSizeMismatchPort);  // no size disagreement to report
     }
 
     [Fact]
-    public void DecodeWindow_DescribesTheSameFramesTheCopyingDecodeProduces()
+    public void DecodeWindow_PointsAtEachFramesBytesInPlace()
     {
         var generation = new SessionGeneration(0x9191919191919191UL, 2);
         var codec = new InputPacketCodec([1, 3], generation);
@@ -221,41 +221,35 @@ public class InputGenerationTests
         Assert.Equal(3, window.Count);
         Assert.Equal(3, window.PayloadSize);
 
-        // The offsets must land exactly where the copying decode's payloads came from.
-        Assert.True(codec.TryDecodeInput(packet, out var frames));
-        Assert.Equal(window.Count, frames.Count);
-        for (int i = 0; i < frames.Count; i++)
-        {
-            Assert.Equal(window.BaseFrame + i, frames[i].Frame);
-            Assert.Equal(window.Port, frames[i].Port);
+        // Each frame's offset must point at the bytes that frame was encoded with. This is the
+        // whole contract of describing a datagram in place rather than copying out of it: the
+        // receive path reads payloads straight from these offsets, so an offset that is off by a
+        // payload applies one frame's buttons under another frame's number.
+        var encoded = new[] { new byte[] { 1, 2, 3 }, new byte[] { 4, 5, 6 }, new byte[] { 7, 8, 9 } };
+        for (int i = 0; i < window.Count; i++)
             for (int b = 0; b < window.PayloadSize; b++)
-                Assert.Equal(frames[i].Payload[b], packet[window.OffsetOf(i) + b]);
-        }
+                Assert.Equal(encoded[i][b], packet[window.OffsetOf(i) + b]);
     }
 
     [Fact]
-    public void DecodeWindow_RefusesAndCountsExactlyWhatTheCopyingDecodeDoes()
+    public void DecodeWindow_CountsASizeRefusalButNotARequest()
     {
         var generation = new SessionGeneration(0x3131313131313131UL, 1);
         var sender = new InputPacketCodec([1, 1, 3], generation);
         var packet = sender.EncodeInput(2,
             new[] { new KeyValuePair<int, byte[]>(10, [1, 2, 3]) });
 
-        var viaWindow = new InputPacketCodec([1, 1, 1], generation);
-        var viaCopy = new InputPacketCodec([1, 1, 1], generation);
-        Assert.False(viaWindow.TryDecodeInputWindow(packet, out _));
-        Assert.False(viaCopy.TryDecodeInput(packet, out _));
+        var receiver = new InputPacketCodec([1, 1, 1], generation);
+        Assert.False(receiver.TryDecodeInputWindow(packet, out _));
+        Assert.Equal(1, receiver.RejectedTotal);
+        Assert.Equal(1, receiver.RejectedPayloadSize);
+        Assert.Equal(2, receiver.LastSizeMismatchPort);
+        Assert.Equal(3, receiver.LastSizeMismatchObserved);
 
-        // Both entry points share one set of acceptance rules and one set of counters, so a
-        // diagnosis drawn from the logs means the same thing whichever the hot path used.
-        Assert.Equal(viaCopy.RejectedTotal, viaWindow.RejectedTotal);
-        Assert.Equal(viaCopy.RejectedPayloadSize, viaWindow.RejectedPayloadSize);
-        Assert.Equal(viaCopy.LastSizeMismatchPort, viaWindow.LastSizeMismatchPort);
-        Assert.Equal(viaCopy.LastSizeMismatchObserved, viaWindow.LastSizeMismatchObserved);
-
-        var request = viaWindow.EncodeRequest(1, 7);
-        Assert.False(viaWindow.TryDecodeInputWindow(request, out _));
-        Assert.Equal(viaCopy.RejectedTotal, viaWindow.RejectedTotal); // still not a refusal
+        // A gap request is not an input packet, so it must leave the counters alone — otherwise
+        // they read non-zero on every healthy session and a real refusal means nothing.
+        Assert.False(receiver.TryDecodeInputWindow(receiver.EncodeRequest(1, 7), out _));
+        Assert.Equal(1, receiver.RejectedTotal);
     }
 
     /// <summary>

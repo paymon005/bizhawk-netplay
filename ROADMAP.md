@@ -23,12 +23,6 @@ difference between "works for us" and "works".
 
 ## Planned
 
-- **Feed the repair-derived terms to the depth solver.** The probe's
-  [repair line](docs/capability-probe.md#the-repair-line) reports the depth verdict as ~15% optimistic
-  on every stationary run, and the cause is known: `load=` is timed in isolation, and a load defers
-  work onto the frame that follows it, so the once-per-repair cost is nearer 3.8 ms than the 1.6 ms
-  reported. Fixing it moves the reported depth at native from 3 to what sparse keyframes now earns
-  honestly.
 - **Live relay failover.** The host's relay for a failed joiner↔joiner leg is decided once, at session
   start. A leg that dies mid-game is not failed over to it. Start-of-session is deterministic, shows
   up in the log and cannot oscillate under packet loss; live failover is a harder problem and was

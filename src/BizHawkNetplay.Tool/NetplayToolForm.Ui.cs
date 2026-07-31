@@ -353,25 +353,12 @@ public sealed partial class NetplayToolForm
                                : "arm this during a session to test resync");
         };
 
-        // Settles an open question rather than injecting a fault: is our own present a duplicate of
-        // the Render() EmuHawk already runs every loop iteration? Tick this mid-session — if the
-        // picture keeps updating, it is redundant and can go; if it freezes, it is load-bearing.
-        _skipPresentCheck = new CheckBox
-        {
-            Text = "Skip our video present (diag)", AutoSize = true, Location = new Point(200, 78),
-        };
-        _skipPresentCheck.CheckedChanged += (_, __) =>
-        {
-            _skipOurPresent = _skipPresentCheck.Checked;
-            Log(_skipOurPresent
-                ? "not presenting video ourselves — EmuHawk's own Render() is now the only thing " +
-                  "drawing. If the picture keeps moving, our present is redundant; if it freezes, it is not."
-                : "presenting video ourselves again");
-        };
-        _tips.SetToolTip(_skipPresentCheck,
-            "Diagnostic. EmuHawk calls Render() every run-loop iteration, right after it calls this\r\n" +
-            "tool, so our own present may be doing the same work twice. Tick it during a session and\r\n" +
-            "watch whether the picture keeps updating.");
+        // The "skip our video present" checkbox lived here. It asked whether our own present
+        // duplicated the Render() EmuHawk runs every loop iteration; it does, the answer was
+        // measured on N64 on 2026-07-30, and the fine clock has skipped presenting unconditionally
+        // ever since. What the box still controlled was the WM_TIMER fallback path — the one case
+        // where the present is genuinely load-bearing — so ticking it had stopped being a diagnostic
+        // and become a way to freeze the picture.
 
         var simLatencyLabel = new Label { Text = "Sim latency ms:", AutoSize = true, Location = new Point(12, 132) };
         _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(110, 130), Width = 60 };
@@ -388,7 +375,7 @@ public sealed partial class NetplayToolForm
         page.Controls.AddRange(
         [
             _probeButton, _testInputButton, _analogWatchButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
-            _skipPresentCheck, simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
+            simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
         ]);
         return page;
     }

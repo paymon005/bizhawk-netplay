@@ -221,26 +221,6 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     public static MeshUdpTransport Bind(int localPort) => new(localPort);
 
     /// <summary>
-    /// Compatibility API for callers that have a flat endpoint list. Every unique endpoint is treated
-    /// as its own logical peer, preserving the old send-to-every-endpoint behavior.
-    /// </summary>
-    public void SetPeers(IEnumerable<IPEndPoint> peers)
-    {
-        if (peers == null) throw new ArgumentNullException(nameof(peers));
-        var routes = new List<PeerRoute>();
-        var seen = new HashSet<IPEndPoint>();
-        int remotePort = 0;
-        foreach (var endpoint in peers)
-        {
-            if (endpoint == null)
-                throw new ArgumentException("Peer endpoints cannot contain null", nameof(peers));
-            if (seen.Add(endpoint))
-                routes.Add(new PeerRoute(remotePort++, new[] { endpoint }));
-        }
-        SetPeerRoutes(routes);
-    }
-
-    /// <summary>
     /// Peers whose direct joiner-to-joiner paths did not open, so this node forwards every other
     /// peer's input to them. Host only, decided once at session start; empty is the normal case and
     /// costs a single array length check per received datagram.
@@ -626,13 +606,6 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         }
         if (!found) bestRtt = 0;
         return found;
-    }
-
-    /// <summary>Snapshot of the candidate endpoints with a currently-open direct path.</summary>
-    public IReadOnlyList<IPEndPoint> AliveEndpoints()
-    {
-        long now = Clock.ElapsedMilliseconds;
-        return _routeTable.Endpoints.Where(endpoint => IsEndpointAlive(endpoint, now)).ToArray();
     }
 
     /// <summary>

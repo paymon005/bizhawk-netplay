@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
@@ -119,8 +119,6 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private Label _lobbyStateLabel = null!;
     private System.Windows.Forms.Timer _lobbyTimer = null!;
     private bool _lobbyFlashOn;                       // which half of the flash cycle we are in
-    private bool _lobbyShouldFlash;                   // whether the current state is a frozen one
-    private Color _lobbyStateColor = Color.DimGray;   // the un-dimmed colour of the current state
     // Set by the lobby/join paths, which know things no session state records — that we are dialling
     // out, or how many seats are still empty. Empty once a session is running or nothing is going on.
     private string _lobbyPhaseText = "";
@@ -129,8 +127,6 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private RichTextBox _connLog = null!;
     private Label _logFileLabel = null!;
     private CheckBox _simUnresponsiveCheck = null!;
-    private CheckBox _skipPresentCheck = null!;
-    private bool _skipOurPresent;   // diagnostic: leave presenting entirely to EmuHawk's Render()
     private Button _analogWatchButton = null!;
     private System.Windows.Forms.Timer? _analogWatchTimer;
     private const int AnalogWatchIntervalMs = 50;

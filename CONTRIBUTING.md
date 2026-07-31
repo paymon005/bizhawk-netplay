@@ -35,6 +35,7 @@ immediately before attaching anything to a release.
 ```
 src/
   BizHawkNetplay.Core/    netstandard2.0 — no BizHawk dependency, fully unit-testable
+    Compat/  IsExternalInit                     (shim so `init`/records compile here)
     Diag/    RotatingLogFile                    (the on-disk session log)
     Emu/     IEmuAdapter, StateHandle           (the seam BizHawk sits behind)
     Input/   ControllerLayout, InputSerializer  (generic-over-any-core packing)
@@ -56,6 +57,8 @@ src/
                           subject: .Identity .Input .InputDiagnostics .Output
     InputSetController.cs InputSet -> IController for invisible frame advance
     NetplaySettings.cs    persisted UI prefs
+    NetplaySoundBuffer.cs the audio ring the session pumps EmuHawk's device from
+    StopwatchClock.cs     IMonotonicClock over Stopwatch, for the probe and tuning
     SessionLogFile.cs     where this tool keeps its logs, and how many
 tests/
   BizHawkNetplay.Core.Tests/  xUnit, multi-targeted net10.0 + net48 — no EmuHawk required

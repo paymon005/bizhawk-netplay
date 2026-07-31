@@ -85,7 +85,22 @@ public sealed class SessionParams
 /// </summary>
 public static class Handshake
 {
-    /// <summary>Host side: accept a joiner, transfer initial state, agree on parameters.</summary>
+    /// <summary>
+    /// Host side: accept a joiner, transfer initial state, agree on parameters.
+    ///
+    /// SUPERSEDED, and no longer called by the tool. The session path is the multi-peer sequence —
+    /// <see cref="HostGreet"/>, then <see cref="HostSendWelcome"/> / <see cref="HostSendStart"/> /
+    /// <see cref="HostSendAssignment"/>, then the READY barrier and <see cref="HostSendGo"/> — which
+    /// handles one joiner as the two-player case rather than treating it specially.
+    ///
+    /// Kept because it is the fixture the handshake tests drive: rom mismatch, the password
+    /// challenge, state transfer, the post-apply callback and the rollback downgrade are all
+    /// exercised through here, and every step it performs is a call into the same production code
+    /// the multi-peer path uses. Only this ORDERING is test-only. It has not been moved into the
+    /// test project because <c>ReceiveStartData</c>, which its client half needs, is private and
+    /// shared with the live <see cref="RunClientMulti"/> — exposing that to delete this would be the
+    /// worse trade.
+    /// </summary>
     public static SessionParams RunHost(
         ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs,
         byte[] hostState, int localUdpPort, Action<SessionParams>? beforeGo = null,
@@ -150,7 +165,8 @@ public static class Handshake
         return session;
     }
 
-    /// <summary>Client side: join a host, receive initial state, agree on parameters.</summary>
+    /// <summary>Client half of <see cref="RunHost"/>, and superseded by
+    /// <see cref="RunClientMulti"/> on the same terms — see that summary.</summary>
     public static SessionParams RunClient(
         ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
         Action<SessionParams>? beforeReady = null, Action? afterGreet = null)
@@ -274,17 +290,11 @@ public static class Handshake
     }
 
     /// <summary>
-    /// Measure the settled round-trip time of an authenticated lobby control link before WELCOME.
-    /// The client-side start loop echoes these probes while it waits. Median filtering keeps one
-    /// scheduler/TCP spike from permanently adding another frame of input latency.
-    /// </summary>
-    public static double MeasureLobbyRoundTrip(ControlChannel channel, int samples = 5) =>
-        MeasureLobbyRtt(channel, samples).MedianMs;
-
-    /// <summary>
-    /// As <see cref="MeasureLobbyRoundTrip"/>, but also reports how far the link swings above its
-    /// settled cost. Delay has to cover the worst packet rather than the typical one, so the
-    /// median alone under-delays a jittery link — see <see cref="LobbyDelayPolicy"/>.
+    /// Measure the settled round-trip time of an authenticated lobby control link before WELCOME,
+    /// and how far the link swings above it. The client-side start loop echoes these probes while it
+    /// waits. Median filtering keeps one scheduler/TCP spike from permanently adding another frame
+    /// of input latency, and the jitter figure is reported alongside because delay has to cover the
+    /// worst packet rather than the typical one — see <see cref="LobbyDelayPolicy"/>.
     /// </summary>
     public static LobbyRttSample MeasureLobbyRtt(ControlChannel channel, int samples = 9)
     {

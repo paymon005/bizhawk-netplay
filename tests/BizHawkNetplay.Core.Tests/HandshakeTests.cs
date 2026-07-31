@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -93,7 +93,7 @@ public class HandshakeTests
                 {
                     Assert.Equal(SyncMode.Rollback, mode);
                     Assert.Equal(1, floor);
-                    measuredRtt = Handshake.MeasureLobbyRoundTrip(channel, samples: 3);
+                    measuredRtt = Handshake.MeasureLobbyRtt(channel, samples: 3).MedianMs;
                     return 4;
                 }));
 
@@ -304,8 +304,8 @@ public class HandshakeTests
 
             // Lobby auto-selection probes every authenticated link while all joiners are still
             // waiting for WELCOME; neither client may mistake the probe for start data.
-            Assert.True(Handshake.MeasureLobbyRoundTrip(hostCh1, samples: 2) >= 0);
-            Assert.True(Handshake.MeasureLobbyRoundTrip(hostCh2, samples: 2) >= 0);
+            Assert.True(Handshake.MeasureLobbyRtt(hostCh1, samples: 2).MedianMs >= 0);
+            Assert.True(Handshake.MeasureLobbyRtt(hostCh2, samples: 2).MedianMs >= 0);
 
             // Authoritative delay is the max over everyone: max(3, 2, 5) = 5.
             int delay = Math.Max(hostPrefs.InputDelay, Math.Max(g1.Prefs.InputDelay, g2.Prefs.InputDelay));

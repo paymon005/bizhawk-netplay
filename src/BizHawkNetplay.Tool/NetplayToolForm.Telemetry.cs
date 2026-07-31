@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Threading;
 using BizHawkNetplay.Core.Session;
@@ -15,17 +15,6 @@ public sealed partial class NetplayToolForm
     /// player's input delay and sizes rollback's prediction horizon, measuring the wrong path costs
     /// real latency. Falls back to the TCP ping when no peer's ack carried a timestamp (older build).
     /// </summary>
-    /// <summary>
-    /// Milliseconds since a <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> reading.
-    ///
-    /// The frame loop times several spans per tick and per frame. A Stopwatch object for each was
-    /// roughly 180 allocations a second of pure measurement overhead — inside the very loop whose
-    /// collection counts it exists to instrument. GetTimestamp is a static that allocates nothing.
-    /// </summary>
-    private static double ElapsedMs(long sinceTimestamp) =>
-        (System.Diagnostics.Stopwatch.GetTimestamp() - sinceTimestamp) * 1000.0
-        / System.Diagnostics.Stopwatch.Frequency;
-
     private double WorstPingMs(out bool udpMeasured)
     {
         udpMeasured = false;
@@ -39,6 +28,17 @@ public sealed partial class NetplayToolForm
         lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
         return ping;
     }
+
+    /// <summary>
+    /// Milliseconds since a <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> reading.
+    ///
+    /// The frame loop times several spans per tick and per frame. A Stopwatch object for each was
+    /// roughly 180 allocations a second of pure measurement overhead — inside the very loop whose
+    /// collection counts it exists to instrument. GetTimestamp is a static that allocates nothing.
+    /// </summary>
+    private static double ElapsedMs(long sinceTimestamp) =>
+        (System.Diagnostics.Stopwatch.GetTimestamp() - sinceTimestamp) * 1000.0
+        / System.Diagnostics.Stopwatch.Frequency;
 
     /// <summary>
     /// How many frames ahead of the peers we are actually running, or 0 when unmeasured.
@@ -90,12 +90,12 @@ public sealed partial class NetplayToolForm
             {
                 _udpWarningActive = true;
                 Log($"no UDP input from P{port + 1} for {seconds:F1}s — re-punching the input path" +
-                    RejectionNote());
+                    RejectionNote() + MeshHealthNote());
             }
         }
         if (seconds >= UdpLostAfterSeconds)
             EndSession($"UDP input path lost for P{port + 1} ({seconds:F0}s without input; " +
-                       $"control link was still alive){RejectionNote()}");
+                       $"control link was still alive){RejectionNote()}{MeshHealthNote()}");
     }
 
     /// <summary>
@@ -123,6 +123,31 @@ public sealed partial class NetplayToolForm
                $"(gen {codec.RejectedGeneration}, port {codec.RejectedUnknownPort}, " +
                $"size {codec.RejectedPayloadSize}, malformed {codec.RejectedMalformed}){detail}. " +
                "This is not a network fault — the packets are getting through.";
+    }
+
+    /// <summary>
+    /// If the mesh transport itself is unhealthy, say how — otherwise "".
+    ///
+    /// Appended beside <see cref="RejectionNote"/> for the same reason: "no UDP input from P2" has
+    /// several causes that look identical from the chair. A nonzero drop count means datagrams
+    /// arrived and the frame loop was too far behind to take them; a nonzero fault count means the
+    /// receive path threw, which is a bug here rather than anything about the network. Both were
+    /// already being counted and neither was ever read, so the log could not tell them apart from
+    /// a peer that had simply gone quiet.
+    /// </summary>
+    private string MeshHealthNote()
+    {
+        var mesh = _mesh;
+        if (mesh == null) return "";
+        string note = "";
+        if (mesh.InboundDropped > 0)
+            note += $" — NOTE: {mesh.InboundDropped} input datagram(s) were dropped from a full " +
+                    $"receive backlog (peak depth {mesh.InboundPeakDepth}), so they arrived and this " +
+                    "machine could not keep up with them.";
+        if (mesh.ReceiveFaults > 0)
+            note += $" — NOTE: the UDP receive path threw {mesh.ReceiveFaults} time(s), most recently " +
+                    $"'{mesh.LastReceiveFault}'. That is a fault in this tool, not in the network.";
+        return note;
     }
 
     private void MaybeSendChecksum()

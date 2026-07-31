@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net48</TargetFramework>
@@ -21,26 +21,19 @@
 
   <!-- BizHawk assemblies to compile against, resolved from the local install.
        Never copied to output: EmuHawk loads the tool from its own ExternalTools dir
-       where these already live. -->
+       where these already live.
+
+       Only what is actually compiled against. BizHawk.Common, BizHawk.WinForms.Controls and
+       BizHawk.Bizware.Graphics were listed here and named by nothing — no using, no type, and no
+       member signature that needed them; each was removed and the Tool still built. They are of
+       course still loaded by EmuHawk itself, which is why nothing at runtime notices. -->
   <ItemGroup>
     <Reference Include="BizHawk.Client.Common">
       <HintPath>$(BizHawkHome)\dll\BizHawk.Client.Common.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="BizHawk.Common">
-      <HintPath>$(BizHawkHome)\dll\BizHawk.Common.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
     <Reference Include="BizHawk.Emulation.Common">
       <HintPath>$(BizHawkHome)\dll\BizHawk.Emulation.Common.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="BizHawk.WinForms.Controls">
-      <HintPath>$(BizHawkHome)\dll\BizHawk.WinForms.Controls.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="BizHawk.Bizware.Graphics">
-      <HintPath>$(BizHawkHome)\dll\BizHawk.Bizware.Graphics.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="BizHawk.Client.EmuHawk">

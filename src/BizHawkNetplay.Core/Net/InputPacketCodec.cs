@@ -78,7 +78,7 @@ public sealed class InputPacketCodec
 
     /// <summary>
     /// Input datagrams thrown away, by reason. A rejected input packet used to vanish without a
-    /// trace: <c>TryDecodeInput</c> returned false and the receive loop simply moved on. That made
+    /// trace: the decode returned false and the receive loop simply moved on. That made
     /// a whole class of failure undiagnosable from a log — a 3-player NES session where every packet
     /// from the third port was discarded on arrival read exactly like a network problem ("no UDP
     /// input from P3"), while the UDP path had opened and the packets were in fact arriving.
@@ -208,8 +208,7 @@ public sealed class InputPacketCodec
 
     /// <summary>
     /// Validate a datagram and describe its contents without copying any of them. Same acceptance
-    /// rules and same rejection counters as <see cref="TryDecodeInput"/> — that method is now this
-    /// one plus the copying.
+    /// rules and same rejection counters the copying decode this replaced used to apply.
     /// </summary>
     public bool TryDecodeInputWindow(byte[] datagram, out InputWindow window)
     {
@@ -251,26 +250,6 @@ public sealed class InputPacketCodec
         return true;
     }
 
-    /// <summary>
-    /// Decode a datagram into per-frame <see cref="InputFrame"/>s. Returns false for unknown,
-    /// malformed, or differently generated datagrams rather than throwing — the input channel
-    /// is untrusted UDP. The receive hot path uses <see cref="TryDecodeInputWindow"/> instead and
-    /// copies only the frames it will keep.
-    /// </summary>
-    public bool TryDecodeInput(byte[] datagram, out List<InputFrame> frames)
-    {
-        frames = new List<InputFrame>();
-        if (!TryDecodeInputWindow(datagram, out var window)) return false;
-
-        for (int i = 0; i < window.Count; i++)
-        {
-            var payload = new byte[window.PayloadSize];
-            Buffer.BlockCopy(datagram, window.OffsetOf(i), payload, 0, window.PayloadSize);
-            frames.Add(new InputFrame(window.BaseFrame + i, window.Port, payload));
-        }
-        return true;
-    }
-
     /// <summary>Encode a request for <paramref name="targetPort"/>'s inputs from <paramref name="fromFrame"/> on.</summary>
     public byte[] EncodeRequest(byte targetPort, int fromFrame)
     {
@@ -285,7 +264,7 @@ public sealed class InputPacketCodec
         return buffer;
     }
 
-    /// <summary>Decode a gap request. Same tolerance rules as <see cref="TryDecodeInput"/>.</summary>
+    /// <summary>Decode a gap request. Same tolerance rules as <see cref="TryDecodeInputWindow"/>.</summary>
     public bool TryDecodeRequest(byte[] datagram, out byte targetPort, out int fromFrame)
     {
         targetPort = 0;

@@ -202,8 +202,7 @@ however fast the core runs.
 ### What happens automatically
 
 - **Desync detection.** Every 300 frames (~5s) peers trade a memory hash. On a mismatch the host
-  resyncs everyone from its authoritative state rather than ending the session, and saves the
-  diverged state to quick-slot 10 for inspection.
+  resyncs everyone from its authoritative state rather than ending the session.
 - **Drop and rejoin.** If a player loses their connection, the host holds their seat and freezes the
   others while they reconnect. One missing player at a time.
 - **Frame pacing.** Under load the tool renders only the last frame of a catch-up burst, so heavy

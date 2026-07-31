@@ -450,7 +450,7 @@ public sealed partial class NetplayToolForm
             // meaning what they meant; only `present mean`, which times our own call, drops to zero,
             // and that zero is the saving. The standing caveat is unchanged: these count frames we
             // handed to the display, not refreshes the player's eye received.
-            if (steppedThisTick && !_skipOurPresent)
+            if (steppedThisTick)
             {
                 bool presented = true;
                 if (fromFineClock)
