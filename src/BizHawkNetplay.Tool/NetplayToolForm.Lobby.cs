@@ -607,9 +607,12 @@ public sealed partial class NetplayToolForm
             var report = Handshake.HostWaitMeshRtt(link.Control, generation);
             totalEdges += report.TotalEdges;
             measuredEdges += report.MeasuredEdges;
-            // A joiner short of its own edge count has a leg to another joiner that never opened.
-            // The host's own leg to it cannot be the missing one — it is connected to us — so the
-            // gap is joiner-to-joiner, which is what the relay exists for.
+            // A joiner short of its own edge count has at least one direct leg that never opened.
+            //
+            // WHICH leg is not knowable from this report — it carries counts, not identities — and an
+            // earlier version of this comment asserted the host's own leg could not be the missing
+            // one "because it is connected to us". That was wrong: the connection proving it is TCP,
+            // and says nothing about whether UDP reaches us. See InstallMeshRelay for what that costs.
             if (report.MeasuredEdges < report.TotalEdges) incomplete.Add(link);
             if (!report.HasMeasurement)
             {
@@ -655,14 +658,22 @@ public sealed partial class NetplayToolForm
     /// <summary>
     /// Have the host forward input to joiners whose direct legs to the other joiners never opened.
     ///
-    /// This is the symmetric-NAT case. Such a peer can still reach the host — it dialled out to a
-    /// forwarded port, which is a path it opened itself — but no peer can be told an address for it
-    /// that stays valid, so the joiner-to-joiner legs cannot be punched at all. Before this, a
-    /// 3-4 player session with one such peer simply never received that peer's input on those legs.
-    ///
-    /// The host is already the rendezvous every joiner reached, so it can relay without any external
+    /// The host is already the rendezvous every joiner reached, so it can relay with no external
     /// server: no TURN, no third party, nothing to run. The cost is one extra hop on the affected
     /// legs and a little host uplink.
+    ///
+    /// WHAT THIS DOES NOT FIX, despite the first version of this comment saying so: a TRUE symmetric
+    /// NAT. Relaying needs a live host-to-peer UDP leg to relay over, and under symmetric NAT that
+    /// leg does not exist either. The peer's router assigns a fresh external port per destination, so
+    /// the port it uses toward us is not the one it advertised from STUN — and the receive path pins
+    /// on the exact endpoint (MeshUdpTransport line ~651), dropping the packet before anything can
+    /// learn from it. The path is physically fine; we refuse to recognise it.
+    ///
+    /// So this helps the case where the host legs DID open and only joiner-to-joiner failed — an
+    /// address-restricted NAT that ran out of punch time, a firewall that permits the host but not
+    /// peers. Symmetric NAT needs the endpoint to be learnable instead: a per-peer token over the
+    /// authenticated control channel that lets a peer's real source endpoint bind or migrate. That
+    /// is a wire change and is not done.
     ///
     /// Decided once, here, from the mesh round — not failed over live. A start-of-session decision is
     /// deterministic, shows up in the log, and cannot oscillate under packet loss; live failover is a
@@ -674,25 +685,50 @@ public sealed partial class NetplayToolForm
     /// copy arriving beside a direct one is discarded. Narrowing it to the exact failed pair would
     /// need the report to name peers, and that is a wire change for a bandwidth saving nobody needs.
     /// </summary>
+    /// <summary>Whether ANY candidate endpoint of this peer has answered on UDP — i.e. whether the
+    /// host has a real mesh path to it, as distinct from the TCP control link it arrived on.</summary>
+    private static bool LinkHasLiveMeshPath(MeshUdpTransport mesh, PeerLink link) =>
+        mesh.IsEndpointAlive(link.UdpEndpoint)
+        || (link.ReflexiveEndpoint != null && mesh.IsEndpointAlive(link.ReflexiveEndpoint));
+
     private void InstallMeshRelay(MeshUdpTransport mesh, List<PeerLink> links, List<PeerLink> incomplete)
     {
-        if (incomplete.Count == 0) { mesh.SetRelayRoutes([]); return; }
+        _relayPorts.Clear();
+        if (incomplete.Count == 0) { RefreshRelayRoutes(); return; }
 
         // Relaying is pointless with one joiner: there is no other joiner for it to fail to reach,
         // and the host's own input already goes to it directly.
         if (links.Count < 2)
         {
-            mesh.SetRelayRoutes([]);
+            RefreshRelayRoutes();
             UiConnLog("a direct UDP path did not open, but with one joiner there is nothing to relay " +
                       "— the host's own link is the only one that matters.", Color.DarkOrange);
             return;
         }
 
-        mesh.SetRelayRoutes(RoutesExcept(incomplete, null));
+        // Stored as PORTS, not as the routes themselves: endpoints change when someone rejoins, and
+        // RefreshRelayRoutes re-resolves these against the live peer list every time that happens.
+        foreach (var link in incomplete) _relayPorts.Add(link.RemotePort);
+        RefreshRelayRoutes();
+
+        // Only claim what the relay can actually deliver. If a joiner's missing leg is the one to
+        // THIS host, there is nothing to relay over and the session is about to stall instead —
+        // which is what a true symmetric NAT looks like from here.
+        int noHostLeg = 0;
+        foreach (var link in incomplete)
+            if (!LinkHasLiveMeshPath(mesh, link)) noHostLeg++;
+
         UiConnLog($"relaying input through this host for {incomplete.Count} player(s) whose direct " +
-                  "paths to the other players did not open — usually a symmetric NAT. They stay in " +
-                  "the session; their input just takes one extra hop, so expect slightly more delay " +
-                  "on those legs than the lobby measured.", Color.DarkOrange);
+                  "paths to the other players did not open. They stay in the session; their input " +
+                  "takes one extra hop, so expect a little more delay on those legs than the lobby " +
+                  "measured.", Color.DarkOrange);
+        if (noHostLeg > 0)
+            UiConnLog($"WARNING: {noHostLeg} of those has no live UDP path to this host either, so " +
+                      "there is nothing to relay over and their input will not arrive at all. That is " +
+                      "what a symmetric NAT looks like from here — the router gives them a different " +
+                      "public port for every destination, so the address they advertised is not the " +
+                      "one they reach us from. Have them forward a UDP port and host instead, or play " +
+                      "2-player against a forwarded host.", Color.Firebrick);
     }
 
     /// <summary>

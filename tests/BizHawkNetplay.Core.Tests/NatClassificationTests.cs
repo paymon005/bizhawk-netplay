@@ -57,15 +57,19 @@ public class NatClassificationTests
         Assert.Contains("SYMMETRIC", s);
         Assert.Contains("50000", s);
         Assert.Contains("50001", s);
-        // It must not overstate the damage. Joining a forwarded host still works, because the joiner
-        // opens that path itself — and since the host relay landed, the joiner-to-joiner legs it
-        // cannot punch are carried for it, so 3-4 players is no longer lost either.
+        // It must not overstate the damage: joining a forwarded host is worth trying, because the
+        // joiner opens that path itself.
         Assert.Contains("still works", s);
         Assert.Contains("forwarded one", s);
-        Assert.Contains("relays input", s);
-        // ...and must not understate it either: the one thing still genuinely unavailable is hosting
-        // without a forwarded port, since then nothing is reachable to relay through.
-        Assert.Contains("hosting", s);
+        Assert.Contains("relays", s);
+
+        // ...and must not overstate the CURE either, which is the failure this test now exists to
+        // catch. An earlier version promised the host relay made symmetric NAT a solved problem at
+        // 3-4 players. It does not: relaying needs a live path to relay over, and a symmetric router
+        // can hand the host a port it was never told about, so that path may not exist. The message
+        // has to admit the join can fail rather than sending someone to debug a working router.
+        Assert.Contains("may still give", s);
+        Assert.Contains("only relay to someone it can still reach", s);
         Assert.Contains("forward a UDP port and host", s);
         Assert.True(r.IsSymmetric);
     }

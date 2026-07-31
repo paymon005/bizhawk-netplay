@@ -49,10 +49,11 @@ public readonly struct NatReport
             $"socket ({First?.Port} and {Second?.Port}), so no peer can be told an address that " +
             "will still be valid when it aims there. What this breaks: UDP Punch, and hosting " +
             "without a forwarded port. What still works: joining a host who has forwarded one, " +
-            "because you open that path yourself — and at 3-4 players the host now relays input " +
-            "over the direct legs to the other joiners that cannot open, so you play normally with " +
-            "one extra hop of delay on those legs. So: join a forwarded host, or forward a UDP " +
-            "port and host it yourself.",
+            "because you open that path yourself — though a truly symmetric router may still give " +
+            "the host a port it was not told about, in which case even that fails. The host relays " +
+            "joiner-to-joiner legs that do not open, but it can only relay to someone it can still " +
+            "reach. So: join a forwarded host and see whether it holds, or forward a UDP port and " +
+            "host it yourself.",
         _ => "NAT check: could not reach two STUN servers, so nothing was established about your " +
              "router. This is not a verdict either way.",
     };

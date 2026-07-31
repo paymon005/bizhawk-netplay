@@ -137,6 +137,25 @@ public sealed partial class NetplayToolForm
     {
         if (_mesh == null) return;
         try { _mesh.SetPeerRoutes(RoutesExcept(_peers, null)); } catch { }
+        RefreshRelayRoutes();
+    }
+
+    /// <summary>
+    /// Rebuild the relay's physical routes from the logical ports it was installed for.
+    ///
+    /// Relay routes used to be a snapshot taken once in the lobby, and nothing refreshed them. A peer
+    /// that dropped and rejoined comes back on a NEW endpoint — that is the whole reason
+    /// <see cref="RedistributeMesh"/> exists — so the relay was left aimed at an address nobody was
+    /// listening on, and a peer that left for good was still being sent copies. Keeping the decision
+    /// as PORT numbers and re-resolving them here means the relay follows the same candidate updates
+    /// everything else does.
+    /// </summary>
+    private void RefreshRelayRoutes()
+    {
+        if (_mesh == null) return;
+        if (_relayPorts.Count == 0) { try { _mesh.SetRelayRoutes([]); } catch { } return; }
+        var live = _peers.FindAll(p => _relayPorts.Contains(p.RemotePort));
+        try { _mesh.SetRelayRoutes(RoutesExcept(live, null)); } catch { }
     }
 
     /// <summary>Host: re-point our own mesh and re-send each joiner its candidate peer list (used
@@ -469,6 +488,7 @@ public sealed partial class NetplayToolForm
         RestorePauseState();
         lock (_hashLock) { _checksums.Clear(); }
 
+        _relayPorts.Clear(); // a fresh session re-measures; nothing from the last one should carry
         _netcodeLabel.Text = "Netcode in use: —";
         _netcodeLabel.ForeColor = Color.DimGray;
         SetLobbyPhase("", Color.DimGray); // back to "Not connected", and stop flashing
