@@ -13,7 +13,7 @@ public sealed partial class NetplayToolForm
 {
     // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
     private Config? _config;
-    private bool _configApplied;
+    private bool _hostOwnershipHeld;
     private int _logLines;      // lines currently in _log, tracked so trimming needn't split its text
     private bool _prevAcceptBackgroundInput;
     private bool _prevAcceptBackgroundInputControllerOnly;
@@ -56,8 +56,8 @@ public sealed partial class NetplayToolForm
                 // Idempotent: acquisition happens at the FIRST pause and a session pauses several
                 // times on the way in. Re-running would snapshot the values we ourselves just wrote,
                 // and teardown would then "restore" the user's settings to ours.
-                if (_configApplied) return;
-                _configApplied = true;
+                if (_hostOwnershipHeld) return;
+                _hostOwnershipHeld = true;
 
                 // Taken first, and independent of everything below, because this is the guard that
                 // actually stops EmuHawk stepping the core. Pause cannot: advancing a paused core is
@@ -83,9 +83,15 @@ public sealed partial class NetplayToolForm
                 Log("EmuHawk's own frame advance blocked and rewind suspended; run-in-background " +
                     "enabled (controller-only)");
             }
-            else if (_configApplied)
+            else if (_hostOwnershipHeld)
             {
-                _configApplied = false;
+                // Clearing the flag FIRST is load-bearing, not tidiness. EnableRewind calls
+                // CreateRewinder when the rewinder is null, and CreateRewinder opens with
+                // "if (ToolControllingRewind is not null) return;" — so restoring rewind while we
+                // still claim it silently fails to recreate anything, and rewind stays dead for the
+                // rest of the EmuHawk run. Separate try blocks for the same reason: one failed
+                // restoration must not skip the others.
+                _hostOwnershipHeld = false;
                 try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
                 try { APIs.EmuClient.EnableRewind(_prevRewindEnabled); } catch { }
                 if (_config != null)

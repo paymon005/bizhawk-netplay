@@ -432,8 +432,12 @@ public sealed partial class NetplayToolForm
 
     private void EndSession(string reason)
     {
+        // Ownership is in this guard because it is no longer implied by owning a socket. It is taken
+        // at the first pause, before the listener or transport exists, so a fast-path return here
+        // could leave the frame advance blocked and the frontend commands refused with nothing left
+        // to explain why.
         if (!_phase.IsActive && _listener == null && _joiningTcp == null && _greetingTcp == null
-            && _peers.Count == 0
+            && _peers.Count == 0 && !_hostOwnershipHeld && !_pausedByUs
             && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
         { SetBusy(false); return; }
         bool wasActive = _phase.IsActive;
