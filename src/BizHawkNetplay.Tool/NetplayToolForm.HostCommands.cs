@@ -28,15 +28,21 @@ namespace BizHawkNetplay.Tool;
 /// </summary>
 public sealed partial class NetplayToolForm : IControlMainform
 {
-    /// <summary>Refusals are driven by hotkeys, which repeat. Say it once, not once per press.</summary>
-    private const double HostCommandRefusalIntervalMs = 3000;
-    private double _lastHostCommandRefusalMs = double.NegativeInfinity;
+    /// <summary>
+    /// Refusals are driven by hotkeys, which repeat. Say it once, not once per press.
+    ///
+    /// In SECONDS, through the same helper everything else here uses. This first compared
+    /// MonotonicNow() against 3000 as though it were milliseconds — it is a raw
+    /// Stopwatch.GetTimestamp(), so against a 10MHz QPC the throttle was 0.3ms and every repeat got
+    /// its own line. A zero stamp reads as PositiveInfinity, so the first refusal always speaks.
+    /// </summary>
+    private const double HostCommandRefusalIntervalSeconds = 3;
+    private long _lastHostCommandRefusalStamp;
 
     private void RefuseHostCommand(string what)
     {
-        double now = MonotonicNow();
-        if (now - _lastHostCommandRefusalMs < HostCommandRefusalIntervalMs) return;
-        _lastHostCommandRefusalMs = now;
+        if (MonotonicElapsedSeconds(_lastHostCommandRefusalStamp) < HostCommandRefusalIntervalSeconds) return;
+        _lastHostCommandRefusalStamp = MonotonicNow();
         ConnLog($"{what} is disabled while netplay owns the timeline — it would replace the emulator " +
                 "state under every other player. Disconnect first.", Color.DarkOrange);
     }
