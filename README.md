@@ -30,6 +30,10 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 > handshake, which is the intended behaviour rather than a fault. **v0.22.0 and v0.23.0 keep protocol
 > 13**, so anything from v0.21.0 onward mixes freely — update whenever suits you. v0.23.0 adds host
 > relaying, which changes only what the host chooses to forward, not the format of anything on the wire.
+> **v0.24.0 moves to protocol 14** — every seat now gets a token in its WELCOME and announces it over
+> UDP, so a peer can be recognised at the address it actually arrives from rather than the one it
+> advertised. A protocol-13 peer sends no token, and its packets would stay unroutable to anyone whose
+> NAT rewrote the source port — silent one-way input loss — so the handshake refuses the mix instead.
 
 ## Status
 
@@ -43,7 +47,7 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | **M2 — hardening** | ✅ Live ping/RTT + delay hints, **desync auto-recovery** (mismatch → resync from an authoritative state instead of ending), alt-tab audio resilience |
 | **2–4 players** | ✅ Host picks the player count (2 up to the core's port count); direct peer-to-peer input **full mesh** — every peer sends straight to every other, so input is normally one hop from its author and the host coordinates without carrying it. Where a joiner↔joiner leg fails to open, the host relays just that leg (one extra hop, decided at session start; it cannot help a peer whose leg to the *host* also failed) — with **host-as-rendezvous** connectivity checks (active hole-punch + UDP keepalive, per-peer direct-link status). **2P and 4P lockstep verified on hardware** in July 2025. **3P verified on three separate machines over the internet** in July 2026 — SNES rollback, N64 lockstep, and N64 rollback at delay 5 — see KNOWN-ISSUES KI-8. 4P remains measured on one machine only. |
 | **M3 — rollback** | ✅ Code-complete — GGPO-style `RollbackStrategy` drops in behind `ISyncStrategy`; probe-gated + handshake-negotiated (or forced via the netcode dropdown). **Verified in real 3-player internet play** in July 2026 on SNES (Gauntlet II, low delay) and N64 (Pokemon Stadium, delay 5). |
-| **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT. **The 3P mesh legs were punched over the real internet** in July 2026 across three separate machines; whether the connect-code UDP Punch admission path specifically was exercised there is not recorded. |
+| **M4 — NAT punch-through** | ✅ Code-complete — STUN + UPnP; **UDP Punch** (RemotePlay-style connect-code hole-punching) carries a whole 2-player session over a reliable-over-UDP control channel; host-as-rendezvous auto-punches the 3–4P mesh legs. Cone NAT, plus **symmetric NAT via per-seat tokens** as of v0.24.0 — code-complete, not yet proven on a real symmetric path. **The 3P mesh legs were punched over the real internet** in July 2026 across three separate machines; whether the connect-code UDP Punch admission path specifically was exercised there is not recorded. |
 | **Session passwords** (v0.8.0) | ✅ Nonce challenge-response with a slow KDF — the password never crosses the wire and a captured proof can't be replayed. A refused joiner loses only its own connection; the host keeps hosting. **Protocol v4 — everyone must update.** |
 | **Latency & liveness** (v0.9.0) | ✅ Audio cushion halved (a permanent 80ms video→audio offset, now 40ms); RTT measured on the UDP path input actually rides rather than the TCP control link; rollback time-syncs on a real **frame advantage** exchange, so the peer genuinely ahead yields instead of both guessing from a symmetric RTT; delay advice is mode-aware. Per-link drop detection no longer goes blind during a resync. *Protocol unchanged — mixes with v0.8.0 peers.* |
 | **Punch admission** (v0.11.0) | ✅ Hosting and UDP punch are one flow, RemotePlay-style: the host just clicks **Start Hosting**; a joiner who can't reach it enters the host's IP and clicks **UDP Punch**, sends the code it gets, and the host pastes it to admit them — into the same 2–4 player lobby as TCP joiners, over a reliable control stream on the session's own UDP socket. One code per NAT'd joiner; no port-forwarding on their side. |
@@ -54,6 +58,8 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | **Input & host commands** (v0.22.0) | ✅ **The tool window no longer steals your controller.** BizHawk refuses host input outright while an external tool has focus (`IExternalToolForm => AllowInput.None`), so clicking this window mid-game stopped your pad — fixed the way TAStudio does it, conditionally, so typing an IP still goes only to the box. Input capture now reads `Joypad.Get`, the end of EmuHawk's own controller chain, instead of re-deriving the bind maths here. A **host loading a savestate now takes every player with it** — the same resync a desync recovery uses — while a joiner's load is refused. Plus **Watch Analog**, which reports every distinct value a stick actually delivers to the core. *Protocol unchanged — mixes with v0.21.0 peers.* |
 
 | **Audio & mesh relay** (v0.23.0) | ✅ **Opening Config → Sound no longer kills audio for the rest of the session** — the dialog re-attaches EmuHawk's own provider (and may replace the `Sound` object outright), which then fought the session for the device at zero volume; ownership is now re-taken before every pump. Master mute works too, which it never had. Where a **joiner↔joiner UDP leg fails to open**, the host relays that leg rather than the pair simply never hearing each other — no external server, since the host is already the rendezvous. It cannot help a peer whose leg to the *host* also failed (true symmetric NAT), and now says so loudly instead of relaying into a void. *Protocol unchanged — mixes with v0.21.0+.* |
+
+| **Symmetric NAT & named edges** (v0.24.0) | ✅ An advertised address is a guess: a symmetric NAT hands out a different public port per destination, so the endpoint a peer learns from STUN is valid for the STUN server and nobody else — everyone else saw its packets arrive from an address they were never told about, and dropped them unread. Each **seat now gets a 16-byte token**, minted by the host and delivered in WELCOME over the already-authenticated control channel; a peer announces it alongside its punch probes, and the receiver binds that seat to wherever the packet really came from. Tokens are keyed by seat and outlive the player in it, so a **rejoin on a new address is recognisable** with no redistribution. The learned address is probed and kept warm like any other, and the lobby now **names the edges** — who answered, who did not, and who could only be reached at an address they never advertised. **Code-complete; not yet proven on a real symmetric-NAT path.** **Protocol v14 — everyone must update.** |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
@@ -250,11 +256,16 @@ Loading a state is about keeping the workload *still*, not about it being dearer
 - **The depth verdict is ~15% optimistic.** The probe's [repair line](#the-repair-line) says so on every stationary run, and the cause is known: `load=` is timed in isolation and the load defers work onto the frame that follows it, so the once-per-repair cost is nearer 3.8 ms than the 1.6 ms reported. Feeding the repair-derived terms to the solver is the fix; it moves the reported depth at native from 3 to what sparse keyframes now earns honestly.
 - **A repair spends up to `MaxFramesPerTick` frame periods, and the catch-up path can run exactly that many back per tick.** The two are now tied rather than chosen alongside each other, so raising either alone can no longer leave repairs running up arrears the pacing rebase quietly discards.
 - **Where N64's frame cost actually comes from:** mostly the render resolution — a controlled sweep puts it at 2.4 ms at 320×240 and 7.7 ms at 2880×2160 (see [Heavy cores](#heavy-cores-n64-and-friends)). An earlier uncontrolled sweep looked like noise and was read that way; it simply hadn't spanned enough of the range for the curve to clear the scatter. Whether resolution accounts for *all* of the 1.6–12 ms swing seen across one evening's sessions is still open — the top of that range is above anything measured here — but it is no longer an unexplained term.
-- **Symmetric-NAT peers still can't HOST.** The joiner↔joiner legs they can't punch are now relayed
-  through the host, which needs no external server because the host is already the rendezvous
-  everyone reached. What that doesn't solve is a symmetric-NAT peer *hosting* without forwarding a
-  port — there is no reachable rendezvous then, and that is the case a TURN-style server would be
-  for. Also still start-of-session only: a leg that dies mid-game is not failed over to the relay.
+- **Symmetric-NAT peers still can't HOST.** As of v0.24.0 such a peer can *join* and be recognised at
+  the address it really arrives from (per-seat tokens, protocol 14), and the legs that still don't
+  open are relayed through the host — which needs no external server because the host is already the
+  rendezvous everyone reached. What none of that solves is a symmetric-NAT peer *hosting* without
+  forwarding a port: there is no reachable rendezvous then, and that is the case a TURN-style server
+  would be for. Relay is also still start-of-session only: a leg that dies mid-game is not failed
+  over to it.
+- **The symmetric-NAT path has never been exercised for real.** It is built, unit-tested against a
+  transport that deliberately advertises the wrong port, and reasoned through — but no session has
+  been played across an actual symmetric NAT, so treat it as untested rather than working.
 
 ## Known limitations
 
@@ -262,15 +273,25 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
 
 - **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined to non-RAM state can slip past the checksum until it perturbs RAM.
 - **Sync-settings check is best-effort** — the handshake compares the core's real sync-settings blob (read via `ISettable.GetSyncSettings()`), so mismatched per-core settings (e.g. different N64 video plugins) are refused up front rather than desyncing. If a core's settings can't be read it falls back to a coarse core+version+system digest, which wouldn't catch such a mismatch.
-- **NAT traversal is cone-only** — UDP Punch and the mesh connectivity checks open cone-NAT paths;
-  **symmetric NAT** (a different mapping per destination) cannot be punched at all — but such a peer can still *join* a reachable host, and at 3–4 players the host relays input over the joiner↔joiner legs that don't open, so they play with one extra hop on those legs. What symmetric NAT still prevents is *hosting* without a forwarded port. The host must be reachable (forwarded, or via the connect-code punch) either way, since it is the rendezvous for the joiner↔joiner mesh and now the relay for it too.
-  The tool now **detects and names this** rather than failing silently: pressing **My public address**, or starting a **UDP Punch**, asks two STUN servers for the same socket's mapping and compares them. A symmetric verdict is logged with what it does and doesn't break — punch and the joiner↔joiner legs are lost, joining a forwarded host still works, since you open that path yourself. It's advisory and never refuses a connection: two servers can be wrong in your favour.
-- **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
-  for playing with people you trust; not a hostile-network guarantee.
+- **NAT traversal punches cone NAT; symmetric NAT is handled a different way** — a symmetric router
+  assigns a different mapping per destination, so there is no address such a peer can advertise that
+  works for everyone, and it cannot be punched in the usual sense. As of v0.24.0 it doesn't have to
+  be: the peer announces a **per-seat token** (handed out in WELCOME over the authenticated control
+  channel) alongside its probes, and whoever receives it binds that seat to the address the packet
+  genuinely came from. Legs that still don't open are relayed through the host. What symmetric NAT
+  still prevents is *hosting* without a forwarded port — the host must be reachable (forwarded, or
+  via the connect-code punch) either way, since it is the rendezvous for the joiner↔joiner mesh and
+  the relay for it too. **This path is code-complete but has never been exercised on a real
+  symmetric NAT.**
+  The tool also **detects and names** the condition: pressing **My public address**, or starting a **UDP Punch**, asks two STUN servers for the same socket's mapping and compares them. A symmetric verdict is logged with what it does and doesn't break. It's advisory and never refuses a connection: two servers can be wrong in your favour.
+- **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically bound to a controller port, so a malicious peer could submit input for a port it doesn't own. The
+  v0.24.0 seat tokens don't change this: they keep *outsiders* out and let a member's real address be
+  found, but every member is told every seat's token, so they are not a defence against each other.
+  Fine for playing with people you trust; not a hostile-network guarantee.
 - **The session password** is verified by a nonce challenge-response (`SessionAuth`): the password is never sent (not even hashed), a captured proof can't be replayed to another session, and role-tagging blocks a reflection attack. An empty password means an open session. A refused joiner (wrong password, wrong ROM/core, a HELLO that never arrives) only loses its own connection — the host logs it and keeps listening, so a typo doesn't cost you the lobby. Still not a fortress — it's a shared secret over a plaintext control channel with no forward secrecy — but it's a real gate, not an echo-able hash.
 - **Movies / TAStudio / Lua aren't blocked** during a session — see the limitation above; avoid them.
-- **Symmetric NAT is untested** over a real internet path — though the tool now detects and names it
-  (see the NAT bullet above) rather than failing silently.
+- **Symmetric NAT is untested** over a real internet path — the token-learning path that is meant to
+  make it work (see the NAT bullet above) has only ever been exercised by unit tests.
 - **Three players works on real hardware over the internet.** Several 20–30 minute sessions on three
   separate machines: Gauntlet II (SNES) on **rollback** at low delay, Mario Golf (N64) on
   **lockstep**, and Pokémon Stadium (N64) on **rollback at delay 5**, all reported as playing well.

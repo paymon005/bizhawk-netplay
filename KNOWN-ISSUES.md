@@ -172,6 +172,23 @@ joiners shared a machine — which is exactly what four separate machines would 
   delay is under-covering the link.
 - **Rollback depth and gate cost** on the two heaviest machines. This is where a light core and a
   heavy one diverge most.
+- **The named-edge lines** (v0.24.0). Each joiner now logs `no direct path answered to: …` and
+  `reached at a learned address: …` by player. The first names who to look at; the second says a
+  symmetric NAT was worked around rather than merely survived.
+
+**KI-12 (validation) — the symmetric-NAT path has never met a symmetric NAT.**
+v0.24.0 (protocol 14) gives every seat a token so a peer can be recognised at the address it really
+arrives from, which is the only way such a peer's packets can be placed. It is unit-tested against a
+transport deliberately pointed at the wrong port — the honest simulation of "advertised one address,
+arrives from another" — and the learned address is probed, kept warm, and survives route refreshes.
+None of that is a real router. Until someone behind a symmetric NAT joins a session, treat it as
+built-and-reasoned rather than working.
+
+*What to read off such a session:*
+- **`reached at a learned address: P<n>`** on any peer's log — that is the mechanism firing. Its
+  absence when a STUN symmetric verdict was logged is the interesting failure.
+- **Whether the host's relay warning fires anyway.** It now says a symmetric NAT alone should no
+  longer cause it; if it does fire, the token never got through and that assumption is wrong.
 
 ## Fixed (2026-07-27, v0.11.3)
 
