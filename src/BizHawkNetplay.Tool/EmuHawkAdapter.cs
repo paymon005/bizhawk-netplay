@@ -547,7 +547,11 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         int cap = _soundBuffer?.Capacity ?? 0;
         string err = string.IsNullOrEmpty(_audioSyncErr) ? "" : $" drainErr='{_audioSyncErr}'";
         return $"audio stats: coreMode={(_coreSyncSound ? "Sync" : "Async")} frames={_audioFrames} " +
-               $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} shorts peak={_audioPeak}" +
+               $"pairsProduced={_audioPairs} pumps={_audioPumps} ring={ring}/{cap} " +
+               // "shorts peak=N" read as short READS — underruns — when it is the loudest PCM sample
+               // seen, the check for "is the core producing sound at all". Named against full scale
+               // so it cannot be mistaken for a count of anything.
+               $"peakSample={_audioPeak}/{short.MaxValue}" +
                $"{(AudioRevivals > 0 ? $" revivals={AudioRevivals}" : "")}{err}";
     }
 
