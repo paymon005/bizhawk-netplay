@@ -65,6 +65,7 @@ public sealed partial class NetplayToolForm
         _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
         SetGeneration(sp.Generation);
         _meshOthers = new List<PeerRoute>(sp.PeerRoutes);
+        _mesh?.ApplyTokens(sp.Tokens);
         ApplyJoinerMesh();
         PrepareSessionDriver(sp.Mode);
     }

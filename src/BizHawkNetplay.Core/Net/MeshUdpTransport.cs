@@ -37,6 +37,10 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private const byte TCtrlSeg = 0x20; // reliable control-stream segment (punched-joiner admission)
     private const byte TPunch = 0x30;
     private const byte TPunchAck = 0x31;
+    // "I am the peer holding this token, and this is the address you actually see me at." The one
+    // frame accepted from an endpoint we were never told about — see LearnFromHello.
+    private const byte THello = 0x40;
+    private const int TokenBytes = 16;
 
     private const int PunchTickMs = 250;     // probe cadence while a candidate is unconfirmed
     private const int KeepaliveMs = 1000;    // re-probe cadence once a candidate is alive (holds the NAT mapping)
@@ -67,6 +71,16 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private volatile RouteTable _routeTable = RouteTable.Empty;
     // Host only: peers to echo every other peer's input to, because their direct legs never opened.
     private volatile PeerRoute[] _relayRoutes = [];
+
+    // --- endpoint learning (the symmetric-NAT fix) ---------------------------------------------
+    // Our own token, announced in THello, and the tokens we will accept from others. Both are
+    // distributed over the authenticated control channel, so possessing one is proof of membership.
+    private volatile byte[]? _localToken;
+    private readonly ConcurrentDictionary<int, byte[]> _peerTokens = new();       // remotePort -> token
+    // Where each peer ACTUALLY reaches us from, once it has proved who it is. A symmetric NAT gives
+    // a different public port per destination, so this is frequently not any address it advertised.
+    private readonly ConcurrentDictionary<int, IPEndPoint> _learnedByPort = new();
+    private readonly ConcurrentDictionary<IPEndPoint, int> _learnedByEndpoint = new();
 
     /// <summary>An immutable routing snapshot, atomically replaced when rendezvous data changes.</summary>
     private sealed class RouteTable
@@ -423,6 +437,16 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     private IPEndPoint? SelectSendCandidate(PeerRoute route, long now)
     {
+        // A learned endpoint outranks every advertised candidate, because it is the only one we have
+        // OBSERVED this peer arriving from. For a symmetric-NAT peer none of the advertised
+        // candidates can ever work, so without this the learning would be recorded and never used.
+        if (_learnedByPort.TryGetValue(route.RemotePort, out var learned)
+            && _alive.TryGetValue(learned, out var learnedHeard) && now - learnedHeard < AliveWindowMs)
+        {
+            _lastSelected[route.RemotePort] = learned;
+            return learned;
+        }
+
         IPEndPoint? firstFresh = null, bestFresh = null;
         IPEndPoint? firstLive = null, bestLive = null;
         double bestFreshRtt = double.MaxValue, bestLiveRtt = double.MaxValue;
@@ -604,6 +628,12 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
                         // different route once the mesh is direct, and is inflated by TCP's own
                         // queueing and retransmits.
                         SendFramed(Frame(TPunch, BitConverter.GetBytes(now)), p);
+                        // Ride alongside the probe: whatever address our NAT gives this particular
+                        // destination, the token lets the far side recognise the packet as ours and
+                        // record where we really came from. Only while the path is unconfirmed —
+                        // once it answers, the advertised address evidently works and this is noise.
+                        var token = _localToken;
+                        if (token != null && !alive) SendFramed(Frame(THello, token), p);
                         _lastPunch[p] = now;
                     }
                 }
@@ -648,7 +678,17 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             byte type = buffer[5];
 
             var source = (IPEndPoint)from;
-            if (!_routeTable.TryResolve(source, out var known)) continue; // pin to known peers
+            if (!_routeTable.TryResolve(source, out var known))
+            {
+                // Already learned: everything from here on is ordinary traffic from a known peer.
+                if (_learnedByEndpoint.ContainsKey(source)) known = source;
+                // Otherwise, not an address anyone advertised — and exactly one thing may still be
+                // true of it: a peer holding a valid token is telling us this is where it really
+                // comes from. That is the symmetric-NAT case, where the address it advertised was
+                // only ever valid for the STUN server it asked. Anything else is dropped here, unread.
+                else if (type == THello && LearnFromHello(buffer, n, source)) known = source;
+                else continue;
+            }
 
             _alive[known] = Clock.ElapsedMilliseconds; // any framed packet proves the path is up
 
@@ -773,6 +813,83 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             Buffer.BlockCopy(source, 0, slice, 0, length);
             return slice;
         }
+    }
+
+    /// <summary>
+    /// Our own membership token, announced in every <c>THello</c> so peers can recognise us at
+    /// whatever address their side of the network actually sees. Distributed over the authenticated
+    /// control channel, so holding one is proof of belonging to this session.
+    /// </summary>
+    public void SetLocalToken(byte[]? token) =>
+        _localToken = token is { Length: TokenBytes } ? (byte[])token.Clone() : null;
+
+    /// <summary>The tokens we will accept, by the controller port that owns each. A peer presenting
+    /// one of these is telling us where it really is; anything else stays unroutable.</summary>
+    public void SetPeerTokens(IEnumerable<KeyValuePair<int, byte[]>>? tokens)
+    {
+        _peerTokens.Clear();
+        if (tokens == null) return;
+        foreach (var kv in tokens)
+            if (kv.Value is { Length: TokenBytes }) _peerTokens[kv.Key] = (byte[])kv.Value.Clone();
+    }
+
+    /// <summary>Adopt a whole mesh identity at once — who we announce ourselves as and who we will
+    /// accept. The two always arrive together from the control channel, so they are applied together.</summary>
+    public void ApplyTokens(MeshTokens? tokens)
+    {
+        SetLocalToken(tokens?.Local);
+        SetPeerTokens(tokens?.Peers);
+    }
+
+    /// <summary>Endpoints learned from a token that no advertised candidate matched — i.e. peers
+    /// whose real address only became knowable by being told. Zero on a well-behaved network.</summary>
+    public int LearnedEndpointCount => _learnedByPort.Count;
+
+    /// <summary>The address a peer was learned at, for the session log.</summary>
+    public bool TryGetLearnedEndpoint(int remotePort, out IPEndPoint endpoint) =>
+        _learnedByPort.TryGetValue(remotePort, out endpoint!);
+
+    /// <summary>
+    /// Accept an endpoint nobody advertised, on the strength of a token.
+    ///
+    /// This is the whole symmetric-NAT fix. Such a router assigns a fresh public port per
+    /// DESTINATION, so the address a peer discovered by asking a STUN server is not the address it
+    /// reaches us from — and pinning on advertised endpoints alone meant we dropped its packets
+    /// unread, forever, on a path that was physically working. The peer cannot know its own
+    /// destination-specific port either; only we can see it, which is why it has to be learned here
+    /// rather than announced.
+    ///
+    /// The token is what makes that safe: it is 16 random bytes handed out over the authenticated
+    /// control channel, so an off-path attacker guessing one is the same problem as guessing the
+    /// session password. Compared in constant time, and a peer may migrate — a NAT rebinding
+    /// mid-session is the same event as the first arrival.
+    /// </summary>
+    private bool LearnFromHello(byte[] buffer, int n, IPEndPoint source)
+    {
+        if (n < HeaderSize + TokenBytes) return false;
+        foreach (var kv in _peerTokens)
+        {
+            if (!ConstantTimeEquals(kv.Value, buffer, HeaderSize)) continue;
+
+            int port = kv.Key;
+            if (_learnedByPort.TryGetValue(port, out var previous))
+            {
+                if (previous.Equals(source)) return true; // already known, nothing to record
+                _learnedByEndpoint.TryRemove(previous, out _);
+                _alive.TryRemove(previous, out _);
+            }
+            _learnedByPort[port] = source;
+            _learnedByEndpoint[source] = port;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool ConstantTimeEquals(byte[] expected, byte[] buffer, int offset)
+    {
+        int diff = 0;
+        for (int i = 0; i < expected.Length; i++) diff |= expected[i] ^ buffer[offset + i];
+        return diff == 0;
     }
 
     private void SendFramed(byte[] framed, IPEndPoint to)

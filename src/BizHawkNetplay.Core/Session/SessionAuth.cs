@@ -33,6 +33,11 @@ public static class SessionAuth
         return n;
     }
 
+    /// <summary>A fresh mesh membership token for one seat (see <see cref="Net.MeshTokens"/>).
+    /// Same size and source of randomness as a nonce; named apart because it lives for the whole
+    /// session rather than one exchange.</summary>
+    public static byte[] NewMeshToken() => NewNonce();
+
     /// <summary>A fresh non-zero identifier for one netplay session.</summary>
     public static ulong NewSessionId()
     {

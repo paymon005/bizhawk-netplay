@@ -38,7 +38,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // phantom desync every interval.
     // 12: the lobby now measures every UDP mesh edge and the host publishes the settled delay in its
     // own control frame (MeshRtt / InputDelay), which an older build neither sends nor expects.
-    private const int Protocol = 13;  // v13: resync/reconnect states are deflated on the wire
+    // 13: resync/reconnect states are deflated on the wire.
+    // 14: WELCOME carries per-seat mesh tokens, and peers announce themselves with them over UDP —
+    // an older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote
+    // the source port, which is silent one-way input loss rather than a refusal. Hence the bump.
+    private const int Protocol = 14;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

@@ -132,6 +132,33 @@ public sealed partial class NetplayToolForm
         return routes;
     }
 
+    /// <summary>
+    /// Host: this session's mesh tokens, one per seat, minted on first use.
+    ///
+    /// Keyed by controller port rather than by player because a token identifies the SEAT: when
+    /// someone drops and rejoins they come back on a new address, which is precisely the moment
+    /// their packets are unrecognisable and the token is what makes them placeable again. Cleared
+    /// when the session ends, so tokens never outlive the channel that authenticated them.
+    /// </summary>
+    private readonly Dictionary<int, byte[]> _portTokens = new();
+
+    private byte[] TokenForPort(int port)
+    {
+        if (!_portTokens.TryGetValue(port, out var token))
+            _portTokens[port] = token = SessionAuth.NewMeshToken();
+        return token;
+    }
+
+    /// <summary>Host: the mesh identity handed to the peer in <paramref name="port"/> — its own
+    /// token plus every other seat's, including seat 0 (us), which is never listed as a route.</summary>
+    private MeshTokens TokensFor(int port, int players)
+    {
+        var peers = new Dictionary<int, byte[]>();
+        for (int p = 0; p < players; p++)
+            if (p != port) peers[p] = TokenForPort(p);
+        return new MeshTokens(TokenForPort(port), peers);
+    }
+
     /// <summary>Host: point our mesh at every currently-connected joiner's candidate endpoints.</summary>
     private void UpdateMeshPeers()
     {
@@ -275,6 +302,9 @@ public sealed partial class NetplayToolForm
             if (!generation.IsValid || generation != CurrentGeneration)
                 throw new InvalidOperationException("reconnect generation is no longer current");
             var meshPeers = RoutesExcept(_peers, null);
+            // Minted here rather than on the sending thread below: the seat's token is the same one
+            // the survivors already hold, and _portTokens stays single-threaded that way.
+            var rejoinTokens = TokensFor(freedPort, _playerCount);
             Status($"P{freedPort + 1} rejoined — sending epoch {generation.Epoch} " +
                 $"({state.Length / 1024}KiB)…", Color.DarkOrange);
 
@@ -286,7 +316,7 @@ public sealed partial class NetplayToolForm
                 {
                     ConfigureStateTransferTimeouts(tcp, state.Length);
                     Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
-                        generation, meshPeers);
+                        generation, meshPeers, rejoinTokens);
                     Handshake.HostWaitReady(channel, generation);
                     try { tcp.ReceiveTimeout = 0; tcp.SendTimeout = 0; } catch { }
                     BeginInvokeUi(() =>
@@ -489,6 +519,7 @@ public sealed partial class NetplayToolForm
         lock (_hashLock) { _checksums.Clear(); }
 
         _relayPorts.Clear(); // a fresh session re-measures; nothing from the last one should carry
+        _portTokens.Clear(); // tokens must not outlive the control channel that authenticated them
         _netcodeLabel.Text = "Netcode in use: —";
         _netcodeLabel.ForeColor = Color.DimGray;
         SetLobbyPhase("", Color.DimGray); // back to "Not connected", and stop flashing

@@ -19,8 +19,9 @@ public sealed class SessionParams
 {
     public SessionParams(SyncMode mode, int inputDelay, int localPort, int remotePort,
         int remoteUdpPort, byte[]? initialState, SessionGeneration generation,
-        int playerCount = 2, IReadOnlyList<PeerRoute>? peerRoutes = null)
+        int playerCount = 2, IReadOnlyList<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null)
     {
+        Tokens = tokens ?? MeshTokens.None;
         Mode = mode;
         InputDelay = inputDelay;
         LocalPort = localPort;
@@ -65,6 +66,10 @@ public sealed class SessionParams
     /// joiner these are the other joiners; the host/control peer remains described by
     /// <see cref="RemotePort"/> and <see cref="RemoteUdpPort"/>.</summary>
     public IReadOnlyList<PeerRoute> PeerRoutes { get; }
+
+    /// <summary>This peer's mesh identity for the session: the token it announces as itself and the
+    /// ones it accepts. Empty on a session whose host predates them.</summary>
+    public MeshTokens Tokens { get; }
 
     /// <summary>The OTHER peers' UDP endpoints for the direct input mesh (excludes self and the host,
     /// which the joiner reaches at the address it connected to). Empty for a 2-player session.</summary>
@@ -326,9 +331,9 @@ public static class Handshake
     /// </summary>
     public static void HostSendWelcome(
         ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
-        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
+        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null)
     {
-        HostSendStart(channel, assignedPort, playerCount, inputDelay, mode, state, generation, peerRoutes);
+        HostSendStart(channel, assignedPort, playerCount, inputDelay, mode, state, generation, peerRoutes, tokens);
         HostRequestReady(channel, generation);
     }
 
@@ -339,9 +344,9 @@ public static class Handshake
     /// </summary>
     public static void HostSendStart(
         ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
-        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
+        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null)
     {
-        HostSendAssignment(channel, assignedPort, playerCount, inputDelay, mode, generation, peerRoutes);
+        HostSendAssignment(channel, assignedPort, playerCount, inputDelay, mode, generation, peerRoutes, tokens);
         // Framed and deflated: this is the transfer a joiner sits through before the game starts,
         // and on a heavy core it was the whole savestate raw over whatever link they have.
         channel.Send(ControlMessageType.State, StateCompression.Pack(state ?? []));
@@ -356,9 +361,9 @@ public static class Handshake
     /// </summary>
     public static void HostSendAssignment(
         ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode,
-        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
+        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null)
         => channel.Send(ControlMessageType.Welcome,
-            HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes));
+            HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes, tokens));
 
     /// <summary>Ask this joiner to apply everything it has been sent and acknowledge READY.</summary>
     public static void HostRequestReady(ControlChannel channel, SessionGeneration generation)
@@ -417,7 +422,7 @@ public static class Handshake
     public static SessionParams RunClientMulti(
         ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
         Action<SessionParams>? beforeReady = null, Action? afterGreet = null,
-        Func<int, IReadOnlyList<PeerRoute>, LobbyMeshSample>? measureMesh = null,
+        Func<int, IReadOnlyList<PeerRoute>, MeshTokens, LobbyMeshSample>? measureMesh = null,
         IPEndPoint? localReflexive = null)
     {
         var joinNonce = SessionAuth.NewNonce();
@@ -446,12 +451,13 @@ public static class Handshake
     /// that exact generation, then remain blocked until the host releases the same generation.</summary>
     private static SessionParams ReceiveStartData(
         ControlChannel channel, int hostUdpPort, Action<SessionParams>? beforeReady,
-        Func<int, IReadOnlyList<PeerRoute>, LobbyMeshSample>? measureMesh = null)
+        Func<int, IReadOnlyList<PeerRoute>, MeshTokens, LobbyMeshSample>? measureMesh = null)
     {
         int assignedPort = 0, playerCount = 0, delay = 0;
         SyncMode mode = SyncMode.Lockstep;
         SessionGeneration generation = default;
         IReadOnlyList<PeerRoute> peerRoutes = Array.Empty<PeerRoute>();
+        MeshTokens tokens = MeshTokens.None;
         byte[]? initialState = null;
         bool haveWelcome = false;
         bool readySent = false;
@@ -482,6 +488,7 @@ public static class Handshake
                 {
                     (assignedPort, playerCount, delay, mode, generation, peerRoutes) =
                         HandshakeCodec.DecodeWelcome(body);
+                    tokens = HandshakeCodec.DecodeTokens(body);
                 }
                 catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
                 {
@@ -506,7 +513,7 @@ public static class Handshake
                     throw new HandshakeException("host asked for a mesh measurement before sending WELCOME");
                 RequireGeneration(ControlMessageType.MeshRtt, body, generation);
                 var mesh = measureMesh != null
-                    ? measureMesh(hostUdpPort, peerRoutes)
+                    ? measureMesh(hostUdpPort, peerRoutes, tokens)
                     : LobbyMeshSample.None;
                 channel.Send(ControlMessageType.MeshRtt, ControlMessageCodec.EncodeMeshRtt(
                     generation, mesh.Rtt.MedianMs, mesh.Rtt.HighMs, mesh.MeasuredEdges, mesh.TotalEdges));
@@ -536,7 +543,7 @@ public static class Handshake
                 RequireGeneration(ControlMessageType.Ready, body, generation);
 
                 session = new SessionParams(mode, delay, localPort: assignedPort, remotePort: 0,
-                    remoteUdpPort: hostUdpPort, initialState, generation, playerCount, peerRoutes);
+                    remoteUdpPort: hostUdpPort, initialState, generation, playerCount, peerRoutes, tokens);
                 beforeReady?.Invoke(session);
                 channel.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(generation));
                 readySent = true;

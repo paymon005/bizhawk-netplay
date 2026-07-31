@@ -421,6 +421,7 @@ public sealed partial class NetplayToolForm
         // Trust the negotiated endpoints before asking clients to prepare their drivers: their
         // pre-READY neutral windows can then queue instead of being rejected as foreign UDP.
         _mesh!.SetPeerRoutes(RoutesExcept(links, null));
+        _mesh!.ApplyTokens(TokensFor(0, players));
         // WELCOME + state, but NOT the READY request: the routes WELCOME carries are what every
         // joiner needs before it can punch and measure the edges this machine cannot see, and
         // READY is the point of no return for the delay each driver gets built with.
@@ -432,11 +433,11 @@ public sealed partial class NetplayToolForm
                 // A survivor of a restart already has the state, and the host has not stepped the
                 // core since exporting it — only the assignment and the routes have changed.
                 Handshake.HostSendAssignment(link.Control, link.RemotePort, players, delay, mode,
-                    generation, RoutesExcept(links, link));
+                    generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players));
                 return;
             }
             Handshake.HostSendStart(link.Control, link.RemotePort, players, delay, mode, state,
-                generation, RoutesExcept(links, link));
+                generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players));
             link.HoldsState = true;
         });
         if (!DropCasualties(links, casualties, need, attempt)) return false;
@@ -738,10 +739,14 @@ public sealed partial class NetplayToolForm
     /// the same set is installed again by <see cref="ApplyJoinerMesh"/> a moment later, which
     /// leaves the confirmations and samples taken here intact.
     /// </summary>
-    private LobbyMeshSample MeasureJoinerMesh(IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes)
+    private LobbyMeshSample MeasureJoinerMesh(
+        IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes, MeshTokens tokens)
     {
         UiConnLog($"measuring my {peerRoutes.Count + 1} direct UDP path(s) ({MeshProbeWindowMs}ms)…",
             Color.DarkSlateBlue);
+        // Tokens before probes: an edge whose far side only ever sees us at an address we were
+        // never able to advertise is exactly the edge this measurement would otherwise write off.
+        _mesh?.ApplyTokens(tokens);
         var sample = TakeJoinerMeshSample(hostEndpoint, peerRoutes);
         UiConnLog(sample.HasMeasurement
             ? $"my worst direct path: ~{sample.Rtt.MedianMs:F0}ms (±{sample.Rtt.JitterMs:F0}ms), " +
@@ -910,8 +915,8 @@ public sealed partial class NetplayToolForm
                                   "Disconnect still cancels.", Color.DarkGreen);
                         UiLobbyPhase("Connected — waiting for the host to fill the lobby and start…",
                             Color.DarkGreen);
-                    }, measureMesh: (hostUdpPort, peerRoutes) =>
-                        MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes),
+                    }, measureMesh: (hostUdpPort, peerRoutes, tokens) =>
+                        MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes, tokens),
                        localReflexive: AwaitLocalReflexive());
                 }
                 catch (Exception ex) when (greetDeadline.Expired)

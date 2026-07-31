@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Net;
 using System.Threading;
 using BizHawkNetplay.Core.Input;
@@ -529,6 +531,74 @@ public class MeshUdpTransportTests
             AssertNoRecv(a);
         }
         finally { host.Dispose(); a.Dispose(); }
+    }
+
+    private static byte[] Token(byte fill) => Enumerable.Repeat(fill, 16).ToArray();
+
+    /// <summary>
+    /// The symmetric-NAT case, modelled honestly: the peer's packets arrive from a port nobody was
+    /// ever told about, because its router assigns one per destination.
+    ///
+    /// Simulated by pointing the host at a DIFFERENT address than the one the peer actually sends
+    /// from — which is precisely what "advertised the STUN address, arrives from another" means. The
+    /// host must reject that traffic until a token identifies it, and accept it afterwards.
+    /// </summary>
+    [Fact]
+    public void AnUnadvertisedEndpointIsLearnedFromItsTokenAndNotBefore()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        try
+        {
+            // What the peer advertised: a port it does not send from. Nothing else is routable.
+            int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(wrongPort) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+
+            // Unrecognised source: dropped, exactly as before this existed.
+            peer.Send([1]);
+            AssertNoRecv(host);
+
+            // The host is told which token belongs to that port; the peer announces it.
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            // The punch loop announces on unconfirmed paths, so this needs no explicit trigger.
+            var sw = Stopwatch.StartNew();
+            while (host.LearnedEndpointCount == 0 && sw.ElapsedMilliseconds < 3000) Thread.Sleep(10);
+            Assert.Equal(1, host.LearnedEndpointCount);
+            Assert.True(host.TryGetLearnedEndpoint(1, out var learned));
+            Assert.Equal(peer.LocalPort, learned.Port); // where it REALLY comes from, not what it claimed
+
+            // ...and now ordinary input from that endpoint is accepted.
+            peer.Send([2]);
+            Assert.Equal(new byte[] { 2 }, WaitRecv(host));
+        }
+        finally { host.Dispose(); peer.Dispose(); }
+    }
+
+    /// <summary>A wrong token must buy nothing: the endpoint stays unroutable and its input stays
+    /// dropped. Otherwise the pin this replaces would have been traded for no protection at all.</summary>
+    [Fact]
+    public void AWrongTokenLearnsNothing()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        try
+        {
+            int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(wrongPort) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xCD)); // not the one the host will accept
+
+            Thread.Sleep(1200); // several announce cycles
+            Assert.Equal(0, host.LearnedEndpointCount);
+            peer.Send([3]);
+            AssertNoRecv(host);
+        }
+        finally { host.Dispose(); peer.Dispose(); }
     }
 
     private static byte[] WaitRecv(ITransport t)

@@ -507,7 +507,7 @@ public class HandshakeTests
 
             var c1 = Task.Run(() => Handshake.RunClientMulti(
                 clientCh1, Id(), new SessionPreferences(1, false), 51001,
-                measureMesh: (hostUdpPort, routes) =>
+                measureMesh: (hostUdpPort, routes, _) =>
                 {
                     Assert.Equal(47800, hostUdpPort);        // the joiner measures the host edge too
                     Assert.Equal(2, Assert.Single(routes).RemotePort);
@@ -515,7 +515,7 @@ public class HandshakeTests
                 }));
             var c2 = Task.Run(() => Handshake.RunClientMulti(
                 clientCh2, Id(), new SessionPreferences(1, false), 51002,
-                measureMesh: (_, __) => j2Mesh));
+                measureMesh: (_, __, ___) => j2Mesh));
 
             var hostPrefs = new SessionPreferences(1, false);
             var g1 = Handshake.HostGreet(hostCh1, Id(), hostPrefs, 47800);
@@ -574,7 +574,7 @@ public class HandshakeTests
             var generation = Generation(0xC0DEUL, epoch: 1);
             var client = Task.Run(() => Handshake.RunClientMulti(
                 clientCh, Id(), new SessionPreferences(1, false), 51001,
-                measureMesh: (_, __) => new LobbyMeshSample(default, measuredEdges: 0, totalEdges: 3)));
+                measureMesh: (_, __, ___) => new LobbyMeshSample(default, measuredEdges: 0, totalEdges: 3)));
 
             Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
             Handshake.HostSendStart(hostCh, 1, 2, 3, SyncMode.Lockstep, new byte[8], generation);
@@ -801,5 +801,90 @@ public class HandshakeTests
             Assert.Contains("STATE more than once", ex.Message);
         }
         finally { dispose(); }
+    }
+
+    private static byte[] Token(byte fill)
+    {
+        var t = new byte[HandshakeCodec.TokenBytes];
+        for (int i = 0; i < t.Length; i++) t[i] = fill;
+        return t;
+    }
+
+    [Fact]
+    public void AJoinerLeavesTheHandshakeKnowingItsOwnTokenAndEveryoneElsesIncludingTheHosts()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var generation = Generation(0x7070UL, epoch: 1);
+            var client = Task.Run(() => Handshake.RunClientMulti(
+                clientCh, Id(), new SessionPreferences(1, false), 51001));
+
+            var tokens = new MeshTokens(Token(0x11), new Dictionary<int, byte[]>
+            {
+                [0] = Token(0xA0),   // the host, which is never listed as a route
+                [2] = Token(0xA2),
+            });
+
+            Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
+            Handshake.HostSendStart(hostCh, 1, 3, 2, SyncMode.Lockstep, new byte[16], generation,
+                new[] { new PeerRoute(2, new[] { new IPEndPoint(IPAddress.Loopback, 51002) }) }, tokens);
+            Handshake.HostRequestReady(hostCh, generation);
+            Handshake.HostWaitReady(hostCh, generation);
+            Handshake.HostSendGo(hostCh, generation);
+
+            var session = client.GetAwaiter().GetResult();
+            Assert.Equal(Token(0x11), session.Tokens.Local);
+            // Seat 0 has no route — the joiner reaches the host at the address it connected to —
+            // so if tokens rode along with routes this is the one that would go missing.
+            Assert.Equal(Token(0xA0), session.Tokens.Peers[0]);
+            Assert.Equal(Token(0xA2), session.Tokens.Peers[2]);
+            Assert.False(session.Tokens.Peers.ContainsKey(1)); // its own seat is not one it accepts
+        }
+        finally { dispose(); }
+    }
+
+    [Fact]
+    public void ATokenlessHostLeavesTheJoinerWithNothingRatherThanSomethingUnusable()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var generation = Generation(0x7171UL, epoch: 1);
+            var client = Task.Run(() => Handshake.RunClientMulti(
+                clientCh, Id(), new SessionPreferences(1, false), 51001));
+
+            Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
+            Handshake.HostSendStart(hostCh, 1, 2, 2, SyncMode.Lockstep, new byte[16], generation);
+            Handshake.HostRequestReady(hostCh, generation);
+            Handshake.HostWaitReady(hostCh, generation);
+            Handshake.HostSendGo(hostCh, generation);
+
+            var session = client.GetAwaiter().GetResult();
+            Assert.True(session.Tokens.IsEmpty);
+            Assert.Null(session.Tokens.Local);
+        }
+        finally { dispose(); }
+    }
+
+    [Fact]
+    public void GarbageInTheTokenSectionIsSkippedRatherThanFailingTheWelcome()
+    {
+        var generation = Generation(0x7272UL, epoch: 1);
+        var good = new MeshTokens(Token(0x33), new Dictionary<int, byte[]> { [0] = Token(0xB0) });
+        var body = HandshakeCodec.EncodeWelcome(1, 2, 2, SyncMode.Lockstep, generation, null, good);
+
+        var text = System.Text.Encoding.UTF8.GetString(body)
+                 + "tok=9:" + new string('a', 32) + "\n"   // seat out of range
+                 + "tok=1:zz\n"                            // not hex
+                 + "tok=1\n"                               // no separator
+                 + "mytok=abcd\n";                         // right shape, wrong length
+        var decoded = HandshakeCodec.DecodeTokens(System.Text.Encoding.UTF8.GetBytes(text));
+
+        // The last mytok= line wins, and it is invalid — so the valid one before it is discarded
+        // rather than a malformed peer being allowed to keep an identity we cannot vouch for.
+        Assert.Null(decoded.Local);
+        Assert.Equal(Token(0xB0), decoded.Peers[0]);
+        Assert.Single(decoded.Peers);
     }
 }

@@ -21,6 +21,9 @@ public static class HandshakeCodec
     public const int MaxInputDelay = 60;   // generous vs the UI's 20, but finite
     public const int MaxPlayers = 8;
 
+    /// <summary>Length of a per-peer mesh membership token (see <see cref="EncodeTokens"/>).</summary>
+    public const int TokenBytes = 16;
+
     private static int ClampDelay(int d) => d < 1 ? 1 : d > MaxInputDelay ? MaxInputDelay : d;
 
     /// <param name="reflexive">
@@ -60,9 +63,14 @@ public static class HandshakeCodec
 
     /// <summary>Encode the host's WELCOME: assignment, negotiated settings, input-timeline
     /// generation, and the candidate endpoints grouped by remote controller port.</summary>
+    /// <param name="tokens">
+    /// This recipient's mesh identity — the token it announces as itself, plus the tokens it should
+    /// accept. The accepted set includes the host, which is never listed as a route.
+    /// </param>
     public static byte[] EncodeWelcome(
         int assignedPort, int playerCount, int inputDelay, SyncMode mode,
-        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null)
+        SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null,
+        MeshTokens? tokens = null)
     {
         if (!generation.IsValid) throw new ArgumentException("A valid session generation is required", nameof(generation));
         var sb = new StringBuilder();
@@ -72,7 +80,14 @@ public static class HandshakeCodec
         sb.Append("mode=").Append(mode == SyncMode.Rollback ? "rollback" : "lockstep").Append('\n');
         sb.Append("session=").Append(generation.SessionId.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("epoch=").Append(generation.Epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        if (tokens?.Local is { } local)
+        {
+            if (local.Length != TokenBytes)
+                throw new ArgumentException($"A token must be exactly {TokenBytes} bytes", nameof(tokens));
+            sb.Append("mytok=").Append(SessionAuth.ToHex(local)).Append('\n');
+        }
         sb.Append(Encoding.UTF8.GetString(EncodeRoutes(peerRoutes ?? Array.Empty<PeerRoute>())));
+        if (tokens != null) sb.Append(Encoding.UTF8.GetString(EncodeTokens(tokens.Peers)));
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
@@ -152,6 +167,62 @@ public static class HandshakeCodec
         foreach (int remotePort in order)
             routes.Add(new PeerRoute(remotePort, byPort[remotePort]));
         return routes;
+    }
+
+    /// <summary>
+    /// Encode per-peer membership tokens, one <c>tok=&lt;port&gt;:&lt;hex&gt;</c> line each.
+    ///
+    /// Kept as its own section rather than folded into the route lines because a token is not a
+    /// route: the host's own token has to reach every joiner even though the host is never listed
+    /// as one. Every WELCOME carries every seat, so a token never has to be re-sent — a seat's
+    /// token outlives the player in it, which is what makes a rejoin on a new address recognisable.
+    /// </summary>
+    private static byte[] EncodeTokens(IEnumerable<KeyValuePair<int, byte[]>> tokens)
+    {
+        if (tokens == null) throw new ArgumentNullException(nameof(tokens));
+        var sb = new StringBuilder();
+        foreach (var kv in tokens)
+        {
+            if (kv.Key < 0 || kv.Key >= MaxPlayers)
+                throw new ArgumentOutOfRangeException(nameof(tokens), $"Port must be between 0 and {MaxPlayers - 1}");
+            if (kv.Value == null || kv.Value.Length != TokenBytes)
+                throw new ArgumentException($"A token must be exactly {TokenBytes} bytes", nameof(tokens));
+            sb.Append("tok=").Append(kv.Key).Append(':').Append(SessionAuth.ToHex(kv.Value)).Append('\n');
+        }
+        return Encoding.UTF8.GetBytes(sb.ToString());
+    }
+
+    /// <summary>Decode the token section of any body that carries one — <c>mytok=</c> becomes
+    /// <see cref="MeshTokens.Local"/>, the <c>tok=</c> lines become <see cref="MeshTokens.Peers"/>.
+    /// Malformed or wrong-length entries are skipped (untrusted input); last entry per port wins.</summary>
+    public static MeshTokens DecodeTokens(byte[] body)
+    {
+        if (body == null) throw new ArgumentNullException(nameof(body));
+        byte[]? local = null;
+        var peers = new Dictionary<int, byte[]>();
+        foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith("mytok=", StringComparison.Ordinal))
+            {
+                local = ValidToken(line.Substring(6));
+                continue;
+            }
+            if (!line.StartsWith("tok=", StringComparison.Ordinal)) continue;
+            int colon = line.IndexOf(':');
+            if (colon < 0) continue;
+            if (!int.TryParse(line.Substring(4, colon - 4), NumberStyles.Integer, CultureInfo.InvariantCulture,
+                    out int port) || port < 0 || port >= MaxPlayers)
+                continue;
+            if (ValidToken(line.Substring(colon + 1)) is { } token) peers[port] = token;
+        }
+        return new MeshTokens(local, peers);
+    }
+
+    private static byte[]? ValidToken(string hex)
+    {
+        var token = SessionAuth.FromHex(hex);
+        return token != null && token.Length == TokenBytes ? token : null;
     }
 
     /// <summary>Encode a set of peer UDP endpoints (one "ip:port" per line) for the PeerList body.</summary>
