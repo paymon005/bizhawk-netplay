@@ -174,28 +174,60 @@ public sealed partial class NetplayToolForm : IControlMainform
         catch { /* container already gone (ROM swap, shutdown) — the old one is garbage anyway */ }
     }
 
-    /// <summary>Refuse the load before MainForm acts on it. Quick SAVE is a different event we do
-    /// not subscribe to, so it is unaffected.</summary>
+    /// <summary>
+    /// Whether a load here can become everyone's load. The host's state is the session's state — it
+    /// is what a resync ships — so a deliberate load can be carried to every peer. A joiner's state
+    /// has no authority behind it, and a rebuild or a held seat already has a state in flight that a
+    /// second one would collide with.
+    /// </summary>
+    private bool CanLoadStateForEveryone =>
+        _phase.IsActive && _isHost && !_phase.IsRebuilding && !_phase.AwaitingRejoin;
+
+    /// <summary>Let a host's Quick Load through — <see cref="OnStateLoaded"/> turns it into a resync
+    /// everyone follows. Refuse everyone else's before MainForm acts on it. Quick SAVE is a separate
+    /// event we never subscribe to, so it is unaffected either way.</summary>
     private void OnBeforeQuickLoad(object sender, BeforeQuickLoadEventArgs e)
     {
-        if (!_hostOwnershipHeld) return;
+        if (!_hostOwnershipHeld || CanLoadStateForEveryone) return;
         e.Handled = true;
-        RefuseHostCommand($"Quick Load ({e.Name})");
+        RefuseHostCommand(_phase.IsActive && !_isHost
+            ? $"Quick Load ({e.Name}) — only the host can load a state into a running session; yours"
+            : $"Quick Load ({e.Name})");
     }
 
     /// <summary>
-    /// A state was loaded by some route we do not intercept — the menu, Load State As, a drag-drop.
-    /// End the session on the load itself rather than waiting for a symptom: this machine is now
-    /// playing a different game from everyone else, and unlike the frame-drift check this does not
-    /// depend on the frame number having changed.
+    /// A state was loaded. On the host this becomes the session's new baseline: capture it, ship it
+    /// to every peer on a fresh generation and carry on — the same operation a desync recovery and a
+    /// live settings change already perform, because it is the same problem (everyone must land on
+    /// one state at one generation). So loading a save means "everyone continue from here".
     ///
-    /// Our own state work never reaches here: the probe and the adapter go through
-    /// IMemorySaveStateApi and IStatable, straight to the core, never through MainForm.LoadState.
+    /// Anywhere else it ends the session, on the load itself rather than on a symptom. Unlike the
+    /// frame-drift check this does not care whether the frame number moved, which is the case that
+    /// check cannot see: a state captured at the frame we are already on, with different contents.
+    ///
+    /// Our own state work never reaches here — the probe and the adapter go through
+    /// IMemorySaveStateApi and IStatable, straight to the core, never MainForm.LoadState.
     /// </summary>
     private void OnStateLoaded(object sender, StateLoadedEventArgs e)
     {
         if (!_hostOwnershipHeld) return;
-        EndSession($"a savestate was loaded ('{e.Name}') — this machine's timeline no longer matches " +
-                   "the other players'. Saving during a session is fine; loading is not.");
+
+        if (CanLoadStateForEveryone)
+        {
+            ConnLog($"loaded '{e.Name}' — sending it to every player so the session continues from " +
+                    "there.", Color.DarkSlateBlue);
+            ShipAuthoritativeState($"savestate '{e.Name}'", isSettingsChange: true);
+            return;
+        }
+
+        EndSession(
+            !_phase.IsActive
+                ? $"a savestate was loaded ('{e.Name}') before the session started — the baseline the " +
+                  "other players were given is no longer what this machine is running."
+                : !_isHost
+                    ? $"a savestate was loaded ('{e.Name}') — only the host can do that during a " +
+                      "session, because only the host's state is the one everyone follows."
+                    : $"a savestate was loaded ('{e.Name}') while the session was already rebuilding — " +
+                      "there was a state in flight that this one would have collided with.");
     }
 }

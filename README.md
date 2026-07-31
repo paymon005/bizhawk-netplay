@@ -238,15 +238,6 @@ Each run is a **fresh EmuHawk**, so the core is always constructed with the plug
 Loading a state is about keeping the workload *still*, not about it being dearer. Eight runs each way on Super Smash Bros. put the boot screen at 2.21 ms a frame against 2.32 ms in-game — the same, inside the spread. But the probe's passes run over several seconds, and a booting game moves through logos, an intro and an attract demo while they do; the repair decomposition assumes a stationary cost, and on some boot runs it misreads badly enough to put the derived load at zero.
 
 # To Do
-- **Make a host-side Quick Load mean "everyone jump to this save".** Saving works during a session and
-  loading does not: the load replaces this machine's state, the frame counter moves, and the drift
-  check ends the session naming the cause. But the host's state is authoritative — the same thing a
-  resync already ships — so a host load could instead push the loaded state to every peer and carry
-  on, turning a hotkey that currently ends the session into a way to restart from a save together.
-  The mechanism is the resync path that already exists and is proven. What needs deciding is the
-  joiner side, where a load has no authority behind it and would still have to be refused or simply
-  overwritten by the host's next state, and whether a hotkey should silently move four people's
-  games at all. Deliberately not in 1.0: it changes what a key means mid-session.
 - **Heavy-core performance:** BizHawk's N64 core is interpreter-only, so it's CPU-heavy. Frame-skip, audio-under-load smoothing, a frame-relative catch-up budget and pacing telemetry are in; moving emulation off the UI thread is *not* an option (cores are thread-affine — Waterbox/GL), so the remaining levers are core/plugin settings and a capable CPU.
 - **State transfers are compressed (v13), but rollback's savestates are not.** Every whole-state transfer over the control channel — initial join, resync, rejoin, live settings change — is deflated, which is where the multi-second freezes on heavy cores came from. That is the *network* copy only. The rollback ring still saves and loads raw, deliberately: those are on the frame path, where the memcpy is the budget and compressing would cost more than it saves.
 - **Rollback depth on heavy cores:** N64 runs rollback ~3 frames deep at native — enough for a nearby opponent, not a distant one. Sparse keyframes (snapshotting every *other* predicted frame; see below) is in and buys a frame of that. Beyond it the wall is arithmetic: the savestate is **74%** of what a repaired frame costs, and a 16.7 MiB state moves at memory bandwidth — 2.9 GB/s written, measured identically across ten games, both plugins and every resolution. Making the state smaller or incremental would be the real win and needs core support BizHawk doesn't expose.

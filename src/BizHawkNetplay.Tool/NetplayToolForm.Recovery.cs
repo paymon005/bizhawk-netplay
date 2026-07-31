@@ -273,9 +273,18 @@ public sealed partial class NetplayToolForm
         try
         {
             _phase.BeginRebuild(isSettingsChange ? RebuildReason.SettingsChange : RebuildReason.Desync);
-            if (isSettingsChange && (inputDelay != _sessionDelay || mode != _mode))
-                ConnLog($"the host changed the session to {DescribeMode(mode)} at input delay " +
-                        $"{inputDelay} — staying connected through the rebuild.", Color.DarkSlateBlue);
+            // Always say something for a deliberate rebuild, not only when the parameters moved. A
+            // host savestate load rides this same flag — it is deliberate and must not spend the
+            // desync budget — but changes neither delay nor mode, so it used to arrive as an
+            // unexplained jump. The wire cannot tell the two apart without a protocol bump that is
+            // not worth spending on a sentence, so say which one it looks like.
+            if (isSettingsChange)
+                ConnLog(inputDelay != _sessionDelay || mode != _mode
+                        ? $"the host changed the session to {DescribeMode(mode)} at input delay " +
+                          $"{inputDelay} — staying connected through the rebuild."
+                        : "the host rebuilt the session from its own state — a savestate load, or an " +
+                          "Apply that changed nothing. Staying connected through the rebuild.",
+                    Color.DarkSlateBlue);
             Status($"applying {state.Length / 1024}KiB host resync epoch {generation.Epoch}…",
                 Color.DarkOrange);
             _adapter!.ImportState(state);
