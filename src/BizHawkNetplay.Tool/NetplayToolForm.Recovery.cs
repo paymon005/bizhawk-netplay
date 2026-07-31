@@ -137,12 +137,8 @@ public sealed partial class NetplayToolForm
             int peerCount = _peers.Count;
             var generationBody = ControlMessageCodec.EncodeResyncBegin(generation, state.Length,
                 _sessionDelay, _mode, waitSeconds: 0, isSettingsChange: isSettingsChange);
-            var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
             Status($"{label}: sending epoch {generation.Epoch} " +
                 $"({state.Length / 1024}KiB) to {peerCount} peer(s)…", Color.DarkOrange);
-            Log($"{label}: captured {state.Length / 1024}KiB for epoch {generation.Epoch}, " +
-                $"{DescribeStateTransfer(state.Length, stateBody.Length)}; " +
-                "waiting for every peer to import it");
 
             if (peerCount == 0)
             {
@@ -151,28 +147,78 @@ public sealed partial class NetplayToolForm
                 RefreshLiveSettingsUi();
                 return;
             }
-            foreach (var link in _peers)
+
+            // Only the capture above needs this thread. Deflating the state does not, and on a heavy
+            // core it is a few hundred milliseconds of the UI thread — every resync, every settings
+            // change, every savestate load — during which EmuHawk is simply frozen. The peers are
+            // already waiting and still ponging normally, so spending that time off-thread costs the
+            // transfer nothing and gives the window back to WinForms.
+            new Thread(() =>
             {
-                GraceForStateTransfer(link, state.Length); // it can't pong while its reader consumes the frame
-                link.AwaitingAppliedEpoch = generation.Epoch;
-                Interlocked.Exchange(ref link.AppliedDeadlineTicks, StateApplyDeadlineTicks(state.Length));
-                if (!QueueControl(link, ControlMessageType.ResyncBegin, generationBody)
-                    || !QueueControl(link, ControlMessageType.Resync, stateBody, ok =>
-                    {
-                        if (!ok) BeginInvokeUi(() =>
-                        {
-                            if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
-                                && CurrentGeneration == generation)
-                                EndSession("resync state transfer failed");
-                        });
-                    }))
+                byte[] stateBody;
+                try { stateBody = ControlMessageCodec.EncodeStatePayload(generation, state); }
+                catch (Exception ex)
                 {
-                    EndSession("resync state transfer could not be queued");
+                    BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
+                            && CurrentGeneration == generation)
+                            EndSession("resync failed: " + ex.Message);
+                    });
                     return;
                 }
-            }
+                BeginInvokeUi(() => QueueAuthoritativeState(
+                    label, attempt, generation, state.Length, generationBody, stateBody));
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-state-pack" }.Start();
         }
         catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
+    }
+
+    /// <summary>
+    /// Hand the packed authoritative state to each peer's writer. Runs on the UI thread once
+    /// <see cref="ShipAuthoritativeState"/>'s packing thread has finished.
+    ///
+    /// The per-peer leashes are set HERE rather than before packing, so the transfer deadline covers
+    /// the transfer rather than the compression that preceded it.
+    /// </summary>
+    private void QueueAuthoritativeState(string label, int attempt, SessionGeneration generation,
+        int stateLength, byte[] generationBody, byte[] stateBody)
+    {
+        if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive
+            || CurrentGeneration != generation) return;
+
+        Log($"{label}: captured {stateLength / 1024}KiB for epoch {generation.Epoch}, " +
+            $"{DescribeStateTransfer(stateLength, stateBody.Length)}; " +
+            "waiting for every peer to import it");
+
+        if (_peers.Count == 0)
+        {
+            _phase.EndRebuild();
+            RebaseFrameSchedule();
+            RefreshLiveSettingsUi();
+            return;
+        }
+        foreach (var link in _peers)
+        {
+            GraceForStateTransfer(link, stateLength); // it can't pong while its reader consumes the frame
+            link.AwaitingAppliedEpoch = generation.Epoch;
+            Interlocked.Exchange(ref link.AppliedDeadlineTicks, StateApplyDeadlineTicks(stateLength));
+            if (!QueueControl(link, ControlMessageType.ResyncBegin, generationBody)
+                || !QueueControl(link, ControlMessageType.Resync, stateBody, ok =>
+                {
+                    if (!ok) BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
+                            && CurrentGeneration == generation)
+                            EndSession("resync state transfer failed");
+                    });
+                }))
+            {
+                EndSession("resync state transfer could not be queued");
+                return;
+            }
+        }
     }
 
     /// <summary>
