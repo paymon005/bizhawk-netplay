@@ -566,7 +566,9 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
                // "shorts peak=N" read as short READS — underruns — when it is the loudest PCM sample
                // seen, the check for "is the core producing sound at all". Named against full scale
                // so it cannot be mistaken for a count of anything.
-               $"peakSample={_audioPeak}/{short.MaxValue}" +
+               // Clamped: |short.MinValue| is 32768, one past short.MaxValue, so a sample at the
+               // negative rail printed as "32768/32767" — a fraction over its own maximum.
+               $"peakSample={Math.Min(_audioPeak, short.MaxValue)}/{short.MaxValue}" +
                $"{(AudioRevivals > 0 ? $" revivals={AudioRevivals}" : "")}{err}";
     }
 
@@ -826,6 +828,9 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
             sb.Append("]\n");
         }
 
+        string? stickOverride = DigitalStickOverrideDiagnostic();
+        if (stickOverride != null) sb.Append("  !! ").Append(stickOverride).Append('\n');
+
         var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
         IReadOnlyDictionary<string, object>? padAxes;
         try { padAxes = _apis.Joypad.Get(1); }
@@ -1035,6 +1040,57 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
             return atten < 0 ? 0.0 : atten > 1 ? 1.0 : atten;
         }
         catch { return 1.0; }
+    }
+
+    /// <summary>
+    /// The N64's digital stick directions, when they are bound at the same time as the analog stick.
+    ///
+    /// The core resolves the two by letting the BUTTON win outright — N64Input.GetStickValues reads
+    /// "if A Left pressed, x = -128; else if A Right pressed, x = +127; ELSE use the X Axis". So a
+    /// binding like "P1 A Left &lt;- X1 LStickLeft", which is what BizHawk's own default XInput layout
+    /// gives you, means pushing the stick past the digital threshold slams the axis to full
+    /// deflection and throws the analog reading away. Below the threshold the deadzone eats what is
+    /// left, so the stick reads minimum or maximum and nothing in between.
+    ///
+    /// Nothing in netplay causes it and nothing in netplay can fix it — local play behaves the same
+    /// — but it presents as "the netplay stick is broken", so the session says it plainly. Returns
+    /// null when there is nothing to warn about.
+    /// </summary>
+    public string? DigitalStickOverrideDiagnostic()
+    {
+        try
+        {
+            if (!string.Equals(_emulator.SystemId, "N64", StringComparison.OrdinalIgnoreCase)) return null;
+            if (_layouts.Length == 0) return null;
+
+            var bound = new List<string>();
+            for (int i = 0; i < _layouts[0].Buttons.Count; i++)
+            {
+                string name = _layouts[0].Buttons[i];
+                if (!name.EndsWith(" A Up", StringComparison.Ordinal)
+                    && !name.EndsWith(" A Down", StringComparison.Ordinal)
+                    && !name.EndsWith(" A Left", StringComparison.Ordinal)
+                    && !name.EndsWith(" A Right", StringComparison.Ordinal)) continue;
+                if (!string.IsNullOrEmpty(_bindings[0][i])) bound.Add(StripPortPrefix(name));
+            }
+            if (bound.Count == 0) return null;
+
+            // Only a problem alongside a bound analog stick; on a keyboard-only setup the digital
+            // directions are the whole point.
+            bool analogBound = false;
+            for (int j = 0; j < _analogBinds[0].Length; j++)
+                if (_analogBinds[0][j] is { } b && !string.IsNullOrEmpty(b.Value)) analogBound = true;
+            if (!analogBound) return null;
+
+            return $"P1 has BOTH the analog stick and the digital stick directions bound " +
+                   $"({string.Join(", ", bound)}). The N64 core lets the digital ones win: press one " +
+                   "and the stick is forced to full deflection and the analog value is discarded — so " +
+                   "the stick gives you minimum or maximum and nothing in between. If your pad's " +
+                   "stick is bound to both (BizHawk's default XInput layout does exactly that), clear " +
+                   "the four A Up/Down/Left/Right binds in Config > Controllers. This is a BizHawk " +
+                   "controller-config issue, not a netplay one — local play behaves the same way.";
+        }
+        catch { return null; }
     }
 
     /// <summary>The core's IsReversed flag per axis (BizHawk applies it when mapping host -> core).</summary>

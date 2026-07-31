@@ -298,6 +298,9 @@ public sealed partial class NetplayToolForm
                 "and those bytes come from the GPU — which disagrees between machines even when both " +
                 "players have identical settings, and shows up as a desync at every checksum.");
 
+        string? stickWarning = _adapter.DigitalStickOverrideDiagnostic();
+        if (stickWarning != null) ConnLog(stickWarning, Color.DarkOrange);
+
         // One reader and one serialized outbound writer per control link. The writer is what keeps
         // checksums, pings, and especially whole-state resync transfers off EmuHawk's UI thread.
         foreach (var link in _peers)
