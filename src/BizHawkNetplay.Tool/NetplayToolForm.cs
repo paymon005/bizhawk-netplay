@@ -125,6 +125,10 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private CheckBox _simUnresponsiveCheck = null!;
     private CheckBox _skipPresentCheck = null!;
     private bool _skipOurPresent;   // diagnostic: leave presenting entirely to EmuHawk's Render()
+    private Button _analogWatchButton = null!;
+    private System.Windows.Forms.Timer? _analogWatchTimer;
+    private const int AnalogWatchIntervalMs = 50;
+    private const int AnalogWatchSamples = 100;   // 5 seconds
     private CheckBox _upnpCheck = null!;
     private TextBox _passwordBox = null!;
     private NumericUpDown _simLatencyBox = null!;
@@ -456,6 +460,7 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         // Not parented to the form, so nothing else would ever stop it — a running timer whose Tick
         // touches disposed labels is the classic way a closed tool keeps throwing.
         try { _lobbyTimer.Stop(); _lobbyTimer.Dispose(); } catch { }
+        StopAnalogWatch();
         try { _tips.Dispose(); } catch { }
         base.OnFormClosed(e);
     }

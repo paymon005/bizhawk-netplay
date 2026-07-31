@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 
@@ -46,6 +48,94 @@ public sealed partial class NetplayToolForm
     /// Dumps what BizHawk sees for input: the controller/binding keys we resolve against, and
     /// the host inputs pressed right now vs how they map to P1. Hold a button and click.
     /// </summary>
+    /// <summary>
+    /// Watch the analog axes for a few seconds and report every distinct value the core was handed.
+    ///
+    /// The question this answers is "does the stick cover its range, or does it jump?" — and the
+    /// distinct-value list answers it on sight. A healthy stick produces a spread of values across
+    /// the range. A stick whose digital directions are also bound produces small values and then
+    /// nothing until the extreme, because the core's GetStickValues discards the axis the moment the
+    /// digital button fires. The gap in the middle is the whole complaint.
+    ///
+    /// Sampled on a timer rather than in a loop: blocking the UI thread here would stall the frame
+    /// clock during a session, and this is most useful during one.
+    /// </summary>
+    private void StartAnalogWatch()
+    {
+        if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
+        if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
+        if (_analogWatchTimer != null) { Log("analog watch already running."); return; }
+
+        EmuHawkAdapter adapter;
+        try { adapter = _adapter ?? new EmuHawkAdapter(APIs, _emulator, _statable); }
+        catch (Exception ex) { Log("analog watch failed: " + ex.Message); return; }
+
+        var seen = new Dictionary<string, SortedSet<int>>(StringComparer.Ordinal);
+        var rawLo = new Dictionary<string, int>(StringComparer.Ordinal);
+        var rawHi = new Dictionary<string, int>(StringComparer.Ordinal);
+        int ticksLeft = AnalogWatchSamples;
+
+        Log($"=== analog watch: move the stick through its full travel for the next " +
+            $"{AnalogWatchSamples * AnalogWatchIntervalMs / 1000} seconds ===");
+
+        _analogWatchTimer = new System.Windows.Forms.Timer { Interval = AnalogWatchIntervalMs };
+        _analogWatchTimer.Tick += (_, __) =>
+        {
+            try
+            {
+                foreach (var (name, raw, resolved) in adapter.SampleAnalog())
+                {
+                    if (!seen.TryGetValue(name, out var set)) seen[name] = set = new SortedSet<int>();
+                    set.Add(resolved);
+                    rawLo[name] = rawLo.TryGetValue(name, out int lo) ? Math.Min(lo, raw) : raw;
+                    rawHi[name] = rawHi.TryGetValue(name, out int hi) ? Math.Max(hi, raw) : raw;
+                }
+            }
+            catch { }
+
+            if (--ticksLeft > 0) return;
+            StopAnalogWatch();
+            ReportAnalogWatch(seen, rawLo, rawHi);
+        };
+        _analogWatchTimer.Start();
+    }
+
+    private void StopAnalogWatch()
+    {
+        try { _analogWatchTimer?.Stop(); _analogWatchTimer?.Dispose(); } catch { }
+        _analogWatchTimer = null;
+    }
+
+    private void ReportAnalogWatch(Dictionary<string, SortedSet<int>> seen,
+        Dictionary<string, int> rawLo, Dictionary<string, int> rawHi)
+    {
+        var sb = new System.Text.StringBuilder("=== analog watch result ===\n");
+        foreach (var kv in seen)
+        {
+            var values = kv.Value;
+            sb.Append("  '").Append(kv.Key).Append("': ").Append(values.Count)
+              .Append(" distinct value(s) reached the core, from ").Append(values.Min)
+              .Append(" to ").Append(values.Max)
+              .Append("   (raw host ").Append(rawLo[kv.Key]).Append("..").Append(rawHi[kv.Key]).Append(")\n");
+            sb.Append("      ").Append(string.Join(", ", values)).Append('\n');
+
+            // The tell. A stick that travels produces a spread; one whose digital directions are
+            // bound produces a cluster near neutral, then a jump straight to the rail.
+            int biggestGap = 0, gapFrom = 0, gapTo = 0, prev = int.MinValue;
+            foreach (int v in values)
+            {
+                if (prev != int.MinValue && v - prev > biggestGap) { biggestGap = v - prev; gapFrom = prev; gapTo = v; }
+                prev = v;
+            }
+            if (biggestGap > 8)
+                sb.Append("      !! biggest jump is ").Append(gapFrom).Append(" -> ").Append(gapTo)
+                  .Append(" (").Append(biggestGap).Append(" wide) — nothing in that band ever reached the core. ")
+                  .Append("If the four A Up/Down/Left/Right binds are still set, that gap is them.\n");
+        }
+        if (seen.Count == 0) sb.Append("  (no axes sampled)\n");
+        Log(sb.ToString());
+    }
+
     private void RunInputTest()
     {
         if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }

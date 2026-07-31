@@ -332,6 +332,12 @@ public sealed partial class NetplayToolForm
         _probeButton.Click += (_, __) => RunProbe();
         _testInputButton = new Button { Text = "Test Input", Location = new Point(152, 12), Width = 130 };
         _testInputButton.Click += (_, __) => RunInputTest();
+        _analogWatchButton = new Button { Text = "Watch Analog (5s)", Location = new Point(292, 12), Width = 130 };
+        _analogWatchButton.Click += (_, __) => StartAnalogWatch();
+        _tips.SetToolTip(_analogWatchButton,
+            "Click, then move the stick through its FULL travel for five seconds.\r\n" +
+            "Reports every distinct value that actually reached the core, so a stick\r\n" +
+            "that jumps from small values straight to full deflection shows the gap.");
 
         _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(12, 54) };
         _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(12, 78) };
@@ -381,7 +387,7 @@ public sealed partial class NetplayToolForm
 
         page.Controls.AddRange(
         [
-            _probeButton, _testInputButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
+            _probeButton, _testInputButton, _analogWatchButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
             _skipPresentCheck, simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
         ]);
         return page;

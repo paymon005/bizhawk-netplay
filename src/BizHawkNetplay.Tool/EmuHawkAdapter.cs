@@ -1093,6 +1093,40 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         catch { return null; }
     }
 
+    /// <summary>
+    /// One instantaneous reading per P1 axis: the raw host value behind the bind, and the value
+    /// BizHawk resolves it to (which is what a session sends).
+    ///
+    /// Exists because the input test could not answer the question it was built for. It samples when
+    /// you click it, and you cannot hold a stick at half deflection and click a button on another
+    /// window at the same time — so every dump it produced was the stick's resting position, to the
+    /// digit. Sampling over seconds is the only way to see the travel.
+    /// </summary>
+    public (string Name, int Raw, int Resolved)[] SampleAnalog()
+    {
+        if (_layouts.Length == 0 || _layouts[0].Axes.Count == 0) return [];
+        var layout = _layouts[0];
+
+        IReadOnlyDictionary<string, int>? hostAxes;
+        try { hostAxes = _apis.Input.GetPressedAxes(); } catch { hostAxes = null; }
+        IReadOnlyDictionary<string, object>? pad;
+        try { pad = _apis.Joypad.Get(1); } catch { pad = null; }
+
+        var result = new (string, int, int)[layout.Axes.Count];
+        for (int j = 0; j < layout.Axes.Count; j++)
+        {
+            var spec = layout.Axes[j];
+            int raw = 0;
+            if (_analogBinds[0][j] is { } bind && hostAxes != null && !string.IsNullOrEmpty(bind.Value))
+                hostAxes.TryGetValue(bind.Value, out raw);
+            int resolved = pad != null && pad.TryGetValue(_padAxisKeys[0][j], out var v) && v is int n
+                ? n
+                : spec.Neutral;
+            result[j] = (spec.Name, raw, resolved);
+        }
+        return result;
+    }
+
     /// <summary>The core's IsReversed flag per axis (BizHawk applies it when mapping host -> core).</summary>
     private bool[][] BuildAxisReversed()
     {
