@@ -65,6 +65,8 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private readonly Thread _punchThread;
     private volatile bool _running = true;
     private volatile RouteTable _routeTable = RouteTable.Empty;
+    // Host only: peers to echo every other peer's input to, because their direct legs never opened.
+    private volatile PeerRoute[] _relayRoutes = [];
 
     /// <summary>An immutable routing snapshot, atomically replaced when rendezvous data changes.</summary>
     private sealed class RouteTable
@@ -202,6 +204,18 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// route, so an endpoint advertised twice is probed and sent to only once. Repeated entries for the
     /// same remote port are merged in their original order.
     /// </summary>
+    /// <summary>
+    /// Peers whose direct joiner-to-joiner paths did not open, so this node forwards every other
+    /// peer's input to them. Host only, decided once at session start; empty is the normal case and
+    /// costs a single array length check per received datagram.
+    /// </summary>
+    public void SetRelayRoutes(IEnumerable<PeerRoute> routes) =>
+        _relayRoutes = routes == null ? [] : routes.ToArray();
+
+    /// <summary>How many peers are being relayed to — for the session log, and zero when the mesh
+    /// is fully connected.</summary>
+    public int RelayRouteCount => _relayRoutes.Length;
+
     public void SetPeerRoutes(IEnumerable<PeerRoute> routes)
     {
         if (routes == null) throw new ArgumentNullException(nameof(routes));
@@ -677,6 +691,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             var payload = new byte[n - HeaderSize];
             Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
             EnqueueInput(payload);
+            RelayInput(buffer, n, known);
         }
     }
 
@@ -717,6 +732,47 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         framed[5] = type;
         Buffer.BlockCopy(payload, 0, framed, HeaderSize, payload.Length);
         return framed;
+    }
+
+    /// <summary>
+    /// Echo one peer's input datagram to the peers that cannot receive it directly.
+    ///
+    /// Only the host ever has relay routes, and the reason this needs no new wire format is that an
+    /// input datagram already names its own source: the port is byte [1] of the payload, so whoever
+    /// receives it attributes the input to that port regardless of which endpoint it arrived from.
+    /// The bytes are forwarded verbatim, envelope and all — nothing here parses the payload, and a
+    /// duplicate arriving alongside a direct copy is harmless, since input is keyed by (port, frame).
+    ///
+    /// A relayed leg costs one extra hop of latency and some host uplink. It is only ever installed
+    /// for the joiner-to-joiner edges that failed to open, which in practice means a peer behind a
+    /// symmetric NAT — the case where no amount of punching can produce a direct path.
+    /// </summary>
+    private void RelayInput(byte[] buffer, int n, IPEndPoint from)
+    {
+        var routes = _relayRoutes;
+        if (routes.Length == 0) return;
+
+        byte[]? copy = null; // only allocated when there is actually something to forward
+        long now = Clock.ElapsedMilliseconds;
+        foreach (var route in routes)
+        {
+            // Never bounce a datagram back to the peer it came from.
+            bool isSender = false;
+            foreach (var candidate in route.Candidates) if (candidate.Equals(from)) { isSender = true; break; }
+            if (isSender) continue;
+
+            var endpoint = SelectSendCandidate(route, now);
+            if (endpoint == null) continue; // no live path to relay over yet; direct copies still flow
+            copy ??= Slice(buffer, n);
+            SendFramed(copy, endpoint);
+        }
+
+        static byte[] Slice(byte[] source, int length)
+        {
+            var slice = new byte[length];
+            Buffer.BlockCopy(source, 0, slice, 0, length);
+            return slice;
+        }
     }
 
     private void SendFramed(byte[] framed, IPEndPoint to)

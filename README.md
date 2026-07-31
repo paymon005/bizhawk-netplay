@@ -247,7 +247,11 @@ Loading a state is about keeping the workload *still*, not about it being dearer
 - **The depth verdict is ~15% optimistic.** The probe's [repair line](#the-repair-line) says so on every stationary run, and the cause is known: `load=` is timed in isolation and the load defers work onto the frame that follows it, so the once-per-repair cost is nearer 3.8 ms than the 1.6 ms reported. Feeding the repair-derived terms to the solver is the fix; it moves the reported depth at native from 3 to what sparse keyframes now earns honestly.
 - **A repair spends up to `MaxFramesPerTick` frame periods, and the catch-up path can run exactly that many back per tick.** The two are now tied rather than chosen alongside each other, so raising either alone can no longer leave repairs running up arrears the pacing rebase quietly discards.
 - **Where N64's frame cost actually comes from:** mostly the render resolution — a controlled sweep puts it at 2.4 ms at 320×240 and 7.7 ms at 2880×2160 (see [Heavy cores](#heavy-cores-n64-and-friends)). An earlier uncontrolled sweep looked like noise and was read that way; it simply hadn't spanned enough of the range for the curve to clear the scatter. Whether resolution accounts for *all* of the 1.6–12 ms swing seen across one evening's sessions is still open — the top of that range is above anything measured here — but it is no longer an unexplained term.
-- **Symmetric-NAT traversal:** a TURN-style relay fallback for the peers cone-NAT punching can't reach.
+- **Symmetric-NAT peers still can't HOST.** The joiner↔joiner legs they can't punch are now relayed
+  through the host, which needs no external server because the host is already the rendezvous
+  everyone reached. What that doesn't solve is a symmetric-NAT peer *hosting* without forwarding a
+  port — there is no reachable rendezvous then, and that is the case a TURN-style server would be
+  for. Also still start-of-session only: a leg that dies mid-game is not failed over to the relay.
 
 ## Known limitations
 
@@ -256,7 +260,7 @@ Things that are by-design gaps or not-yet-built, worth knowing before relying on
 - **Desync detection hashes main RAM only** — not CPU/mapper/PPU/APU/RTC state. A divergence confined to non-RAM state can slip past the checksum until it perturbs RAM.
 - **Sync-settings check is best-effort** — the handshake compares the core's real sync-settings blob (read via `ISettable.GetSyncSettings()`), so mismatched per-core settings (e.g. different N64 video plugins) are refused up front rather than desyncing. If a core's settings can't be read it falls back to a coarse core+version+system digest, which wouldn't catch such a mismatch.
 - **NAT traversal is cone-only** — UDP Punch and the mesh connectivity checks open cone-NAT paths;
-  **symmetric NAT** (a different mapping per destination) still needs a TURN-style relay, which isn't built. The host must also be reachable (forwarded, or via the connect-code punch) to act as the rendezvous for the joiner↔joiner mesh.
+  **symmetric NAT** (a different mapping per destination) cannot be punched at all — but such a peer can still *join* a reachable host, and at 3–4 players the host relays input over the joiner↔joiner legs that don't open, so they play with one extra hop on those legs. What symmetric NAT still prevents is *hosting* without a forwarded port. The host must be reachable (forwarded, or via the connect-code punch) either way, since it is the rendezvous for the joiner↔joiner mesh and now the relay for it too.
   The tool now **detects and names this** rather than failing silently: pressing **My public address**, or starting a **UDP Punch**, asks two STUN servers for the same socket's mapping and compares them. A symmetric verdict is logged with what it does and doesn't break — punch and the joiner↔joiner legs are lost, joining a forwarded host still works, since you open that path yourself. It's advisory and never refuses a connection: two servers can be wrong in your favour.
 - **Mesh input trusts peers** — datagrams are pinned to a known endpoint but not cryptographically bound to a controller port, so a malicious peer could submit input for a port it doesn't own. Fine
   for playing with people you trust; not a hostile-network guarantee.

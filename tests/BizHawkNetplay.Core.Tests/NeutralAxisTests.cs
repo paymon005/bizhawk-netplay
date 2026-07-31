@@ -76,7 +76,7 @@ public class NeutralAxisTests
         var spec = new AxisSpec("P1 X Axis", 0, 255, 128);
 
         Assert.NotEqual(0, spec.Neutral);
-        Assert.Equal(spec.Min, 0);
+        Assert.Equal(0, spec.Min);
         Assert.True(Math.Abs(0 - spec.Neutral) == 128, "zero is a full-scale deflection here");
     }
 }

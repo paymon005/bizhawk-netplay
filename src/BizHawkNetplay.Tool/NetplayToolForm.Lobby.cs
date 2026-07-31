@@ -600,12 +600,17 @@ public sealed partial class NetplayToolForm
             link => Handshake.HostRequestMeshRtt(link.Control, generation));
 
         int measuredEdges = 0, totalEdges = 0;
+        var incomplete = new List<PeerLink>();   // joiners that could not open every direct leg
         double rtt = worstRttMs, jitter = worstJitterMs; // ref params cannot be captured below
         RunStartPhase(links, casualties, attempt, "we waited for its mesh measurement", link =>
         {
             var report = Handshake.HostWaitMeshRtt(link.Control, generation);
             totalEdges += report.TotalEdges;
             measuredEdges += report.MeasuredEdges;
+            // A joiner short of its own edge count has a leg to another joiner that never opened.
+            // The host's own leg to it cannot be the missing one — it is connected to us — so the
+            // gap is joiner-to-joiner, which is what the relay exists for.
+            if (report.MeasuredEdges < report.TotalEdges) incomplete.Add(link);
             if (!report.HasMeasurement)
             {
                 UiConnLog($"{link.Label} could not measure any of its {report.TotalEdges} UDP edge(s) — " +
@@ -638,11 +643,56 @@ public sealed partial class NetplayToolForm
                       "delay below is a lower bound, and a path that opens later may need more.",
                 Color.DarkOrange);
 
+        InstallMeshRelay(mesh, links, incomplete);
+
         static void Fold(LobbyRttSample sample, ref double rtt, ref double jitter)
         {
             if (sample.MedianMs > rtt) rtt = sample.MedianMs;
             if (sample.JitterMs > jitter) jitter = sample.JitterMs;
         }
+    }
+
+    /// <summary>
+    /// Have the host forward input to joiners whose direct legs to the other joiners never opened.
+    ///
+    /// This is the symmetric-NAT case. Such a peer can still reach the host — it dialled out to a
+    /// forwarded port, which is a path it opened itself — but no peer can be told an address for it
+    /// that stays valid, so the joiner-to-joiner legs cannot be punched at all. Before this, a
+    /// 3-4 player session with one such peer simply never received that peer's input on those legs.
+    ///
+    /// The host is already the rendezvous every joiner reached, so it can relay without any external
+    /// server: no TURN, no third party, nothing to run. The cost is one extra hop on the affected
+    /// legs and a little host uplink.
+    ///
+    /// Decided once, here, from the mesh round — not failed over live. A start-of-session decision is
+    /// deterministic, shows up in the log, and cannot oscillate under packet loss; live failover is a
+    /// harder problem and deliberately left alone.
+    ///
+    /// Deliberately coarse: the mesh report says HOW MANY of a joiner's edges answered, not which, so
+    /// a joiner that is short even one leg gets everything relayed to it. That over-delivers rather
+    /// than under-delivers, and a duplicate is free — input is keyed by (port, frame), so a relayed
+    /// copy arriving beside a direct one is discarded. Narrowing it to the exact failed pair would
+    /// need the report to name peers, and that is a wire change for a bandwidth saving nobody needs.
+    /// </summary>
+    private void InstallMeshRelay(MeshUdpTransport mesh, List<PeerLink> links, List<PeerLink> incomplete)
+    {
+        if (incomplete.Count == 0) { mesh.SetRelayRoutes([]); return; }
+
+        // Relaying is pointless with one joiner: there is no other joiner for it to fail to reach,
+        // and the host's own input already goes to it directly.
+        if (links.Count < 2)
+        {
+            mesh.SetRelayRoutes([]);
+            UiConnLog("a direct UDP path did not open, but with one joiner there is nothing to relay " +
+                      "— the host's own link is the only one that matters.", Color.DarkOrange);
+            return;
+        }
+
+        mesh.SetRelayRoutes(RoutesExcept(incomplete, null));
+        UiConnLog($"relaying input through this host for {incomplete.Count} player(s) whose direct " +
+                  "paths to the other players did not open — usually a symmetric NAT. They stay in " +
+                  "the session; their input just takes one extra hop, so expect slightly more delay " +
+                  "on those legs than the lobby measured.", Color.DarkOrange);
     }
 
     /// <summary>

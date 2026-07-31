@@ -33,8 +33,11 @@ public readonly struct NatReport
     public bool IsSymmetric => Mapping == NatMapping.Symmetric;
 
     /// <summary>
-    /// What to tell the player. Phrased around what they can do, because the one thing they cannot
-    /// do is make this tool traverse a symmetric NAT — the relay that would is not built.
+    /// What to tell the player, phrased around what they can do about it.
+    ///
+    /// A symmetric NAT still cannot be punched — that is not solvable from this side — but it is no
+    /// longer a dead end at 3-4 players: the host relays input over the legs that never opened, so
+    /// such a peer plays, one extra hop behind. What it still cannot do is HOST without forwarding.
     /// </summary>
     public string Describe() => Mapping switch
     {
@@ -44,11 +47,12 @@ public readonly struct NatReport
         NatMapping.Symmetric =>
             $"NAT check: SYMMETRIC NAT — your router gave two different public ports for the same " +
             $"socket ({First?.Port} and {Second?.Port}), so no peer can be told an address that " +
-            "will still be valid when it aims there. What this breaks: UDP Punch, and the direct " +
-            "leg to every OTHER joiner in a 3-4 player session. What still works: joining a host " +
-            "who has forwarded a port, because you open that path yourself. So — play 2-player " +
-            "against a forwarded host, or forward a UDP port and host it yourself. A relay for the " +
-            "rest is not built.",
+            "will still be valid when it aims there. What this breaks: UDP Punch, and hosting " +
+            "without a forwarded port. What still works: joining a host who has forwarded one, " +
+            "because you open that path yourself — and at 3-4 players the host now relays input " +
+            "over the direct legs to the other joiners that cannot open, so you play normally with " +
+            "one extra hop of delay on those legs. So: join a forwarded host, or forward a UDP " +
+            "port and host it yourself.",
         _ => "NAT check: could not reach two STUN servers, so nothing was established about your " +
              "router. This is not a verdict either way.",
     };

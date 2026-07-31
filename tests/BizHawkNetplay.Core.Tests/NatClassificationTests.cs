@@ -57,13 +57,16 @@ public class NatClassificationTests
         Assert.Contains("SYMMETRIC", s);
         Assert.Contains("50000", s);
         Assert.Contains("50001", s);
-        // It must not overstate the damage: joining a forwarded host still works, because the
-        // joiner opens that path itself. Only punch and the joiner-to-joiner legs are lost.
+        // It must not overstate the damage. Joining a forwarded host still works, because the joiner
+        // opens that path itself — and since the host relay landed, the joiner-to-joiner legs it
+        // cannot punch are carried for it, so 3-4 players is no longer lost either.
         Assert.Contains("still works", s);
-        Assert.Contains("forwarded a port", s);
-        // The actions available, and honesty that the one that would fix the rest does not exist.
+        Assert.Contains("forwarded one", s);
+        Assert.Contains("relays input", s);
+        // ...and must not understate it either: the one thing still genuinely unavailable is hosting
+        // without a forwarded port, since then nothing is reachable to relay through.
+        Assert.Contains("hosting", s);
         Assert.Contains("forward a UDP port and host", s);
-        Assert.Contains("not built", s);
         Assert.True(r.IsSymmetric);
     }
 

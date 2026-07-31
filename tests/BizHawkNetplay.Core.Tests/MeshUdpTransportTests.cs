@@ -465,6 +465,72 @@ public class MeshUdpTransportTests
         finally { for (int i = 0; i < Players; i++) t[i].Dispose(); }
     }
 
+    /// <summary>
+    /// The symmetric-NAT fallback: two joiners that cannot see each other still exchange input,
+    /// because the host forwards it.
+    ///
+    /// Modelled by simply never telling A and C about each other — which is what an unpunchable leg
+    /// looks like from the transport's side. Both still reach the host, as a symmetric-NAT peer
+    /// does, having dialled out to a forwarded port itself.
+    /// </summary>
+    [Fact]
+    public void HostRelaysInputBetweenJoinersThatCannotReachEachOther()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var a = MeshUdpTransport.Bind(0);
+        var c = MeshUdpTransport.Bind(0);
+        try
+        {
+            var toA = new PeerRoute(1, new[] { Loop(a.LocalPort) });
+            var toC = new PeerRoute(2, new[] { Loop(c.LocalPort) });
+            host.SetPeerRoutes(new[] { toA, toC });
+            // The broken mesh: each joiner knows only the host.
+            a.SetPeers(new[] { Loop(host.LocalPort) });
+            c.SetPeers(new[] { Loop(host.LocalPort) });
+
+            // Without the relay, A's input reaches the host and stops there.
+            a.Send([7]);
+            Assert.Equal(new byte[] { 7 }, WaitRecv(host));
+            AssertNoRecv(c);
+
+            // The host must have heard from both before it can pick a live candidate to relay over.
+            c.Send([8]);
+            Assert.Equal(new byte[] { 8 }, WaitRecv(host));
+
+            host.SetRelayRoutes(new[] { toA, toC });
+            Assert.Equal(2, host.RelayRouteCount);
+
+            a.Send([9]);
+            Assert.Equal(new byte[] { 9 }, WaitRecv(host)); // still delivered locally
+            Assert.Equal(new byte[] { 9 }, WaitRecv(c));    // ...and forwarded to the unreachable peer
+        }
+        finally { host.Dispose(); a.Dispose(); c.Dispose(); }
+    }
+
+    /// <summary>A relayed datagram must not be bounced back to the peer that sent it — that would be
+    /// a duplicate at best and, if anything ever forwarded onward, a loop.</summary>
+    [Fact]
+    public void RelayNeverEchoesBackToTheSender()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var a = MeshUdpTransport.Bind(0);
+        try
+        {
+            var toA = new PeerRoute(1, new[] { Loop(a.LocalPort) });
+            host.SetPeerRoutes(new[] { toA });
+            a.SetPeers(new[] { Loop(host.LocalPort) });
+
+            a.Send([1]);
+            Assert.Equal(new byte[] { 1 }, WaitRecv(host)); // host now has a live path to A
+
+            host.SetRelayRoutes(new[] { toA }); // A is its own relay target, and must be skipped
+            a.Send([2]);
+            Assert.Equal(new byte[] { 2 }, WaitRecv(host));
+            AssertNoRecv(a);
+        }
+        finally { host.Dispose(); a.Dispose(); }
+    }
+
     private static byte[] WaitRecv(ITransport t)
     {
         var sw = Stopwatch.StartNew();
