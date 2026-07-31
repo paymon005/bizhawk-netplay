@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 
 namespace BizHawkNetplay.Core.Net;
 
@@ -25,12 +26,27 @@ public static class StunClient
         ("stun.cloudflare.com", 3478),
     ];
 
+    /// <summary>
+    /// How long to wait on name resolution before giving up on a STUN server.
+    ///
+    /// Dns.GetHostAddresses has no timeout parameter and, against a blackholed resolver, blocks for
+    /// the system default — on the host path that is the lobby accept loop, so joiners wait with no
+    /// feedback for something that is only ever an optimisation. Three servers are tried in turn;
+    /// the budget is per server.
+    /// </summary>
+    private const int ResolveTimeoutMs = 3000;
+
     /// <summary>Resolve a STUN server host to its first IPv4 endpoint, or null.</summary>
     public static IPEndPoint? ResolveV4(string host, int port)
     {
         try
         {
-            foreach (var a in Dns.GetHostAddresses(host))
+            // The resolve itself cannot be cancelled — the abandoned task simply finishes into
+            // nothing later. What matters is that the CALLER stops waiting, since every path here
+            // treats a null as "try the next server".
+            var lookup = Task.Run(() => Dns.GetHostAddresses(host));
+            if (!lookup.Wait(ResolveTimeoutMs)) return null;
+            foreach (var a in lookup.Result)
                 if (a.AddressFamily == AddressFamily.InterNetwork) return new IPEndPoint(a, port);
         }
         catch { }

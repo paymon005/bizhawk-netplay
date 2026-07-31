@@ -185,21 +185,51 @@ public static class UpnpPortMapper
         req.ContentType = "text/xml; charset=\"utf-8\"";
         req.Headers["SOAPAction"] = "\"" + serviceType + "#" + action + "\"";
         req.Timeout = (int)timeout.TotalMilliseconds;
+        req.ReadWriteTimeout = (int)timeout.TotalMilliseconds;
         using (var rs = req.GetRequestStream()) rs.Write(data, 0, data.Length);
         using var resp = (HttpWebResponse)req.GetResponse();
-        using var ms = new MemoryStream();
-        resp.GetResponseStream().CopyTo(ms);
-        return ms.ToArray();
+        return ReadBounded(resp);
     }
 
     private static string HttpGet(string url, TimeSpan timeout)
     {
         var req = (HttpWebRequest)WebRequest.Create(url);
         req.Timeout = (int)timeout.TotalMilliseconds;
+        req.ReadWriteTimeout = (int)timeout.TotalMilliseconds;
         req.UserAgent = "BizHawkNetplay";
         using var resp = (HttpWebResponse)req.GetResponse();
-        using var sr = new StreamReader(resp.GetResponseStream());
-        return sr.ReadToEnd();
+        return Encoding.UTF8.GetString(ReadBounded(resp));
+    }
+
+    /// <summary>
+    /// Largest device description or SOAP reply worth reading. Real ones are a few kilobytes; the
+    /// cap exists because the responder is whatever answered an SSDP broadcast on the local network,
+    /// which is not necessarily a router and is not necessarily well behaved.
+    /// </summary>
+    private const int MaxResponseBytes = 1 << 20;   // 1 MiB
+
+    /// <summary>
+    /// Read a response body with a ceiling.
+    ///
+    /// Timeout alone was not enough: HttpWebRequest.Timeout covers the connect and the response
+    /// HEADERS, and the body copy below was governed by ReadWriteTimeout — which defaults to five
+    /// minutes. A device that accepted the connection and then trickled bytes held the host's lobby
+    /// accept loop for that long, per call, while joiners sat in the backlog with no explanation.
+    /// </summary>
+    private static byte[] ReadBounded(HttpWebResponse resp)
+    {
+        using var ms = new MemoryStream();
+        var stream = resp.GetResponseStream();
+        var buffer = new byte[8192];
+        int read;
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            if (ms.Length + read > MaxResponseBytes)
+                throw new InvalidOperationException(
+                    $"UPnP response exceeded {MaxResponseBytes} bytes; ignoring this device.");
+            ms.Write(buffer, 0, read);
+        }
+        return ms.ToArray();
     }
 
     private static bool ContainsWan(string serviceType)

@@ -60,8 +60,11 @@ public sealed partial class NetplayToolForm
         RefreshLiveSettingsUi(); // no settings change while a seat is empty and waiting
 
         _peers.Remove(link);
-        // The link leaves _peers here, so TeardownNetwork's reaping will never see it again —
-        // shut its writer down now or the thread spins on OutboundSignal forever (KI-4).
+        // The link leaves _peers here, so TeardownNetwork's reaping would never see it again —
+        // shut its writer down now or the thread spins on OutboundSignal forever (KI-4). Retiring
+        // it rather than dropping it on the floor is what lets teardown still join its threads and
+        // dispose its signal; a rejoin arrives as a NEW PeerLink, so this one is finished either way.
+        _retiredLinks.Add(link);
         link.WriterRunning = false;
         try { link.OutboundSignal.Set(); } catch { }
         try { link.Tcp?.Close(); } catch { }
@@ -471,6 +474,11 @@ public sealed partial class NetplayToolForm
         try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
         TeardownNetwork();
         if (!wasActive) RestorePreJoinState();
+        // Same two lines EndSession clears, for the same reasons: a failed attempt still minted seat
+        // tokens, and tokens must not outlive the control channel that authenticated them. Leaving
+        // them behind let the next session reuse them via TokenForPort.
+        _relayPorts.Clear();
+        _portTokens.Clear();
         try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
         ApplySessionHostOwnership(false);
         RestorePauseState(); // undo the freeze from OnGo, unless it was already paused before it
@@ -486,7 +494,7 @@ public sealed partial class NetplayToolForm
         // could leave the frame advance blocked and the frontend commands refused with nothing left
         // to explain why.
         if (!_phase.IsActive && _listener == null && _joiningTcp == null && _greetingTcp == null
-            && _peers.Count == 0 && !_hostOwnershipHeld && !_pausedByUs
+            && _peers.Count == 0 && _retiredLinks.Count == 0 && !_hostOwnershipHeld && !_pausedByUs
             && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
         { SetBusy(false); return; }
         bool wasActive = _phase.IsActive;
@@ -578,6 +586,8 @@ public sealed partial class NetplayToolForm
 
         var peers = new List<PeerLink>(_peers);
         _peers.Clear();
+        peers.AddRange(_retiredLinks);   // reaped on the same terms; see _retiredLinks
+        _retiredLinks.Clear();
         foreach (var link in peers)
         {
             link.WriterRunning = false;

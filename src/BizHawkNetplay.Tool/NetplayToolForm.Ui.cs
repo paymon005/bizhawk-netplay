@@ -443,22 +443,30 @@ public sealed partial class NetplayToolForm
             me.SubItems.Add("—");
             _playersList.Items.Add(me);
 
+            // _pingLock guards PingMs only, and the control-reader threads take it for every Pong and
+            // every Pacing frame. Building ListView items under it made those threads queue behind
+            // WinForms work — and on a log-trim tick, behind a full rewrite of the log buffer, which
+            // is where the pacing samples that feed the time-sync valve were being delayed. Take the
+            // numbers, let go, then build.
+            if (_pingSnapshot.Length < _peers.Count) _pingSnapshot = new double[_peers.Count];
             lock (_pingLock)
-            {
-                foreach (var link in _peers)
-                {
-                    var item = new ListViewItem($"P{link.RemotePort + 1}");
-                    item.SubItems.Add(link.UdpEndpoint?.ToString() ?? link.Label);
-                    item.SubItems.Add(link.PingMs < 0 ? "…" : $"{link.PingMs + 2 * _simLatencyMs:F0} ms");
-                    item.SubItems.Add(MeshLinkStatus(link));
-                    _playersList.Items.Add(item);
+                for (int i = 0; i < _peers.Count; i++) _pingSnapshot[i] = _peers[i].PingMs;
 
-                    // One-time log when a peer's direct UDP path first confirms (host-as-rendezvous punch).
-                    if (MeshLinkAlive(link) && !link.DirectLogged)
-                    {
-                        link.DirectLogged = true;
-                        Log($"{link.Label}: direct UDP path open");
-                    }
+            for (int i = 0; i < _peers.Count; i++)
+            {
+                var link = _peers[i];
+                double ping = _pingSnapshot[i];
+                var item = new ListViewItem($"P{link.RemotePort + 1}");
+                item.SubItems.Add(link.UdpEndpoint?.ToString() ?? link.Label);
+                item.SubItems.Add(ping < 0 ? "…" : $"{ping + 2 * _simLatencyMs:F0} ms");
+                item.SubItems.Add(MeshLinkStatus(link));
+                _playersList.Items.Add(item);
+
+                // One-time log when a peer's direct UDP path first confirms (host-as-rendezvous punch).
+                if (MeshLinkAlive(link) && !link.DirectLogged)
+                {
+                    link.DirectLogged = true;
+                    Log($"{link.Label}: direct UDP path open");
                 }
             }
         }

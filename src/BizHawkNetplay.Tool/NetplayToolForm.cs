@@ -160,8 +160,10 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     // --- Session state (all touched on the UI thread except where noted) ---
     private EmuHawkAdapter? _adapter;
-    private ITransport? _transport;        // the FrameDriver's input channel (see below)
-    private MeshUdpTransport? _mesh;       // direct peer-to-peer UDP: host and joiners both send to all peers
+    // Both volatile: the punch and reconnect threads test `ReferenceEquals(_mesh, mesh)` as their
+    // this-session-is-still-mine guard, and the UI thread is what nulls them at teardown.
+    private volatile ITransport? _transport;        // the FrameDriver's input channel (see below)
+    private volatile MeshUdpTransport? _mesh;       // direct peer-to-peer UDP: host and joiners both send to all peers
     // Our own public UDP endpoint, discovered once per session and reused. Volatile: written by the
     // STUN thread, read by the join thread building its HELLO and by the post-GO share.
     private volatile IPEndPoint? _localReflexive;
@@ -183,7 +185,9 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private readonly ConcurrentQueue<PunchAdmission> _punchAdmissions = new();
     private readonly List<IPEndPoint> _lobbyPunchTargets = new();
     // volatile: the accept thread reads this as its teardown signal (null => Disconnect stopped us),
-    // and it's written from the UI thread. Every other cross-thread field here is volatile too.
+    // and it's written from the UI thread. Every other field read off the UI thread is volatile too;
+    // the ones guarded by a lock instead (_peers' PingMs under _pingLock, _checksums under
+    // _hashLock) say so where they are declared.
     private volatile TcpListener? _listener;
     private volatile TcpClient? _joiningTcp; // a join connect still in progress, so Disconnect can close it
     // Odd count, and enough of them that the high-water figure means something: the delay estimate
@@ -208,12 +212,18 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private bool _sessionDriverPrepared; // built/started before READY, activated only after GO
     private byte[]? _preJoinRestoreState; // restored if pre-READY import never reaches GO
     private readonly List<PeerLink> _peers = new();
+    // Links that left _peers before teardown (a peer dropped and we are waiting for it to return).
+    // TeardownNetwork only ever reaped _peers, so these kept their reader/writer threads unjoined
+    // and their OutboundSignal undisposed — one handle per drop/rejoin cycle.
+    private readonly List<PeerLink> _retiredLinks = new();
     private readonly System.Windows.Forms.Timer _frameTimer;
     // Session lifecycle as one object; see SessionPhase for why rebuilding and awaiting-a-rejoin
     // are independent rather than two values of one enum.
     private readonly SessionPhase _phase = new();
-    private bool _isHost;      // host is authoritative for desync detection + resync
-    private int _playerCount = 2;
+    // Volatile: both are written on the UI thread when a session is prepared and read by the
+    // control-reader threads on every message (PeerReaderLoop branches on _isHost).
+    private volatile bool _isHost;      // host is authoritative for desync detection + resync
+    private volatile int _playerCount = 2;
     private int _localPort;    // our controller port, for rebuilding the driver on resync
     private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
     // Tells "the emulation drifted once" apart from "these two machines were never comparing the
@@ -242,6 +252,9 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // Live round-trip time per control link, for connection-quality feedback.
     private readonly System.Diagnostics.Stopwatch _pingClock = new();
     private readonly object _pingLock = new();
+    // Scratch for RefreshPlayersList, so reading the pings out of _pingLock costs no allocation.
+    // Grown, never shrunk; a session has a handful of peers.
+    private double[] _pingSnapshot = new double[4];
     private int _sessionDelay;    // the input delay this session negotiated
     private bool _delayHintShown; // one-time "raise your delay" hint per session
 
@@ -259,10 +272,12 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // relayed. Kept as ports rather than routes because endpoints change on a rejoin — see
     // RefreshRelayRoutes.
     private readonly HashSet<int> _relayPorts = [];
-    private PeerIdentity? _hostIdentity;
-    private SessionPreferences? _hostPrefs;
-    private int _hostTcpPort;
-    private int _hostUdpPort;
+    // Volatile: written on the UI thread when hosting starts, read by the reconnect accept loop when
+    // it re-greets a returning joiner.
+    private volatile PeerIdentity? _hostIdentity;
+    private volatile SessionPreferences? _hostPrefs;
+    private volatile int _hostTcpPort;
+    private volatile int _hostUdpPort;
 
     // Liveness: pings go out on a wall-clock cadence (independent of frame stepping, so a
     // stalled-but-alive peer keeps answering), and a watchdog drops a link that has gone silent —
@@ -547,8 +562,12 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         // Not parented to the form, so nothing else would ever stop it — a running timer whose Tick
         // touches disposed labels is the classic way a closed tool keeps throwing.
         try { _lobbyTimer.Stop(); _lobbyTimer.Dispose(); } catch { }
+        // Same hazard, same fix: the frame timer is not parented either, and its Tick closes over
+        // this form. Stopping it was the only thing keeping a stray tick off disposed controls.
+        try { _frameTimer.Stop(); _frameTimer.Dispose(); } catch { }
         StopAnalogWatch();
         try { _tips.Dispose(); } catch { }
+        try { _reflexiveKnown.Dispose(); } catch { }
         // Last, so everything the teardown above logged is on disk before the handle goes.
         try { _logFile?.Dispose(); } catch { }
         _logFile = null;

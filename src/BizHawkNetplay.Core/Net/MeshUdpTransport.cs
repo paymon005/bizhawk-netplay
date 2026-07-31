@@ -65,6 +65,8 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private int _inboundDepth;
     private int _inboundPeak;
     private long _inboundDropped;
+    private long _receiveFaults;
+    private volatile string? _lastReceiveFault;
     private readonly Thread _rxThread;
     private readonly Thread _punchThread;
     private volatile bool _running = true;
@@ -178,9 +180,34 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private volatile IPEndPoint? _reflexive;
     private readonly ManualResetEventSlim _stunEvent = new(false);
 
+    /// <summary>
+    /// Windows-only ioctl that stops a UDP socket from reporting an ICMP port-unreachable as a
+    /// receive error. Without it, punching at a peer that is not listening yet — which the punch
+    /// loop does every 250ms, by design — makes the NEXT ReceiveFrom throw 10054, so the receive
+    /// loop spends session start-up throwing and restarting instead of receiving.
+    /// </summary>
+    private const int SioUdpConnReset = unchecked((int)0x9800000C);
+
+    /// <summary>
+    /// Socket buffer size. The default on Windows is ~8KB — a few dozen datagrams — and the kernel
+    /// queue is the only thing absorbing a scheduling gap on the receive thread. Datagrams dropped
+    /// there are invisible: they never reach InboundDropped, so the loss surfaced as a stall or a
+    /// deep rollback and got blamed on the network. MaxInboundBacklog reasons carefully about the
+    /// user-space queue; this is the kernel queue in front of it.
+    /// </summary>
+    private const int SocketBufferBytes = 1 << 18;   // 256 KiB
+
     private MeshUdpTransport(int localPort)
     {
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, SocketBufferBytes);
+        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, SocketBufferBytes);
+        // Both are best-effort: neither is load-bearing, and a platform that refuses one should not
+        // cost the session its transport.
+        try { _socket.IOControl(SioUdpConnReset, new byte[4], null); } catch { /* not Windows */ }
+        // Makes the codec's 1200-byte cap enforced rather than assumed — a datagram that outgrows it
+        // now fails at the sender instead of being fragmented and silently lost to a middlebox.
+        try { _socket.DontFragment = true; } catch { /* unsupported here */ }
         _socket.Bind(new IPEndPoint(IPAddress.Any, localPort));
         _rxThread = new Thread(ReceiveLoop) { IsBackground = true, Name = "BizHawkNetplay-UDP-mesh" };
         _rxThread.Start();
@@ -214,11 +241,6 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     }
 
     /// <summary>
-    /// Replace the logical peer routes. Candidates are de-duplicated globally as well as within each
-    /// route, so an endpoint advertised twice is probed and sent to only once. Repeated entries for the
-    /// same remote port are merged in their original order.
-    /// </summary>
-    /// <summary>
     /// Peers whose direct joiner-to-joiner paths did not open, so this node forwards every other
     /// peer's input to them. Host only, decided once at session start; empty is the normal case and
     /// costs a single array length check per received datagram.
@@ -230,6 +252,52 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// is fully connected.</summary>
     public int RelayRouteCount => _relayRoutes.Length;
 
+    /// <summary>
+    /// Synthetic port numbers for punch targets admitted while a lobby is already up start here.
+    /// Far above any real seat, so a placeholder can never land on — and evict — a port the lobby
+    /// has already routed to a joiner.
+    /// </summary>
+    public const int PunchTargetPortBase = 1000;
+
+    /// <summary>
+    /// Add punch targets WITHOUT disturbing the routes already installed.
+    ///
+    /// <see cref="SetPeerRoutes"/> replaces the table wholesale and forgets the liveness, RTT and
+    /// punch history of every endpoint that falls out of it. Host-side punch admission runs while
+    /// the lobby is live, so calling that there discarded the joiner routes the lobby had just
+    /// installed and reset their measurements — pasting a second connect code undid the first
+    /// joiner's progress. Merging keeps every existing endpoint in the set, so nothing is purged.
+    /// </summary>
+    public void AddPunchTargets(IEnumerable<IPEndPoint> targets)
+    {
+        if (targets == null) throw new ArgumentNullException(nameof(targets));
+
+        var merged = new List<PeerRoute>(_routeTable.Routes);
+        var known = new HashSet<IPEndPoint>();
+        int nextPort = PunchTargetPortBase;
+        foreach (var route in merged)
+        {
+            foreach (var candidate in route.Candidates) known.Add(candidate);
+            if (route.RemotePort >= nextPort) nextPort = route.RemotePort + 1;
+        }
+
+        bool added = false;
+        foreach (var target in targets)
+        {
+            if (target == null)
+                throw new ArgumentException("Punch targets cannot contain null", nameof(targets));
+            if (!known.Add(target)) continue;   // already routed, under whatever port owns it
+            merged.Add(new PeerRoute(nextPort++, new[] { target }));
+            added = true;
+        }
+        if (added) SetPeerRoutes(merged);
+    }
+
+    /// <summary>
+    /// Replace the logical peer routes. Candidates are de-duplicated globally as well as within each
+    /// route, so an endpoint advertised twice is probed and sent to only once. Repeated entries for the
+    /// same remote port are merged in their original order.
+    /// </summary>
     public void SetPeerRoutes(IEnumerable<PeerRoute> routes)
     {
         if (routes == null) throw new ArgumentNullException(nameof(routes));
@@ -323,6 +391,13 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// <summary>Input datagrams discarded because the backlog was full. Any nonzero value here is
     /// worth a line in the log: it means the frame loop stopped draining for long enough to matter.</summary>
     public long InboundDropped => Interlocked.Read(ref _inboundDropped);
+
+    /// <summary>Datagrams whose handling threw. Nonzero means a bug on the receive path, not a bad
+    /// network — the distinction the session log could not previously make.</summary>
+    public long ReceiveFaults => Interlocked.Read(ref _receiveFaults);
+
+    /// <summary>The most recent receive-path fault, or null if there has never been one.</summary>
+    public string? LastReceiveFault => _lastReceiveFault;
 
     /// <summary>True if this candidate endpoint has answered a probe or sent input recently — i.e. a
     /// direct UDP path to it is currently open.</summary>
@@ -699,79 +774,98 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             catch (SocketException) { if (!_running) break; continue; }
             catch (ObjectDisposedException) { break; }
 
-            // While a reflexive discovery is in flight, a STUN response arrives here (it isn't
-            // MAGIC-framed, so it would otherwise be dropped below). Only parsed while pending.
-            var stunTxn = _pendingStunTxn;
-            if (stunTxn != null && n >= 20)
+            // Everything past the receive itself is guarded, because this is the ONE thread that
+            // delivers input, punch acks and control segments. An escape used to end it outright
+            // while _running stayed true and Dispose still reported success, so the session died
+            // eight seconds later on "UDP input path lost" — a code fault wearing a network fault's
+            // clothes. Counted and remembered, so the session log can tell the two apart.
+            try { DispatchDatagram(buffer, n, (IPEndPoint)from); }
+            catch (Exception ex)
             {
-                var pkt = new byte[n];
-                Buffer.BlockCopy(buffer, 0, pkt, 0, n);
-                var refl = StunClient.ParseResponse(pkt, stunTxn);
-                if (refl != null) { _reflexive = refl; _stunEvent.Set(); continue; }
+                if (!_running) break;
+                Interlocked.Increment(ref _receiveFaults);
+                _lastReceiveFault = ex.GetType().Name + ": " + ex.Message;
             }
-
-            if (n < HeaderSize) continue;
-            if (buffer[0] != Magic[0] || buffer[1] != Magic[1] ||
-                buffer[2] != Magic[2] || buffer[3] != Magic[3]) continue;
-            if (buffer[4] != Version) continue;
-            byte type = buffer[5];
-
-            var source = (IPEndPoint)from;
-            if (!_routeTable.TryResolve(source, out var known))
-            {
-                // Already learned: everything from here on is ordinary traffic from a known peer.
-                if (_learnedByEndpoint.ContainsKey(source)) known = source;
-                // Otherwise, not an address anyone advertised — and exactly one thing may still be
-                // true of it: a peer holding a valid token is telling us this is where it really
-                // comes from. That is the symmetric-NAT case, where the address it advertised was
-                // only ever valid for the STUN server it asked. Anything else is dropped here, unread.
-                else if (type == THello && LearnFromHello(buffer, n, source)) known = source;
-                else continue;
-            }
-
-            _alive[known] = Clock.ElapsedMilliseconds; // any framed packet proves the path is up
-
-            if (type == TPunch)
-            {
-                // Echo the probe's timestamp back untouched so the sender can time the round trip.
-                // A peer on an older build sends an empty probe and gets an empty ack — the RTT is
-                // simply never measured there, and the caller falls back to the control-channel ping.
-                var echo = n >= HeaderSize + 8 ? new byte[8] : [];
-                if (echo.Length == 8) Buffer.BlockCopy(buffer, HeaderSize, echo, 0, 8);
-                SendFramed(Frame(TPunchAck, echo), known); // answer so the peer confirms us too
-                continue;
-            }
-            if (type == TPunchAck)
-            {
-                if (n >= HeaderSize + 8)
-                {
-                    long sentAt = BitConverter.ToInt64(buffer, HeaderSize);
-                    double rtt = Clock.ElapsedMilliseconds - sentAt;
-                    // Guard against a stale/garbled echo outliving a clock restart.
-                    if (rtt >= 0 && rtt < 10_000) RecordRtt(known, rtt);
-                }
-                continue; // liveness already recorded above
-            }
-
-            if (type == TCtrlSeg)
-            {
-                // Only endpoints someone explicitly opened a stream for get their segments
-                // delivered; anything else is dropped before any state is allocated.
-                if (_controlStreams.TryGetValue(known, out var stream))
-                {
-                    var seg = new byte[n - HeaderSize];
-                    Buffer.BlockCopy(buffer, HeaderSize, seg, 0, seg.Length);
-                    stream.OnDatagram(seg);
-                }
-                continue;
-            }
-
-            if (type != TInput) continue; // unknown type from a future build — ignore
-            var payload = new byte[n - HeaderSize];
-            Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
-            EnqueueInput(payload);
-            RelayInput(buffer, n, known);
         }
+    }
+
+    /// <summary>
+    /// Handle one received datagram. Separated from the loop so that a throw costs one datagram
+    /// rather than every datagram: see the guard in <see cref="ReceiveLoop"/>.
+    /// </summary>
+    private void DispatchDatagram(byte[] buffer, int n, IPEndPoint source)
+    {
+        // While a reflexive discovery is in flight, a STUN response arrives here (it isn't
+        // MAGIC-framed, so it would otherwise be dropped below). Only parsed while pending.
+        var stunTxn = _pendingStunTxn;
+        if (stunTxn != null && n >= 20)
+        {
+            var pkt = new byte[n];
+            Buffer.BlockCopy(buffer, 0, pkt, 0, n);
+            var refl = StunClient.ParseResponse(pkt, stunTxn);
+            if (refl != null) { _reflexive = refl; _stunEvent.Set(); return; }
+        }
+
+        if (n < HeaderSize) return;
+        if (buffer[0] != Magic[0] || buffer[1] != Magic[1] ||
+            buffer[2] != Magic[2] || buffer[3] != Magic[3]) return;
+        if (buffer[4] != Version) return;
+        byte type = buffer[5];
+
+        if (!_routeTable.TryResolve(source, out var known))
+        {
+            // Already learned: everything from here on is ordinary traffic from a known peer.
+            if (_learnedByEndpoint.ContainsKey(source)) known = source;
+            // Otherwise, not an address anyone advertised — and exactly one thing may still be
+            // true of it: a peer holding a valid token is telling us this is where it really
+            // comes from. That is the symmetric-NAT case, where the address it advertised was
+            // only ever valid for the STUN server it asked. Anything else is dropped here, unread.
+            else if (type == THello && LearnFromHello(buffer, n, source)) known = source;
+            else return;
+        }
+
+        _alive[known] = Clock.ElapsedMilliseconds; // any framed packet proves the path is up
+
+        if (type == TPunch)
+        {
+            // Echo the probe's timestamp back untouched so the sender can time the round trip.
+            // A peer on an older build sends an empty probe and gets an empty ack — the RTT is
+            // simply never measured there, and the caller falls back to the control-channel ping.
+            var echo = n >= HeaderSize + 8 ? new byte[8] : [];
+            if (echo.Length == 8) Buffer.BlockCopy(buffer, HeaderSize, echo, 0, 8);
+            SendFramed(Frame(TPunchAck, echo), known); // answer so the peer confirms us too
+            return;
+        }
+        if (type == TPunchAck)
+        {
+            if (n >= HeaderSize + 8)
+            {
+                long sentAt = BitConverter.ToInt64(buffer, HeaderSize);
+                double rtt = Clock.ElapsedMilliseconds - sentAt;
+                // Guard against a stale/garbled echo outliving a clock restart.
+                if (rtt >= 0 && rtt < 10_000) RecordRtt(known, rtt);
+            }
+            return; // liveness already recorded above
+        }
+
+        if (type == TCtrlSeg)
+        {
+            // Only endpoints someone explicitly opened a stream for get their segments
+            // delivered; anything else is dropped before any state is allocated.
+            if (_controlStreams.TryGetValue(known, out var stream))
+            {
+                var seg = new byte[n - HeaderSize];
+                Buffer.BlockCopy(buffer, HeaderSize, seg, 0, seg.Length);
+                stream.OnDatagram(seg);
+            }
+            return;
+        }
+
+        if (type != TInput) return; // unknown type from a future build — ignore
+        var payload = new byte[n - HeaderSize];
+        Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
+        EnqueueInput(payload);
+        RelayInput(buffer, n, known);
     }
 
     /// <summary>

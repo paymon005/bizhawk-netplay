@@ -54,6 +54,13 @@ public sealed partial class NetplayToolForm
         _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
         SetGeneration(generation);
         _mesh?.SetPeerRoutes(RoutesExcept(links, null));
+        // The lobby decided WHICH ports to relay for; this is the first moment _peers can turn those
+        // port numbers into endpoints. Say how many routes actually resulted — a relay that was
+        // announced in the log but resolved to nothing is the failure this ordering exists to stop.
+        RefreshRelayRoutes();
+        if (_relayPorts.Count > 0)
+            ConnLog($"relay resolved: {_mesh?.RelayRouteCount ?? 0} route(s) for {_relayPorts.Count} " +
+                    "relayed player(s).", (_mesh?.RelayRouteCount ?? 0) > 0 ? Color.DarkOrange : Color.Firebrick);
         PrepareSessionDriver(mode);
     }
 

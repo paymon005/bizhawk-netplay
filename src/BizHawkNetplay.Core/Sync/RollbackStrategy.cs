@@ -72,6 +72,7 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     private int _savedFrame = -1;           // frame whose entering-state is currently snapshotted
     private int _lastRunFrame = -1;         // highest frame actually simulated so far
     private int _lastChecksumFrame = -1;    // highest interval-boundary already checksummed (dedupe)
+    private bool _restoreFailed;            // core stranded off its live frame; nothing can recover
 
     // Checksum of the state entering a checksum anchor, taken while the core was already standing
     // there. -1 means nothing cached and TryConfirmedChecksum must go and fetch the state itself.
@@ -281,10 +282,38 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     /// remains as the fallback for the case the cache cannot cover: a repair that re-simulated the
     /// anchor frame invalidates the cached hash, since the state it described no longer exists.
     /// </summary>
+    /// <summary>
+    /// Put the core back on the live frame and release the pin that held it.
+    ///
+    /// The release happens either way — a failed restore is fatal to the session, but leaking the
+    /// pooled state on the way out helps nobody. The failure is latched so the next entry point
+    /// fails immediately rather than doing more work against a core standing on the wrong frame.
+    /// </summary>
+    private void RestoreLivePosition(StateHandle here)
+    {
+        Exception? restoreError = null;
+        try { _adapter.LoadStateFromMemory(here); }
+        catch (Exception ex) { restoreError = ex; _restoreFailed = true; }
+        _adapter.ReleaseState(here);
+        if (restoreError != null)
+            throw new StateRestoreFailedException(
+                "the core rejected the savestate that would have returned it to the live frame",
+                restoreError);
+    }
+
+    /// <summary>Throw if a previous restore already stranded the core off its live frame.</summary>
+    private void ThrowIfCoreStranded()
+    {
+        if (_restoreFailed)
+            throw new StateRestoreFailedException(
+                "the core was left on the wrong frame by an earlier failed restore");
+    }
+
     public bool TryConfirmedChecksum(int interval, out int frame, out uint hash)
     {
         frame = 0;
         hash = 0;
+        ThrowIfCoreStranded();
         if (interval < 1) return false;
 
         // Highest frame we've both simulated and confirmed from real inputs only.
@@ -315,8 +344,10 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         }
         finally
         {
-            _adapter.LoadStateFromMemory(here);
-            _adapter.ReleaseState(here);
+            // Deliberately allowed to replace an in-flight exception: whatever went wrong above,
+            // being unable to get back to the live frame is worse, and it is the fault the player
+            // has to be told about. Release first so a failed restore does not also leak the pin.
+            RestoreLivePosition(here);
         }
         ChecksumsByVisit++;
         frame = boundary;
@@ -380,6 +411,7 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
 
     private void ExecutePendingRollback(int frame)
     {
+        ThrowIfCoreStranded();
         if (_rollbackTo == int.MaxValue) return;
         int r = _rollbackTo;
         _rollbackTo = int.MaxValue;
@@ -396,7 +428,17 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
                 $"(depth {frame - r} > cap {_maxRollback}); the prediction cap and the prune window " +
                 "should together have prevented running this far ahead.");
 
-        _adapter.LoadStateFromMemory(baseState); // core now sits entering frame b
+        // Unlike the checksum visit above there is no pin to put back: the base state IS where the
+        // repair means to stand. But a core that refuses it is stranded just the same, so the same
+        // named failure applies rather than a generic session error.
+        try { _adapter.LoadStateFromMemory(baseState); } // core now sits entering frame b
+        catch (Exception ex)
+        {
+            _restoreFailed = true;
+            throw new StateRestoreFailedException(
+                $"the core rejected the savestate for frame {b}, which a rollback repair had to " +
+                "replay from", ex);
+        }
         int walkback = r - b;
         int count = frame - b;                   // re-simulate b .. frame-1
         double startedMs = _clock?.NowMs ?? 0;

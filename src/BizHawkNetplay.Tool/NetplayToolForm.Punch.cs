@@ -205,10 +205,10 @@ public sealed partial class NetplayToolForm
         var mesh = _mesh;
         if (mesh == null) return;
         if (!_lobbyPunchTargets.Contains(joiner)) _lobbyPunchTargets.Add(joiner);
-        var routes = new List<PeerRoute>();
-        for (int i = 0; i < _lobbyPunchTargets.Count; i++)
-            routes.Add(new PeerRoute(1 + i, new[] { _lobbyPunchTargets[i] })); // placeholder ports; real routes are set at GO
-        try { mesh.SetPeerRoutes(routes); } catch { }
+        // Merged, not replaced: the lobby may already be up with real joiner routes installed, and
+        // this admission must not evict them. Placeholder ports live above every real seat; the
+        // real routes are set at GO. See MeshUdpTransport.AddPunchTargets.
+        try { mesh.AddPunchTargets(_lobbyPunchTargets); } catch { }
         _punchStatus.Text = $"punching toward {joiner}…";
         _punchStatus.ForeColor = Color.DimGray;
         ConnLog($"punching toward {joiner} — they join the lobby when the path opens…", Color.DarkSlateBlue);

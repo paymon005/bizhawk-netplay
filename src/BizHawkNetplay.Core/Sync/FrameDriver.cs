@@ -66,6 +66,10 @@ public sealed class FrameDriver : IDisposable
     // are produced strictly in order. A few payload-bytes per frame — memory is negligible.
     private const int RetransmitKeepFrames = 240;   // ~4 s at 60 fps
     private const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
+    private const long GapServeWindowMs = 50;       // serve-side budget window (see ServeGapRequest)
+    private const int GapServesPerWindow = 8;
+    private long _serveWindowStartMs = long.MinValue;
+    private int _servesThisWindow;
     private readonly Dictionary<int, byte[]> _sentPayloads = new();
     private int _oldestSentPayload = -1;
     private readonly long[] _lastGapRequestMs;
@@ -380,8 +384,16 @@ public sealed class FrameDriver : IDisposable
             // Track the newest frame the peer has SENT (even if we drop it below): the gap
             // between this and the confirmed frontier is what tells us a missing frame has
             // slid out of the peer's live resend window and must be requested.
+            //
+            // Clamped to the same horizon the per-frame filter below uses. BaseFrame is a raw
+            // ReadInt32 off the wire — the codec checks size, port and generation, not range — so a
+            // datagram corrupted past UDP's 16-bit checksum could latch a frame number far in the
+            // future. Nothing lowers this value, so one such packet made the "unrepaired hole" test
+            // permanently true: a gap request every 50ms forever, and the session killed eight
+            // seconds later for a hole that was never there.
             int newest = window.BaseFrame + window.Count - 1;
-            if (newest > _newestRemoteFrame[port]) _newestRemoteFrame[port] = newest;
+            if (newest > _newestRemoteFrame[port] && newest <= CurrentFrame + _maxLead)
+                _newestRemoteFrame[port] = newest;
 
             for (int i = 0; i < window.Count; i++)
             {
@@ -486,6 +498,20 @@ public sealed class FrameDriver : IDisposable
     private void ServeGapRequest(byte targetPort, int fromFrame)
     {
         if (targetPort != _localPort) return;
+        // Metered, because this is an amplifier: an 18-byte request produces a full redundant
+        // window of up to 1200 bytes, and DrainNetwork will process 128 datagrams in a single pump.
+        // A peer stuck in a request loop — or one built against a shorter request cadence — turned
+        // that into megabytes a second of outbound traffic. Peers ask on a 50ms cadence each, so a
+        // budget of eight per window leaves a four-player session an order of magnitude of headroom
+        // while still bounding the worst case.
+        long now = _sendClock.ElapsedMilliseconds;
+        if (now - _serveWindowStartMs >= GapServeWindowMs)
+        {
+            _serveWindowStartMs = now;
+            _servesThisWindow = 0;
+        }
+        if (_servesThisWindow >= GapServesPerWindow) return;
+
         if (!_sentPayloads.ContainsKey(fromFrame)) return; // aged out even of the long history
         var window = new List<KeyValuePair<int, byte[]>>(_redundancy);
         for (int f = fromFrame; f < fromFrame + _redundancy; f++)
@@ -494,7 +520,10 @@ public sealed class FrameDriver : IDisposable
             window.Add(new KeyValuePair<int, byte[]>(f, payload));
         }
         if (window.Count > 0)
+        {
+            _servesThisWindow++;
             _transport.Send(_codec.EncodeInput((byte)_localPort, window));
+        }
     }
 
     private void SendWindow(bool force)

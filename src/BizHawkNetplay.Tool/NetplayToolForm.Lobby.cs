@@ -693,23 +693,32 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private void InstallMeshRelay(MeshUdpTransport mesh, List<PeerLink> links, List<PeerLink> incomplete)
     {
-        _relayPorts.Clear();
-        if (incomplete.Count == 0) { RefreshRelayRoutes(); return; }
-
         // Relaying is pointless with one joiner: there is no other joiner for it to fail to reach,
         // and the host's own input already goes to it directly.
-        if (links.Count < 2)
+        bool worthRelaying = incomplete.Count > 0 && links.Count >= 2;
+
+        // Stored as PORTS, not as the routes themselves: endpoints change when someone rejoins, and
+        // RefreshRelayRoutes re-resolves these against the live peer list every time that happens.
+        //
+        // Decided here on the lobby thread but RESOLVED later, on the UI thread, by
+        // PrepareSessionHost. _peers belongs to the UI thread and is not filled until then, so
+        // resolving here would resolve against an empty list — which is what this used to do,
+        // leaving the relay holding nothing while the log below claimed it was carrying players.
+        var ports = new List<int>();
+        if (worthRelaying) foreach (var link in incomplete) ports.Add(link.RemotePort);
+        InvokeUiBlocking(() =>
         {
-            RefreshRelayRoutes();
+            _relayPorts.Clear();
+            foreach (int p in ports) _relayPorts.Add(p);
+        });
+
+        if (incomplete.Count == 0) return;
+        if (!worthRelaying)
+        {
             UiConnLog("a direct UDP path did not open, but with one joiner there is nothing to relay " +
                       "— the host's own link is the only one that matters.", Color.DarkOrange);
             return;
         }
-
-        // Stored as PORTS, not as the routes themselves: endpoints change when someone rejoins, and
-        // RefreshRelayRoutes re-resolves these against the live peer list every time that happens.
-        foreach (var link in incomplete) _relayPorts.Add(link.RemotePort);
-        RefreshRelayRoutes();
 
         // Only claim what the relay can actually deliver. If a joiner's missing leg is the one to
         // THIS host, there is nothing to relay over and the session is about to stall instead.
