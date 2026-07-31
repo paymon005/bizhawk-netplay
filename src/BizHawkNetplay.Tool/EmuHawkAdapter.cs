@@ -414,6 +414,7 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     public void PumpAudio()
     {
         if (!_audioReady) return;
+        if (!EnsureAudioOwnership()) return;
         var dev = _outputDevice;
         var snd = _sound;
         if (dev == null || snd == null || _soundBuffer == null) return;
@@ -446,6 +447,55 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         }
         catch { /* transient hiccup while the voice is being recreated — skip this tick, stay armed */ }
     }
+
+    /// <summary>
+    /// Re-take the audio device if EmuHawk has taken it back, before every pump.
+    ///
+    /// Opening Config → Sound during a session used to break audio for the rest of it, and both
+    /// halves of why are in MainForm.Events.cs: on OK it either calls Sound.StopSound(), or — when
+    /// the output method or device changed — Sound.Dispose() and builds a WHOLE NEW Sound. Then,
+    /// either way, it calls RewireSound(), which does SetInputPin(_currentSoundProvider).
+    ///
+    /// So two things break at once. Our Sound and device references can point at a disposed object;
+    /// and even when they survive, EmuHawk has re-attached its own provider, so its UpdateSound stops
+    /// early-returning and starts fighting us for the device — at atten 0, because BlockFrameAdvance
+    /// means the run loop never reaches the line that computes volume. The audible result is exactly
+    /// what was reported: sound dies and does not come back.
+    ///
+    /// Reasserting is free. SetInputPin(null) with nothing attached is two null checks and a return;
+    /// with something attached it detaches AND discards the samples EmuHawk buffered, which is what
+    /// we want anyway. So it is simply done every pump rather than tracked.
+    /// </summary>
+    private bool EnsureAudioOwnership()
+    {
+        var mainForm = _mainForm;
+        if (mainForm == null) return _sound != null;
+        try
+        {
+            var current = typeof(BizHawk.Client.EmuHawk.MainForm)
+                .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                ?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;
+            if (current == null) return false;
+
+            if (!ReferenceEquals(current, _sound))
+            {
+                // A new Sound object: the old device is disposed and every reference we hold is dead.
+                _sound = current;
+                _outputDevice = typeof(BizHawk.Client.EmuHawk.Sound)
+                    .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?.GetValue(current) as ISoundOutput;
+                _soundBuffer?.DiscardSamples(); // buffered for a device that no longer exists
+                AudioRebinds++;
+            }
+            _sound?.SetInputPin(null);
+            return _outputDevice != null;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Times EmuHawk handed us a different Sound object mid-session — a sound-settings
+    /// change. Reported by AudioStats so "I opened Config → Sound" is visible in a log.</summary>
+    public int AudioRebinds { get; private set; }
 
     /// <summary>
     /// Bring EmuHawk's sound device back up after it stopped under us.
@@ -569,7 +619,8 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
                // Clamped: |short.MinValue| is 32768, one past short.MaxValue, so a sample at the
                // negative rail printed as "32768/32767" — a fraction over its own maximum.
                $"peakSample={Math.Min(_audioPeak, short.MaxValue)}/{short.MaxValue}" +
-               $"{(AudioRevivals > 0 ? $" revivals={AudioRevivals}" : "")}{err}";
+               $"{(AudioRevivals > 0 ? $" revivals={AudioRevivals}" : "")}" +
+               $"{(AudioRebinds > 0 ? $" rebinds={AudioRebinds}" : "")}{err}";
     }
 
     private void UpdatePeak(short[] buf, int shorts)
@@ -613,6 +664,7 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         AudioDiagnostic = "";
         _audioFrames = _audioPairs = _audioPumps = 0;
         _audioPeak = 0;
+        AudioRebinds = 0;
         _audioSyncErr = "";
         try
         {
@@ -1035,7 +1087,11 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         if (cfg == null) return 1.0;
         try
         {
-            if (!cfg.SoundEnabledNormal) return 0.0;
+            // Both switches, not just the normal-play one. SoundEnabled is the master mute, which
+            // EmuHawk honours in UpdateSound rather than in the attenuation it passes — so a session
+            // reading only SoundEnabledNormal kept playing through a master mute, since we bypass
+            // UpdateSound entirely.
+            if (!cfg.SoundEnabled || !cfg.SoundEnabledNormal) return 0.0;
             double atten = cfg.SoundVolume / 100.0;
             return atten < 0 ? 0.0 : atten > 1 ? 1.0 : atten;
         }
