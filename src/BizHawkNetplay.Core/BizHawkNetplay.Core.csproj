@@ -5,6 +5,10 @@
     <RootNamespace>BizHawkNetplay.Core</RootNamespace>
     <AssemblyName>BizHawkNetplay.Core</AssemblyName>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- Kept in step with the Tool's version. The two DLLs ship together and must be installed
+         together, so a pair that disagrees about which release it is would defeat the point of
+         stamping either. Bump both when cutting a release. -->
+    <Version>0.24.0</Version>
   </PropertyGroup>
 
 </Project>
