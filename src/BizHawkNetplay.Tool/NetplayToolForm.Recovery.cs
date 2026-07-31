@@ -129,9 +129,21 @@ public sealed partial class NetplayToolForm
         int attempt = CurrentConnectionAttempt;
         try
         {
+            // Claim the rebuild BEFORE anything irreversible. BeginRebuild refusing a second
+            // rebuild while one is in flight is the point of the phase flag — but the refusal was
+            // being discarded, after the generation had already advanced. Every current caller
+            // checks IsRebuilding first on the UI thread, so this is unreachable today; the pack
+            // thread now holds the rebuild open for hundreds of milliseconds longer than it used
+            // to, and the failure a careless fourth caller would produce — two authoritative
+            // baselines racing on a generation peers were never told about — is the worst one in
+            // this file. Cheap insurance, honestly labelled.
+            if (!_phase.BeginRebuild(isSettingsChange ? RebuildReason.SettingsChange : RebuildReason.Desync))
+            {
+                Log($"{label}: a rebuild is already in flight — refused");
+                return;
+            }
             var state = _adapter!.ExportState();
             var generation = AdvanceGeneration();
-            _phase.BeginRebuild(isSettingsChange ? RebuildReason.SettingsChange : RebuildReason.Desync);
             RebuildDriver();
             RefreshLiveSettingsUi();
             int peerCount = _peers.Count;
@@ -468,6 +480,13 @@ public sealed partial class NetplayToolForm
         // and counting them would show a stall rate the running session never had.
         _pacing.Reset();
         _lastPacing = default;
+        // And for the gap stamps, which Reset() cannot reach: left standing, the first tick after
+        // the freeze fed the entire freeze — seconds, on a heavy-core state transfer — into the
+        // tick and present interval stats, so one resync put a multi-thousand-ms max in the gap
+        // column, guaranteed one judder count, and inflated the very mean the presentation hint
+        // quotes back to the user as advice.
+        _lastTickClockMs = -1;
+        _lastPresentClockMs = -1;
         _stallHint.RestartWindow();
         _presentHint.RestartWindow();
     }

@@ -70,9 +70,19 @@ public sealed partial class NetplayToolForm
 
                 _config = (APIs.Emulation as EmulationApi)?.ForbiddenConfigReference;
                 // Rewind rewrites the frame counter the whole timeline is indexed by, and a lobby
-                // baseline is every bit as rewindable as a running session. Snapshot the preference
-                // now so teardown can restore it even if the config becomes unreachable later.
-                _prevRewindEnabled = _config?.Rewind.Enabled ?? true;
+                // baseline is every bit as rewindable as a running session. Snapshot what teardown
+                // should restore — the RUNTIME state, not the config flag: EnableRewind suspends
+                // and resumes the live rewinder and never touches Config.Rewind.Enabled, so a user
+                // who had rewind config-enabled but suspended it by hand before connecting used to
+                // get it resumed on disconnect. The config flag stays as the fallback when the
+                // concrete MainForm isn't reachable.
+                try
+                {
+                    _prevRewindEnabled = MainForm is BizHawk.Client.EmuHawk.MainForm mf
+                        ? mf.Rewinder is { Active: true }
+                        : _config?.Rewind.Enabled ?? true;
+                }
+                catch { _prevRewindEnabled = _config?.Rewind.Enabled ?? true; }
                 try { APIs.EmuClient.EnableRewind(false); } catch { }
 
                 if (_config == null) { Log("(note) couldn't reach config to disable pause-on-unfocus"); return; }

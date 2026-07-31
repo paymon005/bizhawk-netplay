@@ -457,6 +457,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         Controls.Add(_status);
         ResumeLayout(false);
 
+        // Every control exists by now; from here the input poll thread reads a cached answer
+        // instead of walking live focus state. See BlocksInputWhenFocused.
+        HookFocusTracking(this);
+        RecomputeBlocksInput();
+
         _frameTimer = new System.Windows.Forms.Timer();
         // Fallback only. While UpdateValues is running frames this does nothing, so the tick count
         // stays one-per-frame and `stall%` keeps meaning what it did. If EmuHawk stops calling in —
@@ -541,18 +546,40 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     /// else. Read-only boxes — the log, the connection status — deliberately do NOT block, since
     /// reading the log during a session must not cost you your controller.
     /// </summary>
-    public override bool BlocksInputWhenFocused
+    /// <summary>
+    /// One more constraint the property itself can't show: BizHawk evaluates this on its INPUT
+    /// POLL THREAD, every ~2ms — Input.EnqueueNewEvents calls the AllowInput lambda from
+    /// UpdateThreadProc, with BizHawk's own source remarking "WE SHOULD NOT BE SO NAIVELY TOUCHING
+    /// MAINFORM FROM THE INPUTTHREAD". Walking live WinForms focus state from there is an
+    /// unsynchronised read of a chain the UI thread mutates, up to 500 times a second. So the walk
+    /// runs on the UI thread, on focus events, into a volatile bool the poll thread reads.
+    /// </summary>
+    public override bool BlocksInputWhenFocused => _blocksInputWhenFocused;
+
+    private volatile bool _blocksInputWhenFocused;
+
+    /// <summary>Recompute on the UI thread which the input poll thread then reads. Hooked to
+    /// GotFocus/LostFocus of every control (see <see cref="HookFocusTracking"/>).</summary>
+    private void RecomputeBlocksInput()
     {
-        get
-        {
-            // Form.ActiveControl is the active child of THIS container; the focused leaf may be
-            // several containers down (tab page -> panel -> box), so walk to it.
-            Control? focused = ActiveControl;
-            while (focused is IContainerControl container && container.ActiveControl != null)
-                focused = container.ActiveControl;
-            return focused is NumericUpDown or ComboBox
-                || (focused is TextBoxBase box && !box.ReadOnly);
-        }
+        // Form.ActiveControl is the active child of THIS container; the focused leaf may be
+        // several containers down (tab page -> panel -> box), so walk to it.
+        Control? focused = ActiveControl;
+        while (focused is IContainerControl container && container.ActiveControl != null)
+            focused = container.ActiveControl;
+        _blocksInputWhenFocused = focused is NumericUpDown or ComboBox
+            || (focused is TextBoxBase box && !box.ReadOnly);
+    }
+
+    /// <summary>Attach the recompute to every control's focus events, including ones added later.
+    /// GotFocus/LostFocus rather than Enter/Leave because the focused leaf is often an internal
+    /// child (NumericUpDown's inner edit box) that Enter/Leave never names.</summary>
+    private void HookFocusTracking(Control root)
+    {
+        root.GotFocus += (_, __) => RecomputeBlocksInput();
+        root.LostFocus += (_, __) => RecomputeBlocksInput();
+        root.ControlAdded += (_, e) => HookFocusTracking(e.Control);
+        foreach (Control child in root.Controls) HookFocusTracking(child);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)

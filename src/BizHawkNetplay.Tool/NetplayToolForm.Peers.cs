@@ -38,6 +38,26 @@ public sealed partial class NetplayToolForm
         }
         link.Outbound.Enqueue(new OutboundMessage(type, body, completed));
         link.OutboundSignal.Set();
+        // Re-check AFTER the enqueue. If the writer exited between the check at the top and the
+        // Enqueue — its finally-drain having already run — the message would sit in the queue
+        // forever: the completion never fires either way and QueuedBytes never comes back down. A
+        // resync whose Resync frame hit this window would wait out the full apply deadline instead
+        // of failing fast, and EndSession's Bye barrier would always time out. Draining here races
+        // benignly with the writer's own drain: TryDequeue hands each item to exactly one caller,
+        // so a completion still fires exactly once. False only when something was actually
+        // abandoned — an empty drain means the message was handled (sent, or failed through its
+        // own callback), and calling that a failure would be inventing one.
+        if (!link.WriterRunning)
+        {
+            bool abandoned = false;
+            while (link.Outbound.TryDequeue(out var orphan))
+            {
+                abandoned = true;
+                Interlocked.Add(ref link.QueuedBytes, -(orphan.Body.LongLength + 5));
+                try { orphan.Completed?.Invoke(false); } catch { }
+            }
+            if (abandoned) return false;
+        }
         return true;
     }
 

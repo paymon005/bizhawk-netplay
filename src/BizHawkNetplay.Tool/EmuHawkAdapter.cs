@@ -205,10 +205,12 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     }
 
     /// <summary>Drop every retired buffer. Called when a session ends so a long idle between
-    /// sessions does not hold the ring's worth of memory for nothing.</summary>
+    /// sessions does not hold the ring's worth of memory for nothing. Must run AFTER the driver is
+    /// disposed — disposing the rollback ring is what pushes its buffers back in here.</summary>
     public void ClearStatePool()
     {
         while (_statePool.Count > 0) _statePool.Pop().Dispose();
+        _hashScratch = [];   // sized to the main-memory domain — 8MiB on N64, same argument
     }
 
     /// <summary>Buffers currently retired and reusable. Reported so a session can show the pool

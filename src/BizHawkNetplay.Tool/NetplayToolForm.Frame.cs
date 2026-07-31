@@ -134,15 +134,16 @@ public sealed partial class NetplayToolForm
         FrameTick(fromFineClock: true);
     }
 
-    /// <summary>Stops the heartbeat timer and hands back the session's memory. The fine clock needs
-    /// no unhooking — it is EmuHawk's own callback, gated on <see cref="SessionPhase.IsActive"/>,
-    /// so clearing that flag is what stops it.</summary>
+    /// <summary>Stops the heartbeat timer. The fine clock needs no unhooking — it is EmuHawk's own
+    /// callback, gated on <see cref="SessionPhase.IsActive"/>, so clearing that flag is what stops
+    /// it. The savestate pool is NOT released here: this runs before TeardownNetwork disposes the
+    /// driver, and disposing the rollback ring pushes every buffer back INTO the pool — clearing
+    /// first meant the "hand the memory back for the idle" promise was inverted, with up to a
+    /// ring's worth of full-size states pinned on the large object heap until the next session.
+    /// The release lives at the end of teardown, after the refill.</summary>
     private void StopFramePacing()
     {
         _frameTimer.Stop();
-        // The ring's worth of savestate buffers is real memory; hand it back rather than holding
-        // it across a long idle between sessions.
-        try { _adapter?.ClearStatePool(); } catch { }
     }
 
     /// <summary>

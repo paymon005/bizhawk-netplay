@@ -429,6 +429,7 @@ public sealed partial class NetplayToolForm
                             || !_phase.AwaitingRejoin || generation != CurrentGeneration)
                         { UntrackHandshakeClient(link.Tcp); try { link.Tcp?.Close(); } catch { } return; }
                         _peers.Add(link);
+                        ReapRetiredLinks();   // the dropped seat's old link is finished for good now
                         UntrackHandshakeClient(link.Tcp);
                         _greetingTcp = null;
                         _reconnectState = null;
@@ -500,6 +501,24 @@ public sealed partial class NetplayToolForm
         !_phase.IsActive && _listener == null && _joiningTcp == null && _greetingTcp == null
         && _peers.Count == 0 && _retiredLinks.Count == 0 && !_hostOwnershipHeld && !_pausedByUs
         && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null;
+
+    /// <summary>
+    /// Release retired links whose threads have finished. Teardown reaps whatever is left, but a
+    /// session that cycles through drops and rejoins used to accumulate one dead link per cycle
+    /// until it ended — a closed TcpClient, an undisposed kernel event, two dead Thread objects —
+    /// which is exactly the leak the retired list was introduced to close, one level up. Links
+    /// whose writer is still flushing are left for teardown; this must never block the UI thread.
+    /// </summary>
+    private void ReapRetiredLinks()
+    {
+        for (int i = _retiredLinks.Count - 1; i >= 0; i--)
+        {
+            var link = _retiredLinks[i];
+            if (link.Reader is { IsAlive: true } || link.Writer is { IsAlive: true }) continue;
+            _retiredLinks.RemoveAt(i);
+            try { link.OutboundSignal.Dispose(); } catch { }
+        }
+    }
 
     private void EndSession(string reason)
     {
@@ -603,7 +622,11 @@ public sealed partial class NetplayToolForm
         foreach (var link in peers) { try { link.Tcp?.Close(); } catch { } }
 
         try { (_transport as IDisposable)?.Dispose(); } catch { }
-        try { _driver?.Dispose(); } catch { } // release the rollback ring's savestates
+        try { _driver?.Dispose(); } catch { } // release the rollback ring's savestates (into the pool)
+        // AFTER the dispose above, which is what refills the pool. The ring's worth of savestate
+        // buffers is real memory — on a heavy core, hundreds of MiB of large object heap — so hand
+        // it back rather than holding it across a long idle between sessions.
+        try { _adapter?.ClearStatePool(); } catch { }
         _transport = null; _mesh = null;
         // The endpoint belonged to that socket; the next session binds a new one.
         _localReflexive = null;
