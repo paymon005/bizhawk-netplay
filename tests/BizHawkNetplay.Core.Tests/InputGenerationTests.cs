@@ -203,6 +203,43 @@ public class InputGenerationTests
         Assert.Equal(-1, codec.LastSizeMismatchPort);  // no size disagreement to report
     }
 
+    /// <summary>
+    /// A frame number is a raw int off the wire, and UDP's 16-bit checksum misses some corruption.
+    /// Near frame 0 — session start, and right after every resync rebuild — a small negative frame
+    /// used to slip past rollback's too-old filter and reach the pipeline, whose argument check
+    /// then threw: one corrupt datagram ending the session with a generic error. The codec now
+    /// refuses it as malformed, where it gets a counter instead of a stack trace.
+    /// </summary>
+    [Fact]
+    public void DecodeWindow_RefusesANegativeOrOverflowingBaseFrame()
+    {
+        var generation = new SessionGeneration(0x4242424242424242UL, 1);
+        var codec = new InputPacketCodec([1, 1], generation);
+        var packet = codec.EncodeInput(1, new[]
+        {
+            new KeyValuePair<int, byte[]>(10, [1]),
+            new KeyValuePair<int, byte[]>(11, [2]),
+        });
+
+        // Corrupt baseFrame (bytes 14..17, little-endian) to -3: covers the current frame at
+        // session start, which is exactly what made this reachable.
+        var negative = (byte[])packet.Clone();
+        BitConverter.GetBytes(-3).CopyTo(negative, 14);
+        Assert.False(codec.TryDecodeInputWindow(negative, out _));
+        Assert.Equal(1, codec.RejectedMalformed);
+
+        // And a baseFrame whose baseFrame+count wraps past int.MaxValue — same corruption,
+        // different byte.
+        var wrapping = (byte[])packet.Clone();
+        BitConverter.GetBytes(int.MaxValue - 1).CopyTo(wrapping, 14);
+        Assert.False(codec.TryDecodeInputWindow(wrapping, out _));
+        Assert.Equal(2, codec.RejectedMalformed);
+
+        // The uncorrupted packet still decodes, so the refusals above weren't something else.
+        Assert.True(codec.TryDecodeInputWindow(packet, out var window));
+        Assert.Equal(10, window.BaseFrame);
+    }
+
     [Fact]
     public void DecodeWindow_PointsAtEachFramesBytesInPlace()
     {

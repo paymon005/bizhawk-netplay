@@ -245,6 +245,15 @@ public sealed class InputPacketCodec
             return false;
         }
         if (count == 0) { RejectedMalformed++; return false; }
+        // No frame is ever legitimately negative — the driver starts every timeline at 0 — but a
+        // datagram corrupted past UDP's 16-bit checksum can claim one, and the receive filters
+        // downstream only bound the FUTURE side. Near frame 0 (session start, or right after any
+        // resync rebuild) a small negative frame passed rollback's too-old filter and reached the
+        // pipeline, whose argument check then threw — one bad packet ending the session with a
+        // generic error. Refused here instead, where it gets a counter and shows up in the log's
+        // rejection note. Overflow rides along: a huge baseFrame whose baseFrame+count wraps
+        // negative is the same corruption wearing a different byte.
+        if (baseFrame < 0 || baseFrame > int.MaxValue - count) { RejectedMalformed++; return false; }
 
         window = new InputWindow(port, baseFrame, count, payloadSize);
         return true;
