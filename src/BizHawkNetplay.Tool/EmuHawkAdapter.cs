@@ -35,13 +35,22 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     // [assignedPort][sourcePort] — whether reading the source port's bindings for the assigned
     // port's layout maps control-for-control. See BuildRemapCompatibility.
     private readonly bool[][] _remapCompatible;
-    // The N64 stick gate. EmuHawk applies this right after latching physical input; see
-    // ApplyAxisConstraints for what its absence did to analog magnitude.
+    // Layout control names with the "P<n> " prefix removed, which is the form Joypad.Get keys its
+    // dictionary by. Precomputed: ReadLocalInput runs every frame and must not be doing string work.
+    private readonly string[][] _padButtonKeys;
+    private readonly string[][] _padAxisKeys;
+    // The N64 stick gate: the stick is round, and the constraint clamps the (X,Y) VECTOR to radius
+    // 127, without which a diagonal reaches ~180 — 42% past anything the hardware can produce, so a
+    // game reading stick MAGNITUDE saturates its top bucket at about 70% deflection.
+    //
+    // Reported by the input test but no longer applied here: capture reads the end of EmuHawk's own
+    // controller chain, and RunControllerChain applies it to ActiveController before the value can
+    // reach Joypad.Get. Still worth showing, since with the setting off a diagonal really does
+    // exceed what the hardware could send.
     private readonly bool _useCircularAnalogConstraint;
     // EmuHawk's live config, for the master volume the audio pump has to apply itself. Read per
     // pump, not cached as a value: the slider moves while you play.
     private readonly Config? _hostConfig;
-    private readonly Dictionary<string, int>? _constraintScratch;
 
     // Raw main-memory access for the periodic desync checksum, resolved lazily (see HashMainMemory).
     private IMemoryDomains? _memoryDomains;
@@ -84,10 +93,15 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         _analogBinds = BuildAnalogBinds();
         _axisReversed = BuildAxisReversed();
         _remapCompatible = BuildRemapCompatibility();
+        _padButtonKeys = new string[_layouts.Length][];
+        _padAxisKeys = new string[_layouts.Length][];
+        for (int p = 0; p < _layouts.Length; p++)
+        {
+            _padButtonKeys[p] = _layouts[p].Buttons.Select(StripPortPrefix).ToArray();
+            _padAxisKeys[p] = _layouts[p].Axes.Select(a => StripPortPrefix(a.Name)).ToArray();
+        }
         try { _hostConfig = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference; } catch { }
         _useCircularAnalogConstraint = ReadCircularAnalogConstraintSetting();
-        if (_useCircularAnalogConstraint)
-            _constraintScratch = new Dictionary<string, int>(StringComparer.Ordinal);
     }
 
     /// <summary>True if we found the user's controller bindings (needed to capture input).</summary>
@@ -269,44 +283,45 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         if (ForceNeutralInput)
             return PortInput.Neutral(layout);
 
-        // Read raw host input directly (IInputApi.Get works while the emulator is paused and does
-        // NOT run EmuHawk's controller/hotkey chain), then resolve to core buttons via the user's
-        // bindings. Input capture thus stays entirely out of the emulation path — the core only
-        // ever sees the merged inputs we feed in AdvanceFrame, so there is no physical leak, no
-        // hotkey firing, and both peers stay deterministic.
-        var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
-        // Optionally source the pad from a different port's bindings, but only where the two ports
-        // genuinely describe the same controls — see BuildRemapCompatibility. Buttons and axes make
-        // the same decision, so it is made once here rather than tested twice on different grounds.
+        // Ask BizHawk what this pad resolves to, rather than working it out again ourselves.
+        //
+        // Joypad.Get returns MovieIn, which is the END of EmuHawk's own controller chain:
+        // ActiveController.LatchFromPhysical (bindings, deadzone, multiplier, axis reversal) OR
+        // AutoFire, through the U+D/L+R policy, with the N64 circular constraint applied, XOR the
+        // sticky hold/autofire controllers — and then, deliberately, BEFORE the movie layer, which
+        // is the difference between Get and GetWithMovie. In other words exactly what local play
+        // feeds the core.
+        //
+        // This used to be a reimplementation: read the raw host coalescers and re-derive the bind
+        // math in ResolveAxis. That is a copy of someone else's algorithm, kept in step by hand, and
+        // it had already drifted — it evaluated button binds against HostInputCoalescer while
+        // BizHawk evaluates them against ControllerInputCoalescer, which are different objects.
+        // Since the digital branch of an analog bind wins over the stick whenever it fires, and
+        // yields exactly +/-1, a disagreement there reads as "the stick only gives min or max".
+        //
+        // Determinism is unaffected: whatever this resolves to is what we send, so peers replay the
+        // value rather than the inputs behind it. Autohold and autofire simply become part of it.
         int src = InputSourcePort;
         bool remap = src >= 0 && src < _layouts.Length && _remapCompatible[port][src];
-        var binds = remap ? _bindings[src] : _bindings[port];
-        var buttons = new bool[layout.Buttons.Count];
-        for (int i = 0; i < buttons.Length; i++)
-            buttons[i] = EvaluateBinding(binds[i], pressed);
+        int readPort = remap ? src : port;
 
+        IReadOnlyDictionary<string, object>? pad;
+        try { pad = _apis.Joypad.Get(readPort + 1); } // Joypad ports are 1-based
+        catch { pad = null; }
+
+        var buttons = new bool[layout.Buttons.Count];
         var axes = new int[layout.Axes.Count];
-        if (axes.Length > 0)
-        {
-            // Read live host analog axes (BizHawk's ±10000 convention) and apply BizHawk's own
-            // analog-bind math, so the captured value matches exactly what local play would feed the
-            // core. Same source-port remap as buttons, so a player assigned P2/P3/P4 uses their P1 stick.
-            //
-            // NOT the same coalescer as GetPressedButtons, whatever this comment used to claim:
-            // InputApi.GetPressedAxes reads ControllerInputCoalescer while GetPressedButtons reads
-            // HostInputCoalescer (InputApi.cs:43-48 in 2.11.1). ControllerInputCoalescer is the right
-            // one — it is the source LatchFromPhysical itself consumes, and InputManager.ProcessInput
-            // feeds it raw host axis values unconditionally, outside the hotkey gate that filters
-            // button events. It also means axes refresh only when EmuHawk's main loop runs, which a
-            // catch-up burst inside one timer callback does not do; see AppendAnalogState.
-            int axSrc = remap ? src : port;
-            IReadOnlyDictionary<string, int>? hostAxes;
-            try { hostAxes = _apis.Input.GetPressedAxes(); }
-            catch { hostAxes = null; } // ResolveAxis treats null as "no live axes" (neutral)
-            for (int j = 0; j < axes.Length; j++)
-                axes[j] = ResolveAxis(_analogBinds[axSrc][j], layout.Axes[j], _axisReversed[port][j], hostAxes, pressed);
-            ApplyAxisConstraints(layout, axes);
-        }
+        // Keys come back with the "P<n> " prefix stripped, which is why the remap works at all: two
+        // ports that describe the same controls produce the same keys. Anything missing rests at
+        // that axis's own Neutral rather than 0, which on an unsigned axis is a full deflection.
+        var buttonKeys = _padButtonKeys[port];
+        var axisKeys = _padAxisKeys[port];
+        for (int i = 0; i < buttons.Length; i++)
+            buttons[i] = pad != null && pad.TryGetValue(buttonKeys[i], out var b) && b is bool on && on;
+        for (int j = 0; j < axes.Length; j++)
+            axes[j] = pad != null && pad.TryGetValue(axisKeys[j], out var a) && a is int v
+                ? v
+                : layout.Axes[j].Neutral;
         return new PortInput(buttons, axes);
     }
 
@@ -812,6 +827,9 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
         }
 
         var pressed = new HashSet<string>(_apis.Input.GetPressedButtons());
+        IReadOnlyDictionary<string, object>? padAxes;
+        try { padAxes = _apis.Joypad.Get(1); }
+        catch { padAxes = null; }
         for (int j = 0; j < layout.Axes.Count; j++)
         {
             var spec = layout.Axes[j];
@@ -840,7 +858,20 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
 
             sb.Append("      host=").Append(haveRaw ? raw.ToString(CultureInfo.InvariantCulture) : "ABSENT")
               .Append(haveRaw ? $" ({raw / 10000f:0.000} of full)" : " (bind name not in the dictionary above)")
-              .Append("  ->  core value ").Append(resolved).Append('\n');
+              .Append("  ->  our old math would say ").Append(resolved).Append('\n');
+
+            // What is ACTUALLY sent: BizHawk's own resolved value, the end of its controller chain.
+            // Printed beside the old reimplementation precisely so a disagreement is visible rather
+            // than argued about — a difference here is a bug in the copy, and the copy is no longer
+            // in the capture path.
+            int fromPad = padAxes != null && padAxes.TryGetValue(_padAxisKeys[0][j], out var pv) && pv is int pi
+                ? pi
+                : int.MinValue;
+            sb.Append("      BizHawk resolves it to ")
+              .Append(fromPad == int.MinValue ? "ABSENT" : fromPad.ToString(CultureInfo.InvariantCulture))
+              .Append("   <- this is what gets sent\n");
+            if (fromPad != int.MinValue && fromPad != resolved)
+                sb.Append("      !! the two disagree — BizHawk's is the one in use; the old math was wrong here.\n");
 
             // The digital branch wins over the stick whenever it fires, exactly as BizHawk's
             // LatchFromPhysical does — and it can only ever produce full deflection.
@@ -1020,38 +1051,6 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
             result[p] = arr;
         }
         return result;
-    }
-
-    /// <summary>
-    /// The step that follows LatchFromPhysical in EmuHawk's own input path, and that this adapter
-    /// was missing: the N64's stick is round, and its gate clamps the (X,Y) VECTOR to radius 127.
-    ///
-    /// Without it a diagonal reaches magnitude √(127² + 127²) ≈ 180 — 42% past anything the real
-    /// hardware can produce. A game that reads the stick's magnitude (throw power, run speed, a
-    /// charge meter) then saturates its top bucket at about 70% deflection, and with a 0.1 deadzone
-    /// eating the bottom there is no travel left in between: every input reads as minimum or
-    /// maximum. That is precisely the symptom this was found from, on a game whose throw distance
-    /// is chosen by how far the stick is flicked.
-    ///
-    /// It runs on capture rather than on injection so the value that goes on the wire is the value
-    /// the core will see, which keeps a peer's view of an input identical to its author's.
-    ///
-    /// Uses BizHawk's own <see cref="ControllerDefinition.ApplyAxisConstraints"/> rather than
-    /// reimplementing the clamp. Reimplementing the analog-bind math above was already a standing
-    /// risk of silent drift; there was no reason to take it twice.
-    /// </summary>
-    private void ApplyAxisConstraints(CoreLayout layout, int[] axes)
-    {
-        if (!_useCircularAnalogConstraint) return;
-        var scratch = _constraintScratch;
-        if (scratch == null) return;
-
-        scratch.Clear();
-        for (int j = 0; j < axes.Length; j++) scratch[layout.Axes[j].Name] = axes[j];
-        try { _emulator.ControllerDefinition.ApplyAxisConstraints("Natural Circle", scratch); }
-        catch { return; }   // a core without constraints must not cost anyone their input
-        for (int j = 0; j < axes.Length; j++)
-            if (scratch.TryGetValue(layout.Axes[j].Name, out int v)) axes[j] = v;
     }
 
     /// <summary>
