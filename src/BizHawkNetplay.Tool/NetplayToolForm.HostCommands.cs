@@ -7,9 +7,11 @@ namespace BizHawkNetplay.Tool;
 /// The frontend commands a session has to refuse, via BizHawk's own <see cref="IControlMainform"/>.
 ///
 /// <c>BlockFrameAdvance</c> stops the run loop STEPPING the core. It does nothing about the commands
-/// that MUTATE it: quick-load, load-state, and reboot all replace the machine underneath a running
-/// timeline, and every peer would carry on from a state this one no longer has. That is a desync
-/// with no cause visible in any log — the frame counter does not even jump.
+/// that MUTATE it: rewind and reboot replace the machine underneath a running timeline, and every
+/// peer would carry on from a state this one no longer has.
+///
+/// Savestates are deliberately left alone — saving is something worth being able to do mid-session,
+/// and the interface cannot separate saving from loading. See the savestate section below.
 ///
 /// BizHawk already has the seam for this. A tool that claims a command has MainForm call the tool
 /// instead of doing the thing (<c>MainForm.cs:4094</c> and friends), so refusing is a supported
@@ -23,8 +25,8 @@ namespace BizHawkNetplay.Tool;
 /// them away from TAStudio for no benefit.
 ///
 /// Known limit: BizHawk picks the FIRST claimant, so this does not make TAStudio interoperable —
-/// both would claim savestates and rewind. That is already covered by the standing "don't run
-/// TAStudio during netplay" warning the session start puts up.
+/// both would claim rewind. That is already covered by the standing "don't run TAStudio during
+/// netplay" warning the session start puts up.
 /// </summary>
 public sealed partial class NetplayToolForm : IControlMainform
 {
@@ -47,28 +49,39 @@ public sealed partial class NetplayToolForm : IControlMainform
                 "state under every other player. Disconnect first.", Color.DarkOrange);
     }
 
-    // --- savestates ------------------------------------------------------------------------------
-    // Loads return false ("did not load"), saves simply do not happen. Saving is refused as well as
-    // loading: a quick-save taken mid-session is a state whose frame means nothing outside it, and
-    // silently writing one over a slot the user cares about is its own small betrayal.
+    // --- savestates: deliberately NOT claimed ----------------------------------------------------
+    //
+    // Saving a state is harmless — it reads the core out, it does not replace it — and it is worth
+    // being able to do mid-session. Loading one is the hazard. But WantsToControlSavestates is a
+    // single switch over both, and claiming it means MainForm calls the tool and then RETURNS: for
+    // saves it does no work at all ("assume success by the tool", MainForm.cs:4167 and 4238), and
+    // IMainFormForTools exposes no save method a tool could call to do the work itself. So the only
+    // ways to permit saving are to fake it — which cannot honour the quick-slot the user actually
+    // pressed — or to not claim. Not claiming is the honest one.
+    //
+    // What that gives up is prevention of load-state, not detection of it. A load moves the core's
+    // frame counter, and FrameTick already compares that counter against the driver's every tick:
+    // it ends the session naming the cause ("the core's frame count jumped back N — a rewind/
+    // load-state hotkey fired?") rather than letting it become a mystery desync. Rewind and reboot
+    // stay claimed below, since those are separate switches and neither is wanted mid-session.
+    //
+    // Every member here is therefore unreachable while the property is false. They exist because
+    // the interface requires them.
 
-    public bool WantsToControlSavestates => _hostOwnershipHeld;
+    public bool WantsToControlSavestates => false;
 
-    public void SaveState() => RefuseHostCommand("Save State");
+    public void SaveState() { }
 
-    public bool LoadState() { RefuseHostCommand("Load State"); return false; }
+    public bool LoadState() => false;
 
-    public void SaveStateAs() => RefuseHostCommand("Save State As");
+    public void SaveStateAs() { }
 
-    public bool LoadStateAs() { RefuseHostCommand("Load State As"); return false; }
+    public bool LoadStateAs() => false;
 
-    public void SaveQuickSave(int slot) => RefuseHostCommand($"Quick Save (slot {slot})");
+    public void SaveQuickSave(int slot) { }
 
-    public bool LoadQuickSave(int slot) { RefuseHostCommand($"Quick Load (slot {slot})"); return false; }
+    public bool LoadQuickSave(int slot) => false;
 
-    // Slot selection changes which slot is selected, not the machine. Returning false means "not
-    // handled — carry on", so the normal behaviour continues and the user can still move the
-    // selection around while connected.
     public bool SelectSlot(int slot) => false;
 
     public bool PreviousSlot() => false;
