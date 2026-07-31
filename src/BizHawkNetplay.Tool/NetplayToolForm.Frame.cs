@@ -421,15 +421,21 @@ public sealed partial class NetplayToolForm
 
             // Present the latest frame ourselves, once per tick (the video twin of PumpAudio above).
             //
-            // The reason recorded here was that a paused EmuHawk "never presents". That is wrong:
-            // MainForm's loop calls Render() every iteration, right after the external-tool callback
-            // and regardless of pause, and Render() reads the live video provider. But the symptom
-            // this was added for was real and reproducible — the host's picture froze while the core,
-            // audio and netplay all kept running — so the call stays until something explains the
-            // gap between those two facts. Worth measuring before removing: if Render() does cover
-            // it on the normal path, this is a duplicate costing the ~0.2-0.3ms `present mean` in
-            // the pacing line, and would still be needed for the WinForms fallback clock.
-            if (steppedThisTick)
+            // The reason recorded here was that a paused EmuHawk "never presents". That is false:
+            // MainForm's loop calls Render() every iteration, regardless of pause, off the live
+            // video provider. But the frozen picture this was added for was real — so what changed?
+            //
+            // Probably the clock. This predates the fine clock, when frames were advanced from a
+            // WM_TIMER message: that runs during message dispatch, NOT between
+            // GeneralUpdateActiveExtTools and Render, so a frame could land after Render had already
+            // drawn and sit unshown until the next iteration. Now the tick runs inside that callback
+            // and Render is the very next thing MainForm does, which would make this redundant.
+            //
+            // That is a hypothesis about the past, not a measurement, so the call stays and the
+            // Diagnostics tab has a switch to settle it: tick "Skip our video present" mid-session
+            // and see whether the picture keeps moving. Note the fallback clock still needs this
+            // either way — it is the WM_TIMER path the theory says was the original problem.
+            if (steppedThisTick && !_skipOurPresent)
             {
                 var phase = System.Diagnostics.Stopwatch.StartNew();
                 bool presented = _adapter!.PresentVideo();

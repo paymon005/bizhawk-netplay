@@ -123,6 +123,8 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private Button _applyLiveButton = null!;
     private RichTextBox _connLog = null!;
     private CheckBox _simUnresponsiveCheck = null!;
+    private CheckBox _skipPresentCheck = null!;
+    private bool _skipOurPresent;   // diagnostic: leave presenting entirely to EmuHawk's Render()
     private CheckBox _upnpCheck = null!;
     private TextBox _passwordBox = null!;
     private NumericUpDown _simLatencyBox = null!;
