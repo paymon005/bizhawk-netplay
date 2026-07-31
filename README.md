@@ -23,10 +23,11 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 > **Everyone must be on the same version.** The network protocol is versioned and the handshake
 > refuses a mismatch, so when you update, your friends must update to the same release too. The
 > protocol version numbers in the table below are historical — each says what that release changed.
-> **`main` is currently on protocol 13**, which is a break from the last release: the lobby measures
-> every UDP mesh edge before choosing input delay, the host can change netcode or delay mid-session,
-> and every savestate transfer — the initial join, a resync, a rejoin, a settings change — is
-> deflated on the wire instead of being sent raw.
+> **v0.21.0 moves to protocol 13, a break from v0.20.0 (protocol 12)** — the lobby measures every UDP
+> mesh edge before choosing input delay, the host can change netcode or delay mid-session, and every
+> savestate transfer (the initial join, a resync, a rejoin, a settings change) is deflated on the wire
+> instead of being sent raw. A v0.20.0 peer and a v0.21.0 peer will refuse each other at the
+> handshake, which is the intended behaviour rather than a fault.
 
 ## Status
 
@@ -45,6 +46,8 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | **Latency & liveness** (v0.9.0) | ✅ Audio cushion halved (a permanent 80ms video→audio offset, now 40ms); RTT measured on the UDP path input actually rides rather than the TCP control link; rollback time-syncs on a real **frame advantage** exchange, so the peer genuinely ahead yields instead of both guessing from a symmetric RTT; delay advice is mode-aware. Per-link drop detection no longer goes blind during a resync. *Protocol unchanged — mixes with v0.8.0 peers.* |
 | **Punch admission** (v0.11.0) | ✅ Hosting and UDP punch are one flow, RemotePlay-style: the host just clicks **Start Hosting**; a joiner who can't reach it enters the host's IP and clicks **UDP Punch**, sends the code it gets, and the host pastes it to admit them — into the same 2–4 player lobby as TCP joiners, over a reliable control stream on the session's own UDP socket. One code per NAT'd joiner; no port-forwarding on their side. |
 | **Generations & auto-delay** (v0.10.0) | ✅ Every session/timeline carries a **(session ID, epoch) generation** stamped on input, checksums, pacing, READY/GO and resync — stale-generation packets are rejected on every ingress path, so a rebuilt timeline can't be poisoned by the old one. The UDP mesh groups each peer's LAN + public endpoints as **routes**: all candidates probed, input rides the best live path, a silently-dead path fails over in ~2.5s. State transfers declare their size with **bounded, size-scaled deadlines**; the host **auto-selects input delay from lobby RTT** (capped, never lowers a manual ask). Rollback gains **gap retransmission** — a loss burst that outruns the redundant window no longer freezes both players forever. The whole diff was adversarially reviewed and every finding fixed (v0.10.1); open items in `KNOWN-ISSUES.md`. **Protocol v6 — everyone must update.** |
+
+| **Host integration & compression** (v0.21.0) | ✅ The session now owns the emulator through BizHawk's own seams, from the moment the lobby opens rather than from GO: `BlockFrameAdvance` stops EmuHawk's run loop stepping the core, `IControlMainform` refuses Rewind and Reboot, and `BeforeQuickLoad` refuses Quick Load while leaving **Quick Save working normally**; any other load ends the session on the load itself. Pause, rewind and run-in-background are snapshotted and restored exactly as found. Axes rest at each axis's own Neutral (not 0), the "My controls" remap compares control *names* rather than counts, and audio finally honours the volume slider and mute. Every savestate transfer is deflated on the wire. CI builds the shipping DLL against a hash-pinned BizHawk 2.11.1. **Protocol v13 — everyone must update.** |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
