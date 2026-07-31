@@ -12,6 +12,7 @@ using BizHawk.Client.Common;
 using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Input;
+using BizHawkNetplay.Core.Session;
 using CoreLayout = BizHawkNetplay.Core.Input.ControllerLayout;
 using CoreAxisSpec = BizHawkNetplay.Core.Input.AxisSpec;
 
@@ -158,6 +159,64 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
             var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(
                 CoreName + "|" + CoreVersion + "|" + _emulator.SystemId + "|" + SyncSettingsBlob()));
             return BitConverter.ToString(bytes, 0, 8).Replace("-", string.Empty);
+        }
+    }
+
+    /// <summary>
+    /// The same settings <see cref="SyncSettingsDigest"/> hashes, flattened to sorted
+    /// <c>name → value</c> pairs so a mismatch can be NAMED rather than merely detected.
+    ///
+    /// The digest stays the decision. This is lossy where the hash is not — nested objects become
+    /// dotted paths, arrays become indexed ones, and both are truncated — so it can fail to explain
+    /// a difference the digest sees, and the negotiator is written to say so rather than imply a
+    /// match. Bounded because these fields are core-defined: nothing here chooses what a core puts
+    /// in its settings, so it is capped instead of trusted.
+    ///
+    /// Sorted by name so both peers produce the same order regardless of how their core declared it.
+    /// </summary>
+    public IReadOnlyList<KeyValuePair<string, string>> SyncSettingsFields
+    {
+        get
+        {
+            var fields = new List<KeyValuePair<string, string>>();
+            try
+            {
+                var blob = SyncSettingsBlob();
+                if (blob.Length == 0) return fields;
+                Flatten(Newtonsoft.Json.Linq.JToken.Parse(blob), "", fields);
+                fields.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+                if (fields.Count > HandshakeCodec.MaxSyncFields)
+                    fields.RemoveRange(HandshakeCodec.MaxSyncFields,
+                        fields.Count - HandshakeCodec.MaxSyncFields);
+            }
+            catch { fields.Clear(); } // explanation is optional; the digest is not
+            return fields;
+        }
+    }
+
+    private static void Flatten(
+        Newtonsoft.Json.Linq.JToken token, string path, List<KeyValuePair<string, string>> into)
+    {
+        // One over the cap, so the caller's trim is what enforces it and this cannot recurse for
+        // ever into a pathological settings object.
+        if (into.Count > HandshakeCodec.MaxSyncFields) return;
+        switch (token)
+        {
+            case Newtonsoft.Json.Linq.JObject obj:
+                foreach (var prop in obj.Properties())
+                    Flatten(prop.Value, path.Length == 0 ? prop.Name : path + "." + prop.Name, into);
+                break;
+            case Newtonsoft.Json.Linq.JArray arr:
+                for (int i = 0; i < arr.Count; i++) Flatten(arr[i], $"{path}[{i}]", into);
+                break;
+            default:
+                var text = token.Type == Newtonsoft.Json.Linq.JTokenType.Null
+                    ? ""
+                    : token.ToString(Newtonsoft.Json.Formatting.None).Trim('"');
+                if (text.Length > HandshakeCodec.MaxSyncFieldChars)
+                    text = text.Substring(0, HandshakeCodec.MaxSyncFieldChars) + "…";
+                into.Add(new KeyValuePair<string, string>(path.Length == 0 ? "value" : path, text));
+                break;
         }
     }
 

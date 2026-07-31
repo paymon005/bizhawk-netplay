@@ -46,6 +46,10 @@ public sealed class FakeEmuAdapter : IEmuAdapter
     public string CoreName => "FakeCore";
     public string CoreVersion => "1.0";
     public string SyncSettingsDigest => "fakesync";
+
+    public IReadOnlyList<KeyValuePair<string, string>> SyncSettingsFields { get; set; } =
+        new List<KeyValuePair<string, string>>();
+
     public bool VerifyDeterministicMode() => true;
 
     public int PortCount { get; }

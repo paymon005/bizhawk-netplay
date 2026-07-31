@@ -18,8 +18,10 @@ public sealed class PeerIdentity
         string syncSettingsDigest,
         IReadOnlyList<string> portLayoutDigests,
         bool deterministic,
-        int maxRollbackDepth)
+        int maxRollbackDepth,
+        IReadOnlyList<KeyValuePair<string, string>>? syncSettingsFields = null)
     {
+        SyncSettingsFields = syncSettingsFields ?? Array.Empty<KeyValuePair<string, string>>();
         ProtocolVersion = protocolVersion;
         RomHash = romHash ?? "";
         CoreName = coreName ?? "";
@@ -35,6 +37,18 @@ public sealed class PeerIdentity
     public string CoreName { get; }
     public string CoreVersion { get; }
     public string SyncSettingsDigest { get; }
+
+    /// <summary>
+    /// The same sync settings as a flat, sorted <c>name → value</c> list — what
+    /// <see cref="SyncSettingsDigest"/> is a hash OF, in a form that can be diffed.
+    ///
+    /// Explanatory only. The digest remains the decision, because flattening is lossy and a hash is
+    /// not: two peers whose lists look identical may still hash differently, and the negotiator has
+    /// to say so rather than quietly declare a match. Empty when the peer could not read its
+    /// settings, or predates this field.
+    /// </summary>
+    public IReadOnlyList<KeyValuePair<string, string>> SyncSettingsFields { get; }
+
     public IReadOnlyList<string> PortLayoutDigests { get; }
     public bool Deterministic { get; }
 

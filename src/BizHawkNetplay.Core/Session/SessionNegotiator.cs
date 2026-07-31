@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BizHawkNetplay.Core.Probe;
 
 namespace BizHawkNetplay.Core.Session;
@@ -79,7 +80,7 @@ public static class SessionNegotiator
                 $"core version mismatch ({local.CoreVersion} vs {remote.CoreVersion}) — use the same BizHawk build");
 
         if (!string.Equals(local.SyncSettingsDigest, remote.SyncSettingsDigest, StringComparison.Ordinal))
-            return NegotiationResult.Reject("core sync-settings mismatch — align sync settings on both ends");
+            return NegotiationResult.Reject(DescribeSyncSettingsMismatch(local, remote));
 
         // Point at the exact difference rather than a bare "controller layout mismatch" — the usual
         // cause is a per-port controller-type difference (3- vs 6-button pad, analog vs digital, a
@@ -116,4 +117,66 @@ public static class SessionNegotiator
         return NegotiationResult.Accept(mode, inputDelay);
     }
 
+    /// <summary>How many differing settings to name before summarising the rest. Six fits a log line
+    /// and, past that, the two machines are configured differently enough that listing every field
+    /// is not the useful message.</summary>
+    private const int MaxNamedSyncDifferences = 6;
+
+    /// <summary>
+    /// Name the sync settings that differ, rather than reporting that some do.
+    ///
+    /// Both peers run this and both run it symmetrically, so each side's "yours" is genuinely its
+    /// own — the two players read complementary halves of the same answer off their own screens
+    /// without having to compare logs.
+    ///
+    /// The digest has already decided; this only explains. Where it cannot explain — a peer too old
+    /// to send its fields, a core that exposes none, or a difference that survives flattening — it
+    /// says so instead of implying the settings match, because "no difference found" from a
+    /// comparison that could not see one is the same sentence as a genuine match and must not read
+    /// like it.
+    /// </summary>
+    private static string DescribeSyncSettingsMismatch(PeerIdentity local, PeerIdentity remote)
+    {
+        const string headline = "core sync-settings mismatch";
+        const string generic = headline + " — align sync settings on both ends";
+
+        if (local.SyncSettingsFields.Count == 0 || remote.SyncSettingsFields.Count == 0)
+            return generic;
+
+        var theirs = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var field in remote.SyncSettingsFields) theirs[field.Key] = field.Value;
+
+        var named = new List<string>();
+        int extra = 0;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var field in local.SyncSettingsFields)
+        {
+            seen.Add(field.Key);
+            string mine = field.Value;
+            string other = theirs.TryGetValue(field.Key, out var v) ? v : null!;
+            if (other != null && string.Equals(mine, other, StringComparison.Ordinal)) continue;
+            if (named.Count < MaxNamedSyncDifferences)
+                named.Add(other == null
+                    ? $"{field.Key} (yours {Show(mine)}, theirs absent)"
+                    : $"{field.Key} (yours {Show(mine)}, theirs {Show(other)})");
+            else extra++;
+        }
+        foreach (var field in remote.SyncSettingsFields)
+        {
+            if (seen.Contains(field.Key)) continue;
+            if (named.Count < MaxNamedSyncDifferences)
+                named.Add($"{field.Key} (yours absent, theirs {Show(field.Value)})");
+            else extra++;
+        }
+
+        if (named.Count == 0)
+            return headline + " — the settings this can compare all match, so the difference is in " +
+                   "something it cannot see. Reload the ROM on both ends with identical core settings.";
+
+        return headline + ": " + string.Join(", ", named)
+             + (extra > 0 ? $", and {extra} more" : "")
+             + ". Change these to match on both machines, then reload the ROM.";
+    }
+
+    private static string Show(string value) => value.Length == 0 ? "(empty)" : value;
 }

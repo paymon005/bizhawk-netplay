@@ -803,6 +803,50 @@ public class HandshakeTests
         finally { dispose(); }
     }
 
+    /// <summary>
+    /// A sync-setting value is core-defined text. It can contain the field separator, the newline
+    /// the HELLO line format ends on, or the backslash doing the escaping — and a value that broke
+    /// the line format would corrupt every field after it, in the one message whose whole job is
+    /// explaining why a session was refused.
+    /// </summary>
+    [Fact]
+    public void SyncSettingFieldsSurviveSeparatorsAndNewlinesInTheirValues()
+    {
+        var fields = new List<KeyValuePair<string, string>>
+        {
+            new("VideoPlugin", "GLideN64"),
+            new("Odd|Name", @"has|a pipe, a \backslash and" + "\na newline"),
+            new("Empty", ""),
+        };
+        var id = new PeerIdentity(14, "ROM", "GPGX", "2.11.1.0", "SYNC",
+            new[] { "L0" }, true, 20, fields);
+
+        var (decoded, _, _, _, _) = HandshakeCodec.Decode(
+            HandshakeCodec.Encode(id, new SessionPreferences(2, false), 47800, SessionAuth.NewNonce()));
+
+        Assert.Equal(fields, decoded.SyncSettingsFields);
+        // The rest of the HELLO still parses — the point of escaping rather than hoping.
+        Assert.Equal("SYNC", decoded.SyncSettingsDigest);
+        Assert.Equal(20, decoded.MaxRollbackDepth);
+    }
+
+    [Fact]
+    public void AFloodOfSyncSettingFieldsIsCappedRatherThanAccepted()
+    {
+        var fields = new List<KeyValuePair<string, string>>();
+        for (int i = 0; i < HandshakeCodec.MaxSyncFields + 50; i++)
+            fields.Add(new KeyValuePair<string, string>($"F{i}", new string('x', 400)));
+        var id = new PeerIdentity(14, "ROM", "GPGX", "2.11.1.0", "SYNC",
+            new[] { "L0" }, true, 20, fields);
+
+        var (decoded, _, _, _, _) = HandshakeCodec.Decode(
+            HandshakeCodec.Encode(id, new SessionPreferences(2, false), 47800, SessionAuth.NewNonce()));
+
+        Assert.Equal(HandshakeCodec.MaxSyncFields, decoded.SyncSettingsFields.Count);
+        Assert.All(decoded.SyncSettingsFields,
+            f => Assert.True(f.Value.Length <= HandshakeCodec.MaxSyncFieldChars + 1));
+    }
+
     private static byte[] Token(byte fill)
     {
         var t = new byte[HandshakeCodec.TokenBytes];

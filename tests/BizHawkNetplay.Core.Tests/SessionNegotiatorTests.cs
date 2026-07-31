@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using BizHawkNetplay.Core.Probe;
 using BizHawkNetplay.Core.Session;
 using Xunit;
@@ -118,5 +119,106 @@ public class SessionNegotiatorTests
         var r3 = SessionNegotiator.Negotiate(Id(depth: 20), Id(depth: 20),
             Pref(rollback: true), Pref(rollback: false));
         Assert.Equal(SyncMode.Lockstep, r3.Mode);
+    }
+
+    private static PeerIdentity IdWithFields(string sync, params string[] pairs)
+    {
+        var fields = new List<KeyValuePair<string, string>>();
+        for (int i = 0; i < pairs.Length; i += 2)
+            fields.Add(new KeyValuePair<string, string>(pairs[i], pairs[i + 1]));
+        return new PeerIdentity(1, "ROMHASH", "GPGX", "2.11.1.0", sync,
+            new[] { "L0", "L1" }, true, 20, fields);
+    }
+
+    [Fact]
+    public void ASyncSettingsMismatchNamesTheSettingsAndBothSidesValues()
+    {
+        var mine = IdWithFields("SYNC1", "VideoPlugin", "GLideN64", "RspPlugin", "HLE", "Region", "NTSC");
+        var theirs = IdWithFields("SYNC2", "VideoPlugin", "Rice", "RspPlugin", "HLE", "Region", "PAL");
+
+        var r = SessionNegotiator.Negotiate(mine, theirs, Pref(), Pref());
+
+        Assert.False(r.Accepted);
+        Assert.Contains("VideoPlugin (yours GLideN64, theirs Rice)", r.RejectReason);
+        Assert.Contains("Region (yours NTSC, theirs PAL)", r.RejectReason);
+        Assert.DoesNotContain("RspPlugin", r.RejectReason); // matched — naming it would be noise
+
+        // Symmetric: the other peer runs the same comparison and reads its own half.
+        var flipped = SessionNegotiator.Negotiate(theirs, mine, Pref(), Pref());
+        Assert.Contains("VideoPlugin (yours Rice, theirs GLideN64)", flipped.RejectReason);
+    }
+
+    /// <summary>
+    /// Both peers run the same core build, so their settings have the same shape — except where
+    /// flattening indexes a collection, which is how one side ends up with a key the other lacks
+    /// (`Controllers[2]` exists for one of them). Named from whichever side is looking.
+    /// </summary>
+    [Fact]
+    public void ASettingOnlyOneSideHasIsNamedFromEitherDirection()
+    {
+        var mine = IdWithFields("SYNC1",
+            "Region", "NTSC", "Controllers[0]", "Standard", "Controllers[1]", "Mempak");
+        var theirs = IdWithFields("SYNC2", "Region", "NTSC", "Controllers[0]", "Standard");
+
+        Assert.Contains("Controllers[1] (yours Mempak, theirs absent)",
+            SessionNegotiator.Negotiate(mine, theirs, Pref(), Pref()).RejectReason);
+        Assert.Contains("Controllers[1] (yours absent, theirs Mempak)",
+            SessionNegotiator.Negotiate(theirs, mine, Pref(), Pref()).RejectReason);
+    }
+
+    /// <summary>A peer that sent no fields at all is indistinguishable from one whose core exposes
+    /// none, so neither gets a named answer — the fallback covers both without guessing.</summary>
+    [Fact]
+    public void OneSideWithNoFieldsAtAllGetsTheFallbackRatherThanAOneSidedList()
+    {
+        var r = SessionNegotiator.Negotiate(
+            IdWithFields("SYNC1", "Region", "NTSC"), IdWithFields("SYNC2"), Pref(), Pref());
+
+        Assert.Equal("core sync-settings mismatch — align sync settings on both ends", r.RejectReason);
+    }
+
+    /// <summary>
+    /// The digest decides; the field list only explains. Flattening is lossy, so it can fail to
+    /// account for a difference the hash saw — and "no difference found" from a comparison that
+    /// could not see one must not read like a genuine match.
+    /// </summary>
+    [Fact]
+    public void AMismatchTheFieldsCannotExplainSaysSoRatherThanClaimingTheyMatch()
+    {
+        var mine = IdWithFields("SYNC1", "VideoPlugin", "GLideN64");
+        var theirs = IdWithFields("SYNC2", "VideoPlugin", "GLideN64");
+
+        var r = SessionNegotiator.Negotiate(mine, theirs, Pref(), Pref());
+
+        Assert.False(r.Accepted);
+        Assert.Contains("cannot see", r.RejectReason);
+    }
+
+    [Fact]
+    public void APeerThatSentNoFieldsFallsBackToTheOldAdvice()
+    {
+        var r = SessionNegotiator.Negotiate(Id(sync: "SYNC1"), Id(sync: "SYNC2"), Pref(), Pref());
+
+        Assert.False(r.Accepted);
+        Assert.Equal("core sync-settings mismatch — align sync settings on both ends", r.RejectReason);
+    }
+
+    [Fact]
+    public void ADozenDifferencesAreSummarisedRatherThanListedInFull()
+    {
+        var minePairs = new List<string>();
+        var theirPairs = new List<string>();
+        for (int i = 0; i < 12; i++)
+        {
+            minePairs.Add($"Setting{i:00}"); minePairs.Add("a");
+            theirPairs.Add($"Setting{i:00}"); theirPairs.Add("b");
+        }
+        var r = SessionNegotiator.Negotiate(
+            IdWithFields("SYNC1", minePairs.ToArray()),
+            IdWithFields("SYNC2", theirPairs.ToArray()), Pref(), Pref());
+
+        Assert.Contains("Setting00 (yours a, theirs b)", r.RejectReason);
+        Assert.Contains("and 6 more", r.RejectReason);
+        Assert.DoesNotContain("Setting11", r.RejectReason);
     }
 }

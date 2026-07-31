@@ -52,6 +52,11 @@ public static class HandshakeCodec
         // response proof exchanged afterward (see SessionAuth). Empty nonce is tolerated (open session).
         sb.Append("nonce=").Append(nonce == null ? "" : SessionAuth.ToHex(nonce)).Append('\n');
         sb.Append("udpport=").Append(udpPort).Append('\n');
+        foreach (var field in id.SyncSettingsFields)
+        {
+            if (string.IsNullOrEmpty(field.Key)) continue;
+            sb.Append("syncf=").Append(Escape(field.Key)).Append('|').Append(Escape(field.Value)).Append('\n');
+        }
         if (reflexive != null)
         {
             sb.Append("refl=");
@@ -315,7 +320,8 @@ public static class HandshakeCodec
             Get(map, "sync"),
             layouts,
             Get(map, "det") == "1",
-            GetInt(map, "depth", 0));
+            GetInt(map, "depth", 0),
+            DecodeSyncFields(body));
 
         // The remote's password is never on the wire — prefs carries only delay/rollback here. Clamp
         // delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge value
@@ -327,6 +333,89 @@ public static class HandshakeCodec
         // cannot name its public endpoint still plays over whatever candidates do work.
         IPEndPoint? reflexive = TryParseEndpoint(Get(map, "refl"), out var parsed) ? parsed : null;
         return (id, prefs, udpPort, nonce, reflexive);
+    }
+
+    /// <summary>Hard cap on how many sync-setting fields a peer may describe. These are core-defined
+    /// — this code does not choose what is in them — and the list is explanatory, not load-bearing,
+    /// so it is bounded rather than trusted. Beyond the cap the digest still refuses the mismatch;
+    /// only the explanation is truncated.</summary>
+    public const int MaxSyncFields = 256;
+
+    /// <summary>Longest value kept for one field, before truncation. Long enough for a plugin name
+    /// or a path tail, short enough that a core with a surprising field cannot flood the log.</summary>
+    public const int MaxSyncFieldChars = 96;
+
+    /// <summary>Read the <c>syncf=</c> section. Its own scan rather than <see cref="ParseLines"/>,
+    /// which is a map and would keep only the last of a repeated key.</summary>
+    private static List<KeyValuePair<string, string>> DecodeSyncFields(byte[] body)
+    {
+        var fields = new List<KeyValuePair<string, string>>();
+        foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
+        {
+            if (fields.Count >= MaxSyncFields) break;
+            var line = raw.Trim();
+            if (!line.StartsWith("syncf=", StringComparison.Ordinal)) continue;
+            var payload = line.Substring(6);
+            int bar = IndexOfUnescaped(payload, '|');
+            if (bar < 0) continue;
+            var key = Unescape(payload.Substring(0, bar));
+            if (key.Length == 0) continue;
+            fields.Add(new KeyValuePair<string, string>(
+                Truncate(key), Truncate(Unescape(payload.Substring(bar + 1)))));
+        }
+        return fields;
+    }
+
+    private static string Truncate(string s) =>
+        s.Length <= MaxSyncFieldChars ? s : s.Substring(0, MaxSyncFieldChars) + "…";
+
+    // A value is core-defined text: it can hold the separator, the newline the line format ends on,
+    // or the backslash doing the escaping. All three are escaped rather than assumed absent.
+    private static string Escape(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new StringBuilder(s!.Length);
+        foreach (var c in s)
+        {
+            switch (c)
+            {
+                case '\\': sb.Append("\\\\"); break;
+                case '|': sb.Append("\\p"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                default: sb.Append(c); break;
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static string Unescape(string s)
+    {
+        if (s.IndexOf('\\') < 0) return s;
+        var sb = new StringBuilder(s.Length);
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] != '\\' || i + 1 >= s.Length) { sb.Append(s[i]); continue; }
+            switch (s[++i])
+            {
+                case '\\': sb.Append('\\'); break;
+                case 'p': sb.Append('|'); break;
+                case 'n': sb.Append('\n'); break;
+                case 'r': sb.Append('\r'); break;
+                default: sb.Append(s[i]); break; // unknown escape: keep the character, drop nothing
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static int IndexOfUnescaped(string s, char target)
+    {
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] == '\\') { i++; continue; }
+            if (s[i] == target) return i;
+        }
+        return -1;
     }
 
     private static Dictionary<string, string> ParseLines(byte[] body)

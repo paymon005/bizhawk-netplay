@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BizHawkNetplay.Core.Input;
 
 namespace BizHawkNetplay.Core.Emu;
@@ -31,6 +32,10 @@ public interface IEmuAdapter
 
     /// <summary>Hash of the core's sync-settings blob, compared across peers.</summary>
     string SyncSettingsDigest { get; }
+
+    /// <summary>The same settings as sorted <c>name → value</c> pairs, so a mismatch on
+    /// <see cref="SyncSettingsDigest"/> can be named. Explanatory only, and may be empty.</summary>
+    IReadOnlyList<KeyValuePair<string, string>> SyncSettingsFields { get; }
 
     /// <summary>False if the core is not running in a deterministic configuration; fails the session.</summary>
     bool VerifyDeterministicMode();

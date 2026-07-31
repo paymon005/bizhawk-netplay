@@ -179,7 +179,8 @@ public sealed partial class NetplayToolForm
         // behaviour with one less box to tick.
         const bool deterministic = true;
         return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
-            a.SyncSettingsDigest, layouts, deterministic, maxRollbackDepth: depth);
+            a.SyncSettingsDigest, layouts, deterministic, maxRollbackDepth: depth,
+            syncSettingsFields: a.SyncSettingsFields);
     }
 
     /// <summary>Map the "My controls" dropdown to an input-source port: P1..P4 (0..3) or -1 (assigned port).</summary>
