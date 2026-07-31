@@ -124,7 +124,7 @@ public sealed partial class NetplayToolForm
         if (nowMs - _lastFineTickMs < FineClockMinSpacingMs) return;
         _lastFineTickMs = nowMs;
         _emuLoopTicksWindow++;
-        FrameTick();
+        FrameTick(fromFineClock: true);
     }
 
     /// <summary>Stops the heartbeat timer and hands back the session's memory. The fine clock needs
@@ -184,7 +184,12 @@ public sealed partial class NetplayToolForm
         _gcGateWindow0 += d0; _gcGateWindow1 += d1; _gcGateWindow2 += d2;
     }
 
-    private void FrameTick()
+    /// <param name="fromFineClock">
+    /// True when EmuHawk's own run loop is calling us (<see cref="UpdateValues"/>), false for the
+    /// WinForms fallback timer. The two differ in one respect that matters below: only the fine
+    /// clock has MainForm.Render() waiting two statements behind it.
+    /// </param>
+    private void FrameTick(bool fromFineClock)
     {
         if (!_phase.IsActive || _driver == null) return;
         // Snapshot the field into a local for the rest of the tick. The null check above does not
@@ -419,33 +424,44 @@ public sealed partial class NetplayToolForm
             if (_lastTickClockMs >= 0) _pacing.AddTickInterval(nowMs - _lastTickClockMs);
             _lastTickClockMs = nowMs;
 
-            // Present the latest frame ourselves, once per tick (the video twin of PumpAudio above).
+            // Put the latest frame on screen — but only on the clock that actually needs us to.
             //
-            // The reason recorded here was that a paused EmuHawk "never presents". That is false:
-            // MainForm's loop calls Render() every iteration, regardless of pause, off the live
-            // video provider. But the frozen picture this was added for was real — so what changed?
+            // The reason once recorded here was that a paused EmuHawk "never presents". That is
+            // false: MainForm's loop calls Render() every iteration regardless of pause. The frozen
+            // picture this was added for was real, though — the clock simply moved underneath it.
+            // It predates the fine clock, when frames advanced from a WM_TIMER message: that runs
+            // during message dispatch, nowhere near Render, so a frame could land after Render had
+            // already drawn and sit unshown.
             //
-            // The clock moved underneath it. This predates the fine clock, when frames were advanced
-            // from a WM_TIMER message: that runs during message dispatch, NOT between
-            // GeneralUpdateActiveExtTools and Render, so a frame could land after Render had already
-            // drawn and sit unshown. Now the tick runs inside that callback and Render is the very
-            // next thing MainForm does.
+            // On the fine clock that cannot happen. MainForm.cs:1008-1011 runs
+            // GeneralUpdateActiveExtTools() -> StepRunLoop_Core() -> Render(), so the picture goes
+            // up two statements after the callback we are standing in — and PresentVideo() invokes
+            // that very same MainForm.Render(). Calling it here draws the identical frame twice,
+            // for ~0.3ms per tick, on the one thread a repair is also bidding for. Skipped
+            // mid-session on N64 (2026-07-30) the picture kept moving, which is the same conclusion
+            // arrived at from the other direction.
             //
-            // MEASURED 2026-07-30 with the switch below: skipped mid-session on N64, the picture kept
-            // moving. So on the fine-clock path this call is redundant — EmuHawk's own Render covers
-            // it. It stays anyway, for two reasons worth more than the ~0.3ms it costs: the fallback
-            // clock is the WM_TIMER path this was originally needed for, and presenting here is what
-            // makes `present`/`undrawn` in the pacing line mean anything at all.
+            // The fallback clock keeps presenting for itself: a WM_TIMER tick gets nowhere near
+            // Render, which is the case this existed for in the first place.
             //
-            // Which is also the caveat on those numbers: they count OUR presents, not the screen's
-            // updates. With Render drawing every loop iteration regardless, the display is not as
-            // starved as a low `present` implies — read it as "how often we drew right after a
-            // frame", not as the refresh the player sees.
+            // A stepped tick still COUNTS as a picture either way, because on the fine clock it is
+            // one — Render draws it immediately after. So `present`, `undrawn` and judder keep
+            // meaning what they meant; only `present mean`, which times our own call, drops to zero,
+            // and that zero is the saving. The standing caveat is unchanged: these count frames we
+            // handed to the display, not refreshes the player's eye received.
             if (steppedThisTick && !_skipOurPresent)
             {
-                var phase = System.Diagnostics.Stopwatch.StartNew();
-                bool presented = _adapter!.PresentVideo();
-                renderMs = phase.Elapsed.TotalMilliseconds;
+                bool presented = true;
+                if (fromFineClock)
+                {
+                    renderMs = 0;
+                }
+                else
+                {
+                    var phase = System.Diagnostics.Stopwatch.StartNew();
+                    presented = _adapter!.PresentVideo();
+                    renderMs = phase.Elapsed.TotalMilliseconds;
+                }
 
                 // Stamp AFTER the picture is on screen, not from the tick's entry timestamp.
                 //
@@ -465,7 +481,7 @@ public sealed partial class NetplayToolForm
                         _pacing.AddPresentInterval(presentedAtMs - _lastPresentClockMs, _frameMs);
                     _lastPresentClockMs = presentedAtMs;
                 }
-                else if (_adapter.PresentFailuresInARow == 1)
+                else if (_adapter!.PresentFailuresInARow == 1)
                 {
                     // Once, on the first failure: a persistent one now shows as presented-fps
                     // falling rather than as a healthy number over a frozen window.

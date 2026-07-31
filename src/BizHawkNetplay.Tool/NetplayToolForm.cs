@@ -416,7 +416,7 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         {
             if (_paceClock.Elapsed.TotalMilliseconds - _lastFineTickMs < FineClockFallbackMs) return;
             _timerTicksWindow++;
-            FrameTick();
+            FrameTick(fromFineClock: false);
         };
 
         // Drives the lobby status box: re-derives the state and advances the flash. Deliberately

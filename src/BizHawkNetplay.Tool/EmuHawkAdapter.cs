@@ -532,11 +532,15 @@ internal sealed class EmuHawkAdapter : IEmuAdapter
     }
 
     /// <summary>
-    /// Blit the core's freshly-rendered frame to EmuHawk's window. We hold EmuHawk paused and drive
-    /// frame-advance ourselves, so its own run loop never presents — a paused window keeps showing
-    /// the last frame its swapchain holds, which is why the host's picture froze while emulation
-    /// (audio, netplay) kept running. MainForm.Render() re-presents the current video provider; we
-    /// call it once per tick after stepping, the video twin of <see cref="PumpAudio"/>. Best-effort.
+    /// Blit the core's freshly-rendered frame to EmuHawk's window, by calling the same
+    /// MainForm.Render() its own run loop calls.
+    ///
+    /// The claim this once carried — that a paused EmuHawk "never presents" — is wrong: Render()
+    /// runs every loop iteration regardless of pause. What is true is that it runs at a fixed point
+    /// in that iteration (MainForm.cs:1011), so a frame landing outside the loop, from the WinForms
+    /// fallback timer, can miss it and sit unshown. That is the caller this exists for; the caller
+    /// driven by the loop itself skips it, because Render is already two statements away.
+    /// Best-effort.
     /// </summary>
     /// <returns>
     /// True if a picture actually reached the window. This returned void and swallowed every
