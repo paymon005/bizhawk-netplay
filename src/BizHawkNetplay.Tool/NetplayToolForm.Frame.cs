@@ -425,16 +425,22 @@ public sealed partial class NetplayToolForm
             // MainForm's loop calls Render() every iteration, regardless of pause, off the live
             // video provider. But the frozen picture this was added for was real — so what changed?
             //
-            // Probably the clock. This predates the fine clock, when frames were advanced from a
-            // WM_TIMER message: that runs during message dispatch, NOT between
+            // The clock moved underneath it. This predates the fine clock, when frames were advanced
+            // from a WM_TIMER message: that runs during message dispatch, NOT between
             // GeneralUpdateActiveExtTools and Render, so a frame could land after Render had already
-            // drawn and sit unshown until the next iteration. Now the tick runs inside that callback
-            // and Render is the very next thing MainForm does, which would make this redundant.
+            // drawn and sit unshown. Now the tick runs inside that callback and Render is the very
+            // next thing MainForm does.
             //
-            // That is a hypothesis about the past, not a measurement, so the call stays and the
-            // Diagnostics tab has a switch to settle it: tick "Skip our video present" mid-session
-            // and see whether the picture keeps moving. Note the fallback clock still needs this
-            // either way — it is the WM_TIMER path the theory says was the original problem.
+            // MEASURED 2026-07-30 with the switch below: skipped mid-session on N64, the picture kept
+            // moving. So on the fine-clock path this call is redundant — EmuHawk's own Render covers
+            // it. It stays anyway, for two reasons worth more than the ~0.3ms it costs: the fallback
+            // clock is the WM_TIMER path this was originally needed for, and presenting here is what
+            // makes `present`/`undrawn` in the pacing line mean anything at all.
+            //
+            // Which is also the caveat on those numbers: they count OUR presents, not the screen's
+            // updates. With Render drawing every loop iteration regardless, the display is not as
+            // starved as a low `present` implies — read it as "how often we drew right after a
+            // frame", not as the refresh the player sees.
             if (steppedThisTick && !_skipOurPresent)
             {
                 var phase = System.Diagnostics.Stopwatch.StartNew();
