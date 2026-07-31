@@ -27,7 +27,8 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 > mesh edge before choosing input delay, the host can change netcode or delay mid-session, and every
 > savestate transfer (the initial join, a resync, a rejoin, a settings change) is deflated on the wire
 > instead of being sent raw. A v0.20.0 peer and a v0.21.0 peer will refuse each other at the
-> handshake, which is the intended behaviour rather than a fault.
+> handshake, which is the intended behaviour rather than a fault. **v0.22.0 keeps protocol 13** and
+> touches no wire code at all, so it mixes freely with v0.21.0 — update whenever suits you.
 
 ## Status
 
@@ -48,6 +49,8 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | **Generations & auto-delay** (v0.10.0) | ✅ Every session/timeline carries a **(session ID, epoch) generation** stamped on input, checksums, pacing, READY/GO and resync — stale-generation packets are rejected on every ingress path, so a rebuilt timeline can't be poisoned by the old one. The UDP mesh groups each peer's LAN + public endpoints as **routes**: all candidates probed, input rides the best live path, a silently-dead path fails over in ~2.5s. State transfers declare their size with **bounded, size-scaled deadlines**; the host **auto-selects input delay from lobby RTT** (capped, never lowers a manual ask). Rollback gains **gap retransmission** — a loss burst that outruns the redundant window no longer freezes both players forever. The whole diff was adversarially reviewed and every finding fixed (v0.10.1); open items in `KNOWN-ISSUES.md`. **Protocol v6 — everyone must update.** |
 
 | **Host integration & compression** (v0.21.0) | ✅ The session now owns the emulator through BizHawk's own seams, from the moment the lobby opens rather than from GO: `BlockFrameAdvance` stops EmuHawk's run loop stepping the core, `IControlMainform` refuses Rewind and Reboot, and `BeforeQuickLoad` refuses Quick Load while leaving **Quick Save working normally**; any other load ends the session on the load itself. Pause, rewind and run-in-background are snapshotted and restored exactly as found. Axes rest at each axis's own Neutral (not 0), the "My controls" remap compares control *names* rather than counts, and audio finally honours the volume slider and mute. Every savestate transfer is deflated on the wire. CI builds the shipping DLL against a hash-pinned BizHawk 2.11.1. **Protocol v13 — everyone must update.** |
+
+| **Input & host commands** (v0.22.0) | ✅ **The tool window no longer steals your controller.** BizHawk refuses host input outright while an external tool has focus (`IExternalToolForm => AllowInput.None`), so clicking this window mid-game stopped your pad — fixed the way TAStudio does it, conditionally, so typing an IP still goes only to the box. Input capture now reads `Joypad.Get`, the end of EmuHawk's own controller chain, instead of re-deriving the bind maths here. A **host loading a savestate now takes every player with it** — the same resync a desync recovery uses — while a joiner's load is refused. Plus **Watch Analog**, which reports every distinct value a stick actually delivers to the core. *Protocol unchanged — mixes with v0.21.0 peers.* |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
