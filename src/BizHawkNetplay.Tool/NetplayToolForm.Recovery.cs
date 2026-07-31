@@ -565,13 +565,24 @@ public sealed partial class NetplayToolForm
         System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
 
     /// <summary>
-    /// Log a heads-up (NEVER block) if something that also owns input or the frame clock is active —
-    /// a loaded movie (playback/record, incl. TAStudio) or a running Lua script. These can desync
-    /// netplay, but we only warn and let the user proceed. Everything here is best-effort and swallows
-    /// its own errors: it must never disrupt starting a session (and resolves EmuHawk types by name,
-    /// so this file carries no compile-time dependency on them).
+    /// Refuse to start under an active movie; warn (never block) about Lua.
+    ///
+    /// The movie case used to be a warning too, and that was the wrong severity. The session steps
+    /// the core through IEmulator.FrameAdvance directly, so MovieSession.HandleFrameBefore/After —
+    /// which MainForm calls around ITS core step — never run. A RECORDING movie therefore silently
+    /// stops recording the frames actually being emulated: the file that comes out is garbage, and
+    /// nothing says so. A movie in PLAYBACK is the mirror image: the movie layer sits downstream of
+    /// the controller netplay reads, so the session captures the user's live pad while the user
+    /// believes the movie is driving. Neither is a session that "might desync" — it is a movie
+    /// being quietly ruined or quietly ignored, so it is refused with the reason named. A FINISHED
+    /// movie injects nothing and only warns.
+    ///
+    /// Lua stays a warning: scripts can interfere but usually don't, and blocking every session for
+    /// an idle overlay script would cost more than it saves. Everything here is best-effort and
+    /// swallows its own errors (EmuHawk types resolved by name; no compile-time dependency).
     /// </summary>
-    private void WarnSessionHazards()
+    /// <returns>True if the session must not start.</returns>
+    private bool SessionHazardsBlockStart()
     {
         try
         {
@@ -579,8 +590,19 @@ public sealed partial class NetplayToolForm
             {
                 string mode = ""; try { mode = APIs.Movie.Mode() ?? ""; } catch { }
                 bool rec = string.Equals(mode, "RECORD", StringComparison.OrdinalIgnoreCase);
-                Log($"WARNING: a movie is {(rec ? "recording" : "loaded")} (or TAStudio is open) — it injects " +
-                    "input and drives frame advance, which will likely desync netplay. Stop it if the session won't sync.");
+                bool play = string.Equals(mode, "PLAY", StringComparison.OrdinalIgnoreCase);
+                if (rec || play)
+                {
+                    ConnLog(rec
+                        ? "a movie is RECORDING (or TAStudio is open). Netplay steps the core itself, " +
+                          "so the recorder would never see the frames actually played and the file " +
+                          "would be garbage. Stop the movie (Movie → Stop), then start again."
+                        : "a movie is PLAYING (or TAStudio is open). Netplay reads the controller, not " +
+                          "the movie, so the session would ignore the playback you are watching. Stop " +
+                          "the movie (Movie → Stop), then start again.", Color.Firebrick);
+                    return true;
+                }
+                Log("note: a finished movie is loaded — harmless, but Movie → Stop clears it.");
             }
         }
         catch { /* movie API unavailable — ignore */ }
@@ -593,6 +615,7 @@ public sealed partial class NetplayToolForm
                     "emu.frameadvance and may desync netplay. Stop them (Lua Console → Stop All Scripts) if you see desyncs.");
         }
         catch { /* best-effort — ignore */ }
+        return false;
     }
 
     /// <summary>Count Lua scripts in the RUNNING state, only if the Lua Console is already open (never

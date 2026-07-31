@@ -515,11 +515,48 @@ public sealed partial class NetplayToolForm
         }
     }
 
+    /// <summary>
+    /// EmuHawk asks every tool this BEFORE it closes the current game — on every ROM load, on
+    /// switching to no ROM, and on File → Exit — and a false return aborts the operation.
+    ///
+    /// This is the hook <see cref="Restart"/> cannot be: Restart runs AFTER the load completed,
+    /// when the old core is already disposed, so a teardown from there is feeling around a corpse
+    /// (see the pre-join note below). Here the old core is still alive, the session can be ended
+    /// against the emulator it belongs to, and — the part no other hook offers — the user gets to
+    /// cancel a ROM load they didn't realise would disconnect every other player.
+    ///
+    /// Config → "Supress 'Ask Save Changes'" bypasses the prompt entirely (EmuHawk answers yes for
+    /// the user), so Restart stays as the backstop and must survive running second.
+    /// </summary>
+    public override bool AskSaveChanges()
+    {
+        if (SessionMachineryIdle) return true;
+        var choice = MessageBox.Show(this,
+            _phase.IsActive
+                ? "A netplay session is running. Loading a ROM or closing EmuHawk disconnects every " +
+                  "other player.\n\nDisconnect and continue?"
+                : "A netplay connection is being set up. Loading a ROM or closing EmuHawk cancels " +
+                  "it.\n\nCancel it and continue?",
+            "BizHawk Netplay", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (choice != DialogResult.Yes) return false;
+        EndSession("ROM change or shutdown requested");
+        return true;
+    }
+
     public override void Restart()
     {
         // ROM load / tool re-init: also tear down a lobby, join, or state transfer. Those phases
         // have already paused the emulator and captured an adapter for the old core even though
         // _phase.IsActive is still false.
+        //
+        // By the time this runs the OLD core is disposed and the injected services point at the
+        // NEW one — AskSaveChanges above is where the graceful teardown happened. Anything that
+        // would touch the old core from here is dropped first: the pre-join state belongs to a
+        // dead emulator, and restoring it into the new one would be wrong even where it didn't
+        // crash (on a waterbox core, LoadStateBinary into a disposed host is a native access
+        // violation, which no catch on this side survives).
+        _preJoinRestoreState = null;
         EndSession("emulator restarted");
         // Invalidate the cached probe depth — the core/ROM may have changed, and a stale (deeper)
         // measurement from a lighter core could wrongly grant rollback to a heavier one.

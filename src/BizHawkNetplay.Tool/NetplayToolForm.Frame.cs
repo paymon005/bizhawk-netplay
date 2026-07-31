@@ -97,8 +97,18 @@ public sealed partial class NetplayToolForm
     /// </summary>
     public override void UpdateValues(ToolFormUpdateType type)
     {
-        _emuLoopCallsWindow++;
         base.UpdateValues(type);
+
+        // Reassert on EVERY delivery, then treat only General as the clock. This method is not
+        // called solely from the run loop's once-per-iteration spot: MainForm also delivers
+        // PostFrame after a savestate load, and once per loop iteration while the Rewind hotkey is
+        // held — a path that additionally suspends the pause throttle, so treating those as
+        // fine-clock ticks meant a held hotkey double-ticked the frame loop at an unthrottled
+        // rate. The reassertion stays unconditional because every delivery point sits just before
+        // somewhere the emulator could step.
+        if (_pausedByUs) ReassertPause();
+        if (type != ToolFormUpdateType.General) return;
+        _emuLoopCallsWindow++;
 
         // This is the frame clock. EmuHawk calls it once per iteration of the loop that owns the UI
         // thread, so nothing we could install can fire between two iterations of the loop we are
@@ -113,12 +123,8 @@ public sealed partial class NetplayToolForm
         // That makes it comparable in RATE to the WM_TIMER fallback, not thirty times better. Its
         // advantage is placement, not frequency: it runs inside EmuHawk's loop immediately before
         // StepRunLoop_Core, rather than as a separate message subject to coalescing — which is also
-        // why the pause reassertion below has to happen here.
-        // Before BOTH guards below. EmuHawk runs StepRunLoop_Core immediately after this callback,
-        // so any iteration that returns without reasserting leaves a window for its loop to step the
-        // core — and that applies from the moment we take the clock at the lobby, not only once a
-        // session is running. _pausedByUs is the ownership flag, not _phase.IsActive.
-        if (_pausedByUs) ReassertPause();
+        // why the pause reassertion above happens on every delivery, from the moment we take the
+        // clock at the lobby (_pausedByUs is the ownership flag, not _phase.IsActive).
         if (!_phase.IsActive || _driver == null) return;
         double nowMs = _paceClock.Elapsed.TotalMilliseconds;
         if (!_schedule.ShouldWake(nowMs, FineClockWakeMarginMs)) return;

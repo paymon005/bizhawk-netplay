@@ -44,7 +44,7 @@ public sealed partial class NetplayToolForm
             return;
         }
 
-        WarnSessionHazards(); // non-blocking heads-up about movies/TAStudio/Lua
+        if (SessionHazardsBlockStart()) return; // active movie refuses; Lua only warns
 
         try
         {

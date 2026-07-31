@@ -21,7 +21,7 @@ public sealed partial class NetplayToolForm
 
         StartLogFile(); // from here on there is something worth keeping a file of
 
-        WarnSessionHazards(); // non-blocking heads-up about movies/TAStudio/Lua
+        if (SessionHazardsBlockStart()) return; // active movie refuses; Lua only warns
 
         try
         {

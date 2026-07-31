@@ -487,16 +487,23 @@ public sealed partial class NetplayToolForm
         Status("Idle.", Color.DimGray);
     }
 
+    /// <summary>
+    /// Nothing to tear down: no session, no lobby, no in-flight join, no held ownership.
+    ///
+    /// Ownership is in this list because it is not implied by owning a socket — it is taken at the
+    /// first pause, before the listener or transport exists, so leaving it out could strand the
+    /// frame advance blocked with nothing left to explain why. Shared by EndSession's fast path and
+    /// by AskSaveChanges' should-I-even-prompt check, so the two can never disagree about what
+    /// counts as "something is going on".
+    /// </summary>
+    private bool SessionMachineryIdle =>
+        !_phase.IsActive && _listener == null && _joiningTcp == null && _greetingTcp == null
+        && _peers.Count == 0 && _retiredLinks.Count == 0 && !_hostOwnershipHeld && !_pausedByUs
+        && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null;
+
     private void EndSession(string reason)
     {
-        // Ownership is in this guard because it is no longer implied by owning a socket. It is taken
-        // at the first pause, before the listener or transport exists, so a fast-path return here
-        // could leave the frame advance blocked and the frontend commands refused with nothing left
-        // to explain why.
-        if (!_phase.IsActive && _listener == null && _joiningTcp == null && _greetingTcp == null
-            && _peers.Count == 0 && _retiredLinks.Count == 0 && !_hostOwnershipHeld && !_pausedByUs
-            && !HasHandshakeClients() && _transport == null && _preJoinRestoreState == null)
-        { SetBusy(false); return; }
+        if (SessionMachineryIdle) { SetBusy(false); return; }
         bool wasActive = _phase.IsActive;
         StopFramePacing();
 
