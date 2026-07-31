@@ -16,6 +16,7 @@ public sealed partial class NetplayToolForm
     private Label _punchInstructions = null!;
     private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
     private readonly ToolTip _tips = new(); // owns a native window — disposed with the form
+    private CheckBox _unpausedClockCheck = null!;
     private CheckBox _verboseCheck = null!;
 
     // ------------------------------------------------------------------ persisted settings
@@ -360,6 +361,22 @@ public sealed partial class NetplayToolForm
         // where the present is genuinely load-bearing — so ticking it had stopped being a diagnostic
         // and become a way to freeze the picture.
 
+        // Experimental: while a session runs, keep EmuHawk UNPAUSED with only BlockFrameAdvance
+        // standing between its loop and the core. On the other side of the pause branch in
+        // Throttle.Step — which is an unconditional Thread.Sleep(15), the ~66Hz ceiling on the
+        // session's frame clock — sits SpeedThrottle: a phase-locked, drift-corrected wait derived
+        // from the core's own vsync rate. If it works, judder collapses; if a frame is ever stolen,
+        // the drift check ends the session by name. Off by default until measured in real play.
+        _unpausedClockCheck = new CheckBox
+        {
+            Text = "Unpaused clock (experimental)", AutoSize = true, Location = new Point(200, 160),
+        };
+        _tips.SetToolTip(_unpausedClockCheck,
+            "Experimental. Runs the session with EmuHawk unpaused (frame stepping still belongs to\r\n" +
+            "netplay via BlockFrameAdvance), which swaps the paused loop's coarse 15ms sleep for\r\n" +
+            "EmuHawk's own phase-locked frame clock. Watch 'judder' and 'gap' in the pacing line.\r\n" +
+            "Read at session start; toggling mid-session does nothing until the next session.");
+
         var simLatencyLabel = new Label { Text = "Sim latency ms:", AutoSize = true, Location = new Point(12, 132) };
         _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(110, 130), Width = 60 };
         _simUnresponsiveCheck = new CheckBox { Text = "Simulate unresponsive (diag)", AutoSize = true, Location = new Point(12, 160) };
@@ -375,7 +392,7 @@ public sealed partial class NetplayToolForm
         page.Controls.AddRange(
         [
             _probeButton, _testInputButton, _analogWatchButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
-            simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck,
+            simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _unpausedClockCheck,
         ]);
         return page;
     }

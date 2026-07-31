@@ -292,6 +292,7 @@ public sealed partial class NetplayToolForm
         _sessionDriverPrepared = false;
         _phase.Start(); // GO: active, not rebuilding, nobody's seat empty
         _preJoinRestoreState = null; // GO committed the imported baseline
+        EngageUnpausedClock(); // experimental opt-in; after _phase.Start so ReassertPause agrees
 
         // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
         // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
