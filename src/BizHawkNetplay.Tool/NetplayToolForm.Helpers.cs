@@ -65,6 +65,7 @@ public sealed partial class NetplayToolForm
                 // reason to skip it — which is what the earlier ordering did.
                 try { _prevBlockFrameAdvance = MainForm.BlockFrameAdvance; MainForm.BlockFrameAdvance = true; }
                 catch (Exception ex) { Log("(note) could not block EmuHawk's frame advance: " + ex.Message); }
+                SubscribeHostCommandEvents(); // Quick Load refused, any other load ends the session
 
                 _config = (APIs.Emulation as EmulationApi)?.ForbiddenConfigReference;
                 // Rewind rewrites the frame counter the whole timeline is indexed by, and a lobby
@@ -92,6 +93,7 @@ public sealed partial class NetplayToolForm
                 // rest of the EmuHawk run. Separate try blocks for the same reason: one failed
                 // restoration must not skip the others.
                 _hostOwnershipHeld = false;
+                UnsubscribeHostCommandEvents();
                 try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
                 try { APIs.EmuClient.EnableRewind(_prevRewindEnabled); } catch { }
                 if (_config != null)

@@ -1,4 +1,6 @@
+using System;
 using System.Drawing;
+using BizHawk.Client.Common;
 using BizHawk.Client.EmuHawk;
 
 namespace BizHawkNetplay.Tool;
@@ -49,24 +51,27 @@ public sealed partial class NetplayToolForm : IControlMainform
                 "state under every other player. Disconnect first.", Color.DarkOrange);
     }
 
-    // --- savestates: deliberately NOT claimed ----------------------------------------------------
+    // --- savestates: not claimed here; handled by events instead ---------------------------------
     //
-    // Saving a state is harmless — it reads the core out, it does not replace it — and it is worth
-    // being able to do mid-session. Loading one is the hazard. But WantsToControlSavestates is a
-    // single switch over both, and claiming it means MainForm calls the tool and then RETURNS: for
-    // saves it does no work at all ("assume success by the tool", MainForm.cs:4167 and 4238), and
-    // IMainFormForTools exposes no save method a tool could call to do the work itself. So the only
-    // ways to permit saving are to fake it — which cannot honour the quick-slot the user actually
-    // pressed — or to not claim. Not claiming is the honest one.
+    // WantsToControlSavestates is a single switch over saving AND loading, and saving is worth
+    // keeping. Claiming it would also stop saves dead: MainForm calls the tool and RETURNS, doing no
+    // work at all for a save ("assume success by the tool", MainForm.cs:4167 and 4238), and
+    // IMainFormForTools exposes no save method a tool could call to do it instead.
     //
-    // What that gives up is prevention of load-state, not detection of it. A load moves the core's
-    // frame counter, and FrameTick already compares that counter against the driver's every tick:
-    // it ends the session naming the cause ("the core's frame count jumped back N — a rewind/
-    // load-state hotkey fired?") rather than letting it become a mystery desync. Rewind and reboot
-    // stay claimed below, since those are separate switches and neither is wanted mid-session.
+    // BizHawk splits what this interface does not. BeforeQuickLoad is cancellable and fires BEFORE
+    // MainForm touches the slot, the file, or the controlling tool (MainForm.cs:4137-4143), and
+    // BeforeQuickSave is a separate event we never touch — so Quick Load refuses while Quick Save
+    // stays completely normal. StateLoaded then catches every load that did happen, by any route.
+    // See SubscribeHostCommandEvents.
     //
-    // Every member here is therefore unreachable while the property is false. They exist because
-    // the interface requires them.
+    // That matters beyond tidiness: the frame-drift check in FrameTick can only see a load that
+    // MOVED the frame counter. A state captured at the frame we are already on, with different
+    // contents, passes it — and would then wait up to a full checksum interval to be caught as a
+    // desync. StateLoaded fires on the load itself, so the frame number is irrelevant. The drift
+    // check stays as the second line, for anything that moves the counter without an event.
+    //
+    // Every member below is unreachable while the property is false. They exist because the
+    // interface requires them.
 
     public bool WantsToControlSavestates => false;
 
@@ -130,4 +135,67 @@ public sealed partial class NetplayToolForm : IControlMainform
     public bool RestartMovie() => false;
 
     public bool WantsToBypassMovieEndAction => false;
+
+    // --- savestate events ------------------------------------------------------------------------
+
+    /// <summary>
+    /// Hook Quick Load and state-loaded for as long as ownership is held.
+    ///
+    /// Subscribed on acquire and dropped on release rather than once for the tool's lifetime, which
+    /// avoids two problems at once. The API container is not injected until AFTER construction, so
+    /// there is nothing to subscribe to in the constructor; and a ROM load REPLACES it — ToolManager
+    /// nulls its provider, re-injects, and only then calls Restart — so a subscription taken once
+    /// would be left attached to a dead EmuClientApi with nothing hooked to the live one. Acquiring
+    /// per session sidesteps both, because a session always starts after injection.
+    ///
+    /// The <c>-=</c> before each <c>+=</c> makes it idempotent regardless.
+    /// </summary>
+    private void SubscribeHostCommandEvents()
+    {
+        try
+        {
+            var client = APIs.EmuClient;
+            client.BeforeQuickLoad -= OnBeforeQuickLoad;
+            client.BeforeQuickLoad += OnBeforeQuickLoad;
+            client.StateLoaded -= OnStateLoaded;
+            client.StateLoaded += OnStateLoaded;
+        }
+        catch (Exception ex) { Log("(note) could not hook savestate events: " + ex.Message); }
+    }
+
+    private void UnsubscribeHostCommandEvents()
+    {
+        try
+        {
+            var client = APIs.EmuClient;
+            client.BeforeQuickLoad -= OnBeforeQuickLoad;
+            client.StateLoaded -= OnStateLoaded;
+        }
+        catch { /* container already gone (ROM swap, shutdown) — the old one is garbage anyway */ }
+    }
+
+    /// <summary>Refuse the load before MainForm acts on it. Quick SAVE is a different event we do
+    /// not subscribe to, so it is unaffected.</summary>
+    private void OnBeforeQuickLoad(object sender, BeforeQuickLoadEventArgs e)
+    {
+        if (!_hostOwnershipHeld) return;
+        e.Handled = true;
+        RefuseHostCommand($"Quick Load ({e.Name})");
+    }
+
+    /// <summary>
+    /// A state was loaded by some route we do not intercept — the menu, Load State As, a drag-drop.
+    /// End the session on the load itself rather than waiting for a symptom: this machine is now
+    /// playing a different game from everyone else, and unlike the frame-drift check this does not
+    /// depend on the frame number having changed.
+    ///
+    /// Our own state work never reaches here: the probe and the adapter go through
+    /// IMemorySaveStateApi and IStatable, straight to the core, never through MainForm.LoadState.
+    /// </summary>
+    private void OnStateLoaded(object sender, StateLoadedEventArgs e)
+    {
+        if (!_hostOwnershipHeld) return;
+        EndSession($"a savestate was loaded ('{e.Name}') — this machine's timeline no longer matches " +
+                   "the other players'. Saving during a session is fine; loading is not.");
+    }
 }
