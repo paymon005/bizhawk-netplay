@@ -27,8 +27,9 @@ Requires **BizHawk 2.11.x** (the .NET Framework 4.8 build) on Windows. Both play
 > mesh edge before choosing input delay, the host can change netcode or delay mid-session, and every
 > savestate transfer (the initial join, a resync, a rejoin, a settings change) is deflated on the wire
 > instead of being sent raw. A v0.20.0 peer and a v0.21.0 peer will refuse each other at the
-> handshake, which is the intended behaviour rather than a fault. **v0.22.0 keeps protocol 13** and
-> touches no wire code at all, so it mixes freely with v0.21.0 — update whenever suits you.
+> handshake, which is the intended behaviour rather than a fault. **v0.22.0 and v0.23.0 keep protocol
+> 13**, so anything from v0.21.0 onward mixes freely — update whenever suits you. v0.23.0 adds host
+> relaying, which changes only what the host chooses to forward, not the format of anything on the wire.
 
 ## Status
 
@@ -51,6 +52,8 @@ Targets **BizHawk 2.11.x** (.NET Framework 4.8 build). Current progress:
 | **Host integration & compression** (v0.21.0) | ✅ The session now owns the emulator through BizHawk's own seams, from the moment the lobby opens rather than from GO: `BlockFrameAdvance` stops EmuHawk's run loop stepping the core, `IControlMainform` refuses Rewind and Reboot, and `BeforeQuickLoad` refuses Quick Load while leaving **Quick Save working normally**; any other load ends the session on the load itself. Pause, rewind and run-in-background are snapshotted and restored exactly as found. Axes rest at each axis's own Neutral (not 0), the "My controls" remap compares control *names* rather than counts, and audio finally honours the volume slider and mute. Every savestate transfer is deflated on the wire. CI builds the shipping DLL against a hash-pinned BizHawk 2.11.1. **Protocol v13 — everyone must update.** |
 
 | **Input & host commands** (v0.22.0) | ✅ **The tool window no longer steals your controller.** BizHawk refuses host input outright while an external tool has focus (`IExternalToolForm => AllowInput.None`), so clicking this window mid-game stopped your pad — fixed the way TAStudio does it, conditionally, so typing an IP still goes only to the box. Input capture now reads `Joypad.Get`, the end of EmuHawk's own controller chain, instead of re-deriving the bind maths here. A **host loading a savestate now takes every player with it** — the same resync a desync recovery uses — while a joiner's load is refused. Plus **Watch Analog**, which reports every distinct value a stick actually delivers to the core. *Protocol unchanged — mixes with v0.21.0 peers.* |
+
+| **Audio & mesh relay** (v0.23.0) | ✅ **Opening Config → Sound no longer kills audio for the rest of the session** — the dialog re-attaches EmuHawk's own provider (and may replace the `Sound` object outright), which then fought the session for the device at zero volume; ownership is now re-taken before every pump. Master mute works too, which it never had. Where a **joiner↔joiner UDP leg fails to open**, the host relays that leg rather than the pair simply never hearing each other — no external server, since the host is already the rendezvous. It cannot help a peer whose leg to the *host* also failed (true symmetric NAT), and now says so loudly instead of relaying into a void. *Protocol unchanged — mixes with v0.21.0+.* |
 
 ### M0 findings (Genesis / GPGX, Contra Hard Corps)
 
