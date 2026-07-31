@@ -91,8 +91,6 @@ public interface IEmuAdapter
 
     // --- Frame control ------------------------------------------------------------
 
-    void SetPaused(bool paused);
-
     /// <summary>
     /// Advance <paramref name="count"/> frames without presenting video, sourcing each
     /// frame's inputs from <paramref name="inputsFor"/> (called with the relative index).
@@ -116,8 +114,6 @@ public interface IEmuAdapter
     /// and the point of measuring both is that the answer is now read rather than assumed.
     /// </summary>
     void AdvanceRenderedFrame(InputSet inputs);
-
-    void SetAudioMuted(bool muted);
 
     // --- Integrity ----------------------------------------------------------------
 

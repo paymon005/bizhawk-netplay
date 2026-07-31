@@ -25,7 +25,7 @@ public sealed partial class NetplayToolForm
 
         try
         {
-            _adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
+            _adapter = new EmuHawkAdapter(APIs, _emulator, _statable, Config, MovieSession);
             _adapter.InputSourcePort = InputSourceFromCombo(); // read your normal pad, whatever port you're assigned
             if (!_adapter.VerifyDeterministicMode())
                 Log("WARNING: core does not report deterministic emulation — desyncs are likely.");

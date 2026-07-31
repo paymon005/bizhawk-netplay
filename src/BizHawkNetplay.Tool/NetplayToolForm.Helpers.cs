@@ -68,7 +68,9 @@ public sealed partial class NetplayToolForm
                 catch (Exception ex) { Log("(note) could not block EmuHawk's frame advance: " + ex.Message); }
                 SubscribeHostCommandEvents(); // Quick Load refused, any other load ends the session
 
-                _config = (APIs.Emulation as EmulationApi)?.ForbiddenConfigReference;
+                // FormBase.Config is the supported route (ToolManager sets it before the form is
+                // shown); the forbidden reference stays as a fallback that should never be needed.
+                _config = Config ?? (APIs.Emulation as EmulationApi)?.ForbiddenConfigReference;
                 // Rewind rewrites the frame counter the whole timeline is indexed by, and a lobby
                 // baseline is every bit as rewindable as a running session. Snapshot what teardown
                 // should restore — the RUNTIME state, not the config flag: EnableRewind suspends

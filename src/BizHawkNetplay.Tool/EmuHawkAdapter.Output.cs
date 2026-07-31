@@ -45,17 +45,6 @@ internal sealed partial class EmuHawkAdapter
     private string _audioSyncErr = "";
 
     /// <summary>
-    /// Move the samples the core just produced into our ring buffer.
-    ///
-    /// EmuHawk's audio device pulls from that ring at the steady real-time rate
-    /// (<see cref="PumpAudio"/>), so the ring absorbs the mismatch between this bursty manual
-    /// stepping and smooth playback. Producing here and consuming there is what keeps audio clean
-    /// despite a coarse frame clock.
-    ///
-    /// Drained in whichever mode the core actually reports: a sync-only drain of an async core gets
-    /// nothing, which is audible as silence rather than as an error.
-    /// </summary>
-    /// <summary>
     /// Empty the core's sound provider without keeping anything. Resolves the provider itself so it
     /// works whether or not <see cref="EnableAudio"/> ever ran — the whole point is the sessions
     /// where it didn't. DiscardSamples is determinism-safe: the sample clocks it resets are pure
@@ -71,6 +60,17 @@ internal sealed partial class EmuHawkAdapter
         catch { /* audio must never break emulation */ }
     }
 
+    /// <summary>
+    /// Move the samples the core just produced into our ring buffer.
+    ///
+    /// EmuHawk's audio device pulls from that ring at the steady real-time rate
+    /// (<see cref="PumpAudio"/>), so the ring absorbs the mismatch between this bursty manual
+    /// stepping and smooth playback. Producing here and consuming there is what keeps audio clean
+    /// despite a coarse frame clock.
+    ///
+    /// Drained in whichever mode the core actually reports: a sync-only drain of an async core gets
+    /// nothing, which is audible as silence rather than as an error.
+    /// </summary>
     private void DrainCoreAudio()
     {
         // A session without working audio still has to EMPTY the core. Skipping the drain entirely
@@ -118,9 +118,14 @@ internal sealed partial class EmuHawkAdapter
         var snd = _sound;
         if (dev == null || snd == null || _soundBuffer == null) return;
 
-        // EmuHawk disposes and recreates its audio device across a window minimize/restore
-        // (Sound.StopSound/StartSound). While it's stopped, skip — do NOT give up permanently, or
-        // audio would stay dead until a reconnect. When EmuHawk restarts the device we resume.
+        // EmuHawk stops (and sometimes recreates) its audio device on several UI paths — the
+        // window RESIZE/MOVE loop (ResizeBegin/ResizeEnd), the mute hotkey, Config → Sound OK —
+        // not, as this comment used to claim, minimize/restore. While it's stopped, skip — do NOT
+        // give up permanently, or audio would stay dead until a reconnect. When EmuHawk restarts
+        // the device we resume. Known interplay, accepted: during a title-bar drag the modal
+        // move/size loop still dispatches WM_TIMER, so the revival below re-arms the device the
+        // resize mute just stopped; the drag also freezes EmuHawk's input latch, so frames advance
+        // on stale input for its duration either way.
         if (!snd.IsStarted)
         {
             // Keep draining anyway. This pump is the ring's only consumer, so standing still
@@ -339,8 +344,14 @@ internal sealed partial class EmuHawkAdapter
     private void UpdatePeak(short[] buf, int shorts)
     {
         if (buf == null) return;
+        // Every 16th sample, not every sample. This answers exactly one question — "is the core
+        // producing sound at all" — for a diagnostic printed once at frame 120 and then only under
+        // Verbose. Scanning all ~1,470 shorts of every frame for that was ~88,000 compares a
+        // second inside the frame step, billed to coreMs; a 16-stride still cannot miss real audio
+        // (any tone spans hundreds of consecutive samples) and only mis-reports the exact peak,
+        // which nothing consumes as a number.
         int n = Math.Min(shorts, buf.Length);
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i += 16)
         {
             int a = buf[i]; if (a < 0) a = -a;
             if (a > _audioPeak) _audioPeak = a;
@@ -396,7 +407,7 @@ internal sealed partial class EmuHawkAdapter
             if (mainForm == null) { AudioDiagnostic = "no MainForm reference"; return; }
             _mainForm = mainForm;
 
-            // MainForm.Sound is a public type but has a private getter, so reflect it once up front.
+            // MainForm.Sound is a PRIVATE property (the type Sound is public), so reflect it once.
             var prop = typeof(BizHawk.Client.EmuHawk.MainForm)
                 .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             _sound = prop?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;

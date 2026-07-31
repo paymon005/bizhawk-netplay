@@ -90,8 +90,14 @@ internal sealed partial class EmuHawkAdapter
     /// </summary>
     private IController? MovieInController
     {
-        get { try { return _mainForm?.MovieSession?.MovieIn; } catch { return null; } }
+        get
+        {
+            try { return (_movieSession ?? _mainForm?.MovieSession)?.MovieIn; }
+            catch { return null; }
+        }
     }
+
+    private readonly IMovieSession? _movieSession;
 
     private ControllerDefinition? _movieInDefinition;
     private bool[]? _movieInCoversPort;
@@ -317,15 +323,10 @@ internal sealed partial class EmuHawkAdapter
     /// </summary>
     private bool ReadCircularAnalogConstraintSetting()
     {
-        try
-        {
-            var config = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference;
-            if (config == null) return true;
-            var prop = config.GetType().GetProperty("N64UseCircularAnalogConstraint");
-            if (prop?.GetValue(config) is bool b) return b;
-        }
-        catch { }
-        return true;
+        // A plain public property on a type this project references directly — the reflection this
+        // used to do was left over from before Config was in reach at construction time.
+        try { return _hostConfig?.N64UseCircularAnalogConstraint ?? true; }
+        catch { return true; }
     }
 
     /// <summary>

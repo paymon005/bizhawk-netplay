@@ -26,6 +26,10 @@ namespace BizHawkNetplay.Tool;
 /// </summary>
 [ExternalTool("BizHawk Netplay",
     Description = "2-player lockstep netplay over direct IP.")]
+// Grey the menu entry out until a ROM is loaded: every entry point here needs a core
+// (PortCountOf, ControllerDefinition, IStatable), and against the NullEmulator they are all
+// meaningless. Menu-only — a ROM closed under an OPEN tool still goes through Restart().
+[ExternalToolApplicability.AnyRomLoaded]
 public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 {
     // v11 changes what the advertised rollback depth MEANS (measured against the model the session

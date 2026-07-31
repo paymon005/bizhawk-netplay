@@ -51,11 +51,20 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     private bool _domainBulkCapable;
     private Type? _domainAccessResolvedFor;   // domain type the three fields above describe
 
-    public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
+    public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable,
+        Config? config = null, IMovieSession? movieSession = null)
     {
         _apis = apis ?? throw new ArgumentNullException(nameof(apis));
         _emulator = emulator ?? throw new ArgumentNullException(nameof(emulator));
         _statable = statable ?? throw new ArgumentNullException(nameof(statable));
+        // The tool passes its FormBase.Config and ToolFormBase.MovieSession — the supported route,
+        // both set by ToolManager before the form is even shown. The config falls back to
+        // EmulationApi.ForbiddenConfigReference (whose name is the API's own comment on being used
+        // that way); the movie session falls back to MainForm when AttachMainForm runs. Getting the
+        // session at construction matters for input: without it, capture silently took the
+        // allocating dictionary path until the audio path happened to hand MainForm over.
+        _hostConfig = config;
+        _movieSession = movieSession;
         _layouts = BuildLayouts(emulator.ControllerDefinition);
         _bindings = BuildBindings();
         _analogBinds = BuildAnalogBinds();
@@ -68,7 +77,8 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
             _padButtonKeys[p] = _layouts[p].Buttons.Select(StripPortPrefix).ToArray();
             _padAxisKeys[p] = _layouts[p].Axes.Select(a => StripPortPrefix(a.Name)).ToArray();
         }
-        try { _hostConfig = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference; } catch { }
+        if (_hostConfig == null)
+            try { _hostConfig = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference; } catch { }
         _useCircularAnalogConstraint = ReadCircularAnalogConstraintSetting();
     }
 
@@ -106,14 +116,6 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         _emulator.FrameAdvance(Controller(inputs), render: renderVideo, renderSound: true);
         DrainCoreAudio();
     }
-
-    public void SetPaused(bool paused)
-    {
-        if (paused) _apis.EmuClient.Pause();
-        else _apis.EmuClient.Unpause();
-    }
-
-    public void SetAudioMuted(bool muted) => _apis.EmuClient.SetSoundOn(!muted);
 
     public void RunFramesInvisible(int count, Func<int, InputSet> inputsFor)
     {
@@ -238,7 +240,10 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     public void ImportState(byte[] state)
     {
         using var ms = new MemoryStream(state);
-        using var br = new BinaryReader(ms);
+        // Same encoding as ExportState's writer, for symmetry's sake. Byte-compatible either way —
+        // BinaryReader/Writer never emit or consume a preamble; encoding only affects Write(string),
+        // which no core uses — but matching removes the question.
+        using var br = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
         _statable.LoadStateBinary(br);
     }
 

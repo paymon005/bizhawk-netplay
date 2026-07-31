@@ -158,8 +158,6 @@ public sealed class FakeEmuAdapter : IEmuAdapter
         Buffer.BlockCopy(state, 4, _memory, 0, _memory.Length);
     }
 
-    public void SetPaused(bool paused) { }
-    public void SetAudioMuted(bool muted) { }
 
     /// <summary>Counted separately so a test can prove the probe times a rendered frame at all;
     /// there is nothing to render here, so it costs whatever the scripted clock says.</summary>

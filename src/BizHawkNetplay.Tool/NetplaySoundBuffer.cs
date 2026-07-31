@@ -4,20 +4,18 @@ using BizHawk.Emulation.Common;
 namespace BizHawkNetplay.Tool;
 
 /// <summary>
-/// An async <see cref="ISoundProvider"/> backed by a ring buffer we fill ourselves. It exists to
-/// smooth audio while we step the core manually.
+/// The ring buffer between our bursty manual frame stepping and the audio device's steady
+/// real-time pull. Producer: <c>DrainCoreAudio</c> enqueues right after each manual FrameAdvance
+/// with whatever the core just generated. Consumer: <c>PumpAudio</c> reads at the device's own
+/// rate and writes to it directly. The ring absorbs the mismatch; a small standing prime of
+/// silence covers pump jitter without much added latency.
 ///
-/// We hold EmuHawk paused and advance frames from a WinForms timer, which fires coarsely and
-/// irregularly (WM_TIMER is ~15 ms and coalesced). EmuHawk's normal *sync* sound path resamples
-/// the core's audio on the assumption of steady once-per-frame pumping, so irregular pumping makes
-/// it warble/discard samples (quiet, crackly). Reporting <see cref="SyncSoundMode.Async"/> instead
-/// routes <c>Sound.SetInputPin</c> to the buffered-async path, which simply tops up the audio
-/// device from a queue — no resampling, no <c>Thread.Sleep</c>, tolerant of jitter.
-///
-/// Producer: <see cref="Enqueue"/> is called right after each manual FrameAdvance with the samples
-/// the core just generated (bursty, tied to our stepping). Consumer: EmuHawk's device pulls via
-/// <see cref="GetSamplesAsync"/> at the steady real-time playback rate. The ring absorbs the
-/// difference; a small standing prime of silence covers pump jitter without much added latency.
+/// Historical note, because the shape is otherwise puzzling: this used to be attached as
+/// EmuHawk's <c>Sound</c> input pin (hence <see cref="ISoundProvider"/> and
+/// <see cref="GetSamplesAsync"/>, which the interface requires). That cannot work while the tool
+/// owns stepping — EmuHawk's own <c>UpdateSound</c> runs at attenuation 0 the whole time and
+/// would discard the ring and flood the device with silence — so the pin is detached and
+/// <c>PumpAudio</c> drives the device itself through <see cref="Read"/>.
 /// </summary>
 internal sealed class NetplaySoundBuffer : ISoundProvider
 {
@@ -103,7 +101,11 @@ internal sealed class NetplaySoundBuffer : ISoundProvider
             if (firstRun < give) Array.Copy(_ring, 0, dest, firstRun, give - firstRun);
             _read = Advance(_read, give);
             _count -= give;
-            for (int i = give; i < count && i < dest.Length; i++) dest[i] = 0;
+            // Block clear, same reason the copies above stopped being per-sample loops: this runs
+            // under the lock the frame thread's Enqueue also wants, and it runs exactly when audio
+            // is already in trouble (an underrun) — the worst moment to hold the lock longer.
+            int padEnd = Math.Min(count, dest.Length);
+            if (padEnd > give) Array.Clear(dest, give, padEnd - give);
         }
     }
 

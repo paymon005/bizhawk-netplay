@@ -1,9 +1,9 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Session;
 
 namespace BizHawkNetplay.Tool;
@@ -24,15 +24,18 @@ internal sealed partial class EmuHawkAdapter
     {
         get
         {
-            // Prefer the core's [Core] attribute name; fall back to the emulator type name.
-            var attr = _emulator.GetType()
-                .GetCustomAttributes(true)
-                .FirstOrDefault(a => a.GetType().Name == "CoreAttribute");
-            if (attr != null)
+            // The core's [Core] attribute name via BizHawk's own extension; fall back to the
+            // emulator type name. The previous reflection here never matched anything: it looked
+            // for a "Name" or "CoreName" PROPERTY (CoreName is a field), and its type-name test
+            // missed PortedCoreAttribute, which every ported core uses — so every peer was
+            // comparing CLR type names. Benign, since both peers degraded identically, but the
+            // diagnostics named the wrong thing.
+            try
             {
-                var nameProp = attr.GetType().GetProperty("Name") ?? attr.GetType().GetProperty("CoreName");
-                if (nameProp?.GetValue(attr) is string s && s.Length > 0) return s;
+                var name = _emulator.Attributes()?.CoreName;
+                if (!string.IsNullOrEmpty(name)) return name!;
             }
+            catch { /* fall through to the type name */ }
             return _emulator.GetType().Name;
         }
     }
@@ -125,15 +128,23 @@ internal sealed partial class EmuHawkAdapter
     /// both-peers-symmetric source) rather than the config dict, so a value the user just changed and a
     /// value loaded from disk can't serialize differently for the same logical settings.
     /// </summary>
+    /// <summary>
+    /// BizHawk's own shim for exactly this job, constructed read-only (every put callback refuses).
+    /// Replaces a hand-rolled GetInterfaces walk that missed what the shim gets right: it resolves
+    /// ISettable off the service provider, and it knows that <c>object</c> as a type argument is
+    /// the "this half doesn't exist" placeholder — the old walk would happily have serialized a
+    /// bare object as a core's settings.
+    /// </summary>
+    private SettingsAdapter ReadOnlySettings() =>
+        new(_emulator, () => false, _ => { }, () => false, _ => { });
+
     private string SyncSettingsBlob()
     {
         try
         {
-            var settable = _emulator.GetType().GetInterfaces().FirstOrDefault(i =>
-                i.IsGenericType && i.GetGenericTypeDefinition().FullName == "BizHawk.Emulation.Common.ISettable`2");
-            var syncSettings = settable?.GetMethod("GetSyncSettings")?.Invoke(_emulator, null);
-            if (syncSettings == null) return "";
-            return Newtonsoft.Json.JsonConvert.SerializeObject(syncSettings);
+            var settings = ReadOnlySettings();
+            if (!settings.HasSyncSettings) return "";
+            return Newtonsoft.Json.JsonConvert.SerializeObject(settings.GetSyncSettings());
         }
         catch { return ""; } // never let a settings read break the handshake — fall back to the coarse digest
     }
@@ -158,16 +169,15 @@ internal sealed partial class EmuHawkAdapter
     {
         try
         {
-            var settable = _emulator.GetType().GetInterfaces().FirstOrDefault(i =>
-                i.IsGenericType && i.GetGenericTypeDefinition().FullName == "BizHawk.Emulation.Common.ISettable`2");
-            var settings = settable?.GetMethod("GetSettings")?.Invoke(_emulator, null);
+            var adapter = ReadOnlySettings();
+            var settings = adapter.HasSettings ? adapter.GetSettings() : null;
             if (settings == null) return null;
 
             var x = MemberValue(settings, "VideoSizeX");
             var y = MemberValue(settings, "VideoSizeY");
             if (x == null || y == null) return null;
 
-            var sync = settable!.GetMethod("GetSyncSettings")?.Invoke(_emulator, null);
+            var sync = adapter.HasSyncSettings ? adapter.GetSyncSettings() : null;
             var plugin = sync == null ? null : MemberValue(sync, "VideoPlugin");
             if (plugin == null) return $"{x}x{y}";
 

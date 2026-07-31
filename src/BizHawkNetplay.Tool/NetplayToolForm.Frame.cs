@@ -276,7 +276,9 @@ public sealed partial class NetplayToolForm
 
             // If EmuHawk's own loop slipped in extra core frames (e.g. a brief unpause), our
             // counter and the core have diverged — report it plainly rather than as a desync.
-            int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
+            // _emulator.Frame directly: FrameCount() is exactly that field behind two interface
+            // hops, and this runs per tick — the emuapi timing column should measure real work.
+            int emuDelta = _emulator!.Frame - _startEmuFrame;
             emuApiMs = ElapsedMs(tickStart) - apiStart;
             if (emuDelta != driver.CurrentFrame)
             {
@@ -424,6 +426,15 @@ public sealed partial class NetplayToolForm
                     _fpsCount++;
                 }
             }
+            // A commitment the loop can break, named so nobody has to rediscover it: the first
+            // frame skips its render when a second is due, and the second may then never run —
+            // MayRunFrame can refuse, or the gate can stall. The frame is emulated with no picture,
+            // so nothing can be re-presented, and the cost is one tick showing the previous image.
+            // Accepted: it needs AnotherFrameFits to say yes and MayRunFrame to say no within one
+            // tick, and the alternative — only skipping the render once the second frame is
+            // guaranteed — would mean never skipping at all, since the gate's answer isn't known
+            // until the frame is stepped.
+            if (committedSecondFrame && Verbose) Log("catch-up burst broke off after an unrendered frame");
 
             // Exactly one tick counted per callback, so the stall rate stays a share of ticks.
             // Ticks that returned early above (frozen for a rejoin, mid-resync) are deliberately
