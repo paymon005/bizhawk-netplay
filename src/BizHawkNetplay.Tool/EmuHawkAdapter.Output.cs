@@ -55,9 +55,29 @@ internal sealed partial class EmuHawkAdapter
     /// Drained in whichever mode the core actually reports: a sync-only drain of an async core gets
     /// nothing, which is audible as silence rather than as an error.
     /// </summary>
+    /// <summary>
+    /// Empty the core's sound provider without keeping anything. Resolves the provider itself so it
+    /// works whether or not <see cref="EnableAudio"/> ever ran — the whole point is the sessions
+    /// where it didn't. DiscardSamples is determinism-safe: the sample clocks it resets are pure
+    /// output timestamps, serialized nowhere and read by nothing but the audio path.
+    /// </summary>
+    private void DiscardCoreAudio()
+    {
+        try
+        {
+            _coreSound ??= _emulator.ServiceProvider.GetService<ISoundProvider>();
+            _coreSound?.DiscardSamples();
+        }
+        catch { /* audio must never break emulation */ }
+    }
+
     private void DrainCoreAudio()
     {
-        if (!_audioReady) return;
+        // A session without working audio still has to EMPTY the core. Skipping the drain entirely
+        // left the Hawk cores' blip_buf accumulating forever — sound merely muted in EmuHawk's
+        // config was enough to reach a native out-of-bounds write within seconds of session start.
+        // See RunFramesInvisible for the chapter and verse.
+        if (!_audioReady) { DiscardCoreAudio(); return; }
         try
         {
             if (_coreSyncSound)

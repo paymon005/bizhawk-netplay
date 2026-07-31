@@ -87,12 +87,7 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     public void AdvanceRenderedFrame(InputSet inputs)
     {
         _emulator.FrameAdvance(Controller(inputs), render: true, renderSound: true);
-        try
-        {
-            _coreSound ??= _emulator.ServiceProvider.GetService<ISoundProvider>();
-            _coreSound?.DiscardSamples();
-        }
-        catch { /* a probe must never be the thing that breaks audio */ }
+        DiscardCoreAudio();
     }
 
     /// <summary>
@@ -120,7 +115,19 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     public void RunFramesInvisible(int count, Func<int, InputSet> inputsFor)
     {
         for (int i = 0; i < count; i++)
+        {
             _emulator.FrameAdvance(Controller(inputsFor(i)), render: false, renderSound: false);
+            // IEmulator's contract, verbatim: "(some?) cores expect you to call
+            // SoundProvider.GetSamples() after each FrameAdvance() ... please do this, even when
+            // renderSound = false". It is not a courtesy. The Hawk cores ignore renderSound
+            // entirely and keep pushing APU deltas into blargg's native blip_buf, whose write
+            // position only resets when samples are taken out — and whose only bounds check is a
+            // C assert compiled out of the shipped DLL. NESHawk's buffer holds ~5.6 frames, the
+            // rollback ring goes to 16, so a deep repair that skipped this wrote past the end of
+            // a native heap allocation. Discard, not drain: a repaired frame's audio was already
+            // produced by its original (predicted) run.
+            DiscardCoreAudio();
+        }
     }
 
     // --- State --------------------------------------------------------------------
