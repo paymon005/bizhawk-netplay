@@ -56,22 +56,35 @@ public sealed class FrameDriver : IDisposable
     private readonly long[] _lastRemoteInputStamp;
     private int _lastPacketsDrained;
 
-    // Rolling window of the local port's most recent serialized inputs, for redundant sends.
-    private readonly LinkedList<KeyValuePair<int, byte[]>> _sendWindow = new();
     private int _lastStamp = -1;
     private bool _started;
 
     // Longer local-input history for answering gap requests: a frame that has aged out of the
-    // redundant send window can still be re-sent from here. Keys stay contiguous because stamps
-    // are produced strictly in order. A few payload-bytes per frame — memory is negligible.
+    // redundant send window can still be re-sent from here. A few payload-bytes per frame — memory
+    // is negligible.
     private const int RetransmitKeepFrames = 240;   // ~4 s at 60 fps
     private const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
     private const long GapServeWindowMs = 50;       // serve-side budget window (see ServeGapRequest)
     private const int GapServesPerWindow = 8;
     private long _serveWindowStartMs = long.MinValue;
     private int _servesThisWindow;
-    private readonly Dictionary<int, byte[]> _sentPayloads = new();
-    private int _oldestSentPayload = -1;
+
+    /// <summary>
+    /// One contiguous ring of the local port's serialized inputs, indexed by frame.
+    ///
+    /// This replaced a LinkedList of (frame, byte[]) for the redundant window PLUS a Dictionary of
+    /// those same arrays for the longer retransmit history. Between them, every frame allocated a
+    /// payload array and a list node, and every datagram built from the window allocated a List and
+    /// its backing array and walked the linked list to fill it — five objects and three passes over
+    /// the window, sixty times a second, for bytes whose home was already decided. Serialization now
+    /// writes straight into the slot the frame will be sent from, and building a datagram is one
+    /// copy out of the ring.
+    /// </summary>
+    private readonly byte[] _sentRing;
+    private readonly int _sentRingFrames;
+    private readonly int _localPayloadSize;
+    private int _oldestSentFrame = -1;   // -1 until the first local frame is produced
+    private int _newestSentFrame = -1;
     private readonly long[] _lastGapRequestMs;
     private readonly int[] _newestRemoteFrame; // highest frame ever decoded per port (-1 = none)
     private readonly long[] _holeFirstSeenMs;  // send-clock ms when a beyond-window hole appeared (-1 = none)
@@ -173,6 +186,13 @@ public sealed class FrameDriver : IDisposable
         }
         _codec = new InputPacketCodec(payloadSizes, _generation);
         _strategy = strategyFactory(_pipeline);
+
+        // Sized to hold the retransmit history, but never fewer frames than one datagram carries —
+        // a tiny layout allows a redundant window wider than the history would otherwise keep, and
+        // the window has to be readable in one contiguous run of slots.
+        _localPayloadSize = payloadSizes[localPort];
+        _sentRingFrames = Math.Max(RetransmitKeepFrames, _redundancy);
+        _sentRing = new byte[_sentRingFrames * Math.Max(1, _localPayloadSize)];
 
         // Keep enough history to cover the delay pipeline, the redundancy window, and (for
         // rollback) the whole ring depth, so real inputs for any resimulated frame survive pruning.
@@ -438,14 +458,45 @@ public sealed class FrameDriver : IDisposable
     private void ProduceLocal(int frame, PortInput input)
     {
         _pipeline.Add(_localPort, frame, input);
-        var payload = _serializers[_localPort].Serialize(input);
-        _sendWindow.AddLast(new KeyValuePair<int, byte[]>(frame, payload));
-        while (_sendWindow.Count > _redundancy) _sendWindow.RemoveFirst();
-        _sentPayloads[frame] = payload;
-        if (_oldestSentPayload < 0) _oldestSentPayload = frame;
-        while (_oldestSentPayload <= frame - RetransmitKeepFrames)
-            _sentPayloads.Remove(_oldestSentPayload++);
+        // Straight into the ring slot this frame will be sent from — no intermediate array, and no
+        // separate copy for the retransmit history, which is the same bytes in the same place.
+        _serializers[_localPort].Serialize(input, _sentRing, SlotOffset(frame));
+        if (_oldestSentFrame < 0) _oldestSentFrame = frame;
+        _newestSentFrame = frame;
+        // The slot a new frame lands in is the one the frame RetransmitKeepFrames back used, so the
+        // history ages out by being overwritten rather than by being removed from anything.
+        if (_newestSentFrame - _oldestSentFrame >= _sentRingFrames)
+            _oldestSentFrame = _newestSentFrame - _sentRingFrames + 1;
         _lastStamp = frame;
+    }
+
+    /// <summary>Byte offset of a frame's payload within <see cref="_sentRing"/>.</summary>
+    private int SlotOffset(int frame) => (frame % _sentRingFrames) * _localPayloadSize;
+
+    /// <summary>Whether the ring still holds this frame's payload.</summary>
+    private bool HasSentFrame(int frame) =>
+        _oldestSentFrame >= 0 && frame >= _oldestSentFrame && frame <= _newestSentFrame;
+
+    /// <summary>
+    /// Build and send one input datagram covering <paramref name="count"/> frames from
+    /// <paramref name="baseFrame"/>, copying their payloads out of the ring.
+    ///
+    /// Two copies at most: the run is contiguous in the ring unless it straddles the wrap.
+    /// </summary>
+    private void SendFrames(int baseFrame, int count)
+    {
+        if (count <= 0 || _localPayloadSize <= 0) return;
+        var datagram = _codec.BeginInputDatagram((byte)_localPort, baseFrame, count, out int offset);
+
+        int startSlot = baseFrame % _sentRingFrames;
+        int firstRun = Math.Min(count, _sentRingFrames - startSlot);
+        Buffer.BlockCopy(_sentRing, startSlot * _localPayloadSize,
+            datagram, offset, firstRun * _localPayloadSize);
+        if (firstRun < count)
+            Buffer.BlockCopy(_sentRing, 0,
+                datagram, offset + firstRun * _localPayloadSize, (count - firstRun) * _localPayloadSize);
+
+        _transport.Send(datagram);
     }
 
     /// <summary>
@@ -512,27 +563,25 @@ public sealed class FrameDriver : IDisposable
         }
         if (_servesThisWindow >= GapServesPerWindow) return;
 
-        if (!_sentPayloads.ContainsKey(fromFrame)) return; // aged out even of the long history
-        var window = new List<KeyValuePair<int, byte[]>>(_redundancy);
-        for (int f = fromFrame; f < fromFrame + _redundancy; f++)
-        {
-            if (!_sentPayloads.TryGetValue(f, out var payload)) break;
-            window.Add(new KeyValuePair<int, byte[]>(f, payload));
-        }
-        if (window.Count > 0)
+        if (!HasSentFrame(fromFrame)) return; // aged out even of the long history
+        int count = 0;
+        while (count < _redundancy && HasSentFrame(fromFrame + count)) count++;
+        if (count > 0)
         {
             _servesThisWindow++;
-            _transport.Send(_codec.EncodeInput((byte)_localPort, window));
+            SendFrames(fromFrame, count);
         }
     }
 
     private void SendWindow(bool force)
     {
-        if (_sendWindow.Count == 0) return;
+        if (_oldestSentFrame < 0) return;
         long now = _sendClock.ElapsedMilliseconds;
         if (!force && now - _lastSendMs < StallResendIntervalMs) return;
-        var window = new List<KeyValuePair<int, byte[]>>(_sendWindow);
-        _transport.Send(_codec.EncodeInput((byte)_localPort, window));
+        // The redundant window is the newest R frames the ring still holds — which is what the
+        // LinkedList was maintaining by hand, one AddLast and one RemoveFirst per frame.
+        int baseFrame = Math.Max(_oldestSentFrame, _newestSentFrame - _redundancy + 1);
+        SendFrames(baseFrame, _newestSentFrame - baseFrame + 1);
         _lastSendMs = now;
     }
 

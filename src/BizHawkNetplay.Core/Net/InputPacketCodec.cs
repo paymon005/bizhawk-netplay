@@ -148,6 +148,39 @@ public sealed class InputPacketCodec
     }
 
     /// <summary>
+    /// Allocate a datagram of exactly the right size and write its header, leaving the payload area
+    /// for the caller to fill. <paramref name="payloadOffset"/> is where the first frame's bytes go;
+    /// the rest follow contiguously at <c>PayloadSizeFor(port)</c> apiece.
+    ///
+    /// The counterpart to <see cref="InputWindow"/> on the receive side: the sender keeps its recent
+    /// payloads in one contiguous ring, so gathering them into a list of arrays just to hand them
+    /// back for copying was work with no purpose. The caller copies once, out of the ring, into here.
+    /// </summary>
+    public byte[] BeginInputDatagram(byte port, int baseFrame, int count, out int payloadOffset)
+    {
+        if (count <= 0) throw new ArgumentOutOfRangeException(nameof(count), "Empty window");
+        if (count > byte.MaxValue) throw new ArgumentOutOfRangeException(nameof(count), "Window too large");
+        int payloadSize = _payloadSizes[port];
+        if (HeaderSize + count * payloadSize > MaxDatagramBytes)
+            throw new ArgumentException(
+                $"Window of {count} frames × {payloadSize} bytes exceeds the " +
+                $"{MaxDatagramBytes}-byte datagram limit for port {port}", nameof(count));
+
+        var buffer = new byte[HeaderSize + count * payloadSize];
+        buffer[0] = TypeInput;
+        buffer[1] = port;
+        WriteUInt64(buffer, 2, _generation.SessionId);
+        WriteInt32(buffer, 10, _generation.Epoch);
+        WriteInt32(buffer, 14, baseFrame);
+        buffer[18] = (byte)count;
+        payloadOffset = HeaderSize;
+        return buffer;
+    }
+
+    /// <summary>Serialized size of one frame for this port, as this codec was configured.</summary>
+    public int PayloadSizeFor(byte port) => _payloadSizes[port];
+
+    /// <summary>
     /// A validated input datagram described in place: which port and frames it covers, and where
     /// each frame's bytes start. No payload is copied, which matters because most of them are
     /// thrown away — a datagram repeats the last R frames, so at delay 4 nine frames arrive and
