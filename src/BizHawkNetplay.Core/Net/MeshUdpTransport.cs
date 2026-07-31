@@ -267,6 +267,18 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
         // Forget telemetry for candidates no longer in the set (a rejoin can change addresses).
         var keep = new HashSet<IPEndPoint>(endpoints);
+
+        // A learned endpoint belongs to a PORT, not to that port's advertised candidates, so it
+        // survives a route refresh — otherwise every reflexive candidate that trickled in would
+        // un-learn the symmetric-NAT peers, which is the one thing they cannot recover from on
+        // their own. It does not survive its port leaving the session.
+        var routedPorts = new HashSet<int>(portOrder);
+        foreach (var kv in _learnedByPort.ToArray())
+        {
+            if (routedPorts.Contains(kv.Key)) { keep.Add(kv.Value); continue; }
+            _learnedByPort.TryRemove(kv.Key, out _);
+            _learnedByEndpoint.TryRemove(kv.Value, out _);
+        }
         foreach (var k in _alive.Keys.ToArray()) if (!keep.Contains(k)) _alive.TryRemove(k, out _);
         foreach (var k in _lastPunch.Keys.ToArray()) if (!keep.Contains(k)) _lastPunch.TryRemove(k, out _);
         foreach (var k in _rtt.Keys.ToArray()) if (!keep.Contains(k)) _rtt.TryRemove(k, out _);
@@ -411,28 +423,52 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         medianMs = -1;
         highMs = -1;
         measuredRoutes = 0;
-        var routes = _routeTable.Routes;
-        totalRoutes = routes.Length;
-        foreach (var route in routes)
+        var edges = DescribeEdges();
+        totalRoutes = edges.Count;
+        foreach (var edge in edges)
         {
-            double bestMedian = double.MaxValue, bestHigh = 0;
-            bool measured = false;
-            foreach (var endpoint in route.Candidates)
+            if (!edge.Measured) continue;
+            measuredRoutes++;
+            if (edge.MedianMs > medianMs) medianMs = edge.MedianMs;
+            if (edge.HighMs > highMs) highMs = edge.HighMs;
+        }
+        return measuredRoutes > 0;
+    }
+
+    /// <summary>
+    /// One row per logical peer: whether its edge answered, how fast, and whether the address that
+    /// worked was one nobody advertised.
+    ///
+    /// A count of answered edges says how much of the mesh is covered but not who is missing, and
+    /// "2/3 answered" is the same sentence whether the silent player is about to have a bad session
+    /// or is not in it yet. Naming the port is what lets the log say something actionable.
+    /// </summary>
+    public IReadOnlyList<MeshEdgeReport> DescribeEdges()
+    {
+        var routes = _routeTable.Routes;
+        var reports = new MeshEdgeReport[routes.Length];
+        for (int i = 0; i < routes.Length; i++)
+        {
+            var route = routes[i];
+            bool learned = _learnedByPort.TryGetValue(route.RemotePort, out var learnedEndpoint);
+            double bestMedian = 0, bestHigh = 0;
+            bool measured = false, viaLearned = false;
+            foreach (var endpoint in learned
+                         ? route.Candidates.Concat(new[] { learnedEndpoint })
+                         : route.Candidates)
             {
                 if (!TryGetRttStats(endpoint, out double candidateMedian, out double candidateHigh)) continue;
                 if (!measured || candidateMedian < bestMedian)
                 {
                     bestMedian = candidateMedian;
                     bestHigh = candidateHigh;
+                    viaLearned = learned && endpoint.Equals(learnedEndpoint);
                 }
                 measured = true;
             }
-            if (!measured) continue;
-            measuredRoutes++;
-            if (bestMedian > medianMs) medianMs = bestMedian;
-            if (bestHigh > highMs) highMs = bestHigh;
+            reports[i] = new MeshEdgeReport(route.RemotePort, measured, bestMedian, bestHigh, viaLearned);
         }
-        return measuredRoutes > 0;
+        return reports;
     }
 
     private IPEndPoint? SelectSendCandidate(PeerRoute route, long now)
@@ -613,8 +649,11 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             {
                 long now = Clock.ElapsedMilliseconds;
                 bursting = now < Interlocked.Read(ref _burstUntilMs);
-                var endpoints = _routeTable.Endpoints;
-                foreach (var p in endpoints)
+                // Learned endpoints are probed alongside the advertised ones. Without this a
+                // symmetric-NAT peer is a one-way street: we accept its input and reply to it, but
+                // never probe it, so nothing ever measures that edge and the lobby reports it silent
+                // while it is plainly carrying traffic. It also has to be kept warm like any other.
+                foreach (var p in _routeTable.Endpoints.Concat(_learnedByPort.Values).Distinct())
                 {
                     bool alive = IsEndpointAlive(p);
                     // Probe aggressively until confirmed, then just often enough to hold the mapping —

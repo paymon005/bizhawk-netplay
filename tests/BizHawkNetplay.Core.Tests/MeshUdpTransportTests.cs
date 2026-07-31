@@ -601,6 +601,79 @@ public class MeshUdpTransportTests
         finally { host.Dispose(); peer.Dispose(); }
     }
 
+    /// <summary>
+    /// Learning is only half the fix. The host must also PROBE the address it learned, or the edge
+    /// is a one-way street: input arrives and is answered, but nothing ever measures it, so the
+    /// lobby reports a working peer as silent and sizes the delay as though it were absent.
+    /// </summary>
+    [Fact]
+    public void ALearnedPeerIsProbedAndNamedAsLearnedInTheEdgeReport()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        try
+        {
+            int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(wrongPort) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            host.BeginRttBurst(1500);
+            var sw = Stopwatch.StartNew();
+            MeshEdgeReport edge = default;
+            while (sw.ElapsedMilliseconds < 4000)
+            {
+                edge = Assert.Single(host.DescribeEdges());
+                if (edge.Measured) break;
+                Thread.Sleep(20);
+            }
+
+            Assert.True(edge.Measured, "the learned edge produced no round-trip sample — it is not being probed");
+            Assert.Equal(1, edge.RemotePort);
+            Assert.True(edge.ViaLearnedEndpoint,
+                "the only address that can answer is the learned one, so the report must say so");
+        }
+        finally { host.Dispose(); peer.Dispose(); }
+    }
+
+    /// <summary>
+    /// A learned endpoint belongs to the SEAT, not to that seat's advertised candidates. Route
+    /// updates happen constantly — every reflexive candidate that arrives triggers one — and each
+    /// would otherwise un-learn every symmetric-NAT peer, which is the one thing they cannot
+    /// recover from on their own. A seat that leaves the session is a different matter.
+    /// </summary>
+    [Fact]
+    public void ARouteRefreshKeepsWhatWasLearnedButLosingTheSeatForgetsIt()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        try
+        {
+            int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(wrongPort) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            var sw = Stopwatch.StartNew();
+            while (host.LearnedEndpointCount == 0 && sw.ElapsedMilliseconds < 3000) Thread.Sleep(10);
+            Assert.Equal(1, host.LearnedEndpointCount);
+
+            // Same seat, extra candidate — exactly what a late reflexive discovery looks like.
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(wrongPort), Loop(wrongPort + 1) }) });
+            Assert.Equal(1, host.LearnedEndpointCount);
+            peer.Send([7]);
+            Assert.Equal(new byte[] { 7 }, WaitRecv(host));
+
+            // Seat 1 is gone: nothing about it should linger, including where it used to be.
+            host.SetPeerRoutes(new[] { new PeerRoute(2, new[] { Loop(wrongPort + 2) }) });
+            Assert.Equal(0, host.LearnedEndpointCount);
+            Assert.False(host.TryGetLearnedEndpoint(1, out _));
+        }
+        finally { host.Dispose(); peer.Dispose(); }
+    }
+
     private static byte[] WaitRecv(ITransport t)
     {
         var sw = Stopwatch.StartNew();

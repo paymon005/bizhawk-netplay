@@ -656,6 +656,15 @@ public sealed partial class NetplayToolForm
         }
     }
 
+    /// <summary>Whether ANY endpoint of this peer has answered on UDP — i.e. whether the host has a
+    /// real mesh path to it, as distinct from the TCP control link it arrived on. The learned
+    /// endpoint counts: for a symmetric-NAT peer it is the ONLY address that will ever answer, so
+    /// leaving it out would flag exactly the peers the tokens just rescued.</summary>
+    private static bool LinkHasLiveMeshPath(MeshUdpTransport mesh, PeerLink link) =>
+        mesh.IsEndpointAlive(link.UdpEndpoint)
+        || (link.ReflexiveEndpoint != null && mesh.IsEndpointAlive(link.ReflexiveEndpoint))
+        || (mesh.TryGetLearnedEndpoint(link.RemotePort, out var learned) && mesh.IsEndpointAlive(learned));
+
     /// <summary>
     /// Have the host forward input to joiners whose direct legs to the other joiners never opened.
     ///
@@ -663,35 +672,23 @@ public sealed partial class NetplayToolForm
     /// server: no TURN, no third party, nothing to run. The cost is one extra hop on the affected
     /// legs and a little host uplink.
     ///
-    /// WHAT THIS DOES NOT FIX, despite the first version of this comment saying so: a TRUE symmetric
-    /// NAT. Relaying needs a live host-to-peer UDP leg to relay over, and under symmetric NAT that
-    /// leg does not exist either. The peer's router assigns a fresh external port per destination, so
-    /// the port it uses toward us is not the one it advertised from STUN — and the receive path pins
-    /// on the exact endpoint (MeshUdpTransport line ~651), dropping the packet before anything can
-    /// learn from it. The path is physically fine; we refuse to recognise it.
-    ///
-    /// So this helps the case where the host legs DID open and only joiner-to-joiner failed — an
-    /// address-restricted NAT that ran out of punch time, a firewall that permits the host but not
-    /// peers. Symmetric NAT needs the endpoint to be learnable instead: a per-peer token over the
-    /// authenticated control channel that lets a peer's real source endpoint bind or migrate. That
-    /// is a wire change and is not done.
+    /// Since protocol 14 a symmetric-NAT peer usually has a host leg to relay over: it announces a
+    /// token, and whoever receives it binds that seat to wherever the packet really came from. What
+    /// remains here is the case where even that did not happen — the peer never got a packet through
+    /// in either direction — and relaying into a peer we cannot reach is a stall, not a rescue, so
+    /// it is said out loud rather than papered over.
     ///
     /// Decided once, here, from the mesh round — not failed over live. A start-of-session decision is
     /// deterministic, shows up in the log, and cannot oscillate under packet loss; live failover is a
     /// harder problem and deliberately left alone.
     ///
-    /// Deliberately coarse: the mesh report says HOW MANY of a joiner's edges answered, not which, so
-    /// a joiner that is short even one leg gets everything relayed to it. That over-delivers rather
-    /// than under-delivers, and a duplicate is free — input is keyed by (port, frame), so a relayed
-    /// copy arriving beside a direct one is discarded. Narrowing it to the exact failed pair would
-    /// need the report to name peers, and that is a wire change for a bandwidth saving nobody needs.
+    /// Deliberately coarse: the report a joiner sends back still says HOW MANY of its edges answered,
+    /// not which, so a joiner short even one leg gets everything relayed to it. That over-delivers
+    /// rather than under-delivers, and a duplicate is free — input is keyed by (port, frame), so a
+    /// relayed copy arriving beside a direct one is discarded. Each joiner now NAMES its silent edges
+    /// in its own log, which is where a player needs them; narrowing the relay itself would mean
+    /// putting those names on the wire, for a bandwidth saving nobody has asked for.
     /// </summary>
-    /// <summary>Whether ANY candidate endpoint of this peer has answered on UDP — i.e. whether the
-    /// host has a real mesh path to it, as distinct from the TCP control link it arrived on.</summary>
-    private static bool LinkHasLiveMeshPath(MeshUdpTransport mesh, PeerLink link) =>
-        mesh.IsEndpointAlive(link.UdpEndpoint)
-        || (link.ReflexiveEndpoint != null && mesh.IsEndpointAlive(link.ReflexiveEndpoint));
-
     private void InstallMeshRelay(MeshUdpTransport mesh, List<PeerLink> links, List<PeerLink> incomplete)
     {
         _relayPorts.Clear();
@@ -713,23 +710,23 @@ public sealed partial class NetplayToolForm
         RefreshRelayRoutes();
 
         // Only claim what the relay can actually deliver. If a joiner's missing leg is the one to
-        // THIS host, there is nothing to relay over and the session is about to stall instead —
-        // which is what a true symmetric NAT looks like from here.
-        int noHostLeg = 0;
+        // THIS host, there is nothing to relay over and the session is about to stall instead.
+        var noHostLeg = new List<string>();
         foreach (var link in incomplete)
-            if (!LinkHasLiveMeshPath(mesh, link)) noHostLeg++;
+            if (!LinkHasLiveMeshPath(mesh, link)) noHostLeg.Add($"P{link.RemotePort + 1}");
 
         UiConnLog($"relaying input through this host for {incomplete.Count} player(s) whose direct " +
                   "paths to the other players did not open. They stay in the session; their input " +
                   "takes one extra hop, so expect a little more delay on those legs than the lobby " +
                   "measured.", Color.DarkOrange);
-        if (noHostLeg > 0)
-            UiConnLog($"WARNING: {noHostLeg} of those has no live UDP path to this host either, so " +
-                      "there is nothing to relay over and their input will not arrive at all. That is " +
-                      "what a symmetric NAT looks like from here — the router gives them a different " +
-                      "public port for every destination, so the address they advertised is not the " +
-                      "one they reach us from. Have them forward a UDP port and host instead, or play " +
-                      "2-player against a forwarded host.", Color.Firebrick);
+        if (noHostLeg.Count > 0)
+            UiConnLog($"WARNING: {string.Join(", ", noHostLeg)} has no live UDP path to this host " +
+                      "either, so there is nothing to relay over and their input will not arrive at " +
+                      "all. Since protocol 14 a symmetric NAT alone should no longer do this — they " +
+                      "would have announced a token and been recognised at whatever address they " +
+                      "really arrive from — so suspect UDP being blocked outright, or a router that " +
+                      "drops the packet before it leaves. Have them forward a UDP port and host " +
+                      "instead, or play 2-player against a forwarded host.", Color.Firebrick);
     }
 
     /// <summary>
@@ -754,7 +751,41 @@ public sealed partial class NetplayToolForm
             : $"none of my {sample.TotalEdges} direct path(s) answered in time — the host will size " +
               "the delay from the paths that did",
             sample.IsComplete ? Color.DarkGreen : Color.DarkOrange);
+        DescribeMeshEdges();
         return sample;
+    }
+
+    /// <summary>
+    /// Name the edges the count above only tallied: who answered, who did not, and who could only
+    /// be reached at an address they were never able to advertise.
+    ///
+    /// "2/3 answered" tells a player their session is about to be worse without telling them which
+    /// player to look at — and the silent edge is the one that decides whether this is a mesh
+    /// problem or one peer's router.
+    /// </summary>
+    private void DescribeMeshEdges()
+    {
+        var edges = _mesh?.DescribeEdges();
+        if (edges == null || edges.Count == 0) return;
+
+        var silent = new List<string>();
+        var learned = new List<string>();
+        foreach (var edge in edges)
+        {
+            string who = edge.RemotePort == 0 ? "the host" : $"P{edge.RemotePort + 1}";
+            if (!edge.Measured) { silent.Add(who); continue; }
+            if (edge.ViaLearnedEndpoint) learned.Add($"{who} (~{edge.MedianMs:F0}ms)");
+        }
+
+        if (learned.Count > 0)
+            UiConnLog($"reached at a learned address: {string.Join(", ", learned)} — that peer is behind " +
+                      "a symmetric NAT, and the address it advertised was never going to work",
+                Color.DarkSlateBlue);
+        if (silent.Count > 0)
+            UiConnLog($"no direct path answered to: {string.Join(", ", silent)} — input to and from " +
+                      (silent.Count == 1 ? "that player" : "those players") +
+                      " may have to go the long way round via the host",
+                Color.DarkOrange);
     }
 
     private LobbyMeshSample TakeJoinerMeshSample(IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes)
