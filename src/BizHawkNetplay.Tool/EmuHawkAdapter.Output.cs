@@ -145,24 +145,36 @@ internal sealed partial class EmuHawkAdapter
     /// with something attached it detaches AND discards the samples EmuHawk buffered, which is what
     /// we want anyway. So it is simply done every pump rather than tracked.
     /// </summary>
+    /// <summary>
+    /// The two by-name lookups the audio path needs, resolved once.
+    ///
+    /// <see cref="EnsureAudioOwnership"/> runs on every pump — sixty to a hundred and twenty times
+    /// a second — and Type.GetProperty with BindingFlags is a name search over the whole of MainForm,
+    /// which is a very large type, plus a PropertyInfo allocation each time. The docstring below is
+    /// right that reasserting the input PIN is free; the reflection above it was not.
+    /// </summary>
+    private static readonly PropertyInfo? SoundProperty =
+        typeof(BizHawk.Client.EmuHawk.MainForm)
+            .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+    private static readonly FieldInfo? OutputDeviceField =
+        typeof(BizHawk.Client.EmuHawk.Sound)
+            .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic);
+
     private bool EnsureAudioOwnership()
     {
         var mainForm = _mainForm;
         if (mainForm == null) return _sound != null;
         try
         {
-            var current = typeof(BizHawk.Client.EmuHawk.MainForm)
-                .GetProperty("Sound", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                ?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;
+            var current = SoundProperty?.GetValue(mainForm) as BizHawk.Client.EmuHawk.Sound;
             if (current == null) return false;
 
             if (!ReferenceEquals(current, _sound))
             {
                 // A new Sound object: the old device is disposed and every reference we hold is dead.
                 _sound = current;
-                _outputDevice = typeof(BizHawk.Client.EmuHawk.Sound)
-                    .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic)
-                    ?.GetValue(current) as ISoundOutput;
+                _outputDevice = OutputDeviceField?.GetValue(current) as ISoundOutput;
                 _soundBuffer?.DiscardSamples(); // buffered for a device that no longer exists
                 AudioRebinds++;
             }
@@ -202,9 +214,7 @@ internal sealed partial class EmuHawkAdapter
             snd.StartSound();
             if (!snd.IsStarted) return; // sound disabled in config, or the device is genuinely gone
 
-            var devField = typeof(BizHawk.Client.EmuHawk.Sound)
-                .GetField("_outputDevice", BindingFlags.Instance | BindingFlags.NonPublic);
-            if (devField?.GetValue(snd) is ISoundOutput fresh) _outputDevice = fresh;
+            if (OutputDeviceField?.GetValue(snd) is ISoundOutput fresh) _outputDevice = fresh;
             AudioRevivals++;
         }
         catch { /* try again on the next interval; never let this kill the frame tick */ }

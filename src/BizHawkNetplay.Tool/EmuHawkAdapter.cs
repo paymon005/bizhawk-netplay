@@ -212,9 +212,14 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
 
     public byte[] ExportState()
     {
-        using var ms = new MemoryStream();
+        // Sized from the same hint the pooled path maintains. Starting at the default 256 bytes made
+        // a 16MiB N64 state grow by doubling — about sixteen reallocations and ~32MiB of copying,
+        // all of it on the large object heap, which net48 never compacts. The hint is free: the
+        // rollback ring has already learned the real size by the time anyone exports.
+        using var ms = new MemoryStream(_stateSizeHint);
         using (var bw = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
             _statable.SaveStateBinary(bw);
+        if (ms.Length > _stateSizeHint) _stateSizeHint = (int)ms.Length;
         return ms.ToArray();
     }
 

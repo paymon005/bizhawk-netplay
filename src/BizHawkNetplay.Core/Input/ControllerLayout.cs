@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -21,6 +20,12 @@ public sealed class AxisSpec
         Min = min;
         Max = max;
         Neutral = neutral;
+
+        long span = (long)max - min; // number of distinct values minus one
+        ByteWidth = span <= byte.MaxValue ? 1
+                  : span <= ushort.MaxValue ? 2
+                  : span <= uint.MaxValue ? 4
+                  : 8;
     }
 
     public string Name { get; }
@@ -28,18 +33,13 @@ public sealed class AxisSpec
     public int Max { get; }
     public int Neutral { get; }
 
-    /// <summary>Bytes needed to hold any value in [Min, Max], packed as an offset from Min.</summary>
-    public int ByteWidth
-    {
-        get
-        {
-            long span = (long)Max - Min; // number of distinct values minus one
-            if (span <= byte.MaxValue) return 1;
-            if (span <= ushort.MaxValue) return 2;
-            if (span <= uint.MaxValue) return 4;
-            return 8;
-        }
-    }
+    /// <summary>
+    /// Bytes needed to hold any value in [Min, Max], packed as an offset from Min. Computed once in
+    /// the constructor rather than per read: the serializer asks for it once per axis per frame and
+    /// again for every accepted remote frame, and this type is immutable, so the branches were being
+    /// re-run tens of thousands of times a second for an answer that cannot change.
+    /// </summary>
+    public int ByteWidth { get; }
 }
 
 /// <summary>
@@ -55,6 +55,11 @@ public sealed class ControllerLayout
     {
         Buttons = buttons ?? throw new ArgumentNullException(nameof(buttons));
         Axes = axes ?? throw new ArgumentNullException(nameof(axes));
+
+        ButtonByteWidth = (Buttons.Count + 7) / 8;
+        int payload = ButtonByteWidth;
+        for (int i = 0; i < Axes.Count; i++) payload += Axes[i].ByteWidth;
+        PayloadByteWidth = payload;
     }
 
     /// <summary>Ordered digital button names (e.g. "P1 Up", "P1 A").</summary>
@@ -64,10 +69,16 @@ public sealed class ControllerLayout
     public IReadOnlyList<AxisSpec> Axes { get; }
 
     /// <summary>Bytes a packed button bitfield occupies for this layout.</summary>
-    public int ButtonByteWidth => (Buttons.Count + 7) / 8;
+    public int ButtonByteWidth { get; }
 
-    /// <summary>Total serialized size of one port's input under this layout.</summary>
-    public int PayloadByteWidth => ButtonByteWidth + Axes.Sum(a => a.ByteWidth);
+    /// <summary>
+    /// Total serialized size of one port's input under this layout. Precomputed with
+    /// <see cref="ButtonByteWidth"/> because both sit on the per-frame path: PayloadByteWidth sizes
+    /// the buffer for every serialized frame and bounds-checks every accepted remote one, and it
+    /// used to be a LINQ Sum over an interface — an enumerator allocation and a walk of every axis,
+    /// sixty times a second, for a constant.
+    /// </summary>
+    public int PayloadByteWidth { get; }
 
     /// <summary>
     /// Stable content hash. Any difference in button/axis names, order, or axis ranges

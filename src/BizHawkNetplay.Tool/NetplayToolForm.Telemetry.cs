@@ -15,6 +15,17 @@ public sealed partial class NetplayToolForm
     /// player's input delay and sizes rollback's prediction horizon, measuring the wrong path costs
     /// real latency. Falls back to the TCP ping when no peer's ack carried a timestamp (older build).
     /// </summary>
+    /// <summary>
+    /// Milliseconds since a <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> reading.
+    ///
+    /// The frame loop times several spans per tick and per frame. A Stopwatch object for each was
+    /// roughly 180 allocations a second of pure measurement overhead — inside the very loop whose
+    /// collection counts it exists to instrument. GetTimestamp is a static that allocates nothing.
+    /// </summary>
+    private static double ElapsedMs(long sinceTimestamp) =>
+        (System.Diagnostics.Stopwatch.GetTimestamp() - sinceTimestamp) * 1000.0
+        / System.Diagnostics.Stopwatch.Frequency;
+
     private double WorstPingMs(out bool udpMeasured)
     {
         udpMeasured = false;
@@ -126,17 +137,21 @@ public sealed partial class NetplayToolForm
             // Normally free: the hash was taken back when the anchor was saved, and its cost was
             // already attributed on that tick. What this still times is the fallback — a repair
             // rewrote the anchor, so the state has to be visited again to hash it.
-            var hashWatch = System.Diagnostics.Stopwatch.StartNew();
+            //
+            // Timestamps rather than a Stopwatch object: this runs on every stepped frame and
+            // returns false on roughly 299 of every 300, so the allocation was paying for a
+            // measurement that was usually of nothing. Stopwatch.GetTimestamp allocates nothing.
+            long hashStart = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
-            _lastHashMs += hashWatch.Elapsed.TotalMilliseconds;
+            _lastHashMs += ElapsedMs(hashStart);
         }
         else
         {
             frame = _driver.CurrentFrame;
             if (frame % ChecksumInterval != 0) return;
-            var hashWatch = System.Diagnostics.Stopwatch.StartNew();
+            long hashStart = System.Diagnostics.Stopwatch.GetTimestamp();
             hash = _adapter!.HashMainMemory(frame);
-            _lastHashMs += hashWatch.Elapsed.TotalMilliseconds;
+            _lastHashMs += ElapsedMs(hashStart);
         }
         // Which checksum path the core actually got, once per session. This is the only place the
         // cost is attributable — in a slow-tick line it just reads as an unexplained hitch.

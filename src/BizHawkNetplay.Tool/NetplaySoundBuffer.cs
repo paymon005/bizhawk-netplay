@@ -47,16 +47,40 @@ internal sealed class NetplaySoundBuffer : ISoundProvider
     public void Enqueue(short[] src, int shortCount)
     {
         if (src == null || shortCount <= 0) return;
+        if (shortCount > src.Length) shortCount = src.Length;
         lock (_lock)
         {
-            for (int i = 0; i < shortCount; i++)
+            // A frame of 44.1kHz stereo is ~1,470 shorts. Copying them one at a time with two
+            // integer divisions each, under the lock the audio device thread also wants, cost about
+            // fifty times what two Array.Copy calls do. Nothing about the ring's behaviour changes —
+            // including dropping the oldest on overflow — only how many instructions it takes.
+            int from = 0;
+            if (shortCount >= _capacity)
             {
-                if (_count == _capacity) { _read = (_read + 1) % _capacity; _count--; } // overflow → drop oldest
-                _ring[_write] = src[i];
-                _write = (_write + 1) % _capacity;
-                _count++;
+                // Everything currently held is about to be overwritten anyway; keep only the newest
+                // capacity-worth and start from empty.
+                from = shortCount - _capacity;
+                shortCount = _capacity;
+                _read = _write = _count = 0;
             }
+            int overflow = _count + shortCount - _capacity;
+            if (overflow > 0) { _read = Advance(_read, overflow); _count -= overflow; }
+
+            int firstRun = Math.Min(shortCount, _capacity - _write);
+            Array.Copy(src, from, _ring, _write, firstRun);
+            if (firstRun < shortCount)
+                Array.Copy(src, from + firstRun, _ring, 0, shortCount - firstRun);
+            _write = Advance(_write, shortCount);
+            _count += shortCount;
         }
+    }
+
+    /// <summary>Move a ring index forward, wrapping. Compare-and-subtract rather than a modulo:
+    /// the step never exceeds the capacity, so one branch replaces an integer division.</summary>
+    private int Advance(int index, int by)
+    {
+        index += by;
+        return index >= _capacity ? index - _capacity : index;
     }
 
     /// <summary>Fill the whole array from the ring for the device; pad with silence on underrun.</summary>
@@ -74,11 +98,10 @@ internal sealed class NetplaySoundBuffer : ISoundProvider
         lock (_lock)
         {
             int give = Math.Min(Math.Min(count, dest.Length), _count);
-            for (int i = 0; i < give; i++)
-            {
-                dest[i] = _ring[_read];
-                _read = (_read + 1) % _capacity;
-            }
+            int firstRun = Math.Min(give, _capacity - _read);
+            Array.Copy(_ring, _read, dest, 0, firstRun);
+            if (firstRun < give) Array.Copy(_ring, 0, dest, firstRun, give - firstRun);
+            _read = Advance(_read, give);
             _count -= give;
             for (int i = give; i < count && i < dest.Length; i++) dest[i] = 0;
         }

@@ -169,10 +169,10 @@ public static class ControlMessageCodec
         if (state.Length > MaxStateBytes)
             throw new ArgumentException("Resync state exceeds control-frame cap", nameof(state));
         var generationBody = HandshakeCodec.EncodeGeneration(generation); // validates the generation
-        var packed = StateCompression.Pack(state);
-        var body = new byte[generationBody.Length + packed.Length];
+        // Packed straight into a buffer that already has room for the generation, rather than packed
+        // and then copied into a bigger one. On a heavy core that copy was the whole state again.
+        var body = StateCompression.Pack(state, generationBody.Length);
         Buffer.BlockCopy(generationBody, 0, body, 0, generationBody.Length);
-        Buffer.BlockCopy(packed, 0, body, generationBody.Length, packed.Length);
         return body;
     }
 

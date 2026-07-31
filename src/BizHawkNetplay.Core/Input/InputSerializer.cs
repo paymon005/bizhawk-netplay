@@ -11,36 +11,66 @@ namespace BizHawkNetplay.Core.Input;
 public sealed class InputSerializer
 {
     private readonly ControllerLayout _layout;
+    // Lifted out of the layout once. Both loops below run per serialized frame and per accepted
+    // remote frame, and reaching Axes[i] through IReadOnlyList is an interface call per axis per
+    // frame for a set that cannot change after the handshake.
+    private readonly AxisSpec[] _axes;
+    private readonly int _buttonCount;
+    private readonly int _buttonByteWidth;
+    private readonly int _payloadSize;
 
     public InputSerializer(ControllerLayout layout)
     {
         _layout = layout ?? throw new ArgumentNullException(nameof(layout));
+        _buttonCount = layout.Buttons.Count;
+        _buttonByteWidth = layout.ButtonByteWidth;
+        _payloadSize = layout.PayloadByteWidth;
+        _axes = new AxisSpec[layout.Axes.Count];
+        for (int i = 0; i < _axes.Length; i++) _axes[i] = layout.Axes[i];
     }
 
     /// <summary>Fixed serialized size of one port under this layout.</summary>
-    public int PayloadSize => _layout.PayloadByteWidth;
+    public int PayloadSize => _payloadSize;
 
     public byte[] Serialize(PortInput input)
     {
+        var buffer = new byte[_payloadSize];
+        Serialize(input, buffer, 0);
+        return buffer;
+    }
+
+    /// <summary>
+    /// Pack one port's input directly into a caller-owned buffer.
+    ///
+    /// The send path holds a ring of the last N frames and rebuilds a datagram from it every frame;
+    /// handing it a fresh array per frame — and then copying that array into the datagram, and the
+    /// datagram into a framed copy — was three allocations and two copies for bytes whose home was
+    /// already known.
+    /// </summary>
+    public void Serialize(PortInput input, byte[] destination, int offset)
+    {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (input.Buttons.Length != _layout.Buttons.Count)
-            throw new ArgumentException($"Button count {input.Buttons.Length} != layout {_layout.Buttons.Count}");
-        if (input.Axes.Length != _layout.Axes.Count)
-            throw new ArgumentException($"Axis count {input.Axes.Length} != layout {_layout.Axes.Count}");
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+        if (input.Buttons.Length != _buttonCount)
+            throw new ArgumentException($"Button count {input.Buttons.Length} != layout {_buttonCount}");
+        if (input.Axes.Length != _axes.Length)
+            throw new ArgumentException($"Axis count {input.Axes.Length} != layout {_axes.Length}");
+        if (offset < 0 || destination.Length - offset < _payloadSize)
+            throw new ArgumentOutOfRangeException(nameof(offset),
+                $"Payload of {_payloadSize} bytes does not fit at offset {offset} of {destination.Length}");
 
-        var buffer = new byte[_layout.PayloadByteWidth];
-        int offset = 0;
-
-        // Buttons: LSB-first bitfield.
+        // Buttons: LSB-first bitfield. Cleared first — the buffer is reused, so the OR below would
+        // otherwise carry a held button forward into a frame that released it.
+        for (int b = 0; b < _buttonByteWidth; b++) destination[offset + b] = 0;
         for (int i = 0; i < input.Buttons.Length; i++)
             if (input.Buttons[i])
-                buffer[offset + (i >> 3)] |= (byte)(1 << (i & 7));
-        offset += _layout.ButtonByteWidth;
+                destination[offset + (i >> 3)] |= (byte)(1 << (i & 7));
+        int cursor = offset + _buttonByteWidth;
 
         // Axes: offset-from-Min, little-endian, native width.
         for (int i = 0; i < input.Axes.Length; i++)
         {
-            var axis = _layout.Axes[i];
+            var axis = _axes[i];
             int clamped = input.Axes[i];
             if (clamped < axis.Min) clamped = axis.Min;
             else if (clamped > axis.Max) clamped = axis.Max;
@@ -48,18 +78,16 @@ public sealed class InputSerializer
             ulong rel = (ulong)((long)clamped - axis.Min);
             int width = axis.ByteWidth;
             for (int b = 0; b < width; b++)
-                buffer[offset + b] = (byte)(rel >> (8 * b));
-            offset += width;
+                destination[cursor + b] = (byte)(rel >> (8 * b));
+            cursor += width;
         }
-
-        return buffer;
     }
 
     public PortInput Deserialize(byte[] payload)
     {
         if (payload == null) throw new ArgumentNullException(nameof(payload));
-        if (payload.Length != _layout.PayloadByteWidth)
-            throw new ArgumentException($"Payload size {payload.Length} != expected {_layout.PayloadByteWidth}");
+        if (payload.Length != _payloadSize)
+            throw new ArgumentException($"Payload size {payload.Length} != expected {_payloadSize}");
         return Deserialize(payload, 0);
     }
 
@@ -71,20 +99,20 @@ public sealed class InputSerializer
     public PortInput Deserialize(byte[] buffer, int offset)
     {
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
-        if (offset < 0 || buffer.Length - offset < _layout.PayloadByteWidth)
+        if (offset < 0 || buffer.Length - offset < _payloadSize)
             throw new ArgumentOutOfRangeException(nameof(offset),
-                $"Payload of {_layout.PayloadByteWidth} bytes does not fit at offset {offset} of {buffer.Length}");
+                $"Payload of {_payloadSize} bytes does not fit at offset {offset} of {buffer.Length}");
 
         int cursor = offset;
-        var buttons = new bool[_layout.Buttons.Count];
+        var buttons = new bool[_buttonCount];
         for (int i = 0; i < buttons.Length; i++)
             buttons[i] = (buffer[cursor + (i >> 3)] & (1 << (i & 7))) != 0;
-        cursor += _layout.ButtonByteWidth;
+        cursor += _buttonByteWidth;
 
-        var axes = new int[_layout.Axes.Count];
+        var axes = new int[_axes.Length];
         for (int i = 0; i < axes.Length; i++)
         {
-            var axis = _layout.Axes[i];
+            var axis = _axes[i];
             int width = axis.ByteWidth;
             ulong rel = 0;
             for (int b = 0; b < width; b++)

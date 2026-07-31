@@ -28,9 +28,20 @@ public static class StateCompression
     public const int HeaderSize = 5;
 
     /// <summary>Frame a state for sending, compressing it when that actually helps.</summary>
-    public static byte[] Pack(byte[] state)
+    public static byte[] Pack(byte[] state) => Pack(state, 0);
+
+    /// <summary>
+    /// Frame a state, leaving <paramref name="reservePrefix"/> zero bytes free at the front for the
+    /// caller to fill.
+    ///
+    /// Every caller had a small header of its own to prepend, and prepending it meant allocating a
+    /// second whole-state array and copying into it — for a 16MiB N64 state, an extra 16MiB of large
+    /// object heap traffic to make room for twelve bytes. Reserving the room up front costs nothing.
+    /// </summary>
+    public static byte[] Pack(byte[] state, int reservePrefix)
     {
         if (state == null) throw new ArgumentNullException(nameof(state));
+        if (reservePrefix < 0) throw new ArgumentOutOfRangeException(nameof(reservePrefix));
 
         byte[] payload = state;
         byte format = FormatRaw;
@@ -41,13 +52,13 @@ public static class StateCompression
             format = FormatDeflate;
         }
 
-        var body = new byte[HeaderSize + payload.Length];
-        body[0] = format;
-        body[1] = (byte)(state.Length >> 24);
-        body[2] = (byte)(state.Length >> 16);
-        body[3] = (byte)(state.Length >> 8);
-        body[4] = (byte)state.Length;
-        Buffer.BlockCopy(payload, 0, body, HeaderSize, payload.Length);
+        var body = new byte[reservePrefix + HeaderSize + payload.Length];
+        body[reservePrefix] = format;
+        body[reservePrefix + 1] = (byte)(state.Length >> 24);
+        body[reservePrefix + 2] = (byte)(state.Length >> 16);
+        body[reservePrefix + 3] = (byte)(state.Length >> 8);
+        body[reservePrefix + 4] = (byte)state.Length;
+        Buffer.BlockCopy(payload, 0, body, reservePrefix + HeaderSize, payload.Length);
         return body;
     }
 
@@ -92,7 +103,10 @@ public static class StateCompression
     {
         try
         {
-            using var output = new MemoryStream();
+            // Sized so the common case never reallocates: a savestate is mostly console RAM and
+            // deflates well below half. An uncapacitied stream doubled from 256 bytes instead —
+            // roughly sixteen reallocations for a big state, each one a full copy.
+            using var output = new MemoryStream(Math.Max(1024, state.Length / 2));
             using (var deflate = new DeflateStream(output, CompressionLevel.Fastest, leaveOpen: true))
                 deflate.Write(state, 0, state.Length);
             return output.ToArray();

@@ -1,7 +1,8 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Threading;
 using BizHawk.Client.Common;
+using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Net;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
@@ -208,7 +209,7 @@ public sealed partial class NetplayToolForm
         // coalesces (never more than one queued), and _frameTickRunning below is what actually keeps
         // a nested message pump from reentering us.
         _frameTickRunning = true;
-        var tickWatch = System.Diagnostics.Stopwatch.StartNew();
+        long tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
         double coreMs = 0, gateMs = 0, renderMs = 0;
         // Everything else the tick does, so a slow one can be attributed instead of guessed at.
         // A report that itemises 0.8ms of a 16.1ms tick names nothing: the four original terms
@@ -234,9 +235,9 @@ public sealed partial class NetplayToolForm
         {
             // Keep the audio device fed every tick, independent of how many frames we step this
             // tick (or none, during a stall) — the ring buffer decouples playback from stepping.
-            double audioStart = tickWatch.Elapsed.TotalMilliseconds;
+            double audioStart = ElapsedMs(tickStart);
             _adapter?.PumpAudio();
-            audioMs = tickWatch.Elapsed.TotalMilliseconds - audioStart;
+            audioMs = ElapsedMs(tickStart) - audioStart;
 
             // Say the moment EmuHawk's sound device stops or restarts, not just that it is down
             // when something else already went wrong. Sampling it on a slow tick reports the
@@ -260,7 +261,7 @@ public sealed partial class NetplayToolForm
 
             // Timed together because they are the same kind of thing: calls across the ApiHawk
             // boundary into EmuHawk, made once per tick for the whole session.
-            double apiStart = tickWatch.Elapsed.TotalMilliseconds;
+            double apiStart = ElapsedMs(tickStart);
 
             // Also here, not only in UpdateValues: the WinForms fallback clock calls FrameTick
             // directly and never passes through UpdateValues at all.
@@ -269,7 +270,7 @@ public sealed partial class NetplayToolForm
             // If EmuHawk's own loop slipped in extra core frames (e.g. a brief unpause), our
             // counter and the core have diverged — report it plainly rather than as a desync.
             int emuDelta = APIs.Emulation.FrameCount() - _startEmuFrame;
-            emuApiMs = tickWatch.Elapsed.TotalMilliseconds - apiStart;
+            emuApiMs = ElapsedMs(tickStart) - apiStart;
             if (emuDelta != driver.CurrentFrame)
             {
                 int diff = emuDelta - driver.CurrentFrame;
@@ -327,7 +328,7 @@ public sealed partial class NetplayToolForm
                 // that second frame after the callback has already consumed its UI work budget.
                 if (framesThisTick > 0)
                 {
-                    if (!committedSecondFrame && tickWatch.Elapsed.TotalMilliseconds >= TickBudgetMs()) break;
+                    if (!committedSecondFrame && ElapsedMs(tickStart) >= TickBudgetMs()) break;
                     // A frame of core execution just happened, and packets that landed during it are
                     // already queued. Draining once per tick would judge this frame's readiness on
                     // network state captured before that work — turning an input that did arrive in
@@ -345,10 +346,10 @@ public sealed partial class NetplayToolForm
                 // for why this is the one measurement that can settle a 55.8ms gate.
                 int g0Before = GC.CollectionCount(0), g1Before = GC.CollectionCount(1),
                     g2Before = GC.CollectionCount(2);
-                var phase = System.Diagnostics.Stopwatch.StartNew();
+                long phaseStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (!driver.CurrentFrameReady())
                 {
-                    double stallGateMs = phase.Elapsed.TotalMilliseconds;
+                    double stallGateMs = ElapsedMs(phaseStart);
                     gateMs += stallGateMs;
                     NoteGate(stallGateMs, g0Before, g1Before, g2Before,
                         ref gcGate0, ref gcGate1, ref gcGate2);
@@ -374,7 +375,7 @@ public sealed partial class NetplayToolForm
                 }
                 else
                 {
-                    double readyGateMs = phase.Elapsed.TotalMilliseconds; // includes rollback repair
+                    double readyGateMs = ElapsedMs(phaseStart); // includes rollback repair
                     // Rollback hashes its checksum anchor inside the frame decision, where the core
                     // is already standing on the state. That time is real but it isn't repair, so
                     // move it into the hash column and keep the two disjoint. Nothing to drain on
@@ -389,7 +390,7 @@ public sealed partial class NetplayToolForm
                     NoteGate(readyGateMs, g0Before, g1Before, g2Before,
                         ref gcGate0, ref gcGate1, ref gcGate2);
                     _pacing.AddGate(readyGateMs);
-                    phase.Restart();
+                    phaseStart = System.Diagnostics.Stopwatch.GetTimestamp();
                     // When wall-clock debt already makes a second frame due, the first picture is
                     // throwaway. Skip it only when frame two is input-safe and recent core cost says
                     // both frames fit the UI budget. If one frame unexpectedly spikes after that
@@ -399,12 +400,12 @@ public sealed partial class NetplayToolForm
                         || (driver.Strategy is RollbackStrategy secondRollback
                             && !secondRollback.HasPendingTimeSyncDebt);
                     bool anotherFrameDue =
-                        _schedule.AnotherFrameFits(nowMs, framesThisTick, tickWatch.Elapsed.TotalMilliseconds)
+                        _schedule.AnotherFrameFits(nowMs, framesThisTick, ElapsedMs(tickStart))
                         && secondGateSafe
                         && driver.NextFrameFullyConfirmed;
                     if (anotherFrameDue) committedSecondFrame = true;
                     _adapter!.AdvanceFrame(driver.CurrentInputs(), renderVideo: !anotherFrameDue);
-                    double frameCoreMs = phase.Elapsed.TotalMilliseconds;
+                    double frameCoreMs = ElapsedMs(phaseStart);
                     coreMs += frameCoreMs;
                     _pacing.AddFrame(frameCoreMs, rendered: !anotherFrameDue);
                     driver.CompleteFrame();
@@ -458,9 +459,9 @@ public sealed partial class NetplayToolForm
                 }
                 else
                 {
-                    var phase = System.Diagnostics.Stopwatch.StartNew();
+                    long phaseStart = System.Diagnostics.Stopwatch.GetTimestamp();
                     presented = _adapter!.PresentVideo();
-                    renderMs = phase.Elapsed.TotalMilliseconds;
+                    renderMs = ElapsedMs(phaseStart);
                 }
 
                 // Stamp AFTER the picture is on screen, not from the tick's entry timestamp.
@@ -521,15 +522,17 @@ public sealed partial class NetplayToolForm
                 Log(_adapter!.AudioStats());
             }
 
-            double uiStart = tickWatch.Elapsed.TotalMilliseconds;
+            double uiStart = ElapsedMs(tickStart);
             UpdateSessionUi(nowMs);
-            uiMs = tickWatch.Elapsed.TotalMilliseconds - uiStart;
+            uiMs = ElapsedMs(tickStart) - uiStart;
         }
+        // Already says what happened and that it is terminal; wrapping it in "session error" would
+        // bury the one detail that distinguishes a broken core from a broken link.
+        catch (StateRestoreFailedException ex) { EndSession(ex.Message); }
         catch (Exception ex) { EndSession("session error: " + ex.Message); }
         finally
         {
-            tickWatch.Stop();
-            double elapsed = tickWatch.Elapsed.TotalMilliseconds;
+            double elapsed = ElapsedMs(tickStart);
             double clockMs = _paceClock.Elapsed.TotalMilliseconds;
             if (_phase.IsActive && elapsed >= Math.Max(12.0, _frameMs * 0.75)
                 && clockMs - _lastSlowTickLogMs >= 1000)
