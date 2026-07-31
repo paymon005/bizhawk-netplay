@@ -298,7 +298,8 @@ public sealed partial class NetplayToolForm
         // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
         // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
         _audioStatsLogged = false;
-        _adapter!.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
+        _adapter!.AttachMainForm(MainForm as BizHawk.Client.EmuHawk.MainForm);
+        _adapter.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
         Log(_adapter.AudioReady ? "audio enabled — " + _adapter.AudioDiagnostic
                                 : "(note) audio unavailable: " + _adapter.AudioDiagnostic);
 

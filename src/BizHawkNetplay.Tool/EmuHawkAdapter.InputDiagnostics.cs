@@ -62,8 +62,8 @@ internal sealed partial class EmuHawkAdapter
     /// that could explain it was invisible.
     ///
     /// It prints the whole chain per axis — the bind, the live host reading, and the core value
-    /// <see cref="ResolveAxis"/> derives from it — so the three candidate explanations separate on
-    /// sight rather than by argument:
+    /// BizHawk's controller chain resolves them to — so the three candidate explanations separate
+    /// on sight rather than by argument:
     ///
     /// * <c>host=</c> absent, or the raw dictionary empty, means the pad's axes are not reaching
     ///   <c>GetPressedAxes</c> at all. Then analog is dead and the only thing that can still move
@@ -145,24 +145,32 @@ internal sealed partial class EmuHawkAdapter
             int raw = 0;
             bool haveRaw = hostAxes != null && !string.IsNullOrEmpty(bind.Value)
                            && hostAxes.TryGetValue(bind.Value, out raw);
-            int resolved = ResolveAxis(bindN, spec, _axisReversed[0][j], hostAxes, pressed);
-
             sb.Append("      host=").Append(haveRaw ? raw.ToString(CultureInfo.InvariantCulture) : "ABSENT")
               .Append(haveRaw ? $" ({raw / 10000f:0.000} of full)" : " (bind name not in the dictionary above)")
-              .Append("  ->  our old math would say ").Append(resolved).Append('\n');
+              .Append('\n');
 
             // What is ACTUALLY sent: BizHawk's own resolved value, the end of its controller chain.
-            // Printed beside the old reimplementation precisely so a disagreement is visible rather
-            // than argued about — a difference here is a bug in the copy, and the copy is no longer
-            // in the capture path.
             int fromPad = padAxes != null && padAxes.TryGetValue(_padAxisKeys[0][j], out var pv) && pv is int pi
                 ? pi
                 : int.MinValue;
             sb.Append("      BizHawk resolves it to ")
               .Append(fromPad == int.MinValue ? "ABSENT" : fromPad.ToString(CultureInfo.InvariantCulture))
               .Append("   <- this is what gets sent\n");
-            if (fromPad != int.MinValue && fromPad != resolved)
-                sb.Append("      !! the two disagree — BizHawk's is the one in use; the old math was wrong here.\n");
+
+            // Capture no longer asks for that dictionary; it reads the same controller directly,
+            // which is the same call ToDictionary would have made on the way to building it. The two
+            // are printed together so the claim is checkable against real hardware and a real pad,
+            // rather than only against BizHawk's source.
+            var direct = MovieInController;
+            int fromDirect = direct != null && MovieInCovers(direct, 0)
+                ? direct.AxisValue(spec.Name)
+                : int.MinValue;
+            if (fromDirect != fromPad)
+                sb.Append("      !! the capture path reads ")
+                  .Append(fromDirect == int.MinValue
+                      ? "NOTHING here, so it is falling back to the dictionary"
+                      : fromDirect.ToString(CultureInfo.InvariantCulture))
+                  .Append(" — this must match the line above.\n");
 
             // The digital branch wins over the stick whenever it fires, exactly as BizHawk's
             // LatchFromPhysical does — and it can only ever produce full deflection.

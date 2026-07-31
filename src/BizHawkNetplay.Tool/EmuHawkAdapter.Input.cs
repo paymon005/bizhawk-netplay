@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using BizHawk.Client.Common;
@@ -82,6 +82,55 @@ internal sealed partial class EmuHawkAdapter
     /// </summary>
     public int InputSourcePort { get; set; } = -1;
 
+    /// <summary>
+    /// The controller <c>Joypad.Get</c> reads: the end of EmuHawk's own controller chain, before the
+    /// movie layer. Read fresh each time — <c>MovieIn</c> is a settable property and gets re-pointed
+    /// when a movie starts — and null whenever the reference is missing, which sends
+    /// <see cref="ReadLocalInput"/> back down the dictionary path unchanged.
+    /// </summary>
+    private IController? MovieInController
+    {
+        get { try { return _mainForm?.MovieSession?.MovieIn; } catch { return null; } }
+    }
+
+    private ControllerDefinition? _movieInDefinition;
+    private bool[]? _movieInCoversPort;
+
+    /// <summary>
+    /// Whether that controller actually declares every control in a port's layout.
+    ///
+    /// <c>ToDictionary</c> builds from the CONTROLLER's own definition and silently omits anything
+    /// it does not have, which the dictionary path below then read as neutral. Asking the controller
+    /// directly has no such omission step, and what an <see cref="IController"/> does with a name it
+    /// does not know is its own business. So the equivalence is checked rather than assumed — once
+    /// per definition, since a mid-session change means a core reboot — and a mismatch falls back
+    /// to the dictionary instead of guessing.
+    /// </summary>
+    private bool MovieInCovers(IController controller, int readPort)
+    {
+        var definition = controller.Definition;
+        if (definition == null) return false;
+        if (!ReferenceEquals(definition, _movieInDefinition))
+        {
+            _movieInDefinition = definition;
+            var covers = new bool[_layouts.Length];
+            for (int p = 0; p < _layouts.Length; p++)
+            {
+                bool ok = true;
+                foreach (var button in _layouts[p].Buttons)
+                    if (!definition.BoolButtons.Contains(button)) { ok = false; break; }
+                if (ok)
+                    foreach (var axis in _layouts[p].Axes)
+                        if (!definition.Axes.ContainsKey(axis.Name)) { ok = false; break; }
+                covers[p] = ok;
+            }
+            _movieInCoversPort = covers;
+        }
+        return _movieInCoversPort != null
+            && readPort >= 0 && readPort < _movieInCoversPort.Length
+            && _movieInCoversPort[readPort];
+    }
+
     public PortInput ReadLocalInput(int port)
     {
         var layout = _layouts[port];
@@ -98,7 +147,7 @@ internal sealed partial class EmuHawkAdapter
         // feeds the core.
         //
         // This used to be a reimplementation: read the raw host coalescers and re-derive the bind
-        // math in ResolveAxis. That is a copy of someone else's algorithm, kept in step by hand, and
+        // math ourselves. That is a copy of someone else's algorithm, kept in step by hand, and
         // it had already drifted — it evaluated button binds against HostInputCoalescer while
         // BizHawk evaluates them against ControllerInputCoalescer, which are different objects.
         // Since the digital branch of an analog bind wins over the stick whenever it fires, and
@@ -110,12 +159,35 @@ internal sealed partial class EmuHawkAdapter
         bool remap = src >= 0 && src < _layouts.Length && _remapCompatible[port][src];
         int readPort = remap ? src : port;
 
+        var buttons = new bool[layout.Buttons.Count];
+        var axes = new int[layout.Axes.Count];
+
+        // Ask that same controller for the values, instead of asking it to build a dictionary of
+        // them. JoypadApi.Get(n) is exactly `_movieSession.MovieIn.ToDictionary(n)`, and
+        // ToDictionary(n) is IsPressed/AxisValue over every control whose name carries the "P<n> "
+        // prefix, re-keyed by the tail. So this reads the same values off the same object; it is
+        // the dictionary that is optional, not the resolution. Nothing here re-derives bind
+        // arithmetic — that is the mistake the comment above is about, and this is not it.
+        //
+        // What the dictionary cost was a fresh Dictionary, a boxed value per control and a
+        // Substring per control name, every frame — roughly two thousand objects a second on an
+        // N64 pad, which is the largest per-frame allocation source left in the session.
+        //
+        // Remap-compatible layouts line up control-for-control (see LayoutsLineUp), so control i of
+        // `port` is control i of `readPort`, under `readPort`'s own full name.
+        var direct = MovieInController;
+        if (direct != null && MovieInCovers(direct, readPort))
+        {
+            var readLayout = _layouts[readPort];
+            for (int i = 0; i < buttons.Length; i++) buttons[i] = direct.IsPressed(readLayout.Buttons[i]);
+            for (int j = 0; j < axes.Length; j++) axes[j] = direct.AxisValue(readLayout.Axes[j].Name);
+            return new PortInput(buttons, axes);
+        }
+
         IReadOnlyDictionary<string, object>? pad;
         try { pad = _apis.Joypad.Get(readPort + 1); } // Joypad ports are 1-based
         catch { pad = null; }
 
-        var buttons = new bool[layout.Buttons.Count];
-        var axes = new int[layout.Axes.Count];
         // Keys come back with the "P<n> " prefix stripped, which is why the remap works at all: two
         // ports that describe the same controls produce the same keys. Anything missing rests at
         // that axis's own Neutral rather than 0, which on an unsigned axis is a full deflection.
@@ -317,44 +389,6 @@ internal sealed partial class EmuHawkAdapter
                 arr[j] = def.Axes[axes[j].Name].IsReversed;
             result[p] = arr;
         }
-        return result;
-    }
-
-    /// <summary>
-    /// Turn a live host analog reading into a core axis value, mirroring BizHawk's own analog-bind
-    /// math (Controller.cs): host value ÷10000 → [-1,1], deadzone, ×Mult, scale to the axis half-range,
-    /// shift to Neutral, clamp. Kept identical so a captured value equals what local play would inject.
-    /// </summary>
-    private static int ResolveAxis(AnalogBind? bindN, CoreAxisSpec spec, bool reversed,
-        IReadOnlyDictionary<string, int>? hostAxes, HashSet<string> pressedButtons)
-    {
-        if (bindN == null) return spec.Neutral;
-        var bind = bindN.Value;
-
-        float value = 0f;
-        if (!string.IsNullOrEmpty(bind.ButtonBindPositive) && EvaluateBinding(bind.ButtonBindPositive, pressedButtons)) value += 1f;
-        if (!string.IsNullOrEmpty(bind.ButtonBindNegative) && EvaluateBinding(bind.ButtonBindNegative, pressedButtons)) value -= 1f;
-        if (value == 0f)
-        {
-            int host = 0;
-            if (hostAxes != null && !string.IsNullOrEmpty(bind.Value)) hostAxes.TryGetValue(bind.Value, out host);
-            value = host / 10000f;
-        }
-
-        float dz = bind.Deadzone;
-        if (value < -dz) value += dz;
-        else if (value < dz) value = 0f;
-        else value -= dz;
-        value = dz < 1f ? value / (1f - dz) : 0f;
-
-        value *= bind.Mult;
-        if (reversed) value = -value;
-        value *= Math.Max(spec.Neutral - spec.Min, spec.Max - spec.Neutral);
-        value += spec.Neutral;
-
-        int result = (int)Math.Round(value);
-        if (result < spec.Min) result = spec.Min;
-        else if (result > spec.Max) result = spec.Max;
         return result;
     }
 

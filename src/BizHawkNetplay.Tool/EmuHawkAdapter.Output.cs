@@ -351,6 +351,18 @@ internal sealed partial class EmuHawkAdapter
     /// from the core each frame in <see cref="DrainCoreAudio"/>, drained to the device each tick in
     /// <see cref="PumpAudio"/>. <see cref="DisableAudio"/> restores EmuHawk's wiring on session end.
     /// </summary>
+    /// <summary>
+    /// Hand the adapter EmuHawk's MainForm.
+    ///
+    /// Separate from <see cref="EnableAudio"/> because the input capture path wants it too, and it
+    /// used to arrive only through there — so a session whose audio was unavailable also silently
+    /// lost the fast capture path, for no related reason.
+    /// </summary>
+    public void AttachMainForm(BizHawk.Client.EmuHawk.MainForm? mainForm)
+    {
+        if (mainForm != null) _mainForm = mainForm;
+    }
+
     public void EnableAudio(BizHawk.Client.EmuHawk.MainForm? mainForm)
     {
         _audioReady = false;
