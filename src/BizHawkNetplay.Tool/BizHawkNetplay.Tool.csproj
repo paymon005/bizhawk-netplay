@@ -23,11 +23,17 @@
        Never copied to output: EmuHawk loads the tool from its own ExternalTools dir
        where these already live.
 
-       Only what is actually compiled against. BizHawk.Common, BizHawk.WinForms.Controls and
+       Only what is actually compiled against. BizHawk.WinForms.Controls and
        BizHawk.Bizware.Graphics were listed here and named by nothing — no using, no type, and no
        member signature that needed them; each was removed and the Tool still built. They are of
-       course still loaded by EmuHawk itself, which is why nothing at runtime notices. -->
+       course still loaded by EmuHawk itself, which is why nothing at runtime notices.
+       BizHawk.Common was removed on the same evidence and came back with a real caller: the
+       checksum's BulkPeekByte path needs Range&lt;long&gt;, which lives there. -->
   <ItemGroup>
+    <Reference Include="BizHawk.Common">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="BizHawk.Client.Common">
       <HintPath>$(BizHawkHome)\dll\BizHawk.Client.Common.dll</HintPath>
       <Private>false</Private>

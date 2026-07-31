@@ -43,7 +43,12 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // 14: WELCOME carries per-seat mesh tokens, and peers announce themselves with them over UDP —
     // an older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote
     // the source port, which is silent one-way input loss rather than a refusal. Hence the bump.
-    private const int Protocol = 14;
+    // 15: the desync checksum reads memory differently on some cores. Waterbox domains (Snes9x,
+    // Ares64, melonDS, the Nyma cores) moved from a 1/16 stride sample to the whole domain via
+    // BulkPeekByte, and byte-array domains (the Hawk cores) hash their backing array directly —
+    // both produce a different value than v14 computed for the same state, so a mixed pair would
+    // report a phantom desync every interval. Same rule as v10: the hash is wire contract.
+    private const int Protocol = 15;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

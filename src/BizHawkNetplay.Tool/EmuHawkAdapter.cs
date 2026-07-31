@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using BizHawk.Common;
 using BizHawk.Client.Common;
 using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Emu;
@@ -46,7 +47,9 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     private bool _memoryDomainsResolved;
     private byte[] _hashScratch = [];
     private PropertyInfo? _domainDataProp;
-    private bool _domainDataResolved;
+    private PropertyInfo? _domainArrayProp;
+    private bool _domainBulkCapable;
+    private Type? _domainAccessResolvedFor;   // domain type the three fields above describe
 
     public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable)
     {
@@ -249,11 +252,14 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// number computed by a peer, so an FNV-1a over the same bytes does the same job for a
     /// fraction of the cost. The peer comparison is why the exact function is part of the wire
     /// contract — changing it requires a Protocol bump so mismatched builds refuse rather than
-    /// reporting a phantom desync.
+    /// reporting a phantom desync (v15 did exactly that: the path selection below changed which
+    /// bytes some cores hash).
     ///
-    /// Two ways in, because domains differ in what they expose: a raw block gets memcpy'd, anything
-    /// else is read a word at a time (see HashByWord). They need not agree with each other — both
-    /// peers run the same core, so both take the same path. Falls back to the portable API path if
+    /// Four ways in, because domains differ in what they expose — see
+    /// <see cref="ResolveDomainAccess"/> for how one is chosen. The paths need not agree with each
+    /// other about byte order or coverage: both peers run the same core, so both take the same
+    /// path. Selection is a pure function of the domain's type, never of measured speed — a fast
+    /// machine and a slow machine must hash the same bytes. Falls back to the portable API path if
     /// the domain service isn't reachable at all.
     /// </summary>
     public uint HashMainMemory(int salt = 0)
@@ -270,13 +276,15 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                     var timer = Stopwatch.StartNew();
                     string how;
                     uint result;
-                    // Waterbox-backed domains (GPGX and friends) only expose their memory while
-                    // activated, and the Monitor variants guard it with a lock; Enter/Exit is a
-                    // no-op for the plain native cores.
+                    ResolveDomainAccess(domain);
+                    // Waterbox-backed domains only expose their memory while activated, and the
+                    // Monitor variants guard it with a lock; Enter/Exit is a no-op for the plain
+                    // native cores.
                     domain.Enter();
                     try
                     {
                         var data = DomainDataPointer(domain);
+                        var array = DomainDataArray(domain);
                         if (data != IntPtr.Zero)
                         {
                             // Pointer-backed domain: a straight memcpy, then hash the buffer. The
@@ -285,6 +293,26 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                             Marshal.Copy(data, _hashScratch, 0, length);
                             result = Fnv1a64(_hashScratch, length);
                             how = "ptr";
+                        }
+                        else if (array != null && array.Length >= length)
+                        {
+                            // Array-backed domain (the Hawk cores' RAM): the bytes are already
+                            // managed, so hash them where they sit. No copy at all.
+                            result = Fnv1a64(array, length);
+                            how = "arr";
+                        }
+                        else if (_domainBulkCapable)
+                        {
+                            // A real BulkPeekByte override — one memcpy or one native call for the
+                            // whole domain. This is what rescues the waterbox function-backed
+                            // domains (the Nyma cores), whose per-byte reads each take a monitor
+                            // round-trip: the full domain now costs about what a 1/16 stride
+                            // sample used to, and a divergence narrower than the stride is caught
+                            // at the next checksum instead of up to stride intervals late.
+                            if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                            domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch);
+                            result = Fnv1a64(_hashScratch, length);
+                            how = "bulk";
                         }
                         else
                         {
@@ -329,11 +357,60 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     public string? HashDiagnostic { get; private set; }
 
     /// <summary>
-    /// The domain's backing block as a raw pointer, or Zero if it doesn't have one. Every
-    /// MemoryDomainIntPtr* variant exposes it as a public <c>Data</c> property; delegate- and
-    /// array-backed domains do not, and fall back to BulkPeekByte. Resolved by reflection once
-    /// because the concrete domain type lives in the emulation cores, which this project has no
-    /// compile-time reference to.
+    /// Work out, once per domain type, which of the four hash paths this domain supports.
+    ///
+    /// - A public <c>IntPtr Data</c> property is the MemoryDomainIntPtr* family (GPGX, mGBA,
+    ///   BSNES, QuickNES): raw pointer, memcpy.
+    /// - A public <c>byte[] Data</c> property is MemoryDomainByteArray (the Hawk cores): the
+    ///   managed array itself, hashed in place.
+    /// - A genuine <c>BulkPeekByte</c> override is the waterbox family (Snes9x, Ares64, melonDS,
+    ///   the Nyma cores): one memcpy or one native call under one monitor round-trip.
+    ///   MemoryDomainDelegate is explicitly EXCLUDED even though it declares an override, because
+    ///   its override silently falls back to the per-byte base loop when the core supplied no bulk
+    ///   delegate — which mupen N64 does not — and that per-byte loop through a delegate is slower
+    ///   than the strided word path this would replace.
+    /// - Everything else reads by word (see HashByWord).
+    ///
+    /// Reflection because the concrete domain types live in the emulation cores, which this
+    /// project has no compile-time reference to. Keyed on the domain's type: the domain OBJECT is
+    /// stable for a core's lifetime (BizHawk mutates domains in place on savestate load rather
+    /// than replacing them), but its backing pointer/array is re-read every hash for exactly that
+    /// reason — MergeList repoints Data on some cores' state loads, so caching the pointer would
+    /// hash a freed buffer.
+    /// </summary>
+    private void ResolveDomainAccess(MemoryDomain domain)
+    {
+        var type = domain.GetType();
+        if (_domainAccessResolvedFor == type) return;
+        _domainAccessResolvedFor = type;
+        _domainDataProp = null;
+        _domainArrayProp = null;
+        _domainBulkCapable = false;
+        try
+        {
+            var prop = type.GetProperty("Data", BindingFlags.Public | BindingFlags.Instance);
+            if (prop != null && prop.CanRead)
+            {
+                if (prop.PropertyType == typeof(IntPtr)) _domainDataProp = prop;
+                else if (prop.PropertyType == typeof(byte[])) _domainArrayProp = prop;
+            }
+
+            var bulk = type.GetMethod(nameof(MemoryDomain.BulkPeekByte),
+                new[] { typeof(BizHawk.Common.Range<long>), typeof(byte[]) });
+            _domainBulkCapable = bulk != null
+                && bulk.DeclaringType != typeof(MemoryDomain)
+                && bulk.DeclaringType != typeof(MemoryDomainDelegate);
+        }
+        catch
+        {
+            _domainDataProp = null;
+            _domainArrayProp = null;
+            _domainBulkCapable = false;
+        }
+    }
+
+    /// <summary>
+    /// The domain's backing block as a raw pointer, or Zero if it doesn't have one.
     ///
     /// Note the Swap16 variants hold their bytes in a different order than PeekByte reports. That
     /// is fine here and only here: this value is never interpreted, only compared against the same
@@ -341,20 +418,18 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// </summary>
     private IntPtr DomainDataPointer(MemoryDomain domain)
     {
-        if (!_domainDataResolved)
-        {
-            _domainDataResolved = true;
-            try
-            {
-                var prop = domain.GetType().GetProperty("Data", BindingFlags.Public | BindingFlags.Instance);
-                if (prop != null && prop.PropertyType == typeof(IntPtr) && prop.CanRead)
-                    _domainDataProp = prop;
-            }
-            catch { _domainDataProp = null; }
-        }
         if (_domainDataProp == null) return IntPtr.Zero;
         try { return (IntPtr)(_domainDataProp.GetValue(domain) ?? IntPtr.Zero); }
         catch { return IntPtr.Zero; }
+    }
+
+    /// <summary>The domain's backing managed array, or null. Re-read per hash — see
+    /// <see cref="ResolveDomainAccess"/> for why caching the array itself would be a bug.</summary>
+    private byte[]? DomainDataArray(MemoryDomain domain)
+    {
+        if (_domainArrayProp == null) return null;
+        try { return _domainArrayProp.GetValue(domain) as byte[]; }
+        catch { return null; }
     }
 
     /// <summary>Main memory as a raw domain, resolved once. Null if the service isn't offered.</summary>
