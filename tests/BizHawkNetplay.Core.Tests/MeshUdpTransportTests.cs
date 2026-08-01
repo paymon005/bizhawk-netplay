@@ -654,6 +654,137 @@ public class MeshUdpTransportTests
     private static byte[] Token(byte fill) => Enumerable.Repeat(fill, 16).ToArray();
 
     /// <summary>
+    /// A port for a candidate that must NOT collide with any socket these tests bind.
+    ///
+    /// Deriving one as "the peer's port plus one" looks harmless and is not: loopback hands out
+    /// ephemeral ports consecutively, so the next socket the test binds lands on exactly that
+    /// number, the advertised candidate resolves as a known route, and the case under test never
+    /// happens. Both ephemeral ranges in play start far above this window (49152 on Windows,
+    /// 32768 on Linux).
+    /// </summary>
+    private static int UnboundPort(int seed) => 20000 + (seed % 1000);
+
+    /// <summary>A THello on the wire: the mesh envelope, then the seat token being claimed.</summary>
+    private static byte[] HelloFrame(byte[] token) =>
+        new byte[] { (byte)'B', (byte)'H', (byte)'N', (byte)'P', 2, 0x40 }.Concat(token).ToArray();
+
+    /// <summary>Whether an input datagram (envelope type 0x10) arrived on this socket, ignoring the
+    /// punch probes that a claimed address legitimately attracts.</summary>
+    private static bool DrainedAnyInput(System.Net.Sockets.Socket socket)
+    {
+        var buffer = new byte[2048];
+        while (true)
+        {
+            try
+            {
+                EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+                int n = socket.ReceiveFrom(buffer, ref from);
+                if (n >= 6 && buffer[5] == 0x10) return true;
+            }
+            catch (System.Net.Sockets.SocketException) { return false; }  // nothing left to read
+        }
+    }
+
+    /// <summary>
+    /// A seat token proves membership. It does not prove that the address a packet claims to come
+    /// from can receive anything — a UDP source address is a claim, and every peer in the session
+    /// holds every seat's token.
+    ///
+    /// Believing one outright is what made this an amplifier: a single 22-byte announcement marked
+    /// the named address alive, an alive learned endpoint outranks every advertised candidate in
+    /// SelectSendCandidate, and the full input stream turned on toward a machine that had never
+    /// spoken. The claim still has to be RECORDED — a symmetric-NAT peer can be probed no other way
+    /// — but until it answers a probe it must not become a destination.
+    /// </summary>
+    [Fact]
+    public void AnAddressThatOnlyClaimsASeatIsProbedButNeverSentInput()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var claimer = new System.Net.Sockets.Socket(
+            System.Net.Sockets.AddressFamily.InterNetwork,
+            System.Net.Sockets.SocketType.Dgram,
+            System.Net.Sockets.ProtocolType.Udp);
+        try
+        {
+            claimer.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            claimer.ReceiveTimeout = 150;
+            int claimerPort = ((IPEndPoint)claimer.LocalEndPoint).Port;
+
+            // The seat's advertised candidate is somewhere else entirely, so the only way input can
+            // reach the claimer is if its own announcement is taken at face value.
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(UnboundPort(claimerPort)) }) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+
+            claimer.SendTo(HelloFrame(Token(0xAB)), Loop(host.LocalPort));
+
+            var sw = Stopwatch.StartNew();
+            while (host.LearnedEndpointCount == 0 && sw.ElapsedMilliseconds < 3000) Thread.Sleep(10);
+            Assert.Equal(1, host.LearnedEndpointCount);  // recorded, because it has to be probed
+
+            // It answers nothing, so nothing ever proves it can receive from us.
+            for (int i = 0; i < 40; i++) { host.Send([7]); Thread.Sleep(10); }
+
+            Assert.False(DrainedAnyInput(claimer),
+                "input was sent to an address that announced itself and then never answered a probe");
+        }
+        finally { host.Dispose(); claimer.Dispose(); }
+    }
+
+    /// <summary>
+    /// The other half of the same rule. Every peer holds every seat's token — that is what makes a
+    /// rejoin on a new address recognisable — so an announcement taken at face value let any member
+    /// point another member's seat wherever it liked and take that player off the mesh.
+    ///
+    /// A binding that is currently answering is kept. A NAT rebinding, the case the learning exists
+    /// for, arrives at a seat that has just gone quiet, and still rebinds.
+    /// </summary>
+    [Fact]
+    public void AClaimDoesNotDisplaceALearnedEndpointThatIsStillAnswering()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        var usurper = new System.Net.Sockets.Socket(
+            System.Net.Sockets.AddressFamily.InterNetwork,
+            System.Net.Sockets.SocketType.Dgram,
+            System.Net.Sockets.ProtocolType.Udp);
+        try
+        {
+            usurper.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(UnboundPort(peer.LocalPort)) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            // Wait for the binding to be PROVED, not merely recorded: an unproven one is meant to be
+            // displaceable, and protecting it would be protecting a claim.
+            var sw = Stopwatch.StartNew();
+            IPEndPoint? learned = null;
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (host.TryGetLearnedEndpoint(1, out var candidate) && host.IsEndpointAlive(candidate))
+                {
+                    learned = candidate;
+                    break;
+                }
+                Thread.Sleep(10);
+            }
+            Assert.NotNull(learned);
+            Assert.Equal(peer.LocalPort, learned!.Port);
+
+            // Same token, different address. Sampled tightly and for less than one punch interval,
+            // so a binding that holds is this rule holding it, not the real peer winning it back.
+            usurper.SendTo(HelloFrame(Token(0xAB)), Loop(host.LocalPort));
+            for (int i = 0; i < 20; i++)
+            {
+                Thread.Sleep(5);
+                Assert.True(host.TryGetLearnedEndpoint(1, out var current));
+                Assert.Equal(peer.LocalPort, current.Port);
+            }
+        }
+        finally { host.Dispose(); peer.Dispose(); usurper.Dispose(); }
+    }
+
+    /// <summary>
     /// The symmetric-NAT case, modelled honestly: the peer's packets arrive from a port nobody was
     /// ever told about, because its router assigns one per destination.
     ///
