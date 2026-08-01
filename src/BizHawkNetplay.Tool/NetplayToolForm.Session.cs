@@ -433,8 +433,10 @@ public sealed partial class NetplayToolForm
                 PublishLocalReflexive(null); // never leave the handshake waiting on a dead answer
                 return;
             }
-            if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh))
-            { PublishLocalReflexive(null); return; }
+            // Stale: a newer attempt owns _reflexiveKnown now, and has Reset it. Setting it here
+            // would release that attempt's AwaitLocalReflexive before ITS discovery answered, so
+            // its HELLO would silently carry no public candidate. Say nothing and touch nothing.
+            if (!IsConnectionAttemptCurrent(attempt) || !ReferenceEquals(_mesh, mesh)) return;
             PublishLocalReflexive(reflexive);
             if (reflexive == null)
             {
