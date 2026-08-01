@@ -463,4 +463,52 @@ internal sealed partial class EmuHawkAdapter
         try { return ControllerDefinition.PlayerNumber(control); }
         catch { return 0; }
     }
+
+    /// <summary>
+    /// Why a session's seats did not map 1:1 onto the core's own player numbers, or null when they
+    /// did (every core except the case below). Logged at session start so the renumbering is
+    /// visible rather than silent.
+    /// </summary>
+    public string? SeatOrderNote { get; private set; }
+
+    /// <summary>
+    /// Order the layouts by the player number the GAME reads, where the core's own numbering
+    /// differs from it.
+    ///
+    /// NESHawk's FourScore numbers its slots by plug: the left device's two slots become P1 and P2,
+    /// the right's P3 and P4. But the hardware — and every game's read loop — polls $4016 as
+    /// controllers 1 and 3 and $4017 as 2 and 4, which is how QuickNES names them. So under
+    /// NESHawk-with-FourScore, "P2" is the pad games read THIRD: a netplay seat 2 mapped onto it
+    /// pressed buttons no 2-player game ever polls, and their controls simply did nothing —
+    /// while the same session under QuickNES worked. Reordering here puts seat N on the pad games
+    /// call player N; every machine derives the same order from the same handshake-compared sync
+    /// settings, and the local player's bindings still resolve through the layout their seat maps
+    /// to, exactly as local FourScore play requires.
+    ///
+    /// Only the left-FourScore shapes are reordered ($4016 slot 1 = game pad 3): a lone FourScore
+    /// in the right port leaves game pad 3 nonexistent and is not a configuration any known game
+    /// expects, so it is left alone rather than guessed at.
+    /// </summary>
+    private CoreLayout[] ReorderLayoutsToGamePlayerNumbering(CoreLayout[] layouts)
+    {
+        try
+        {
+            if (layouts.Length < 3) return layouts;
+            if (_emulator.ControllerDefinition?.Name != "NES Controller") return layouts;
+            var settings = ReadOnlySettings();
+            if (!settings.HasSyncSettings) return layouts;
+            var controls = MemberValue(settings.GetSyncSettings(), "Controls");
+            if (controls == null) return layouts;   // not NESHawk (QuickNES shares the definition name)
+            if (MemberValue(controls, "NesLeftPort") is not string left || left != "FourScore")
+                return layouts;
+
+            var reordered = (CoreLayout[])layouts.Clone();
+            (reordered[1], reordered[2]) = (layouts[2], layouts[1]);
+            SeatOrderNote = "NESHawk FourScore numbers pads by plug ($4016 carries pads 1 and 3), " +
+                            "so seats map P1→P1, P2→P3, P3→P2" + (layouts.Length >= 4 ? ", P4→P4" : "") +
+                            " to follow the numbering games actually read.";
+            return reordered;
+        }
+        catch { return layouts; } // a settings read must never break loading a core
+    }
 }

@@ -65,7 +65,7 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         // allocating dictionary path until the audio path happened to hand MainForm over.
         _hostConfig = config;
         _movieSession = movieSession;
-        _layouts = BuildLayouts(emulator.ControllerDefinition);
+        _layouts = ReorderLayoutsToGamePlayerNumbering(BuildLayouts(emulator.ControllerDefinition));
         _bindings = BuildBindings();
         _analogBinds = BuildAnalogBinds();
         _axisReversed = BuildAxisReversed();

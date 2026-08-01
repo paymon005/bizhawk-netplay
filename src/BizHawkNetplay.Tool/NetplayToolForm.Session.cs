@@ -320,6 +320,11 @@ public sealed partial class NetplayToolForm
                 "and those bytes come from the GPU — which disagrees between machines even when both " +
                 "players have identical settings, and shows up as a desync at every checksum.");
 
+        // A seat that does not sit on the core's own player number is worth one line at start —
+        // otherwise the renumbering is invisible until someone asks why P2's pad works at all.
+        if (_adapter.SeatOrderNote != null)
+            Log($"(note) {_adapter.SeatOrderNote}");
+
         // The digital-stick-override note deliberately does NOT go here. It fires for any N64 setup
         // using BizHawk's default XInput binds, and measurement showed the override usually does not
         // fire at all — so at session start it is an unsolicited warning about a non-problem, which
