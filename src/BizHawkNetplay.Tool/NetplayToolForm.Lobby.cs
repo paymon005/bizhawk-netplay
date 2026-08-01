@@ -248,6 +248,12 @@ public sealed partial class NetplayToolForm
                     if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
                     try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
                     int assignedPort = links.Count + 1;
+                    bool reflexiveCredible = ReflexiveCandidate.IsCredible(greet.Reflexive, remoteIp);
+                    if (greet.Reflexive != null && !reflexiveCredible)
+                        UiConnLog(
+                            $"ignoring the public endpoint P{assignedPort + 1} announced ({greet.Reflexive}) — " +
+                            $"it is not the address they reached us from ({remoteIp}); using that instead",
+                            Color.DarkGoldenrod);
                     links.Add(new PeerLink
                     {
                         Tcp = tcp,
@@ -257,7 +263,10 @@ public sealed partial class NetplayToolForm
                         UdpEndpoint = new IPEndPoint(remoteIp, greet.UdpPort),
                         // Known before WELCOME now, so the routes handed to every OTHER joiner
                         // carry a real punchable candidate rather than a port-preservation guess.
-                        ReflexiveEndpoint = greet.Reflexive,
+                        // Believed only if it matches where this joiner actually reached us from —
+                        // this address gets handed to every other player and probed by all of them,
+                        // so an unchecked one aims the whole session at whoever it names.
+                        ReflexiveEndpoint = reflexiveCredible ? greet.Reflexive : null,
                         Label = $"P{assignedPort + 1} ({remoteIp})",
                     });
                     UiConnLog($"P{assignedPort + 1} joined from {remoteIp} ({links.Count}/{need})", Color.DarkGreen);

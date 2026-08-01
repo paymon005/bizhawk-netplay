@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Net;
 using System.Threading;
@@ -489,12 +490,50 @@ public sealed partial class NetplayToolForm
         { IsBackground = true, Name = "BizHawkNetplay-stun-share" }.Start();
     }
 
-    /// <summary>Host: record a joiner's reflexive endpoint and re-share the candidate lists.</summary>
+    /// <summary>Shortest gap between two candidate updates this host will act on, per peer.</summary>
+    private const int CandidateUpdateIntervalMs = 2000;
+
+    /// <summary>How many candidate updates one peer may have acted on before the rest are ignored.
+    /// STUN answers once; a rebinding might genuinely move it a handful of times in a long session.
+    /// Past that, a peer is not reporting an address, it is driving a broadcast.</summary>
+    private const int MaxCandidateUpdatesPerPeer = 8;
+
+    /// <summary>
+    /// Host: record a joiner's reflexive endpoint and re-share the candidate lists.
+    ///
+    /// Believed only if it matches the address this peer's own control connection arrives from
+    /// (see <see cref="ReflexiveCandidate"/>) — every accepted value here is handed to every other
+    /// player, probed by all of them four times a second, and used as an input destination when no
+    /// direct path is confirmed. Unchecked, this one frame re-aimed the entire session at an
+    /// address of the sender's choosing, mid-game, as often as it liked.
+    ///
+    /// Metered as well as checked: acting on an update costs a PeerList to every peer, so even
+    /// truthful churn is bounded rather than trusted to be occasional.
+    /// </summary>
     private void OnJoinerCandidate(PeerLink link, IPEndPoint reflexive)
     {
         if (!_phase.IsActive || !_isHost || _phase.AwaitingRejoin) return;
         if (!_peers.Contains(link)) return;                                  // dropped meanwhile
         if (reflexive.Equals(link.ReflexiveEndpoint)) return;               // unchanged
+
+        var observed = (link.Tcp?.Client?.RemoteEndPoint as IPEndPoint)?.Address
+                       ?? link.UdpEndpoint?.Address;
+        if (!ReflexiveCandidate.IsCredible(reflexive, observed))
+        {
+            if (Verbose)
+                Log($"{link.Label} announced public endpoint {reflexive}, which is not where it " +
+                    $"reaches us from ({observed?.ToString() ?? "unknown"}) — ignored");
+            return;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        if (link.CandidateUpdates >= MaxCandidateUpdatesPerPeer) return;
+        if (link.LastCandidateTicks != 0
+            && (now - link.LastCandidateTicks) < CandidateUpdateIntervalMs * Stopwatch.Frequency / 1000)
+            return;
+        link.LastCandidateTicks = now;
+        link.CandidateUpdates++;
+
         link.ReflexiveEndpoint = reflexive;
         if (Verbose) Log($"{link.Label} public endpoint {reflexive}");
         RedistributeMesh();

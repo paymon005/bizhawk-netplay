@@ -23,6 +23,8 @@ public sealed partial class NetplayToolForm
         public bool HoldsState;           // has already been sent the initial savestate (lobby-only)
         public IPEndPoint UdpEndpoint = null!;      // LAN/observed endpoint (from TCP source + reported port)
         public IPEndPoint? ReflexiveEndpoint;       // public (STUN) endpoint, for NAT traversal; null until reported
+        public long LastCandidateTicks;   // Stopwatch ticks of the last candidate update acted on
+        public int CandidateUpdates;      // how many have been acted on; both meter OnJoinerCandidate
         public Thread? Reader;
         public Thread? Writer;
         public readonly ConcurrentQueue<OutboundMessage> Outbound = new();
