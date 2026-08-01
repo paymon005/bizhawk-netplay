@@ -437,6 +437,7 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         int walkback = r - b;
         int count = frame - b;                   // re-simulate b .. frame-1
         double startedMs = _clock?.NowMs ?? 0;
+        double hashBeforeMs = _pendingHashMs;
         _adapter.RunFramesInvisible(count, i =>
         {
             int f = b + i;
@@ -450,7 +451,12 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         });
         // Core is back at `frame`; the snapshot previously taken for it is now stale.
         _savedFrame = -1;
-        if (_clock != null && count > 0) RecordRepairCost((_clock.NowMs - startedMs) / count);
+        // Any anchor re-hashed above is checksum cost, not repair cost — the caller drains it
+        // separately through TakeHashCostMs. Charging it here would inflate the per-frame estimate
+        // that governs prediction depth, which is the reason this used to invalidate the cached
+        // hash instead of replacing it.
+        if (_clock != null && count > 0)
+            RecordRepairCost((_clock.NowMs - startedMs - (_pendingHashMs - hashBeforeMs)) / count);
 
         RollbackCount++;
         // Depth is how far the correction reached back; the walkback to the nearest keyframe is
@@ -598,12 +604,17 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     /// <summary>
     /// Take the snapshot, or make sure no stale one survives in its place.
     ///
-    /// A checksum anchor gets hashed here too, on the live path only. Standing on the state is the
+    /// A checksum anchor gets hashed here, live or during a repair. Standing on the state is the
     /// whole cost of checksumming it — the alternative is to come back later and save, load, hash
-    /// and load again for the same bytes. Doing it during a repair instead would fold the hash into
-    /// the timed re-simulation and inflate the per-frame repair cost that governs how far we
-    /// predict, so a repair that rewrites an anchor invalidates the cached hash rather than
-    /// replacing it, and the checksum falls back to fetching that one itself.
+    /// and load again for the same bytes, measured on N64 at 18.4ms against the 7.2ms the hash
+    /// alone costs.
+    ///
+    /// A repair used to INVALIDATE the cached hash instead of replacing it, so every correction
+    /// that reached across a checksum boundary bought that 18.4ms hitch — and did so precisely on
+    /// the high-latency links where corrections are deepest and most frequent. The stated reason
+    /// was that hashing inside the timed re-simulation would inflate the per-frame repair cost
+    /// governing prediction depth; that is what <see cref="_pendingHashMs"/> already solves for
+    /// the live path, and <see cref="ExecutePendingRollback"/> now discounts it the same way.
     /// </summary>
     private void AnchorOrDrop(int frame, bool duringRepair = false)
     {
@@ -611,11 +622,6 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         {
             SaveStateFor(frame);
             if (!IsChecksumAnchor(frame)) return;
-            if (duringRepair)
-            {
-                if (_anchorHashFrame == frame - 1) _anchorHashFrame = -1;
-                return;
-            }
             double startedMs = _clock?.NowMs ?? 0;
             _anchorHash = _adapter.HashMainMemory(frame - 1);
             if (_clock != null) _pendingHashMs += _clock.NowMs - startedMs;

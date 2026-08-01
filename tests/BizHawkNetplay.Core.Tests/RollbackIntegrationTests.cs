@@ -847,11 +847,13 @@ public class RollbackIntegrationTests
     [Fact]
     public void ConfirmedChecksums_StayCorrectWhenARepairRewritesTheAnchor()
     {
-        // The cached hash describes a state a repair can destroy. When a correction re-simulates
-        // the anchor frame the cache is dropped rather than recomputed — recomputing would fold a
-        // full memory hash into the timed re-simulation and inflate the per-frame repair cost that
-        // governs how far we predict — so the checksum falls back to fetching that one itself.
-        // Both routes must produce the same number, which is what peer agreement here proves.
+        // The cached hash describes a state a repair can destroy. The repair now RECOMPUTES it
+        // rather than dropping it: dropping meant the checksum had to go and fetch that state
+        // itself — save, load, hash, load back, 18.4ms on N64 — every time a correction reached
+        // across a boundary, which is most often exactly on the links where corrections are
+        // deepest. Two things must hold: the peers still agree on every shared boundary (the
+        // recomputed hash describes the re-simulated state, not the destroyed one), and the
+        // expensive fallback no longer runs at all.
         const int k = 4;
         const int interval = 5; // short enough that ordinary rollbacks land on anchors constantly
         const int iters = 400;
@@ -873,9 +875,9 @@ public class RollbackIntegrationTests
         }
 
         Assert.True(a.Rollback.RollbackCount > 0, "no repairs ran, so nothing was exercised");
-        Assert.True(a.Rollback.ChecksumsByVisit > 0,
-            "the fallback never ran — this test would pass without ever leaving the fast path");
-        Assert.True(a.Rollback.ChecksumsFromAnchor > 0, "the fast path never ran either");
+        Assert.True(a.Rollback.ChecksumsFromAnchor > 0, "the fast path never ran");
+        Assert.Equal(0, a.Rollback.ChecksumsByVisit); // the save/load/hash/load-back hitch is gone
+        Assert.Equal(0, a.Emu.LoadCount - a.Rollback.RollbackCount); // loads are repairs, nothing else
 
         int shared = 0;
         foreach (var kv in ha)
