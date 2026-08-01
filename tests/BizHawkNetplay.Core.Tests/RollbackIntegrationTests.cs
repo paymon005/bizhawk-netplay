@@ -1023,6 +1023,36 @@ public class RollbackIntegrationTests
         Assert.Equal(2, seeded.Rollback.CostCap);
     }
 
+    /// <summary>
+    /// The catch-up burst repays wall-clock debt by stepping a second, unrendered frame. It used
+    /// to require every port's input for that frame to be already confirmed, which under rollback
+    /// with any input delay below the link latency — the normal setting — is false in steady
+    /// state. So the burst essentially never fired on precisely the sessions whose repairs and
+    /// anchor ticks create the debt. The gate is now the strategy's own caps: predicting one more
+    /// frame is what rollback is for, and it stalls itself when a cap says no.
+    /// </summary>
+    [Fact]
+    public void CatchUpGate_AllowsAPredictedFrameButRespectsTheCaps()
+    {
+        const int k = 4;
+        var clock = new Clock();
+        var (ta, tb) = LatencyLink.Pair(clock, latency: k);
+        var a = BuildRollback(ta, 0, tuning: Eliding(30));
+        var b = BuildRollback(tb, 1, tuning: Eliding(30));
+        Run(clock, a, b, 200);
+
+        int next = a.Driver.CurrentFrame + 1;
+        // The premise: at this latency the next frame is NOT fully confirmed, so the old gate
+        // would have refused it and the burst could never fire.
+        Assert.False(a.Driver.NextFrameFullyConfirmed);
+        Assert.True(a.Rollback.CanRunWithoutStalling(next),
+            "a predicted frame within every cap should be runnable — that is what rollback is for");
+
+        // ...and the caps still bind: a frame far past the ring depth is refused, exactly as
+        // BeginFrame would stall it.
+        Assert.False(a.Rollback.CanRunWithoutStalling(next + MaxRollback + 1));
+    }
+
     [Fact]
     public void SavestateRing_StaysBounded()
     {

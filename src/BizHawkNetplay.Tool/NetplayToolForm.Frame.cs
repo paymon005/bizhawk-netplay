@@ -453,13 +453,18 @@ public sealed partial class NetplayToolForm
                     // both frames fit the UI budget. If one frame unexpectedly spikes after that
                     // commitment, finish the visible second frame once; the conservative rolling
                     // estimate prevents that spike from causing repeated two-frame callbacks.
-                    bool secondGateSafe = driver.Strategy is LockstepStrategy
-                        || (driver.Strategy is RollbackStrategy secondRollback
-                            && !secondRollback.HasPendingTimeSyncDebt);
+                    // Lockstep can only step a frame every port has already sent, so full
+                    // confirmation IS its gate. Rollback's gate is its own caps: predicting one
+                    // frame further is the thing it exists to do, and requiring confirmation here
+                    // meant the burst essentially never fired in rollback's steady state — on
+                    // exactly the heavy-core sessions whose repairs and anchor ticks create the
+                    // debt it exists to repay. See RollbackStrategy.CanRunWithoutStalling.
+                    bool nextFrameRunnable = driver.Strategy is RollbackStrategy secondRollback
+                        ? secondRollback.CanRunWithoutStalling(driver.CurrentFrame + 1)
+                        : driver.Strategy is LockstepStrategy && driver.NextFrameFullyConfirmed;
                     bool anotherFrameDue =
                         _schedule.AnotherFrameFits(nowMs, framesThisTick, ElapsedMs(tickStart))
-                        && secondGateSafe
-                        && driver.NextFrameFullyConfirmed;
+                        && nextFrameRunnable;
                     if (anotherFrameDue) committedSecondFrame = true;
                     _adapter!.AdvanceFrame(driver.CurrentInputs(), renderVideo: !anotherFrameDue);
                     double frameCoreMs = ElapsedMs(phaseStart);

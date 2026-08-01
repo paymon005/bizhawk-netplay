@@ -500,6 +500,31 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         return _neutral[port];
     }
 
+    /// <summary>
+    /// Whether <paramref name="frame"/> would be run rather than stalled — the same three gates
+    /// <see cref="BeginFrame"/> applies (hard ring cap, time-sync and cost caps, outstanding
+    /// measured-advantage debt), asked without side effects.
+    ///
+    /// This exists for the catch-up burst, which repays wall-clock debt by stepping a second,
+    /// unrendered frame in one tick. That burst used to require the next frame's every port to be
+    /// already CONFIRMED — a condition that is false in rollback's steady state whenever input
+    /// delay is below the link's latency, which is the normal setting. So the sessions that hitch
+    /// most (a heavy core's repairs and anchor ticks) were exactly the ones that could never catch
+    /// up afterwards, and the debt was eventually discarded in a lump by the schedule rebase — the
+    /// judder the pacing telemetry reports as "rebases".
+    ///
+    /// Running a predicted frame is what rollback is FOR, and predicting one frame further is
+    /// bounded by the very caps asked about here. A wrong answer costs nothing new either: the
+    /// burst is already written to tolerate a second frame that never runs.
+    /// </summary>
+    public bool CanRunWithoutStalling(int frame)
+    {
+        if (_restoreFailed) return false;
+        if (_advantageStallFrames > 0) return false;
+        int horizon = RemoteHorizon(frame);
+        return horizon <= _maxRollback && horizon <= _softCap && horizon <= _costCap;
+    }
+
     /// <summary>Frames we'd be predicting for the least-advanced remote port if we run <paramref name="frame"/>.</summary>
     private int RemoteHorizon(int frame)
     {
