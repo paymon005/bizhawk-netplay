@@ -243,6 +243,33 @@ public class HandshakeTests
     }
 
     /// <summary>
+    /// A rejection reason is text the far end chose, and it reaches the on-screen log and the
+    /// session file. Unbounded and unfiltered, that let a peer write a quarter-megabyte per attempt
+    /// to someone's disk, and embed newlines to forge log lines indistinguishable from this tool's
+    /// own — in the file people are asked to send when something goes wrong.
+    /// </summary>
+    [Fact]
+    public void APeersRejectionTextIsBoundedAndCannotForgeALogLine()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var hostile = new string('A', 100_000) + "\r\n12:00:00  session established with P2\n";
+            var host = Task.Run(() => hostCh.Send(
+                ControlMessageType.Error, System.Text.Encoding.UTF8.GetBytes(hostile)));
+
+            var ex = Assert.Throws<HandshakeException>(() =>
+                Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, false), 51000));
+            host.GetAwaiter().GetResult();
+
+            Assert.True(ex.Message.Length < 500, $"remote text ran to {ex.Message.Length} characters");
+            Assert.DoesNotContain("\n", ex.Message);
+            Assert.DoesNotContain("\r", ex.Message);
+        }
+        finally { dispose(); }
+    }
+
+    /// <summary>
     /// The host speaks first, and what it says before anyone has proved anything is a challenge.
     ///
     /// It has to go first — the joiner cannot derive a proof without the host's nonce — which is

@@ -39,22 +39,39 @@ public sealed class RotatingLogFile : IDisposable
     /// </summary>
     private const int MaxBufferedLines = 1000;
 
+    /// <summary>
+    /// Ceiling on one file, after which writing stops and says so.
+    ///
+    /// Rotation bounds how many files accumulate across launches; nothing bounded a single one. That
+    /// matters because not every line here is ours: a refused handshake logs the reason the far end
+    /// gave, so a peer that keeps reconnecting with a large reason string is choosing both the
+    /// content and the volume of what this writes to disk. Generous against any real session — a
+    /// long verbose one is a few megabytes — and small enough that filling a disk is not on the
+    /// table. Stopping beats rotating: the start of a session is the part worth keeping, and a
+    /// flood would otherwise rotate it away.
+    /// </summary>
+    public const long DefaultMaxFileBytes = 32L * 1024 * 1024;
+
     private readonly string _directory;
     private readonly string _prefix;
     private readonly int _keepFiles;
     private readonly string? _header;
+    private readonly long _maxFileBytes;
+    private long _written;
+    private bool _capped;
 
     private Queue<string>? _pending = new();
     private int _droppedBeforeActivation;
     private StreamWriter? _writer;
     private bool _disposed;
 
-    private RotatingLogFile(string directory, string prefix, int keepFiles, string? header)
+    private RotatingLogFile(string directory, string prefix, int keepFiles, string? header, long maxFileBytes)
     {
         _directory = directory;
         _prefix = prefix;
         _keepFiles = keepFiles;
         _header = header;
+        _maxFileBytes = maxFileBytes;
     }
 
     /// <summary>Full path of the file being written, or null while nothing has been created.</summary>
@@ -70,13 +87,16 @@ public sealed class RotatingLogFile : IDisposable
     /// <param name="prefix">Filename stem; the timestamp and ".log" are appended.</param>
     /// <param name="keepFiles">Total logs to keep in the folder, including the one this makes.</param>
     /// <param name="header">Written first if a file is ever created, and flushed immediately.</param>
+    /// <param name="maxFileBytes">Ceiling for this one file; see <see cref="DefaultMaxFileBytes"/>.</param>
     public static RotatingLogFile Deferred(
-        string directory, string prefix, int keepFiles, string? header = null)
+        string directory, string prefix, int keepFiles, string? header = null,
+        long maxFileBytes = DefaultMaxFileBytes)
     {
         if (directory == null) throw new ArgumentNullException(nameof(directory));
         if (string.IsNullOrEmpty(prefix)) throw new ArgumentException("A prefix is required", nameof(prefix));
         if (keepFiles < 1) throw new ArgumentOutOfRangeException(nameof(keepFiles));
-        return new RotatingLogFile(directory, prefix, keepFiles, header);
+        if (maxFileBytes < 1) throw new ArgumentOutOfRangeException(nameof(maxFileBytes));
+        return new RotatingLogFile(directory, prefix, keepFiles, header, maxFileBytes);
     }
 
     /// <summary>
@@ -134,7 +154,24 @@ public sealed class RotatingLogFile : IDisposable
             _pending.Enqueue(line);
             return;
         }
-        try { _writer.WriteLine(line); }
+        if (_capped) return;
+        try
+        {
+            // Counted in characters rather than encoded bytes: the difference is a rounding error
+            // against a 32 MiB ceiling, and measuring it exactly would mean encoding every line
+            // twice on a path the UI thread runs.
+            _written += line.Length + 2;
+            if (_written >= _maxFileBytes)
+            {
+                _capped = true;
+                _writer.WriteLine(
+                    $"[log reached its {_maxFileBytes} byte ceiling — nothing further will be " +
+                    "written to this file]");
+                _writer.Flush();
+                return;
+            }
+            _writer.WriteLine(line);
+        }
         catch { Close(); } // a writer that has started failing will not recover; stop trying
     }
 

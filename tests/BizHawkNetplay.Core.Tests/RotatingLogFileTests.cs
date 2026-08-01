@@ -235,4 +235,30 @@ public class RotatingLogFileTests : IDisposable
         Assert.DoesNotContain("line 0\n", text);     // the oldest did not
         Assert.Contains("dropped before this file was created", text);
     }
+
+    /// <summary>
+    /// Rotation bounds how many files pile up across launches; nothing bounded one file. Not every
+    /// line is ours — a refused handshake logs the reason the far end gave — so a peer reconnecting
+    /// with a large reason string chooses both the content and the volume of what reaches this disk.
+    ///
+    /// Writing stops rather than rotating, because the start of a session is the part worth keeping
+    /// and a flood would otherwise rotate exactly that away.
+    /// </summary>
+    [Fact]
+    public void OneFileIsBoundedAndSaysSoRatherThanGrowingForEver()
+    {
+        using var log = RotatingLogFile.Deferred(_dir, "netplay", 10, header: null, maxFileBytes: 4096);
+        log.Activate();
+        log.Write("the opening line, which must survive");
+        for (int i = 0; i < 500; i++) log.Write(new string('x', 200));
+        log.Write("written well past the ceiling");
+        log.Flush();
+
+        var text = ReadWhileOpen(log.Path!);
+        Assert.Contains("the opening line, which must survive", text);
+        Assert.Contains("ceiling", text);
+        Assert.DoesNotContain("written well past the ceiling", text);
+        Assert.True(new FileInfo(log.Path!).Length < 8192,
+            $"the file grew to {new FileInfo(log.Path!).Length} bytes against a 4096-byte ceiling");
+    }
 }

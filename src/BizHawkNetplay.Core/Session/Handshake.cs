@@ -204,7 +204,7 @@ public static class Handshake
         if (isHost)
         {
             var (t, b) = channel.Receive();
-            if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
+            if (t == ControlMessageType.Error) throw new HandshakeException(RemoteText(b));
             if (t != ControlMessageType.Auth) throw new HandshakeException($"expected AUTH from joiner, got {t}");
             if (!SessionAuth.FixedTimeEquals(Encoding.UTF8.GetString(b), peerExpected))
             {
@@ -217,7 +217,7 @@ public static class Handshake
         {
             channel.Send(ControlMessageType.Auth, Encoding.UTF8.GetBytes(myProof));
             var (t, b) = channel.Receive();
-            if (t == ControlMessageType.Error) throw new HandshakeException(Encoding.UTF8.GetString(b));
+            if (t == ControlMessageType.Error) throw new HandshakeException(RemoteText(b));
             if (t != ControlMessageType.Auth) throw new HandshakeException($"expected AUTH from host, got {t}");
             if (!SessionAuth.FixedTimeEquals(Encoding.UTF8.GetString(b), peerExpected))
                 throw new HandshakeException("session password mismatch (could not verify the host)");
@@ -326,7 +326,7 @@ public static class Handshake
             timer.Stop();
 
             if (type == ControlMessageType.Error)
-                throw new HandshakeException(Encoding.UTF8.GetString(reply));
+                throw new HandshakeException(RemoteText(reply));
             if (type != ControlMessageType.Pong || reply.Length != 8
                 || BitConverter.ToInt64(reply, 0) != token)
                 throw new HandshakeException($"expected lobby PONG from joiner, got {type}");
@@ -403,7 +403,7 @@ public static class Handshake
     {
         var (type, body) = channel.Receive();
         if (type == ControlMessageType.Error)
-            throw new HandshakeException(Encoding.UTF8.GetString(body));
+            throw new HandshakeException(RemoteText(body));
         if (type != ControlMessageType.MeshRtt)
             throw new HandshakeException($"expected a mesh RTT report from joiner, got {type}");
         if (!ControlMessageCodec.TryDecodeMeshRtt(body, out var reported, out double medianMs,
@@ -428,7 +428,7 @@ public static class Handshake
     {
         var (type, body) = channel.Receive();
         if (type == ControlMessageType.Error)
-            throw new HandshakeException(Encoding.UTF8.GetString(body));
+            throw new HandshakeException(RemoteText(body));
         if (type != ControlMessageType.Ready)
             throw new HandshakeException($"expected READY from joiner, got {type}");
         RequireGeneration(ControlMessageType.Ready, body, generation);
@@ -472,7 +472,7 @@ public static class Handshake
     {
         var (type, body) = channel.Receive();
         if (type == ControlMessageType.Error)
-            throw new HandshakeException(Encoding.UTF8.GetString(body));
+            throw new HandshakeException(RemoteText(body));
         if (type != ControlMessageType.Hello)
             throw new HandshakeException($"expected HELLO from host, got {type}");
         var (hostProtocol, hostNonce) = HandshakeCodec.DecodeChallenge(body);
@@ -491,7 +491,7 @@ public static class Handshake
 
         (type, body) = channel.Receive();
         if (type == ControlMessageType.Error)
-            throw new HandshakeException(Encoding.UTF8.GetString(body));
+            throw new HandshakeException(RemoteText(body));
         if (type != ControlMessageType.Hello)
             throw new HandshakeException($"expected the host's identity after AUTH, got {type}");
         var (hostId, hostPrefs, hostUdpPort, _, _) = HandshakeCodec.Decode(body);
@@ -523,7 +523,7 @@ public static class Handshake
         {
             var (type, body) = channel.Receive();
             if (type == ControlMessageType.Error)
-                throw new HandshakeException(Encoding.UTF8.GetString(body));
+                throw new HandshakeException(RemoteText(body));
             if (type == ControlMessageType.Ping)
             {
                 if (body.Length != 8)
@@ -614,6 +614,31 @@ public static class Handshake
             }
             throw new HandshakeException($"unexpected control frame during start: {type}");
         }
+    }
+
+    /// <summary>Longest a peer's own words may be before they are cut short.</summary>
+    private const int MaxRemoteTextBytes = 400;
+
+    /// <summary>
+    /// A peer's own words, made safe to put in a message a person reads and a file keeps.
+    ///
+    /// An ERROR body is text the far end chose, and it reached the on-screen log and the session
+    /// file verbatim and unbounded — up to the 256 KiB a control frame allows, newlines and all.
+    /// That is two problems. A peer could write the disk full a quarter-megabyte at a time; and it
+    /// could embed newlines to forge log lines indistinguishable from this tool's own, in the file
+    /// people are asked to send when something goes wrong.
+    /// </summary>
+    private static string RemoteText(byte[] body)
+    {
+        if (body == null || body.Length == 0) return "(no reason given)";
+        int take = Math.Min(body.Length, MaxRemoteTextBytes);
+        var text = Encoding.UTF8.GetString(body, 0, take);
+        var sb = new StringBuilder(text.Length + 1);
+        // Every control character, not just the newline: a bare carriage return rewrites a console
+        // line, and the rest are noise in a file meant to be read.
+        foreach (var c in text) sb.Append(char.IsControl(c) ? ' ' : c);
+        if (body.Length > take) sb.Append('…');
+        return sb.ToString();
     }
 
     private static void RequireGeneration(
