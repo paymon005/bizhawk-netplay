@@ -355,10 +355,17 @@ public sealed partial class NetplayToolForm
         { UntrackHandshakeClient(tcp); try { tcp.Close(); } catch { } return; }
         try
         {
+            // Same credibility rule as the lobby greets: the announced endpoint is handed to every
+            // other player and probed by all of them, so believe it only if it matches where the
+            // rejoiner actually reached us from.
+            bool reflexiveCredible = ReflexiveCandidate.IsCredible(greet.Reflexive, remoteIp);
+            if (greet.Reflexive != null && !reflexiveCredible)
+                Log($"ignoring the public endpoint the rejoiner announced ({greet.Reflexive}) — " +
+                    $"it is not the address they reached us from ({remoteIp})");
             var link = new PeerLink
             {
                 Tcp = tcp, Control = channel, RemotePort = freedPort, Greeting = greet,
-                UdpEndpoint = udpEp, ReflexiveEndpoint = greet.Reflexive,
+                UdpEndpoint = udpEp, ReflexiveEndpoint = reflexiveCredible ? greet.Reflexive : null,
                 Label = $"P{freedPort + 1} ({remoteIp})",
             };
             // Bring each survivor up to date: refresh its mesh with the rejoiner's endpoint, then

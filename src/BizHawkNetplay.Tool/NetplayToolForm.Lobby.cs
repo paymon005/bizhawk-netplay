@@ -571,6 +571,15 @@ public sealed partial class NetplayToolForm
             return;
         }
         int assignedPort = links.Count + 1;
+        // Same credibility rule as the TCP greet above: this address is handed to every other
+        // player and probed by all of them, so an unchecked one aims the whole session at
+        // whoever it names.
+        bool reflexiveCredible = ReflexiveCandidate.IsCredible(greet.Reflexive, admission.Endpoint.Address);
+        if (greet.Reflexive != null && !reflexiveCredible)
+            UiConnLog(
+                $"ignoring the public endpoint P{assignedPort + 1} announced ({greet.Reflexive}) — " +
+                $"it is not the address they reached us from ({admission.Endpoint.Address}); using that instead",
+                Color.DarkGoldenrod);
         links.Add(new PeerLink
         {
             Tcp = null!,
@@ -579,7 +588,7 @@ public sealed partial class NetplayToolForm
             RemotePort = assignedPort,
             Greeting = greet,
             UdpEndpoint = admission.Endpoint, // the punched path IS the peer's working endpoint
-            ReflexiveEndpoint = greet.Reflexive,
+            ReflexiveEndpoint = reflexiveCredible ? greet.Reflexive : null,
             Label = $"P{assignedPort + 1} ({admission.Endpoint.Address})",
         });
         UiConnLog($"P{assignedPort + 1} joined via UDP punch from {admission.Endpoint.Address} " +
