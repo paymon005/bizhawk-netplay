@@ -243,6 +243,34 @@ public class HandshakeTests
     }
 
     /// <summary>
+    /// A peer that has not proved the password learns nothing about what this host is running.
+    ///
+    /// The rejection reason names what failed to match — the ROM hash, the core, a sync setting —
+    /// so negotiating first handed any stranger who opened a socket a comparison oracle for the
+    /// host's ROM, one probe at a time, with nothing proved. Here BOTH checks fail; the password is
+    /// the one that gets reported, on both ends, because it is the one that runs first.
+    /// </summary>
+    [Fact]
+    public void AWrongPasswordIsReportedBeforeAnythingAboutTheRom()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var hostTask = Task.Run(() => Handshake.RunHost(
+                hostCh, Id(rom: "HOSTROM"), new SessionPreferences(2, false, "hunter2"), new byte[10], 47800));
+            var clientEx = Assert.Throws<HandshakeException>(() => Handshake.RunClient(
+                clientCh, Id(rom: "CLIENTROM"), new SessionPreferences(2, false, "letmein"), 51000));
+            var hostEx = Assert.Throws<HandshakeException>(() => hostTask.GetAwaiter().GetResult());
+
+            Assert.Contains("password", clientEx.Message);
+            Assert.DoesNotContain("ROM", clientEx.Message);
+            Assert.Contains("password", hostEx.Message);
+            Assert.DoesNotContain("ROM", hostEx.Message);
+        }
+        finally { dispose(); }
+    }
+
+    /// <summary>
     /// A refused joiner must cost only that joiner's connection: the host greets a wrong-password
     /// attempt, it fails, and the very next connection with the right password still completes.
     /// The tool's accept loop relies on this to keep hosting through a typo'd password instead of
