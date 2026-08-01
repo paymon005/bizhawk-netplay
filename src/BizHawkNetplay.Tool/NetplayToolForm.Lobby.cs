@@ -458,14 +458,19 @@ public sealed partial class NetplayToolForm
         });
         if (!DropCasualties(links, casualties, need, attempt)) return false;
 
+        // ALWAYS, not only when the delay is being chosen automatically. This round is what opens
+        // the joiner-to-joiner edges, decides which of them need relaying, and proves every player
+        // has a UDP path to this host at all — routing questions, not latency ones. Gating it on
+        // the "Auto from ping" checkbox meant turning that checkbox off silently disabled the mesh
+        // relay, so a session with an unopenable edge started with no viable route for it and no
+        // way to say so. Only the delay ARITHMETIC below is a preference.
+        MeasureLobbyMesh(links, casualties, generation, players, attempt,
+            ref worstRttMs, ref worstJitterMs);
+        if (!DropCasualties(links, casualties, need, attempt)) return false;
+
         if (autoDelay)
-        {
-            MeasureLobbyMesh(links, casualties, generation, players, attempt,
-                ref worstRttMs, ref worstJitterMs);
-            if (!DropCasualties(links, casualties, need, attempt)) return false;
             delay = SelectLobbyDelay(delay, autoDelayMax, mode, worstRttMs,
                 lobbyFrameMs, simulatedOneWayMs, players, worstJitterMs);
-        }
 
         // Publish the settled figure before anyone builds a driver. Sent unconditionally, so the
         // delay every peer runs is one number decided in one place rather than each end's own
@@ -681,7 +686,32 @@ public sealed partial class NetplayToolForm
                       "delay below is a lower bound, and a path that opens later may need more.",
                 Color.DarkOrange);
 
-        InstallMeshRelay(mesh, links, incomplete);
+        // A player this host cannot exchange UDP with cannot play, and until now the lobby said so
+        // and started anyway: the warning was written, READY was requested, GO was sent, and the
+        // session sat there with one seat's input never arriving. Relaying cannot rescue it either
+        // — the relay runs over the very leg that is missing. So it is a casualty like any other:
+        // the seat reopens and the lobby waits for them to come back, which is the one outcome
+        // that can actually work.
+        var noHostLeg = new List<PeerLink>();
+        foreach (var link in links)
+            if (!LinkHasLiveMeshPath(mesh, link)) noHostLeg.Add(link);
+        if (noHostLeg.Count > 0)
+        {
+            foreach (var link in noHostLeg)
+            {
+                casualties.Add(link);
+                UiConnLog($"{link.Label} has no live UDP path to this host, so their input cannot " +
+                          "arrive and there is nothing to relay it over. Since protocol 14 a " +
+                          "symmetric NAT alone should no longer do this — they would have announced " +
+                          "a token and been recognised at whatever address they really arrive from — " +
+                          "so suspect UDP blocked outright, or a router dropping the packet before " +
+                          "it leaves. Their seat is open again: have them forward a UDP port and " +
+                          "host instead, or play 2-player against a forwarded host.", Color.Firebrick);
+            }
+            return; // the caller drops them and reopens the lobby
+        }
+
+        InstallMeshRelay(links, incomplete);
 
         static void Fold(LobbyRttSample sample, ref double rtt, ref double jitter)
         {
@@ -723,7 +753,7 @@ public sealed partial class NetplayToolForm
     /// in its own log, which is where a player needs them; narrowing the relay itself would mean
     /// putting those names on the wire, for a bandwidth saving nobody has asked for.
     /// </summary>
-    private void InstallMeshRelay(MeshUdpTransport mesh, List<PeerLink> links, List<PeerLink> incomplete)
+    private void InstallMeshRelay(List<PeerLink> links, List<PeerLink> incomplete)
     {
         // Relaying is pointless with one joiner: there is no other joiner for it to fail to reach,
         // and the host's own input already goes to it directly.
@@ -747,29 +777,20 @@ public sealed partial class NetplayToolForm
         if (incomplete.Count == 0) return;
         if (!worthRelaying)
         {
-            UiConnLog("a direct UDP path did not open, but with one joiner there is nothing to relay " +
-                      "— the host's own link is the only one that matters.", Color.DarkOrange);
+            UiConnLog("a direct UDP path did not answer in the measurement window, but with one " +
+                      "joiner there is no other player to relay to — and the host's link, which is " +
+                      "the only one that carries anything here, has been checked and is live.",
+                Color.DarkOrange);
             return;
         }
 
-        // Only claim what the relay can actually deliver. If a joiner's missing leg is the one to
-        // THIS host, there is nothing to relay over and the session is about to stall instead.
-        var noHostLeg = new List<string>();
-        foreach (var link in incomplete)
-            if (!LinkHasLiveMeshPath(mesh, link)) noHostLeg.Add($"P{link.RemotePort + 1}");
-
+        // Every player still here has a live host leg — MeasureLobbyMesh makes that a precondition
+        // rather than a warning, because a relay over a leg that does not exist is a stall dressed
+        // up as a rescue. So this can now claim what it delivers without qualification.
         UiConnLog($"relaying input through this host for {incomplete.Count} player(s) whose direct " +
                   "paths to the other players did not open. They stay in the session; their input " +
                   "takes one extra hop, so expect a little more delay on those legs than the lobby " +
                   "measured.", Color.DarkOrange);
-        if (noHostLeg.Count > 0)
-            UiConnLog($"WARNING: {string.Join(", ", noHostLeg)} has no live UDP path to this host " +
-                      "either, so there is nothing to relay over and their input will not arrive at " +
-                      "all. Since protocol 14 a symmetric NAT alone should no longer do this — they " +
-                      "would have announced a token and been recognised at whatever address they " +
-                      "really arrive from — so suspect UDP being blocked outright, or a router that " +
-                      "drops the packet before it leaves. Have them forward a UDP port and host " +
-                      "instead, or play 2-player against a forwarded host.", Color.Firebrick);
     }
 
     /// <summary>
