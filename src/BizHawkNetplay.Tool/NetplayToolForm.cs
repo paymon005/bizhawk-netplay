@@ -192,6 +192,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         public System.IO.Stream Control = null!;
     }
     private readonly ConcurrentQueue<PunchAdmission> _punchAdmissions = new();
+    // The lobby is the queue's only consumer, and it drains leftovers exactly once at GO. A punch
+    // that confirms after that drain would otherwise enqueue an admission nobody ever dequeues —
+    // its stream held open all session, its peer dying on a misleading read timeout. Written by
+    // the lobby thread (open at lobby start, closed at GO) and teardown; read by punch workers.
+    private volatile bool _punchDoorOpen;
     private readonly List<IPEndPoint> _lobbyPunchTargets = new();
     // volatile: the accept thread reads this as its teardown signal (null => Disconnect stopped us),
     // and it's written from the UI thread. Every other field read off the UI thread is volatile too;

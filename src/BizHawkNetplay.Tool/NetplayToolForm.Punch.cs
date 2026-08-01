@@ -237,7 +237,33 @@ public sealed partial class NetplayToolForm
             }
             var control = mesh.OpenControl(joiner);
             if (!_lifecycle.Track(control, attempt)) return; // teardown won the race; mesh disposal closes it
-            _punchAdmissions.Enqueue(new PunchAdmission { Endpoint = joiner, Control = control });
+
+            // The lobby drains this queue exactly once, at GO. A punch that confirms after that
+            // has no seat: enqueueing it would hold the stream open all session while the peer
+            // dies on a misleading read timeout. Refuse promptly instead — and re-check after the
+            // enqueue, draining our own late entry if the door closed in between (racing drains
+            // are safe: TryDequeue is atomic, so each admission is refused exactly once).
+            void RefusePunch(PunchAdmission admission)
+            {
+                _lifecycle.Untrack(admission.Control);
+                try { admission.Control.Dispose(); } catch { }
+                mesh.CloseControl(admission.Endpoint);
+            }
+            var ours = new PunchAdmission { Endpoint = joiner, Control = control };
+            if (!_punchDoorOpen)
+            {
+                RefusePunch(ours);
+                BeginInvokeUi(() =>
+                {
+                    if (!IsConnectionAttemptCurrent(attempt)) return;
+                    _punchStatus.Text = $"punched {joiner}, but the lobby had already filled — no seat for them.";
+                    _punchStatus.ForeColor = Color.Firebrick;
+                });
+                return;
+            }
+            _punchAdmissions.Enqueue(ours);
+            if (!_punchDoorOpen)
+                while (_punchAdmissions.TryDequeue(out var leftover)) RefusePunch(leftover);
             BeginInvokeUi(() =>
             {
                 if (!IsConnectionAttemptCurrent(attempt)) return;

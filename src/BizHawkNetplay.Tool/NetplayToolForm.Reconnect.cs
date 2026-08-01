@@ -639,6 +639,7 @@ public sealed partial class NetplayToolForm
         _localReflexive = null;
         try { _reflexiveKnown.Reset(); } catch { }
         _lobbyPunchTargets.Clear();
+        _punchDoorOpen = false;
         while (_punchAdmissions.TryDequeue(out var admission))
         {
             try { admission.Control.Dispose(); } catch { }

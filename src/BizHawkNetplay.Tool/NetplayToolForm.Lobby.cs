@@ -172,6 +172,7 @@ public sealed partial class NetplayToolForm
             _listener = hostListener;
             if (!IsConnectionAttemptCurrent(attempt)) { hostListener.Stop(); return; }
             hostListener.Start();
+            _punchDoorOpen = true; // punch confirmations may enqueue admissions from here to GO
             int need = players - 1;
             UiConnLog($"hosting a {players}-player session on TCP+UDP {port} — you are P1, " +
                       $"waiting for {need} more to join…", Color.DarkSlateBlue);
@@ -295,7 +296,11 @@ public sealed partial class NetplayToolForm
             // have been needed.
             try { hostListener.Stop(); } catch { }
             if (ReferenceEquals(_listener, hostListener)) _listener = null;
-            // A code pasted just as the lobby filled has no seat — close its stream cleanly.
+            // Close the punch door BEFORE draining: a punch worker that checks the door after this
+            // either refuses outright or drains its own late enqueue — either way no admission
+            // outlives this point. A code pasted just as the lobby filled has no seat — close its
+            // stream cleanly.
+            _punchDoorOpen = false;
             while (_punchAdmissions.TryDequeue(out var leftover))
             {
                 _lifecycle.Untrack(leftover.Control);
