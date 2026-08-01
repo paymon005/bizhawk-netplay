@@ -871,6 +871,46 @@ public class MeshUdpTransportTests
         finally { host.Dispose(); peer.Dispose(); }
     }
 
+    /// <summary>
+    /// A peer reachable ONLY at its learned endpoint must still be measurable.
+    ///
+    /// The send path ranks the learned endpoint above every advertised candidate, and the lobby's
+    /// per-edge report includes it — but the live RTT aggregation enumerated advertised candidates
+    /// alone. For a symmetric-NAT peer that set is entirely dead, so the worst-RTT reading found no
+    /// measurement for that route and, because a partial maximum would be dangerously optimistic,
+    /// abandoned the whole figure. The session then fell back to control-channel RTT: it measured
+    /// TCP while input rode a UDP path it was refusing to look at, and the delay advice and the
+    /// rollback soft cap were both sized off the wrong number.
+    /// </summary>
+    [Fact]
+    public void WorstRttSeesAPeerReachableOnlyAtItsLearnedEndpoint()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        try
+        {
+            // Everything this peer advertised is wrong; it really arrives from somewhere else.
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(UnboundPort(peer.LocalPort)) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (host.TryGetLearnedEndpoint(1, out var learned) && host.IsEndpointAlive(learned)
+                    && host.TryGetWorstRttMs(out _)) break;
+                Thread.Sleep(10);
+            }
+
+            Assert.True(host.TryGetWorstRttMs(out double worst),
+                "the only working path to this peer is its learned endpoint, and the worst-RTT " +
+                "reading refused to look at it");
+            Assert.True(worst >= 0, $"a measured route reported {worst}ms");
+        }
+        finally { host.Dispose(); peer.Dispose(); }
+    }
+
     /// <summary>A wrong token must buy nothing: the endpoint stays unroutable and its input stays
     /// dropped. Otherwise the pin this replaces would have been traded for no protection at all.</summary>
     [Fact]

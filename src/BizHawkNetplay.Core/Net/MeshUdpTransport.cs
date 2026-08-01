@@ -593,9 +593,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             bool learned = _learnedByPort.TryGetValue(route.RemotePort, out var learnedEndpoint);
             double bestMedian = 0, bestHigh = 0;
             bool measured = false, viaLearned = false;
-            foreach (var endpoint in learned
-                         ? route.Candidates.Concat(new[] { learnedEndpoint })
-                         : route.Candidates)
+            foreach (var endpoint in CandidatesIncludingLearned(route))
             {
                 if (!TryGetRttStats(endpoint, out double candidateMedian, out double candidateHigh)) continue;
                 if (!measured || candidateMedian < bestMedian)
@@ -679,14 +677,38 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         return null;
     }
 
+    /// <summary>
+    /// Every address that might reach this peer: the ones it advertised, plus the one we LEARNED
+    /// by watching where its packets really come from.
+    ///
+    /// One definition, because three places disagreeing about what the candidate set is, is what
+    /// went wrong. For a symmetric-NAT peer the learned endpoint is by construction never among
+    /// the advertised candidates and is the only address that works, so a measurement that
+    /// enumerates only <see cref="PeerRoute.Candidates"/> reports that peer as unmeasurable while
+    /// the send path is happily using it — and <see cref="TryGetWorstRttMs"/> then abandons the
+    /// whole reading and falls back to the control channel, i.e. measures TCP instead of the path
+    /// input actually rides.
+    ///
+    /// Deliberately NOT used by <see cref="SelectSendCandidate"/>: that one needs the learned
+    /// endpoint ranked ABOVE every advertised candidate rather than merely present, and it runs on
+    /// the per-frame send path where an iterator allocation would not be free. These callers are
+    /// telemetry, at most a few times a second.
+    /// </summary>
+    private IEnumerable<IPEndPoint> CandidatesIncludingLearned(PeerRoute route)
+    {
+        var candidates = route.Candidates;
+        for (int i = 0; i < candidates.Count; i++) yield return candidates[i];
+        if (_learnedByPort.TryGetValue(route.RemotePort, out var learned)
+            && !IsRoutedCandidate(route, learned))
+            yield return learned;
+    }
+
     private bool TryGetBestLiveRtt(PeerRoute route, long now, out double bestRtt)
     {
         bestRtt = double.MaxValue;
         bool found = false;
-        var routeCandidates = route.Candidates;
-        for (int i = 0; i < routeCandidates.Count; i++)
+        foreach (var endpoint in CandidatesIncludingLearned(route))
         {
-            var endpoint = routeCandidates[i];
             if (!IsEndpointAlive(endpoint, now)) continue;
             if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
             if (rtt < bestRtt) bestRtt = rtt;
@@ -702,7 +724,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     {
         bestRtt = double.MaxValue;
         bool found = false;
-        foreach (var endpoint in route.Candidates)
+        foreach (var endpoint in CandidatesIncludingLearned(route))
         {
             if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
             if (rtt < bestRtt) bestRtt = rtt;
