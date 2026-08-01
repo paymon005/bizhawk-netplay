@@ -120,13 +120,15 @@ public static class StunClient
         {
             try
             {
-                IPAddress? v4 = null;
-                foreach (var a in Dns.GetHostAddresses(host))
-                    if (a.AddressFamily == AddressFamily.InterNetwork) { v4 = a; break; }
-                if (v4 == null) continue;
+                // Bounded resolve, same as ClassifyMapping — this runs synchronously on the host
+                // lobby thread, and a raw GetHostAddresses against a blackholed resolver would
+                // block it for the OS default (~10s per server) while joiners' greet deadlines
+                // expire against a host that is actually fine.
+                var server = ResolveV4(host, port);
+                if (server == null) continue;
 
                 var req = BuildRequest(out var txn);
-                sock.SendTo(req, new IPEndPoint(v4, port));
+                sock.SendTo(req, server);
 
                 var buf = new byte[512];
                 EndPoint from = new IPEndPoint(IPAddress.Any, 0);
