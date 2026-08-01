@@ -221,9 +221,17 @@ Use **Open log folder** on the Log tab to find it. Send that file to whoever is 
 holds the whole session, including everything the window has scrolled past, and it survives EmuHawk
 being closed or killed.
 
-Opening the tool and closing it again writes nothing. The ten most recent logs are kept.
+Opening the tool and closing it again writes nothing. The ten most recent logs are kept, and one
+file stops growing at 32 MiB.
 
 When reporting a problem, the other player's log is usually as useful as yours.
+
+**Before posting one publicly**, know what is in it. A session log contains your public IP address,
+your LAN address, the addresses of everyone you played with, and — on cores whose sync settings name
+a file, N64 among them — a path under your user folder, which is to say your Windows username. It
+does not contain the session password or the mesh tokens. That is fine for sending to someone you
+are already playing with, who knows your address anyway; it is worth a look before it goes into a
+public issue or a forum thread.
 
 ### N64 and other heavy cores
 

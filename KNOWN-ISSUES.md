@@ -195,6 +195,31 @@ built-and-reasoned rather than working.
 - **Whether the host's relay warning fires anyway.** It now says a symmetric NAT alone should no
   longer cause it; if it does fire, the token never got through and that assumption is wrong.
 
+**KI-13 (open, upstream) — a joiner imports a savestate, and BizHawk's savestate reader trusts it.**
+This is the one finding from the 2026-07-31 security review that is not fixed here, because it is
+not ours to fix. A joiner accepts a whole-core savestate from its host, twice: once at the start,
+and again on every resync. That state goes to `IStatable.LoadStateBinary`, and on a waterbox core —
+Snes9x, bsnes, melonDS, Ares64, the Nyma cores, most of the modern set — that reaches
+`wbx_load_state`, which restores guest memory contents, guest page protection bits and the guest
+stack pointer from the stream. Those are the inputs to native execution, and the sender chooses all
+of them. It is not a memory-safety accident to be patched; it is what loading a state means. The
+Rust side even notes a hash mismatch and carries on.
+
+Upstream is not wrong to work that way — a savestate is a trusted-input format, and every decision
+in that code is correct for a file off your own disk. What this tool does is turn it into a *remote*
+input. Worth reporting upstream; nothing here can make it safe.
+
+**What follows from it:**
+- A host is not exposed. A host never imports a peer's state — every state-bearing handler is gated
+  on `!_isHost`, and all three `ImportState` call sites are joiner-side or restore our own
+  pre-join state. No path was found by which a host runs a peer's bytes.
+- A joiner is exposed to its host, and to anyone who can inject into the control stream. There is
+  no encryption and no per-frame integrity after the handshake (the PBKDF2 output is compared and
+  discarded rather than kept as a key), so on a hostile network — public wifi, a compromised router
+  — someone on the path can send a `Resync` and reach the same parser without knowing the password.
+  Joining people you know is the mitigation; a MAC over control frames is the fix, and it is not
+  written.
+
 ## Fixed (2026-07-27, v0.11.3)
 
 **KI-9 — the arrival-based watchdog could sleep through an unrepairable freeze.**
