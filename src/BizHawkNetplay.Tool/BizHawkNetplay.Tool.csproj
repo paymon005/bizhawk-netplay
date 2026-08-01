@@ -12,7 +12,7 @@
          unreadable without knowing which build made it, and "which version are you on?" is a
          question people answer wrongly. BUMP THIS WHEN CUTTING A RELEASE — a version that lies is
          worse than none, so it is deliberately the same number as the git tag. -->
-    <Version>0.28.0</Version>
+    <Version>0.28.1</Version>
   </PropertyGroup>
 
   <ItemGroup>

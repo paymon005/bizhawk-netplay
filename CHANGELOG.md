@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.28.0 | **17** | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
+| v0.28.0 – v0.28.1 | **17** | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
 | v0.27.0 | 16 | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
 | v0.26.0 | 15 | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
 | v0.24.0 – v0.25.0 | 14 | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
@@ -23,6 +23,30 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.28.1 — the ninth gap request
+
+**Wire-compatible with v0.28.0** (still protocol 17), and everyone on v0.27.0 or v0.28.0 should
+take it: it fixes a permanent session freeze that both of those releases shipped.
+
+When a loss burst is wider than the redundant window, the frame a peer is missing has slid out of
+the sender's live window and can only come back through a gap request. Answering one is metered —
+eight per 50ms — because a small request produces a full window in reply, and a peer stuck in a
+request loop would otherwise become an amplifier. The meter is meant to be a rate. It was behaving
+as a lifetime quota: the window-reset comparison ran against a `long.MinValue` sentinel, and since
+the clock starts near zero, `now - long.MinValue` overflows *negative*, so the reset never fired.
+After the eighth serve of a session, that peer refused every gap request for the rest of it.
+
+The result is not a slow recovery but a permanent one. Both peers sit at their prediction caps
+forever — one asking every 50ms, one refusing — which is exactly the freeze the gap-request path
+exists to prevent.
+
+It was caught by CI and not by local runs, for a reason worth recording: the integration test drove
+one simulated tick per 1ms sleep, compressing the tick-to-wall-clock ratio sixteenfold against a
+real 60fps session, so the whole recovery finished inside the first budget window and the ninth
+request never mattered. The test now sleeps a frame period, which is the honest ratio and what CI's
+coarser timer was effectively already doing. A direct regression test asks that twenty-four
+requests spread over several windows be answered more than eight times.
 
 ### v0.28.0 — recovery paths that recover, and the heavy-core costs behind them
 
