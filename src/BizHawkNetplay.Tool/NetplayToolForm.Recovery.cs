@@ -492,6 +492,7 @@ public sealed partial class NetplayToolForm
         _lastPresentClockMs = -1;
         _stallHint.RestartWindow();
         _presentHint.RestartWindow();
+        _saveRateHint.RestartWindow();
     }
 
     private SessionGeneration CurrentGeneration

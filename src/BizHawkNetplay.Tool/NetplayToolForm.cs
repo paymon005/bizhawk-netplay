@@ -323,6 +323,9 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // 0 until a probe has run (a lockstep-only session never pays for one). Seeds the rollback
     // strategy's cost cap so a cold session does not discover the figure by hitching on it.
     private double _probeRepairPerFrameMs;
+    // What the probe timed one whole-core savestate at. Only used to say whether the snapshot
+    // rate is worth a word (see MaybeHintSaveRate) — on a light core it never is.
+    private double _probeSaveMs;
     // Whether the core reproduced the same memory on replay. Unlike depth this is a correctness
     // result, not a performance one, so forcing Rollback does not get to override it.
     private bool _replayDeterministic = true;
@@ -365,6 +368,16 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // One-shot "rollback costs more than it can afford here" advisory; fires as soon as the
     // measured cost latches, since it is a property of the core and CPU, not a passing condition.
     private readonly SustainedTrigger _rollbackCostHint = new(0);
+    // One-shot "the snapshot rate is what is costing you" advisory. Sustained like the stall hint
+    // rather than latched: the elided share moves with the link, and one bad second is not a
+    // reason to tell someone to change their input delay.
+    private readonly SustainedTrigger _saveRateHint = new(StallHintSustainMs);
+    // A savestate cheap enough that taking one every other frame does not matter — GPGX measures
+    // ~0.4ms, N64 ~6ms, so this sits well clear of the light cores it must never nag about.
+    private const double SaveRateHintCostMs = 2.0;
+    // Elided share below which snapshots are effectively being taken continuously. A session whose
+    // delay covers the link sits near 1.0; the failing case measured close to 0.
+    private const double SaveRateHintElidedShare = 0.25;
     private bool _hashDiagLogged; // one-time "which checksum path ran" line per session
     private double _lastTickClockMs = -1; // pace-clock stamp of the previous tick, for gap stats
     private double _lastPresentClockMs = -1; // ...and of the previous present, for judder stats

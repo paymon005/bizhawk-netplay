@@ -358,6 +358,7 @@ public sealed partial class NetplayToolForm
         _lastPacingLogMs = double.NegativeInfinity;
         _stallHint.Reset();
         _rollbackCostHint.Reset();
+        _saveRateHint.Reset();
         _audioDevWasUp = true;   // a fresh session starts assuming sound is up; the edge reports otherwise
         _presentHint.Reset();
         _hashDiagLogged = false;

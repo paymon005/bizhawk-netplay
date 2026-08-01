@@ -761,6 +761,36 @@ public sealed partial class NetplayToolForm
             $"{ApplyDelayAdvice(_sessionDelay + 2)}", Color.DarkOrange);
     }
 
+    /// <summary>
+    /// Say once when snapshot elision — rollback's largest saving on a heavy core — is not firing.
+    ///
+    /// A frame is only elided when every port's input for it is already confirmed, so elision
+    /// fires exactly when input delay covers the link's latency. Below that, remote ports are
+    /// predicted continuously and a snapshot is taken every keyframe interval forever: on N64
+    /// that is a ~6ms whole-core savestate roughly thirty times a second, which is the dominant
+    /// steady-state cost in the whole program and reaches the player as judder with no stated
+    /// cause. The session measures both halves already — the elided share, and what the probe
+    /// timed a save at — but nothing connected them to the one setting that governs it.
+    ///
+    /// Stated as a trade, not a recommendation: a frame of delay is a real cost too, and which
+    /// one a player prefers is theirs to choose. This only makes the choice visible.
+    /// </summary>
+    private void MaybeHintSaveRate(double nowMs, long savesTaken, long savesElided)
+    {
+        if (_mode != SyncMode.Rollback || _probeSaveMs < SaveRateHintCostMs) return;
+        long considered = savesTaken + savesElided;
+        if (considered < 30) return; // not a window worth judging
+        double elidedShare = (double)savesElided / considered;
+        if (!_saveRateHint.ShouldFire(elidedShare < SaveRateHintElidedShare, nowMs)) return;
+
+        ConnLog($"taking {savesTaken} savestates a second at {_probeSaveMs:F1}ms each " +
+            $"(~{savesTaken * _probeSaveMs:F0}ms of every second), because input delay " +
+            $"{_sessionDelay} is below this link's latency: rollback can only skip a snapshot for a " +
+            "frame whose input has already arrived, and at this delay almost none have. Raising the " +
+            "delay until they do is what makes that cost disappear — it is the single biggest one " +
+            $"this core pays. {DelayRemedy(_sessionDelay + 1)}", Color.DarkOrange);
+    }
+
     private void MaybeHintStalling(double nowMs)
     {
         if (_mode != SyncMode.Lockstep || _lastPacing.Ticks == 0) return;
@@ -871,6 +901,9 @@ public sealed partial class NetplayToolForm
             // from the tuning constants.
             long taken = _pacingSavesTaken.Observe(rb.SavesTaken);
             long elided = _pacingSavesElided.Observe(rb.SavesElided);
+            // These are the windowed figures the save-rate advisory reasons from, so it is asked
+            // here rather than duplicating the windowing beside it.
+            MaybeHintSaveRate(MonotonicNow(), taken, elided);
             // buffers=N is the acceptance test for the state pool: it should climb to the ring's
             // size in the first second or two and then stop. Still climbing means the pool is
             // being outrun and savestates are still being allocated per frame.

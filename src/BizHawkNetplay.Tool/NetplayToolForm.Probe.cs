@@ -284,6 +284,7 @@ public sealed partial class NetplayToolForm
             // discovers it — see RollbackTuning.SeedRepairPerFrameMs.
             _probeRepairPerFrameMs = result.MedianFrameMs
                 + result.MedianSaveMs / Math.Max(1, RepairKeyframeInterval);
+            _probeSaveMs = result.MedianSaveMs;
             Log($"rollback probe — {DescribeProbe(result, a)}");
             if (!result.ReplayDeterministic)
                 ConnLog("this core did not reproduce the same memory when the probe replayed the " +
