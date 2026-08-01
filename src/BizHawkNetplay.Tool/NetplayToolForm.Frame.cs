@@ -106,6 +106,14 @@ public sealed partial class NetplayToolForm
         // fine-clock ticks meant a held hotkey double-ticked the frame loop at an unthrottled
         // rate. The reassertion stays unconditional because every delivery point sits just before
         // somewhere the emulator could step.
+        // Before the pause reassertion: if the core has been swapped under us there is nothing left
+        // worth asserting, and holding EmuHawk paused through its own ROM load would be actively
+        // unhelpful. FrameTick checks the same thing — this is the earlier of the two doors.
+        if ((_pausedByUs || _phase.IsActive) && !CoreStillOurs())
+        {
+            EndSession("the ROM was closed or changed underneath the session");
+            return;
+        }
         if (_pausedByUs) ReassertPause();
         if (type != ToolFormUpdateType.General) return;
         _emuLoopCallsWindow++;
@@ -197,9 +205,39 @@ public sealed partial class NetplayToolForm
     /// WinForms fallback timer. The two differ in one respect that matters below: only the fine
     /// clock has MainForm.Render() waiting two statements behind it.
     /// </param>
+    /// <summary>
+    /// Whether the core this session was built against is still the one EmuHawk is holding.
+    ///
+    /// A ROM load disposes the old core and only then reassigns <c>MainForm.Emulator</c>, and the
+    /// hook that lets a tool tear down first — AskSaveChanges — is skipped entirely when the user
+    /// has ticked Config → Customize → "Supress 'Ask Save Changes'". With it skipped, nothing stops
+    /// the frame timer, and every modal EmuHawk shows on the way into the next ROM (missing
+    /// firmware, the archive chooser, the platform picker) pumps messages — delivering a tick that
+    /// steps a disposed core. On a waterbox core that is a native access violation, which no catch
+    /// on this side survives.
+    ///
+    /// The window between Dispose and the reassignment contains no message pump, so comparing
+    /// references closes it. Cheap enough for the top of every tick: one interface call and a
+    /// reference compare.
+    /// </summary>
+    private bool CoreStillOurs()
+    {
+        try
+        {
+            if (MainForm is not BizHawk.Client.EmuHawk.MainForm mf) return true; // can't tell — assume yes
+            return ReferenceEquals(_emulator, mf.Emulator);
+        }
+        catch { return true; }
+    }
+
     private void FrameTick(bool fromFineClock)
     {
         if (!_phase.IsActive || _driver == null) return;
+        if (!CoreStillOurs())
+        {
+            EndSession("the ROM was closed or changed underneath the session");
+            return;
+        }
         // Snapshot the field into a local for the rest of the tick. The null check above does not
         // survive the first call the compiler cannot see inside — a field could be reassigned by
         // anything — so every later use was a nullable dereference, which is what CS8602 was

@@ -575,6 +575,11 @@ public sealed partial class NetplayToolForm
         // violation, which no catch on this side survives).
         _preJoinRestoreState = null;
         EndSession("emulator restarted");
+        // The adapter holds the OLD core's IEmulator and IStatable in readonly fields, so it is
+        // scrap the moment the ROM changes. It used to survive here, and the Diagnostics buttons
+        // reuse it when present (`_adapter ?? new EmuHawkAdapter(...)`) — so a session, a
+        // disconnect, a different ROM and then "Test Input" read a disposed core.
+        _adapter = null;
         // Invalidate the cached probe depth — the core/ROM may have changed, and a stale (deeper)
         // measurement from a lighter core could wrongly grant rollback to a heavier one.
         _probeDepth = -1;
