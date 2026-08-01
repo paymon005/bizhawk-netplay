@@ -600,18 +600,27 @@ public class RollbackIntegrationTests
         for (int i = 0; i < 80; i++) { clock.Tick = ++tick; a.Step(); b.Step(); }
         Assert.True(b.Driver.IsStalled, "B should be cap-stalled while starved of A's input");
 
-        // Phase 3: the link heals. Gap requests are wall-clock throttled (50 ms per port), so tick
-        // with a real sleep until both sides have clearly resumed. Without the retransmit path this
-        // loop runs to exhaustion with both drivers frozen at their caps.
+        // Phase 3: the link heals. Gap requests and the serve budget are wall-clock throttled, so
+        // ticking needs a real sleep; without the retransmit path this loop runs to exhaustion with
+        // both drivers frozen at their caps.
+        //
+        // The sleep is ~one frame period ON PURPOSE. This loop drives one virtual tick per
+        // iteration, so the sleep sets the ratio between simulated ticks and the wall clock those
+        // throttles measure — and at 60fps that ratio is ~16ms per tick. It used to sleep 1ms,
+        // compressing it sixteen-fold, which let the whole recovery finish inside a single serve
+        // budget window and hid a permanent freeze: the serve budget never reopened (an overflowing
+        // long.MinValue sentinel), so only the first eight requests of a session were ever
+        // answered. Under the realistic ratio the ninth request matters, and the test failed.
+        // Keep this honest — a faster sleep here buys nothing but blindness.
         burst = false;
         int targetA = a.Driver.CurrentFrame + 60;
         int targetB = b.Driver.CurrentFrame + 60;
-        for (int i = 0; i < 5000 && (a.Driver.CurrentFrame < targetA || b.Driver.CurrentFrame < targetB); i++)
+        for (int i = 0; i < 600 && (a.Driver.CurrentFrame < targetA || b.Driver.CurrentFrame < targetB); i++)
         {
             clock.Tick = ++tick;
             a.Step();
             b.Step();
-            System.Threading.Thread.Sleep(1);
+            System.Threading.Thread.Sleep(16);
         }
 
         Assert.True(a.Driver.CurrentFrame >= targetA && b.Driver.CurrentFrame >= targetB,

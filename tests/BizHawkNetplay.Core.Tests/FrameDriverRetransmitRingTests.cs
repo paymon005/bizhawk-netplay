@@ -166,6 +166,49 @@ public class FrameDriverRetransmitRingTests
         }
     }
 
+    /// <summary>
+    /// The serve budget must REOPEN. It is metered — a request is small and its answer is a full
+    /// window, so a peer stuck in a request loop could otherwise be turned into an amplifier — but
+    /// the meter is a rate, not a lifetime quota, and it was behaving as a quota.
+    ///
+    /// The window-reset test compared against a <c>long.MinValue</c> sentinel, so
+    /// <c>now - _serveWindowStartMs</c> overflowed to a negative number and the reset never fired.
+    /// After the eighth serve of a session, this peer refused every gap request for the rest of it.
+    /// The cost is not a slow recovery, it is a permanent one: a peer whose loss burst outran its
+    /// redundant window can only be repaired by these retransmissions, so both sides sit at their
+    /// prediction caps forever — one asking, one refusing. That freeze reproduced end-to-end, but
+    /// only at a realistic tick-to-wall-clock ratio, which is why it hid.
+    ///
+    /// Deliberately asks for more than the per-window budget, spread across several windows.
+    /// </summary>
+    [Fact]
+    public void TheServeBudgetReopensAfterItsWindow()
+    {
+        var (pa, ea, da, _) = RunPastWrap();
+        var codec = ReaderCodec(da);
+
+        const int RequestFrom = 300;
+        const int Rounds = 24;              // 3x the per-window budget of 8
+        int served = 0;
+        for (int round = 0; round < Rounds; round++)
+        {
+            pa.Sent.Clear();
+            pa.Inject(codec.EncodeRequest(0, RequestFrom));
+            if (da.OnPreFrame() == FrameStep.Ran) { ea.AdvanceAppliedFrame(); da.OnPostFrame(); }
+            foreach (var datagram in pa.Sent)
+                if (codec.TryDecodeInputWindow(datagram, out var w) && w.BaseFrame == RequestFrom)
+                { served++; break; }
+            // Cross a window boundary, so each round is entitled to its own budget rather than
+            // sharing one. The metering is deliberately kept — this asks that it recover, not
+            // that it be absent.
+            System.Threading.Thread.Sleep(60);
+        }
+
+        Assert.True(served > 8,
+            $"only {served} of {Rounds} requests were answered — the serve budget never reopened, " +
+            "so a peer needing more retransmission than one window's worth can never recover");
+    }
+
     [Fact]
     public void FramesOlderThanTheRingAreNotServed()
     {

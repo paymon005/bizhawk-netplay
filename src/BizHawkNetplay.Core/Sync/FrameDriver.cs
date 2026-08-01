@@ -52,7 +52,11 @@ public sealed class FrameDriver : IDisposable
     private const int MaxDatagramsPerPump = 128;
     private const long StallResendIntervalMs = 20; // at most 50 redundant windows/second
     private readonly Stopwatch _sendClock = Stopwatch.StartNew();
-    private long _lastSendMs = long.MinValue;
+    // "Long ago", expressed so that `now - this` cannot overflow. long.MinValue looks like the
+    // natural sentinel and is a trap: the clock starts near zero, so `now - long.MinValue` wraps
+    // to a NEGATIVE number, every "is it due yet" test answers no, and the timer it guards never
+    // fires again — see _serveWindowStartMs below, where that cost a permanent session freeze.
+    private long _lastSendMs = -StallResendIntervalMs;
     private readonly long[] _lastRemoteInputStamp;
     private int _lastPacketsDrained;
 
@@ -66,7 +70,14 @@ public sealed class FrameDriver : IDisposable
     private const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
     private const long GapServeWindowMs = 50;       // serve-side budget window (see ServeGapRequest)
     private const int GapServesPerWindow = 8;
-    private long _serveWindowStartMs = long.MinValue;
+    // Same overflow-safe sentinel as _lastSendMs, and here it was load-bearing: with long.MinValue
+    // the window-reset test `now - _serveWindowStartMs >= GapServeWindowMs` overflowed negative and
+    // never fired, so _servesThisWindow climbed to GapServesPerWindow and STAYED there — after the
+    // eighth serve of a session this peer refused every gap request for the rest of it. A peer that
+    // then lost a burst wider than its redundant window could never be re-sent the frames it was
+    // missing: both sides sat at their prediction caps forever, asking and refusing, which is the
+    // permanent freeze the gap-request path exists to prevent.
+    private long _serveWindowStartMs = -GapServeWindowMs;
     private int _servesThisWindow;
 
     /// <summary>
