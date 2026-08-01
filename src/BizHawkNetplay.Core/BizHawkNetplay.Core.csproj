@@ -8,7 +8,7 @@
     <!-- Kept in step with the Tool's version. The two DLLs ship together and must be installed
          together, so a pair that disagrees about which release it is would defeat the point of
          stamping either. Bump both when cutting a release. -->
-    <Version>0.25.0</Version>
+    <Version>0.26.0</Version>
   </PropertyGroup>
 
 </Project>

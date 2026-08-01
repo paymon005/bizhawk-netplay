@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| (unreleased) | **15** | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
+| v0.26.0 | **15** | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
 | v0.24.0 – v0.25.0 | 14 | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
 | v0.21.0 – v0.23.0 | 13 | Resync and reconnect states are deflated on the wire. |
 | v0.20.0 | 12 | The lobby measures every UDP mesh edge and the host publishes the settled delay in its own control frame (`MeshRtt` / `InputDelay`), which an older build neither sends nor expects. |
@@ -21,6 +21,39 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.26.0 — a crash, an amplifier, and a relay that talked to itself
+
+**Protocol 15 — everyone must update.** A v0.25.0 peer and a v0.26.0 peer refuse each other at the
+handshake, which is intended rather than a fault: the desync checksum now reads whole memory
+domains on cores where it previously sampled one word in sixteen, and that value crosses the wire.
+
+- **EmuHawk could be crashed by loading a ROM mid-session.** The hook that lets a tool tear down
+  first is skipped entirely when "Supress 'Ask Save Changes'" is ticked, so nothing stopped the
+  frame clock and any modal on the way into the next ROM — missing firmware, the archive chooser —
+  pumped messages that stepped a core EmuHawk had already disposed. On a waterbox core that is a
+  native access violation, not an exception. Both clock entry points now check.
+- **One joiner's malformed UDP port took down the whole lobby**, because the value reached an
+  IPEndPoint constructor outside the per-joiner handler whose entire purpose is that a bad greet
+  costs its author a seat and nobody else.
+- **The relay sent symmetric-NAT peers their own input back**, and never delivered their gap
+  requests to the peer that could answer them — which surfaced as "retransmission could not repair"
+  and ended sessions blaming the network. It reads the datagram's own addressing now instead of
+  guessing from source addresses.
+- **A peer could talk your machine into flooding a third party.** Nothing capped the candidate list
+  a route could carry, and the punch loop probes every candidate four times a second. Routes are now
+  bounded and refuse addresses the socket could never send to anyway; control frames get a per-type
+  size ceiling so only savestates may be large.
+- **A lost segment in a state transfer repairs in about a round trip** instead of waiting out a
+  retransmit timer that doubles to 1.5s. On a lossy link that was the difference between a resync
+  that completes and one that fails.
+- **Sticky autofire and Virtual Pad clicks work during a session again** — both froze, and a stuck
+  virtual-pad button looks exactly like a desync. An A/V capture now refuses a session rather than
+  silently recording nothing.
+- **The advisory that says your machine cannot afford rollback is now reachable** without ticking a
+  debug checkbox, and the per-second telemetry stops accumulating session-long when it is off.
+- Whole-domain checksums on waterbox cores: a divergence narrower than the old sampling stride is
+  now caught at the next checksum rather than up to sixteen intervals later.
 
 ### v0.25.0 — a relay that was never installed, and a lighter frame
 
