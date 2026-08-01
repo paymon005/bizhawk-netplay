@@ -504,13 +504,23 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     ///
     /// Above <see cref="HashWordBudget"/> the domain is therefore sampled with a stride. To avoid
     /// permanently ignoring the unsampled words, the starting offset rotates with the frame the
-    /// checksum describes: over <c>stride</c> consecutive checksums every word is covered. Both
-    /// peers derive the offset from the same frame number, so they always read the same slice.
+    /// checksum describes. Both peers derive the offset from the same frame number, so they always
+    /// read the same slice.
+    ///
+    /// The salt is bit-mixed before the modulo, and the reason is a bug this code shipped with for
+    /// its whole life: the salt is a checksum frame, checksum frames are multiples of the interval
+    /// (300), and 300 shares every factor of the strides this budget actually produces — so
+    /// <c>salt % stride</c> was 0 on every boundary and the "rotation" never moved. Only words at
+    /// offset 0 mod stride were ever hashed; on 8MiB RDRAM that is a fixed 25% of memory, forever.
+    /// Mixing first makes the offset depend on all of the salt's bits, so consecutive boundaries
+    /// land on different residues regardless of what the interval and stride happen to divide.
     ///
     /// The trade this makes, stated plainly: a divergence spanning at least <c>stride</c> words is
-    /// still caught immediately, and anything narrower is caught within <c>stride</c> intervals
-    /// instead of at the next one. Emulation divergence spreads across memory within a few frames,
-    /// so in practice this costs detection latency rather than detection.
+    /// still caught immediately. Anything narrower is caught when the rotation lands on it — the
+    /// offsets are a deterministic pseudo-random sequence rather than a strict round-robin, so
+    /// expected coverage of all residues takes a few times <c>stride</c> intervals rather than
+    /// exactly <c>stride</c>. Emulation divergence spreads across memory within a few frames, so
+    /// in practice this costs detection latency rather than detection.
     /// </summary>
     private static uint HashByWord(MemoryDomain domain, long size, int salt, out int stride)
     {
@@ -518,7 +528,7 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         stride = words <= HashWordBudget
             ? 1
             : (int)Math.Min(int.MaxValue, (words + HashWordBudget - 1) / HashWordBudget);
-        long offset = stride <= 1 ? 0 : (uint)salt % (uint)stride;
+        long offset = stride <= 1 ? 0 : MixSalt((uint)salt) % (uint)stride;
 
         const ulong prime = 1099511628211UL;
         ulong h = 14695981039346656037UL;
@@ -536,6 +546,22 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                 h = (h ^ domain.PeekByte(a)) * prime;
 
         return (uint)(h ^ (h >> 32));
+    }
+
+    /// <summary>
+    /// murmur3's 32-bit finalizer. Every output bit depends on every input bit, which is the one
+    /// property <see cref="HashByWord"/>'s offset needs: a salt divisible by the stride must not
+    /// produce an offset of zero every time. Both peers run it on the same salt, so they still
+    /// read the same slice.
+    /// </summary>
+    private static uint MixSalt(uint x)
+    {
+        x ^= x >> 16;
+        x *= 0x85EBCA6Bu;
+        x ^= x >> 13;
+        x *= 0xC2B2AE35u;
+        x ^= x >> 16;
+        return x;
     }
 
     /// <summary>
