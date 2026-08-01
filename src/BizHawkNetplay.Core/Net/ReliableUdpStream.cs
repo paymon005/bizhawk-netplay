@@ -31,6 +31,16 @@ public sealed class ReliableUdpStream : Stream
     private const int RtoMaxMs = 1500;    // backoff ceiling
     private const int DeadRetries = 40;   // consecutive fruitless retransmits of the base -> fault
 
+    /// <summary>
+    /// How much reassembled data may wait for a reader before the sender is made to wait instead.
+    ///
+    /// Well above anything a real transfer parks here — the consumers read continuously, and the
+    /// window ahead of this is 64 KiB — so it costs a healthy resync nothing. It is here because
+    /// "the reader will keep up" was an assumption rather than a rule, and the party it was trusting
+    /// is the remote one.
+    /// </summary>
+    public const int DefaultMaxReadableBytes = 8 * 1024 * 1024;
+
     private readonly Action<byte[]> _send;
     private readonly object _gate = new();
 
@@ -62,8 +72,14 @@ public sealed class ReliableUdpStream : Stream
     private volatile bool _closed;
     private readonly Thread _timer;
 
-    public ReliableUdpStream(Action<byte[]> send)
+    private readonly int _maxReadableBytes;
+
+    /// <param name="maxReadableBytes">Reassembled bytes that may wait for a reader before the
+    /// sender is held off; see <see cref="DefaultMaxReadableBytes"/>.</param>
+    public ReliableUdpStream(Action<byte[]> send, int maxReadableBytes = DefaultMaxReadableBytes)
     {
+        if (maxReadableBytes < 1) throw new ArgumentOutOfRangeException(nameof(maxReadableBytes));
+        _maxReadableBytes = maxReadableBytes;
         _send = send ?? throw new ArgumentNullException(nameof(send));
         _baseSentTicks = NowMs();
         _timer = new Thread(RetransmitLoop) { IsBackground = true, Name = "BizHawkNetplay-reliable-udp" };
@@ -164,6 +180,9 @@ public sealed class ReliableUdpStream : Stream
                         }
                     }
                     _readableBytes -= written;
+                    // Space just came free: take whatever the cap was holding back, so a sender
+                    // stalled by backpressure is released on this read rather than on a timeout.
+                    DrainToReadable();
                     return written;
                 }
                 if (_finReceived && _rcvBase >= _rcvFinSeq) return 0; // clean EOF
@@ -279,14 +298,31 @@ public sealed class ReliableUdpStream : Stream
         if (s < _rcvBase) return;                       // duplicate already delivered; re-ACK below
         if (s >= _rcvBase + Window) return;             // outside the receive window; drop
         if (!_reorder.ContainsKey(s)) _reorder[s] = payload;
-        // Drain contiguous run from the base into the readable queue.
-        while (_reorder.TryGetValue(_rcvBase, out var p))
+        DrainToReadable();
+        Monitor.PulseAll(_gate); // wake a blocked Read
+    }
+
+    /// <summary>
+    /// Move the contiguous run at the base into the readable queue, and stop at the buffer cap.
+    ///
+    /// The reorder buffer was bounded by the receive window; what sat behind it was not. A sender
+    /// that keeps sending while nothing reads had its bytes accumulate here without limit, because
+    /// every segment delivered advanced the base and so widened the window again. Holding the run
+    /// in place instead leaves the base where it is, which leaves the acknowledgement where it is,
+    /// which is how a sender is told to wait — flow control the protocol already had the machinery
+    /// for and simply never applied.
+    ///
+    /// Called from Read as well as from AcceptData, so space freed by a reader is used at once
+    /// rather than on whatever retransmit happens to arrive next.
+    /// </summary>
+    private void DrainToReadable()
+    {
+        while (_readableBytes < _maxReadableBytes && _reorder.TryGetValue(_rcvBase, out var p))
         {
             _reorder.Remove(_rcvBase);
             if (p.Length > 0) { _readable.Enqueue(p); _readableBytes += p.Length; }
             _rcvBase++;
         }
-        Monitor.PulseAll(_gate); // wake a blocked Read
     }
 
     private byte[] MakeAck()

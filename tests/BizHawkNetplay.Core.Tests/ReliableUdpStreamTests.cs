@@ -32,12 +32,19 @@ public class ReliableUdpStreamTests
         private volatile bool _run = true;
         private Thread _t1 = null!, _t2 = null!;
 
-        public LossyLink(int seed, double drop) { _rng = new Random(seed); _drop = drop; }
+        private readonly int _maxReadable;
+
+        public LossyLink(int seed, double drop, int maxReadable = ReliableUdpStream.DefaultMaxReadableBytes)
+        {
+            _rng = new Random(seed);
+            _drop = drop;
+            _maxReadable = maxReadable;
+        }
 
         public (ReliableUdpStream a, ReliableUdpStream b) Connect()
         {
-            _a = new ReliableUdpStream(seg => Enqueue(_aToB, seg));
-            _b = new ReliableUdpStream(seg => Enqueue(_bToA, seg));
+            _a = new ReliableUdpStream(seg => Enqueue(_aToB, seg), _maxReadable);
+            _b = new ReliableUdpStream(seg => Enqueue(_bToA, seg), _maxReadable);
             _t1 = new Thread(() => Pump(_aToB, () => _b)) { IsBackground = true };
             _t2 = new Thread(() => Pump(_bToA, () => _a)) { IsBackground = true };
             _t1.Start(); _t2.Start();
@@ -70,6 +77,46 @@ public class ReliableUdpStreamTests
         }
 
         public void Dispose() { _run = false; try { _a?.Dispose(); _b?.Dispose(); } catch { } }
+    }
+
+    /// <summary>
+    /// Reassembled bytes waiting for a reader were unbounded: every delivered segment advanced the
+    /// receive base, which widened the window again, so a sender that kept sending while nothing
+    /// read simply grew this without limit. Holding the run in place applies the backpressure the
+    /// protocol already had the machinery for.
+    ///
+    /// The point of the test is the second half. Capping is easy; capping without stalling the
+    /// transfer is the part that could break a resync, so this pushes several times the cap through
+    /// a reader that deliberately lags and requires every byte to arrive intact.
+    /// </summary>
+    [Fact]
+    public void ASlowReaderHoldsTheSenderOffWithoutLosingTheTransfer()
+    {
+        const int Cap = 64 * 1024;
+        using var link = new LossyLink(seed: 11, drop: 0.0, maxReadable: Cap);
+        var (a, b) = link.Connect();
+        b.ReadTimeout = 20_000;
+
+        var blob = new byte[Cap * 6];
+        new Random(1234).NextBytes(blob);
+
+        var writer = new Thread(() => { a.Write(blob, 0, blob.Length); a.Flush(); }) { IsBackground = true };
+        writer.Start();
+
+        // Read in small bites with a pause between them, so the buffer spends the transfer at its
+        // ceiling rather than draining as fast as it fills.
+        var received = new byte[blob.Length];
+        int total = 0;
+        while (total < received.Length)
+        {
+            int n = b.Read(received, total, Math.Min(4096, received.Length - total));
+            Assert.True(n > 0, "the transfer stalled: backpressure was applied and never released");
+            total += n;
+            Thread.Sleep(1);
+        }
+
+        Assert.True(writer.Join(20_000), "the writer never completed");
+        Assert.Equal(blob, received);
     }
 
     [Fact]
