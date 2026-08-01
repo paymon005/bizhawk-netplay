@@ -198,8 +198,9 @@ public static class Handshake
 
         string myRole = isHost ? SessionAuth.RoleHost : SessionAuth.RoleJoin;
         string peerRole = isHost ? SessionAuth.RoleJoin : SessionAuth.RoleHost;
-        string myProof = SessionAuth.Proof(password, myRole, hostNonce, joinNonce);
-        string peerExpected = SessionAuth.Proof(password, peerRole, hostNonce, joinNonce);
+        // One key derivation for both proofs — they differ only in a role tag applied after it.
+        var (myProof, peerExpected) =
+            SessionAuth.ProofPair(password, myRole, peerRole, hostNonce, joinNonce);
 
         if (isHost)
         {

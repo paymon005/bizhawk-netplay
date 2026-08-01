@@ -59,17 +59,46 @@ public static class SessionAuth
     /// </summary>
     public static string Proof(string? password, string role, byte[] hostNonce, byte[] joinNonce)
     {
+        var salt = Salt(hostNonce, joinNonce);
+        return ProofFromKey(DeriveKey(password, salt), role, salt);
+    }
+
+    /// <summary>
+    /// Both proofs for one exchange, from a single key derivation.
+    ///
+    /// The two differ only in a role tag appended after the KDF, so deriving them separately ran
+    /// 100,000 PBKDF2 iterations twice over identical inputs for identical output. Every peer paid
+    /// that, and so did a host for every connection that reached the password step — including the
+    /// ones that were never going to pass it, which made a stranger's connection attempt about
+    /// twice as expensive as it needed to be.
+    /// </summary>
+    public static (string mine, string peers) ProofPair(
+        string? password, string myRole, string peerRole, byte[] hostNonce, byte[] joinNonce)
+    {
+        var salt = Salt(hostNonce, joinNonce);
+        var key = DeriveKey(password, salt);
+        return (ProofFromKey(key, myRole, salt), ProofFromKey(key, peerRole, salt));
+    }
+
+    private static byte[] Salt(byte[] hostNonce, byte[] joinNonce)
+    {
         if (hostNonce == null) throw new ArgumentNullException(nameof(hostNonce));
         if (joinNonce == null) throw new ArgumentNullException(nameof(joinNonce));
 
         var salt = new byte[hostNonce.Length + joinNonce.Length];
         Buffer.BlockCopy(hostNonce, 0, salt, 0, hostNonce.Length);
         Buffer.BlockCopy(joinNonce, 0, salt, hostNonce.Length, joinNonce.Length);
+        return salt;
+    }
 
-        byte[] key;
-        using (var kdf = new Rfc2898DeriveBytes(password ?? "", salt, Iterations))
-            key = kdf.GetBytes(32);
+    private static byte[] DeriveKey(string? password, byte[] salt)
+    {
+        using var kdf = new Rfc2898DeriveBytes(password ?? "", salt, Iterations);
+        return kdf.GetBytes(32);
+    }
 
+    private static string ProofFromKey(byte[] key, string role, byte[] salt)
+    {
         var roleBytes = Encoding.UTF8.GetBytes(role ?? "");
         var msg = new byte[key.Length + roleBytes.Length + salt.Length];
         Buffer.BlockCopy(key, 0, msg, 0, key.Length);

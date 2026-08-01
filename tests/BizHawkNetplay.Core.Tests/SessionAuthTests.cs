@@ -82,4 +82,28 @@ public class SessionAuthTests
     {
         Assert.NotEqual(0UL, SessionAuth.NewSessionId());
     }
+
+    /// <summary>
+    /// The two proofs in one exchange differ only in a role tag applied after the key derivation, so
+    /// deriving them separately ran 100,000 PBKDF2 iterations twice over identical inputs. Sharing
+    /// the derivation halves what every peer pays, and halves what a host pays for a connection
+    /// that was never going to pass the check.
+    ///
+    /// It is a wire value, so what matters is that it produces exactly what computing them one at a
+    /// time did — otherwise this is not an optimisation, it is a protocol change.
+    /// </summary>
+    [Fact]
+    public void ProofPair_MatchesProofComputedSeparately()
+    {
+        var host = SessionAuth.NewNonce();
+        var join = SessionAuth.NewNonce();
+
+        foreach (var password in new[] { "", "hunter2" })
+        {
+            var (mine, peers) = SessionAuth.ProofPair(
+                password, SessionAuth.RoleHost, SessionAuth.RoleJoin, host, join);
+            Assert.Equal(SessionAuth.Proof(password, SessionAuth.RoleHost, host, join), mine);
+            Assert.Equal(SessionAuth.Proof(password, SessionAuth.RoleJoin, host, join), peers);
+        }
+    }
 }
