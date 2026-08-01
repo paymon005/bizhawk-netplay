@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.28.0 – v0.28.1 | **17** | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
+| v0.28.0 – v0.28.2 | **17** | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
 | v0.27.0 | 16 | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
 | v0.26.0 | 15 | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
 | v0.24.0 – v0.25.0 | 14 | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
@@ -23,6 +23,42 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.28.2 — the lobby stops treating reachability as advice
+
+**Wire-compatible with v0.28.0 and v0.28.1** (still protocol 17). Four fixes from an external
+review of the previous release, all in how the lobby decides whether players can actually reach
+each other.
+
+**The mesh round was gated on a latency checkbox.** `MeasureLobbyMesh` is the only thing that
+installs the mesh relay, and it ran only when "Auto from ping" was ticked. Turning that off — a
+*delay* preference — silently skipped the punch burst, the edge measurement and the relay, so a
+session with an unopenable joiner-to-joiner edge started with no viable route for it and nothing
+said so. The round now always runs; only the delay arithmetic is still a preference.
+
+**A player with no UDP path to the host was let into the session anyway.** The code detected it,
+wrote "their input will not arrive at all" to the log, and then requested READY and sent GO —
+starting a session it had just proved could not work. Relaying cannot rescue that case either,
+because the relay runs over the very leg that is missing. It is now a casualty like any other: the
+seat reopens and the lobby waits. The two-player case was the worst of it, since the old code
+returned before the check even ran and told the player that "the host's own link is the only one
+that matters" while that link was the dead one.
+
+**The delay ignored the hop the relay adds.** The lobby measures direct edges, and an edge that
+never opened — the reason the relay exists — contributed nothing to the worst-RTT figure. So the
+delay was sized from the worst direct path while the relayed players were not using one. A relayed
+route's equivalent round-trip is its two host legs added together, which on a 40ms/60ms pair is
+100ms against a 60ms worst direct edge: a real frame of latency, paid as stalls by the seats
+already having the worst time. The worst relayed route is now folded in before the delay is chosen.
+
+**Live RTT ignored learned endpoints.** The send path ranks the learned endpoint — the address a
+peer's packets actually arrive from — above every advertised candidate, and the lobby's per-edge
+report includes it, but the live RTT aggregation enumerated advertised candidates alone. For a
+symmetric-NAT peer that set is entirely dead, so the worst-RTT reading found no measurement and
+discarded the whole figure, falling back to control-channel RTT: it measured TCP while input rode a
+UDP path it refused to look at, sizing both the delay advice and the rollback soft cap off the
+wrong number. There is now one definition of the candidate set, used by all three measurement
+paths.
 
 ### v0.28.1 — the ninth gap request
 
