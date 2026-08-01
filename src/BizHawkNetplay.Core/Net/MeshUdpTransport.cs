@@ -404,10 +404,21 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         foreach (var kv in _lastSelected.ToArray()) if (!keep.Contains(kv.Value)) _lastSelected.TryRemove(kv.Key, out _);
     }
 
+    // Scratch for framing the per-frame input datagram. Send() runs only on the frame thread
+    // (see SendFramed's note), so one buffer suffices — and at 60Hz the copy-to-prepend-6-bytes
+    // was the transport's largest steady-state allocation.
+    private byte[] _inputFrameScratch = new byte[2048];
+
     public void Send(byte[] datagram)
     {
         if (datagram == null) throw new ArgumentNullException(nameof(datagram));
-        var framed = Frame(TInput, datagram);
+        int framedLength = HeaderSize + datagram.Length;
+        var framed = _inputFrameScratch;
+        if (framed.Length < framedLength) _inputFrameScratch = framed = new byte[framedLength];
+        Buffer.BlockCopy(Magic, 0, framed, 0, 4);
+        framed[4] = Version;
+        framed[5] = TInput;
+        Buffer.BlockCopy(datagram, 0, framed, HeaderSize, datagram.Length);
         var table = _routeTable;
         long now = Clock.ElapsedMilliseconds;
         foreach (var route in table.Routes)
@@ -415,7 +426,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             var endpoint = SelectSendCandidate(route, now);
             if (endpoint != null)
             {
-                SendFramed(framed, endpoint);
+                SendFramed(framed, 0, framedLength, endpoint);
                 continue;
             }
             // No path to this peer has EVER been confirmed (fresh session, punch still in
@@ -427,7 +438,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             // AnAddressThatOnlyClaimsASeatIsProbedButNeverSentInput exists to forbid. A learned
             // endpoint that ever carried input is preserved by the _lastSelected fallback above.
             var candidates = route.Candidates;
-            for (int i = 0; i < candidates.Count; i++) SendFramed(framed, candidates[i]);
+            for (int i = 0; i < candidates.Count; i++) SendFramed(framed, 0, framedLength, candidates[i]);
         }
     }
 
@@ -625,8 +636,10 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         IPEndPoint? firstFresh = null, bestFresh = null;
         IPEndPoint? firstLive = null, bestLive = null;
         double bestFreshRtt = double.MaxValue, bestLiveRtt = double.MaxValue;
-        foreach (var endpoint in route.Candidates)
+        var routeCandidates = route.Candidates;
+        for (int i = 0; i < routeCandidates.Count; i++) // indexed: per-frame path, no enumerator box
         {
+            var endpoint = routeCandidates[i];
             if (!_alive.TryGetValue(endpoint, out var heard) || now - heard >= AliveWindowMs) continue;
             bool fresh = now - heard < FreshWindowMs;
             if (firstLive == null) firstLive = endpoint;
@@ -670,8 +683,10 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     {
         bestRtt = double.MaxValue;
         bool found = false;
-        foreach (var endpoint in route.Candidates)
+        var routeCandidates = route.Candidates;
+        for (int i = 0; i < routeCandidates.Count; i++)
         {
+            var endpoint = routeCandidates[i];
             if (!IsEndpointAlive(endpoint, now)) continue;
             if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
             if (rtt < bestRtt) bestRtt = rtt;
