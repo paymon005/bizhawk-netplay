@@ -785,6 +785,71 @@ public class MeshUdpTransportTests
     }
 
     /// <summary>
+    /// The rule above has a failure mode the lobby can manufacture: a pre-GO casualty renumbers the
+    /// survivors, so the peer that announced seat 1's token is still in the session — on another
+    /// seat, still answering from the same endpoint. Its binding therefore never goes quiet, and
+    /// the seat's next genuine occupant would be refused forever. The host's answer is to rotate a
+    /// renumbered seat's token, and this is the transport half of that contract: applying a changed
+    /// token retires the learned binding it obsoletes, so the fresh claim binds immediately even
+    /// though the old endpoint never stopped answering.
+    /// </summary>
+    [Fact]
+    public void RotatingASeatTokenRetiresItsLearnedBinding()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        var replacement = new System.Net.Sockets.Socket(
+            System.Net.Sockets.AddressFamily.InterNetwork,
+            System.Net.Sockets.SocketType.Dgram,
+            System.Net.Sockets.ProtocolType.Udp);
+        try
+        {
+            replacement.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            int replacementPort = ((IPEndPoint)replacement.LocalEndPoint).Port;
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(UnboundPort(peer.LocalPort)) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            // Wait for the old occupant's binding to be proved and answering.
+            var sw = Stopwatch.StartNew();
+            IPEndPoint? learned = null;
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (host.TryGetLearnedEndpoint(1, out var candidate) && host.IsEndpointAlive(candidate))
+                {
+                    learned = candidate;
+                    break;
+                }
+                Thread.Sleep(10);
+            }
+            Assert.NotNull(learned);
+
+            // The lobby renumbered: seat 1 carries a fresh token now. The retirement is immediate —
+            // no waiting out a freshness window the old occupant would keep resetting.
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xCD)) });
+            Assert.False(host.TryGetLearnedEndpoint(1, out _));
+
+            // The seat's next occupant claims it with the fresh token and binds, even though the
+            // old endpoint never went quiet (its transport is still up and still punching).
+            bool bound = false;
+            var claim = Stopwatch.StartNew();
+            while (claim.ElapsedMilliseconds < 3000)
+            {
+                replacement.SendTo(HelloFrame(Token(0xCD)), Loop(host.LocalPort));
+                if (host.TryGetLearnedEndpoint(1, out var current) && current.Port == replacementPort)
+                {
+                    bound = true;
+                    break;
+                }
+                Thread.Sleep(20);
+            }
+            Assert.True(bound, "the fresh token's claim was refused — the retired binding is still pinning the seat");
+        }
+        finally { host.Dispose(); peer.Dispose(); replacement.Dispose(); }
+    }
+
+    /// <summary>
     /// The symmetric-NAT case, modelled honestly: the peer's packets arrive from a port nobody was
     /// ever told about, because its router assigns one per destination.
     ///

@@ -1129,10 +1129,35 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// one of these is telling us where it really is; anything else stays unroutable.</summary>
     public void SetPeerTokens(IEnumerable<KeyValuePair<int, byte[]>>? tokens)
     {
+        var previous = _peerTokens.ToArray();
         _peerTokens.Clear();
-        if (tokens == null) return;
-        foreach (var kv in tokens)
-            if (kv.Value is { Length: TokenBytes }) _peerTokens[kv.Key] = (byte[])kv.Value.Clone();
+        if (tokens != null)
+            foreach (var kv in tokens)
+                if (kv.Value is { Length: TokenBytes }) _peerTokens[kv.Key] = (byte[])kv.Value.Clone();
+
+        // A learned binding was earned by presenting the token its seat carried at the time. If the
+        // seat's token has since changed — the host rotates them when a lobby casualty renumbers
+        // seats — the claim behind the binding no longer stands. Keeping it is not conservative, it
+        // is the failure: the old occupant is usually still in the session on another seat, still
+        // answering from that endpoint, so the stale binding stays "alive" indefinitely and
+        // LearnFromHello refuses the seat's next genuine occupant forever.
+        foreach (var old in previous)
+        {
+            if (_peerTokens.TryGetValue(old.Key, out var current) && TokensEqual(old.Value, current))
+                continue;
+            if (!_learnedByPort.TryRemove(old.Key, out var endpoint)) continue;
+            _learnedByEndpoint.TryRemove(endpoint, out _);
+            _learnedAt.TryRemove(endpoint, out _);
+            _alive.TryRemove(endpoint, out _);
+        }
+    }
+
+    private static bool TokensEqual(byte[] a, byte[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
     }
 
     /// <summary>Adopt a whole mesh identity at once — who we announce ourselves as and who we will

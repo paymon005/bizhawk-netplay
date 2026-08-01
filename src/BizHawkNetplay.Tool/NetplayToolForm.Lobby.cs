@@ -542,6 +542,22 @@ public sealed partial class NetplayToolForm
         // Ports are positional, so a survivor behind a departed joiner moves up. Nobody has been
         // released yet — the next WELCOME carries the corrected assignment — so this is safe here
         // and only here.
+        //
+        // Every seat that changes occupant must also change its mesh token. The token identifies
+        // the SEAT, and every peer that heard the old occupant announce it has that occupant's
+        // endpoint bound to the seat. A renumbered survivor is still in the session, still
+        // answering from that endpoint — so the binding stays "alive" and the seat's next genuine
+        // occupant can never rebind it: their direct traffic goes to the old occupant's machine
+        // for the rest of the session, and the leg limps along on relay. Rotating the token
+        // retires the binding instead (SetPeerTokens drops learned endpoints whose seat token
+        // changed), and the next start attempt distributes the fresh set with its WELCOMEs.
+        // Seats whose occupant did not move keep their token: nothing about them changed.
+        var stableSeats = new HashSet<int>();
+        for (int i = 0; i < links.Count; i++)
+            if (links[i].RemotePort == i + 1) stableSeats.Add(i + 1);
+        for (int port = 1; port <= need; port++)
+            if (!stableSeats.Contains(port)) _portTokens.Remove(port);
+
         for (int i = 0; i < links.Count; i++)
         {
             var link = links[i];
