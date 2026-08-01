@@ -893,33 +893,62 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// for the joiner-to-joiner edges that failed to open, which in practice means a peer behind a
     /// symmetric NAT — the case where no amount of punching can produce a direct path.
     /// </summary>
+    /// <summary>
+    /// Forward one peer's datagram to the peers whose direct legs to it never opened.
+    ///
+    /// Who NOT to send to is read out of the payload, not inferred from the source address. The
+    /// input codec puts its own type at payload byte 0 and a port at byte 1, and that port is
+    /// authoritative: for input it is the author's seat, for a gap request it is the seat being
+    /// asked. Matching on the source ENDPOINT instead — which this used to do — silently failed for
+    /// exactly the peers the relay exists for. A symmetric-NAT peer is recognised at a learned
+    /// address that by construction appears in no route's candidate list, so the sender test never
+    /// matched and the host sent every such peer its own input straight back: doubled traffic on
+    /// the weakest link in the session, and halved headroom in the receiver's drain budget.
+    ///
+    /// No re-relay loop is possible: a forwarded datagram still carries its ORIGINAL author's port,
+    /// so no node can bounce it back to the author, and only the host ever holds relay routes.
+    /// </summary>
     private void RelayInput(byte[] buffer, int n, IPEndPoint from)
     {
-        var routes = _relayRoutes;
-        if (routes.Length == 0) return;
-
-        byte[]? copy = null; // only allocated when there is actually something to forward
+        if (_relayRoutes.Length == 0) return;
+        if (n < HeaderSize + 2) return;          // too short to carry the codec's type and port
+        byte payloadType = buffer[HeaderSize];
+        byte payloadPort = buffer[HeaderSize + 1];
         long now = Clock.ElapsedMilliseconds;
-        foreach (var route in routes)
-        {
-            // Never bounce a datagram back to the peer it came from.
-            bool isSender = false;
-            foreach (var candidate in route.Candidates) if (candidate.Equals(from)) { isSender = true; break; }
-            if (isSender) continue;
 
+        // A gap request is ADDRESSED: exactly one peer owns the input it asks for, and that peer
+        // need not itself be relayed for the requester to be unable to reach it. Forwarding it to
+        // the relay set — as the input path does — meant a request from the one relayed peer went
+        // only back toward itself, and the peer that could have answered never heard it. The
+        // requester then reported a hole retransmission could not repair, and the session ended
+        // eight seconds later blaming mismatched builds.
+        if (payloadType == RelayedRequestType)
+        {
+            foreach (var route in _routeTable.Routes)
+            {
+                if (route.RemotePort != payloadPort) continue;
+                var target = SelectSendCandidate(route, now);
+                if (target != null) SendFramed(buffer, 0, n, target);
+                return;
+            }
+            return;
+        }
+        if (payloadType != RelayedInputType) return;   // not something we know how to address
+
+        foreach (var route in _relayRoutes)
+        {
+            if (route.RemotePort == payloadPort) continue;  // never bounce input back to its author
             var endpoint = SelectSendCandidate(route, now);
             if (endpoint == null) continue; // no live path to relay over yet; direct copies still flow
-            copy ??= Slice(buffer, n);
-            SendFramed(copy, endpoint);
-        }
-
-        static byte[] Slice(byte[] source, int length)
-        {
-            var slice = new byte[length];
-            Buffer.BlockCopy(source, 0, slice, 0, length);
-            return slice;
+            SendFramed(buffer, 0, n, endpoint);
         }
     }
+
+    // The input codec's payload type byte, mirrored here so the relay can address a datagram
+    // without decoding it. Kept in step with InputPacketCodec's own constants by the round-trip
+    // test that sends a real request through a relaying host.
+    private const byte RelayedInputType = 1;
+    private const byte RelayedRequestType = 2;
 
     /// <summary>
     /// Our own membership token, announced in every <c>THello</c> so peers can recognise us at
@@ -998,11 +1027,22 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         return diff == 0;
     }
 
-    private void SendFramed(byte[] framed, IPEndPoint to)
+    private void SendFramed(byte[] framed, IPEndPoint to) => SendFramed(framed, 0, framed.Length, to);
+
+    /// <summary>
+    /// Send an already-framed datagram from within a larger buffer — which is what the relay has,
+    /// so it no longer copies each datagram out just to hand it over.
+    ///
+    /// Catches everything. This is a best-effort unreliable send and there is no failure it should
+    /// propagate: it runs on the receive thread (relay) and on the UI thread inside the frame
+    /// callback (input), and an escape on either is worse than a dropped datagram. Notably a
+    /// candidate of the wrong address family raises ArgumentException rather than SocketException,
+    /// which the previous two-type catch would have let through.
+    /// </summary>
+    private void SendFramed(byte[] framed, int offset, int count, IPEndPoint to)
     {
-        try { _socket.SendTo(framed, to); }
-        catch (SocketException) { /* transient; the input channel tolerates loss */ }
-        catch (ObjectDisposedException) { /* shutting down */ }
+        try { _socket.SendTo(framed, offset, count, SocketFlags.None, to); }
+        catch { /* transient, disposed, or an unroutable candidate — the channel tolerates loss */ }
     }
 
     public void Dispose()

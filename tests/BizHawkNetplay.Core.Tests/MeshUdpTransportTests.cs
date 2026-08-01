@@ -517,26 +517,34 @@ public class MeshUdpTransportTests
             c.SetPeers(new[] { Loop(host.LocalPort) });
 
             // Without the relay, A's input reaches the host and stops there.
-            a.Send([7]);
-            Assert.Equal(new byte[] { 7 }, WaitRecv(host));
+            a.Send(Input(port: 1, 7));
+            Assert.Equal(Input(port: 1, 7), WaitRecv(host));
             AssertNoRecv(c);
 
             // The host must have heard from both before it can pick a live candidate to relay over.
-            c.Send([8]);
-            Assert.Equal(new byte[] { 8 }, WaitRecv(host));
+            c.Send(Input(port: 2, 8));
+            Assert.Equal(Input(port: 2, 8), WaitRecv(host));
 
             host.SetRelayRoutes(new[] { toA, toC });
             Assert.Equal(2, host.RelayRouteCount);
 
-            a.Send([9]);
-            Assert.Equal(new byte[] { 9 }, WaitRecv(host)); // still delivered locally
-            Assert.Equal(new byte[] { 9 }, WaitRecv(c));    // ...and forwarded to the unreachable peer
+            a.Send(Input(port: 1, 9));
+            Assert.Equal(Input(port: 1, 9), WaitRecv(host)); // still delivered locally
+            Assert.Equal(Input(port: 1, 9), WaitRecv(c));    // ...and forwarded to the unreachable peer
         }
         finally { host.Dispose(); a.Dispose(); c.Dispose(); }
     }
 
-    /// <summary>A relayed datagram must not be bounced back to the peer that sent it — that would be
-    /// a duplicate at best and, if anything ever forwarded onward, a loop.</summary>
+    /// <summary>
+    /// A relayed datagram must not be bounced back to the peer that sent it — a duplicate at best,
+    /// and a loop if anything ever forwarded onward.
+    ///
+    /// The author is identified by the PORT in the payload, not by the source address, and that
+    /// distinction is the whole point: a symmetric-NAT peer is recognised at a learned address that
+    /// appears in no route's candidate list, so an address-based test never matched it and the host
+    /// sent exactly those peers their own input back. This test pins the payload-based rule by
+    /// giving the datagram a source address the route does NOT list.
+    /// </summary>
     [Fact]
     public void RelayNeverEchoesBackToTheSender()
     {
@@ -548,16 +556,65 @@ public class MeshUdpTransportTests
             host.SetPeerRoutes(new[] { toA });
             a.SetPeers(new[] { Loop(host.LocalPort) });
 
-            a.Send([1]);
-            Assert.Equal(new byte[] { 1 }, WaitRecv(host)); // host now has a live path to A
+            a.Send(Input(port: 1, 1));
+            Assert.Equal(Input(port: 1, 1), WaitRecv(host)); // host now has a live path to A
 
             host.SetRelayRoutes(new[] { toA }); // A is its own relay target, and must be skipped
-            a.Send([2]);
-            Assert.Equal(new byte[] { 2 }, WaitRecv(host));
+            a.Send(Input(port: 1, 2));
+            Assert.Equal(Input(port: 1, 2), WaitRecv(host));
             AssertNoRecv(a);
         }
         finally { host.Dispose(); a.Dispose(); }
     }
+
+    /// <summary>
+    /// A gap request is addressed to ONE peer, and must reach that peer rather than the relay set.
+    ///
+    /// It used to be forwarded exactly like input — to everyone being relayed for, minus the
+    /// sender. With a single relayed peer that meant a request from it went only back toward
+    /// itself, so the peer that owned the missing input never heard the ask. The requester then
+    /// reported a hole retransmission could not repair and the session ended blaming the network.
+    /// Here B is NOT relayed for (its legs are fine); only C is. C's request for B's input must
+    /// still arrive at B.
+    /// </summary>
+    [Fact]
+    public void RelayForwardsAGapRequestToThePeerThatOwnsTheInput()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var b = MeshUdpTransport.Bind(0);
+        var c = MeshUdpTransport.Bind(0);
+        try
+        {
+            var toB = new PeerRoute(1, new[] { Loop(b.LocalPort) });
+            var toC = new PeerRoute(2, new[] { Loop(c.LocalPort) });
+            host.SetPeerRoutes(new[] { toB, toC });
+            b.SetPeers(new[] { Loop(host.LocalPort) });
+            c.SetPeers(new[] { Loop(host.LocalPort) });
+
+            // The host needs a confirmed path to both before it can address anything.
+            b.Send(Input(port: 1, 1));
+            Assert.Equal(Input(port: 1, 1), WaitRecv(host));
+            c.Send(Input(port: 2, 2));
+            Assert.Equal(Input(port: 2, 2), WaitRecv(host));
+
+            host.SetRelayRoutes(new[] { toC });   // only C's legs failed
+
+            // C asks port 1 (B) to re-send. B is not in the relay set at all.
+            var request = Request(targetPort: 1);
+            c.Send(request);
+            Assert.Equal(request, WaitRecv(host));
+            Assert.Equal(request, WaitRecv(b));   // reached the one peer that can answer
+            AssertNoRecv(c);                      // and was not echoed at the requester
+        }
+        finally { host.Dispose(); b.Dispose(); c.Dispose(); }
+    }
+
+    /// <summary>An input datagram as the codec lays it out, far enough to be addressable: type 1,
+    /// then the author's seat, then a tail that stands in for the payload.</summary>
+    private static byte[] Input(byte port, byte tail) => [1, port, tail];
+
+    /// <summary>A gap request: type 2, then the seat whose input is being asked for.</summary>
+    private static byte[] Request(byte targetPort) => [2, targetPort];
 
     private static byte[] Token(byte fill) => Enumerable.Repeat(fill, 16).ToArray();
 
