@@ -35,11 +35,18 @@ public sealed class LoopbackTransport : ITransport
         return (a, b);
     }
 
+    /// <summary>Same drop-oldest cap the mesh transport applies to its backlog. Without it, one
+    /// paused instance grows the other's queue without limit (~180 datagrams/s of retained
+    /// arrays) and then replays a stale flood on resume — UDP semantics say old input should
+    /// simply be lost instead.</summary>
+    private const int MaxInboundDepth = 1024; // matches MeshUdpTransport.MaxInboundBacklog
+
     public void Send(byte[] datagram)
     {
         if (datagram == null) throw new ArgumentNullException(nameof(datagram));
         if (_dropOutgoing != null && _dropOutgoing(datagram)) return; // simulated loss
         _peerInbound.Enqueue(datagram);
+        while (_peerInbound.Count > MaxInboundDepth && _peerInbound.TryDequeue(out _)) { }
     }
 
     public bool TryReceive(out byte[] datagram) => _inbound.TryDequeue(out datagram!);
