@@ -182,13 +182,16 @@ public sealed class ReliableUdpStream : Stream
     {
         if (seg == null || seg.Length < 1) return;
         byte type = seg[0];
-        var replies = new List<byte[]>();
+        // At most one reply per segment (an ACK), plus at most one fast retransmit. A List per
+        // inbound segment was ~16k allocations per state transfer to carry a single element.
+        byte[]? reply = null;
+        byte[]? fastRetransmit = null;
         lock (_gate)
         {
             if (type == SegAck && seg.Length >= 5)
             {
                 uint ack = ReadU32(seg, 1);
-                OnAck(ack);
+                fastRetransmit = OnAck(ack);
             }
             else if (type == SegData && seg.Length >= 5)
             {
@@ -196,26 +199,53 @@ public sealed class ReliableUdpStream : Stream
                 var payload = new byte[seg.Length - 5];
                 Buffer.BlockCopy(seg, 5, payload, 0, payload.Length);
                 AcceptData(s, payload);
-                replies.Add(MakeAck());
+                reply = MakeAck();
             }
             else if (type == SegFin && seg.Length >= 5)
             {
                 uint s = ReadU32(seg, 1);
                 if (!_finReceived) { _finReceived = true; _rcvFinSeq = s; }
-                replies.Add(MakeAck());
+                reply = MakeAck();
                 Monitor.PulseAll(_gate);
             }
         }
-        foreach (var r in replies) _send(r);
+        // Outside the lock, as every other send here is.
+        if (reply != null) _send(reply);
+        if (fastRetransmit != null) _send(fastRetransmit);
     }
 
-    private void OnAck(uint ack)
+    /// <summary>
+    /// Duplicate ACKs before a retransmit is believed. The receiver ACKs every DATA segment, so a
+    /// lost segment at the base produces a train of identical cumulative ACKs while later segments
+    /// keep arriving; three of them is the long-standing signal that it was loss rather than
+    /// reordering, and it is what stops a two-segment swap from triggering a pointless resend.
+    /// </summary>
+    private const int DuplicateAcksBeforeFastRetransmit = 3;
+
+    private uint _lastAckValue;
+    private int _duplicateAcks;
+
+    /// <summary>
+    /// Handle a cumulative ACK; returns a segment to retransmit immediately, or null.
+    ///
+    /// Without this the only repair mechanism is the retransmit timer, which resends the sixteen
+    /// lowest unacked segments per timeout — so with several holes spread through a window, each
+    /// one waits its own full RTO (500ms, doubling to 1500) while fifteen duplicates go out
+    /// alongside it. On a 16MiB state that is thousands of holes at up to 1.5s each: a resync that
+    /// fails on a link which was merely lossy. A single loss now costs about one round trip.
+    ///
+    /// Deliberately does NOT touch the backoff: a fast retransmit is evidence of one lost segment,
+    /// not of a congested path, so doubling the RTO or spending a dead-retry on it would punish
+    /// exactly the case this handles well. _baseSentTicks moves so the timer does not immediately
+    /// resend the same segment on top of this one.
+    /// </summary>
+    private byte[]? OnAck(uint ack)
     {
         // An ACK can only acknowledge data we've actually queued. A corrupt or hostile segment
         // carrying an ack beyond _nextSeq would otherwise spin this loop up to ~4 billion times
         // while holding _gate (a hang) and advance _sendBase past _nextSeq, permanently corrupting
         // the sender. Anything at/below _sendBase is a stale duplicate the while-loop already ignores.
-        if (ack > _nextSeq) return;
+        if (ack > _nextSeq) return null;
         bool progressed = false;
         while (_sendBase < ack)
         {
@@ -227,8 +257,21 @@ public sealed class ReliableUdpStream : Stream
             _baseSentTicks = NowMs();
             _baseRetries = 0;
             _rtoMs = RtoStartMs;
+            _duplicateAcks = 0;
+            _lastAckValue = ack;
             Monitor.PulseAll(_gate); // wake a Write blocked on the window
+            return null;
         }
+
+        // No progress: either a stale duplicate, or the receiver telling us the base is missing
+        // while it keeps taking what follows.
+        if (ack != _lastAckValue) { _lastAckValue = ack; _duplicateAcks = 0; return null; }
+        if (_unacked.Count == 0) return null;
+        if (++_duplicateAcks < DuplicateAcksBeforeFastRetransmit) return null;
+        _duplicateAcks = 0;
+        if (!_unacked.TryGetValue(_sendBase, out var missing)) return null;
+        _baseSentTicks = NowMs();   // the timer must not pile another copy on top of this one
+        return missing;
     }
 
     private void AcceptData(uint s, byte[] payload)

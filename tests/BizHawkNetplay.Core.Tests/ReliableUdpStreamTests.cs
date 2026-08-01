@@ -222,6 +222,75 @@ public class ReliableUdpStreamTests
         Assert.True(acked.Wait(TimeSpan.FromSeconds(5)), "a valid follow-up ack hung after the poison ack");
     }
 
+    /// <summary>
+    /// A single lost segment must be repaired from the duplicate ACKs its successors provoke, not
+    /// by waiting out the retransmit timer.
+    ///
+    /// The timer starts at 500ms and doubles to 1500, and resends the sixteen lowest unacked
+    /// segments each time — so before fast retransmit, every hole cost a full RTO and dragged
+    /// fifteen duplicates along with it. A 16MiB state over a lossy punched link is thousands of
+    /// holes; at up to 1.5s each the transfer outlives the receiver's budget and the resync fails
+    /// on a link that was merely lossy. This asserts the repair lands well inside one RTO, so a
+    /// regression to timer-only recovery fails here rather than in a real session.
+    /// </summary>
+    [Fact]
+    public void ASingleLostSegmentIsRepairedWithoutWaitingForTheRetransmitTimer()
+    {
+        // Hand-driven link: the test decides exactly which segment is lost, so the timing claim is
+        // about the repair mechanism rather than about a random draw.
+        var toReceiver = new List<byte[]>();
+        var toSender = new List<byte[]>();
+        var sender = new ReliableUdpStream(seg => { lock (toReceiver) toReceiver.Add((byte[])seg.Clone()); });
+        var receiver = new ReliableUdpStream(seg => { lock (toSender) toSender.Add((byte[])seg.Clone()); });
+        try
+        {
+            var payload = new byte[4096];
+            for (int i = 0; i < payload.Length; i++) payload[i] = (byte)i;
+            var writer = Task.Run(() => sender.Write(payload, 0, payload.Length));
+
+            List<byte[]> outbound;
+            var spin = System.Diagnostics.Stopwatch.StartNew();
+            while (true)
+            {
+                lock (toReceiver) outbound = new List<byte[]>(toReceiver);
+                if (outbound.Count >= 4) break;
+                Assert.True(spin.ElapsedMilliseconds < 5000, "the sender never queued enough segments");
+                Thread.Sleep(1);
+            }
+
+            // Drop the FIRST segment; deliver the rest. Each one the receiver takes re-ACKs the
+            // still-missing base, which is the duplicate-ACK train fast retransmit reacts to.
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 1; i < outbound.Count; i++) receiver.OnDatagram(outbound[i]);
+            lock (toSender)
+            {
+                foreach (var ack in toSender) sender.OnDatagram(ack);
+                toSender.Clear();
+            }
+
+            // The retransmitted base should now be sitting in the sender's outbox.
+            byte[]? repaired = null;
+            lock (toReceiver)
+                for (int i = outbound.Count; i < toReceiver.Count; i++)
+                    if (toReceiver[i].Length == outbound[0].Length
+                        && toReceiver[i][0] == outbound[0][0]
+                        && toReceiver[i][1] == outbound[0][1] && toReceiver[i][2] == outbound[0][2]
+                        && toReceiver[i][3] == outbound[0][3] && toReceiver[i][4] == outbound[0][4])
+                    { repaired = toReceiver[i]; break; }
+
+            Assert.True(repaired != null,
+                "the lost base was not retransmitted from the duplicate ACKs — only the timer would repair it");
+            Assert.True(clock.ElapsedMilliseconds < 400,
+                $"repair took {clock.ElapsedMilliseconds}ms, which is timer territory (RTO starts at 500ms)");
+
+            // And it really does repair: the receiver can now read the whole payload back.
+            receiver.OnDatagram(repaired!);
+            Assert.Equal(payload, ReadExactly(receiver, payload.Length));
+            Assert.True(writer.Wait(TimeSpan.FromSeconds(5)), "the writer never completed");
+        }
+        finally { sender.Dispose(); receiver.Dispose(); }
+    }
+
     private static byte[] ReadExactly(ReliableUdpStream s, int count)
     {
         var buf = new byte[count];
