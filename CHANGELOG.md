@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.27.0 | **16** | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
+| v0.28.0 | **17** | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
+| v0.27.0 | 16 | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
 | v0.26.0 | 15 | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
 | v0.24.0 – v0.25.0 | 14 | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
 | v0.21.0 – v0.23.0 | 13 | Resync and reconnect states are deflated on the wire. |
@@ -22,6 +23,50 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.28.0 — recovery paths that recover, and the heavy-core costs behind them
+
+**Protocol 17 — everyone must update.** A v0.27.0 peer and a v0.28.0 peer refuse each other at the
+handshake. v0.27.0 stopped the *host* from handing its identity to anyone who opened a socket; the
+joiner was still sending its own — ROM hash, core, sync settings, and on N64 a filesystem path
+containing the Windows username — as its very first frame, to whatever address it was told to dial.
+Addresses get swapped over chat, so that is a real way to collect them. The joiner now opens with
+the mirror of the host's challenge and its identity waits for the host's proof.
+
+Comes out of a model review of the networking and the frame path. Three groups:
+
+**Recovery paths that did not recover.** For a peer behind a symmetric NAT the only working address
+is the one we learned by observing it — never among the addresses it advertised. Two separate places
+forgot that. The last-known-good send path required its anchor to be an advertised candidate, so
+eight seconds of ack loss stopped input to that peer *entirely* until a probe re-proved the path;
+and the per-peer re-punch cleared liveness for every advertised candidate except the one address
+that had actually gone quiet, while logging that it was recovering. Separately, the reliable-UDP
+stream killed its own retransmit thread the moment it was closed, so a lost final message or a lost
+FIN was never resent and the peer misreported a clean refusal as a network timeout.
+
+**Handshake edges.** STUN discovery ran an unbounded DNS lookup on the host's lobby thread, so a
+blackholed resolver could hold the lobby past every joiner's deadline while the host was fine. Two
+of the three greet paths stored a peer's claimed public address without the credibility check the
+others enforce — enough for one authenticated peer to aim the whole session's UDP at a third party.
+The punched greets had no deadline bounding authentication as a whole, so one peer dribbling a byte
+before every timeout could hold the single lobby thread indefinitely.
+
+**Heavy cores.** A rollback correction that reached across a checksum boundary used to throw away
+the cached hash and re-fetch the state — save, load, hash, load back, 18.4ms on N64 — most often on
+exactly the high-latency links where corrections are deepest; it now re-hashes in place for free.
+The catch-up burst that repays a hitch required the next frame to be fully confirmed, which under
+rollback at any competitive input delay is never true, so the sessions that generate the debt were
+the ones that could never repay it. The snapshot spacing is now solved per core from its own
+measured save and frame costs instead of one constant taken from N64. And the cost cap that bounds
+prediction is seeded from the capability probe, so the first deep repair of a session is no longer
+the thing that discovers what a repair costs.
+
+Two things this release does **not** change. The ~66 ticks/s ceiling under a paused EmuHawk is now
+*documented as unreachable* rather than merely unexplained: the sleep is hard-coded, its gates are
+recomputed every loop iteration, and every flag that would open them also makes EmuHawk step the
+core itself — double-stepping every frame, which is a guaranteed desync. And on a heavy core with
+input delay below the link's latency, snapshot elision still cannot fire; the session now says so,
+in one line, naming the trade rather than making it for you.
 
 ### v0.27.0 — what a stranger can reach before they have proved anything
 
