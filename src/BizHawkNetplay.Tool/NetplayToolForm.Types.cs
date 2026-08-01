@@ -77,14 +77,23 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private sealed class AbsoluteSocketDeadline : IDisposable
     {
-        private readonly TcpClient _tcp;
+        private readonly Action _close;
         private readonly System.Threading.Timer _timer;
         // 0 = armed, 1 = completed/disarmed, 2 = expired and owns closing the socket.
         private int _state;
 
         public AbsoluteSocketDeadline(TcpClient tcp, int timeoutMs)
+            : this(() => { try { tcp.Close(); } catch { } }, timeoutMs) { }
+
+        /// <summary>For a punched link, whose greeting runs over a reliable-UDP control stream
+        /// rather than a TCP socket — disposing the stream unblocks its pending read the same way
+        /// closing the socket does.</summary>
+        public AbsoluteSocketDeadline(System.IO.Stream stream, int timeoutMs)
+            : this(() => { try { stream.Dispose(); } catch { } }, timeoutMs) { }
+
+        private AbsoluteSocketDeadline(Action close, int timeoutMs)
         {
-            _tcp = tcp;
+            _close = close;
             _timer = new System.Threading.Timer(_ => Expire(), null, timeoutMs, Timeout.Infinite);
         }
 
@@ -101,7 +110,7 @@ public sealed partial class NetplayToolForm
         private void Expire()
         {
             if (Interlocked.CompareExchange(ref _state, 2, 0) != 0) return;
-            try { _tcp.Close(); } catch { }
+            _close();
         }
 
         public void Dispose()

@@ -154,6 +154,9 @@ public sealed partial class NetplayToolForm
                 bool initialStateApplied = false;
                 int preparations = 0;
                 try { control.ReadTimeout = HandshakeReceiveTimeoutMs; } catch { }
+                // Bound the whole auth phase, as JoinThread does — a per-read timeout alone lets a
+                // hostile listener hold this thread with a byte dribbled before every timeout.
+                using var greetDeadline = new AbsoluteSocketDeadline(control, HandshakeReceiveTimeoutMs);
                 var sp = Handshake.RunClientMulti(channel, id, prefs, mesh.LocalPort, beforeReady: ready =>
                 {
                     if (++preparations > 1)
@@ -170,6 +173,8 @@ public sealed partial class NetplayToolForm
                    localReflexive: AwaitLocalReflexive(),
                    afterGreet: () =>
                 {
+                    if (!greetDeadline.TryComplete())
+                        throw new TimeoutException("host authentication exceeded the 15-second deadline");
                     // Auth done. The lobby wait is legitimately unbounded (the host may wait
                     // minutes for other players); started frames must still finish.
                     try { control.ReadTimeout = Timeout.Infinite; } catch { }

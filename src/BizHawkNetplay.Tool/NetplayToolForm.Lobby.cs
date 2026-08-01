@@ -554,10 +554,16 @@ public sealed partial class NetplayToolForm
     {
         var channel = new ControlChannel(admission.Control);
         Handshake.JoinerGreeting greet;
+        // The per-read timeout alone is the byte-dribble bypass AbsoluteSocketDeadline documents:
+        // one byte before every timeout keeps this greeting — and the single lobby thread it runs
+        // on — alive forever. The deadline bounds the whole authentication, as the TCP greet's does.
+        using var greetDeadline = new AbsoluteSocketDeadline(admission.Control, HandshakeReceiveTimeoutMs);
         try
         {
             try { admission.Control.ReadTimeout = HandshakeReceiveTimeoutMs; } catch { }
             greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+            if (!greetDeadline.TryComplete())
+                throw new TimeoutException($"authentication exceeded the {HandshakeReceiveTimeoutMs / 1000}-second deadline");
             try { admission.Control.ReadTimeout = Timeout.Infinite; } catch { }
         }
         catch (Exception ex)
@@ -566,7 +572,10 @@ public sealed partial class NetplayToolForm
             try { admission.Control.Dispose(); } catch { }
             _mesh?.CloseControl(admission.Endpoint);
             if (!IsConnectionAttemptCurrent(attempt)) return;
-            UiConnLog($"refused a punched join from {admission.Endpoint.Address}: {ex.Message} — " +
+            string why = greetDeadline.Expired
+                ? $"authentication exceeded the {HandshakeReceiveTimeoutMs / 1000}-second deadline"
+                : ex.Message;
+            UiConnLog($"refused a punched join from {admission.Endpoint.Address}: {why} — " +
                       $"still hosting, waiting for {need - links.Count} player(s)", Color.Firebrick);
             return;
         }
