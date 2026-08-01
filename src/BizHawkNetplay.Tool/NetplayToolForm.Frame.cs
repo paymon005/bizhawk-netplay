@@ -882,6 +882,18 @@ public sealed partial class NetplayToolForm
         // disagree the difference HAS to show up as a gap — chasing judder past this is chasing
         // BizHawk's paused-loop sleep, which nothing here can reach. Ticks that ran no frame are
         // exactly (calls - ticks).
+        //
+        // "Nothing here can reach" is a conclusion, not a shrug — checked against the 2.11.1
+        // source, so nobody has to check it again. The sleep is a hard-coded Thread.Sleep(15) in
+        // Throttle.Step, gated on signal_paused && !signal_continuousFrameAdvancing. Both gates are
+        // recomputed from MainForm state on EVERY loop iteration — and _runloopFrameProgress is
+        // force-cleared in StepRunLoop_Core, which runs BEFORE the throttle reads it — so a
+        // reflected write is erased before it can take effect. Every flag that would persistently
+        // open the gate (PressFrameAdvance, HoldFrameAdvance, unpausing) also makes StepRunLoop_Core
+        // step the core itself, which would double-step every frame this session emulates: a
+        // guaranteed desync, traded for a tick rate that even then lands in SpeedThrottle at about
+        // the core's own fps. The only lever on this side of the seam is emulating more than one
+        // frame per tick, which is what the catch-up burst does.
         double judderFloorPct = _emuLoopTicksWindow > 0
             ? 100.0 * Math.Max(0, _emuLoopCallsWindow - _emuLoopTicksWindow) / _emuLoopTicksWindow
             : 0;
