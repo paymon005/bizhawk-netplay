@@ -27,6 +27,8 @@ public sealed partial class NetplayToolForm
     // checkbox is only read there, so toggling mid-session does nothing until the next session.
     private bool _clockUnpaused;
     private bool _prevClockThrottle;
+    private bool _prevUnthrottled;
+    private int _prevSpeedPercent;
     private Label _status = null!;
 
 
@@ -141,6 +143,7 @@ public sealed partial class NetplayToolForm
         // nothing is stepping frames there and paused is the honest state to show the user.
         if (_clockUnpaused && _phase.IsActive)
         {
+            ApplyUnpausedClockThrottle();   // the speed hotkeys would otherwise retune our clock
             if (!APIs.EmuClient.IsPaused()) return;
             APIs.EmuClient.Unpause();
             if (Verbose) Log("re-unpaused (experimental clock — the session owns frame stepping)");
@@ -164,17 +167,46 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private void EngageUnpausedClock()
     {
-        _clockUnpaused = _unpausedClockCheck.Checked;
-        if (!_clockUnpaused) return;
-        if (_config != null)
+        if (_clockUnpaused) return;                       // idempotent: never snapshot our own values
+        if (!_unpausedClockCheck.Checked) return;
+        // Without the config we cannot force the throttle, and unpausing anyway is the one outcome
+        // worse than not trying: with a vsync or sound throttle configured, Throttle.Step's
+        // "paused || ClockThrottle || overrideSecondary" test is all false, SpeedThrottle never
+        // runs, and the loop spins a core flat out for the whole session. Refuse instead.
+        if (_config == null)
         {
-            _prevClockThrottle = _config.ClockThrottle;
-            _config.ClockThrottle = true;
+            Log("unpaused clock unavailable — EmuHawk's config is not reachable, and without it the " +
+                "run loop cannot be kept throttled. Staying paused.");
+            return;
         }
+        _clockUnpaused = true;
+        _prevClockThrottle = _config.ClockThrottle;
+        _prevUnthrottled = _config.Unthrottled;
+        _prevSpeedPercent = _config.SpeedPercent;
+        ApplyUnpausedClockThrottle();
         try { APIs.EmuClient.Unpause(); } catch { }
         Log("EXPERIMENTAL unpaused clock: EmuHawk's loop is running throttled at the core's own " +
             "rate; BlockFrameAdvance alone prevents stolen frames (the drift check names any that " +
-            "slip through). Compare judder/gap in the pacing line against a normal session.");
+            "slip through). Speed and Unthrottle are held at 100% for the session, since under this " +
+            "mode they would scale the netplay frame clock itself. Compare judder/gap in the pacing " +
+            "line against a normal session.");
+    }
+
+    /// <summary>
+    /// Hold the three throttle settings the frame clock now depends on.
+    ///
+    /// Paused, none of this mattered: Throttle.Step took the sleep-15 branch and every speed control
+    /// was inert. Unpaused, the run loop IS the frame clock, so Unthrottle/Turbo makes it spin flat
+    /// out and Speed% scales it directly — at 50% the clock delivers half the wakes the frame rate
+    /// needs, which is exactly the judder this mode exists to remove. Re-applied from ReassertPause
+    /// rather than only at engage, because these are ordinary hotkeys the user can hit mid-session.
+    /// </summary>
+    private void ApplyUnpausedClockThrottle()
+    {
+        if (_config == null) return;
+        _config.ClockThrottle = true;
+        _config.Unthrottled = false;
+        if (_config.SpeedPercent != 100) _config.SpeedPercent = 100;
     }
 
     /// <summary>Leave the experimental clock mode. Runs inside RestorePauseState so every teardown
@@ -183,7 +215,10 @@ public sealed partial class NetplayToolForm
     {
         if (!_clockUnpaused) return;
         _clockUnpaused = false;
-        if (_config != null) _config.ClockThrottle = _prevClockThrottle;
+        if (_config == null) return;
+        _config.ClockThrottle = _prevClockThrottle;
+        _config.Unthrottled = _prevUnthrottled;
+        _config.SpeedPercent = _prevSpeedPercent;
     }
 
     /// <summary>
