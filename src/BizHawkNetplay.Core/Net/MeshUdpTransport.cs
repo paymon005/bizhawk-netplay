@@ -709,8 +709,14 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     public System.IO.Stream OpenControl(IPEndPoint peer)
     {
         if (peer == null) throw new ArgumentNullException(nameof(peer));
-        return _controlStreams.GetOrAdd(peer,
-            ep => new ReliableUdpStream(seg => SendFramed(Frame(TCtrlSeg, seg), ep)));
+        // Not GetOrAdd with a factory: the factory can run, lose the publication race, and its
+        // undisposed loser would keep a retransmit thread waking every 50ms for the process
+        // lifetime. Construct outside, publish, and dispose the loser.
+        if (_controlStreams.TryGetValue(peer, out var existing)) return existing;
+        var created = new ReliableUdpStream(seg => SendFramed(Frame(TCtrlSeg, seg), peer));
+        var winner = _controlStreams.GetOrAdd(peer, created);
+        if (!ReferenceEquals(winner, created)) { try { created.Dispose(); } catch { } }
+        return winner;
     }
 
     /// <summary>Close and forget one peer's control stream (refused admission, or link death).</summary>
@@ -838,12 +844,24 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         // this is the second wall behind it.
         var buffer = new byte[2048];
         EndPoint from = new IPEndPoint(IPAddress.Any, 0);
+        // Safety valve: a SocketException normally consumes one queued ICMP error and the next
+        // receive proceeds, but a socket that errors PERSISTENTLY (repeated WSAENOBUFS, or
+        // continuous ICMP resets where the SIO_UDP_CONNRESET ioctl didn't take) would turn this
+        // retry into a 100%-core spin. Successes reset the count; a run of consecutive failures
+        // buys a brief sleep, cheap enough to never matter on the bounded case.
+        int consecutiveErrors = 0;
         while (_running)
         {
             int n;
             try { n = _socket.ReceiveFrom(buffer, ref from); }
-            catch (SocketException) { if (!_running) break; continue; }
+            catch (SocketException)
+            {
+                if (!_running) break;
+                if (++consecutiveErrors >= 50) { consecutiveErrors = 0; Thread.Sleep(10); }
+                continue;
+            }
             catch (ObjectDisposedException) { break; }
+            consecutiveErrors = 0;
 
             // Everything past the receive itself is guarded, because this is the ONE thread that
             // delivers input, punch acks and control segments. An escape used to end it outright
