@@ -119,15 +119,18 @@ public static class Handshake
         Func<ControlChannel, SyncMode, int, int>? selectInputDelay = null)
     {
         var hostNonce = SessionAuth.NewNonce();
-        channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, localUdpPort, hostNonce));
+        channel.Send(ControlMessageType.Hello,
+            HandshakeCodec.EncodeChallenge(hostId.ProtocolVersion, hostNonce));
 
         var (type, body) = channel.Receive();
         if (type != ControlMessageType.Hello)
             throw new HandshakeException($"expected HELLO from joiner, got {type}");
         var (clientId, clientPrefs, clientUdpPort, joinNonce, _) = HandshakeCodec.Decode(body);
 
-        // Authenticate before negotiating — see HostGreet for why the order matters.
+        // Challenge first, identity after the proof, negotiate last — see HostGreet for all three.
         VerifyPassword(channel, hostPrefs.Password, hostNonce, joinNonce, isHost: true);
+        channel.Send(ControlMessageType.Hello,
+            HandshakeCodec.Encode(hostId, hostPrefs, localUdpPort, hostNonce));
 
         var result = SessionNegotiator.Negotiate(hostId, clientId, hostPrefs, clientPrefs);
         if (!result.Accepted)
@@ -174,23 +177,7 @@ public static class Handshake
         var joinNonce = SessionAuth.NewNonce();
         channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce));
 
-        // First frame back is the host's HELLO (or an early ERROR).
-        var (type, body) = channel.Receive();
-        if (type == ControlMessageType.Error)
-            throw new HandshakeException(Encoding.UTF8.GetString(body));
-        if (type != ControlMessageType.Hello)
-            throw new HandshakeException($"expected HELLO from host, got {type}");
-        var (hostId, hostPrefs, hostUdpPort, hostNonce, _) = HandshakeCodec.Decode(body);
-
-        // Prove we know the session password (and verify the host does too) before taking any state.
-        // Ahead of the negotiate for the same reason the host runs it in that order, and because
-        // bailing out here without sending a proof would leave the host blocked waiting for one.
-        VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
-
-        var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
-        if (!result.Accepted)
-            throw new HandshakeException(result.RejectReason ?? "rejected");
-
+        int hostUdpPort = GreetHost(channel, clientId, clientPrefs, joinNonce);
         afterGreet?.Invoke();
 
         return ReceiveStartData(channel, hostUdpPort, beforeReady);
@@ -271,7 +258,10 @@ public static class Handshake
         ControlChannel channel, PeerIdentity hostId, SessionPreferences hostPrefs, int hostUdpPort)
     {
         var hostNonce = SessionAuth.NewNonce();
-        channel.Send(ControlMessageType.Hello, HandshakeCodec.Encode(hostId, hostPrefs, hostUdpPort, hostNonce));
+        // A challenge, not an identity — see HandshakeCodec.EncodeChallenge. Ours goes out once the
+        // joiner has proved the password, below.
+        channel.Send(ControlMessageType.Hello,
+            HandshakeCodec.EncodeChallenge(hostId.ProtocolVersion, hostNonce));
 
         var (type, body) = channel.Receive();
         if (type != ControlMessageType.Hello)
@@ -296,6 +286,12 @@ public static class Handshake
         // refuse. The wire sequence is unchanged (HELLO, HELLO, AUTH, AUTH): the joiner's own
         // negotiate is local and needs no round trip, so both ends can simply run it one step later.
         VerifyPassword(channel, hostPrefs.Password, hostNonce, joinNonce, isHost: true);
+
+        // Proved. Now they may know what we are running — and unconditionally, ahead of the verdict
+        // below, because a mismatch is described from each peer's own side ("yours X, theirs Y") and
+        // a joiner with no identity to compare against could only echo ours back at its player.
+        channel.Send(ControlMessageType.Hello,
+            HandshakeCodec.Encode(hostId, hostPrefs, hostUdpPort, hostNonce));
 
         var result = SessionNegotiator.Negotiate(hostId, joinerId, hostPrefs, joinerPrefs);
         if (!result.Accepted)
@@ -457,25 +453,54 @@ public static class Handshake
         channel.Send(ControlMessageType.Hello,
             HandshakeCodec.Encode(clientId, clientPrefs, localUdpPort, joinNonce, localReflexive));
 
+        int hostUdpPort = GreetHost(channel, clientId, clientPrefs, joinNonce);
+        afterGreet?.Invoke();
+
+        return ReceiveStartData(channel, hostUdpPort, beforeReady, measureMesh);
+    }
+
+    /// <summary>
+    /// Joiner side of the split greeting: take the host's challenge, prove the password, and only
+    /// then take and check the host's identity. Returns the host's UDP port for the input path.
+    ///
+    /// The negotiate stays here rather than moving into the caller because it is the joiner's own
+    /// defence against a host that accepted a pairing it should not have: it has to happen before
+    /// anything is applied, and the next thing the caller does is start accepting a savestate.
+    /// </summary>
+    private static int GreetHost(
+        ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, byte[] joinNonce)
+    {
         var (type, body) = channel.Receive();
         if (type == ControlMessageType.Error)
             throw new HandshakeException(Encoding.UTF8.GetString(body));
         if (type != ControlMessageType.Hello)
             throw new HandshakeException($"expected HELLO from host, got {type}");
-        var (hostId, hostPrefs, hostUdpPort, hostNonce, _) = HandshakeCodec.Decode(body);
+        var (hostProtocol, hostNonce) = HandshakeCodec.DecodeChallenge(body);
+
+        // Checked here rather than left to the negotiate below. A build that disagrees about the
+        // protocol may also disagree about the message sequence, and naming both versions beats
+        // blocking on an identity the peer never intends to send.
+        if (hostProtocol != clientId.ProtocolVersion)
+            throw new HandshakeException(
+                $"protocol mismatch (local v{clientId.ProtocolVersion}, remote v{hostProtocol})");
 
         // Prove we know the session password (and verify the host does too) before the Welcome flow.
-        // Ahead of the negotiate for the same reason the host runs it in that order, and because
-        // bailing out here without sending a proof would leave the host blocked waiting for one.
+        // Ahead of the negotiate because the host has not told us who it is yet, and because bailing
+        // out without sending a proof would leave it blocked waiting for one.
         VerifyPassword(channel, clientPrefs.Password, hostNonce, joinNonce, isHost: false);
+
+        (type, body) = channel.Receive();
+        if (type == ControlMessageType.Error)
+            throw new HandshakeException(Encoding.UTF8.GetString(body));
+        if (type != ControlMessageType.Hello)
+            throw new HandshakeException($"expected the host's identity after AUTH, got {type}");
+        var (hostId, hostPrefs, hostUdpPort, _, _) = HandshakeCodec.Decode(body);
 
         var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
         if (!result.Accepted)
             throw new HandshakeException(result.RejectReason ?? "rejected");
 
-        afterGreet?.Invoke();
-
-        return ReceiveStartData(channel, hostUdpPort, beforeReady, measureMesh);
+        return hostUdpPort;
     }
 
     /// <summary>Receive the authoritative WELCOME and state, let the caller apply them, acknowledge

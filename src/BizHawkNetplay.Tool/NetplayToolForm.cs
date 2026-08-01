@@ -52,7 +52,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // BulkPeekByte, and byte-array domains (the Hawk cores) hash their backing array directly —
     // both produce a different value than v14 computed for the same state, so a mixed pair would
     // report a phantom desync every interval. Same rule as v10: the hash is wire contract.
-    private const int Protocol = 15;
+    // 16: the host's opening HELLO is a challenge (protocol version + nonce) and its identity
+    // follows only once the joiner's password proof has verified. A v15 peer sends its whole
+    // identity up front and expects the same back, so the two disagree about the message sequence
+    // rather than about a value — which is exactly what the version check exists to catch first.
+    private const int Protocol = 16;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

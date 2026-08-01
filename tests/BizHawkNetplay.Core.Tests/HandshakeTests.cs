@@ -243,6 +243,49 @@ public class HandshakeTests
     }
 
     /// <summary>
+    /// The host speaks first, and what it says before anyone has proved anything is a challenge.
+    ///
+    /// It has to go first — the joiner cannot derive a proof without the host's nonce — which is
+    /// exactly why the rest of a HELLO must not ride along with it. The sync-setting fields are the
+    /// sharpest case: they exist only to explain a mismatch, are never read on a successful join,
+    /// and on N64 one of them is a filesystem path, which is a Windows username.
+    /// </summary>
+    [Fact]
+    public void TheHostsOpeningFrameIsAChallengeAndCarriesNoIdentity()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var syncFields = new[]
+            {
+                new KeyValuePair<string, string>("txPath", @"C:\Users\somebody\AppData\gliden64.dll"),
+            };
+            var hostId = new PeerIdentity(16, "SECRETROMHASH", "Ares64", "2.11.1.0", "SYNCDIGEST",
+                new[] { "L0" }, true, 20, syncFields);
+
+            var host = Task.Run(() => Handshake.HostGreet(
+                hostCh, hostId, new SessionPreferences(2, false, "hunter2"), 47800));
+
+            var (type, body) = clientCh.Receive();
+            var text = System.Text.Encoding.UTF8.GetString(body);
+
+            Assert.Equal(ControlMessageType.Hello, type);
+            Assert.Contains("proto=16", text);      // so a wrong build fails by name, not by hanging
+            Assert.Contains("nonce=", text);        // the one field that genuinely cannot wait
+
+            Assert.DoesNotContain("SECRETROMHASH", text);
+            Assert.DoesNotContain("Ares64", text);
+            Assert.DoesNotContain("SYNCDIGEST", text);
+            Assert.DoesNotContain("txPath", text);
+            Assert.DoesNotContain("somebody", text);
+
+            dispose();  // the host is now blocked on a HELLO that is never coming
+            Assert.ThrowsAny<Exception>(() => host.GetAwaiter().GetResult());
+        }
+        finally { dispose(); }
+    }
+
+    /// <summary>
     /// A peer that has not proved the password learns nothing about what this host is running.
     ///
     /// The rejection reason names what failed to match — the ROM hash, the core, a sync setting —

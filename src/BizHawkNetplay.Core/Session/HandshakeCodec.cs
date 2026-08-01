@@ -66,6 +66,42 @@ public static class HandshakeCodec
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
+    /// <summary>
+    /// The host's opening greeting: a challenge, and nothing else.
+    ///
+    /// A HELLO otherwise describes the peer completely — ROM hash, core, core version, every
+    /// sync-setting field by name and value, the UDP port, the reflexive endpoint. The host sends
+    /// its greeting first, because the joiner cannot compute a password proof without the host's
+    /// nonce, so all of that used to reach anyone who opened a socket before they had proved
+    /// anything at all. On an N64 session the sync fields include <c>txPath</c>, which is a
+    /// filesystem path, which is a Windows username.
+    ///
+    /// Only two fields have to travel this early. The nonce, because it seeds the proof and there
+    /// is no way around going first. And the protocol version, so that a peer on a different build
+    /// still fails with a sentence naming the versions rather than by hanging on a message shape it
+    /// does not recognise. Everything else waits for <see cref="Encode"/>, sent once the joiner's
+    /// proof has verified.
+    ///
+    /// On a session with no password this is a speed bump rather than a gate — an empty password
+    /// derives a proof anyone can compute, so a scanner willing to spend two PBKDF2 passes per
+    /// probe still gets through to the identity. It is a real gate on any session that sets one.
+    /// </summary>
+    public static byte[] EncodeChallenge(int protocolVersion, byte[]? nonce)
+    {
+        var sb = new StringBuilder();
+        sb.Append("proto=").Append(protocolVersion).Append('\n');
+        sb.Append("nonce=").Append(nonce == null ? "" : SessionAuth.ToHex(nonce)).Append('\n');
+        return Encoding.UTF8.GetBytes(sb.ToString());
+    }
+
+    /// <summary>Read an opening greeting. A full <see cref="Encode"/> body decodes here too — it
+    /// carries both fields — which is what lets one receive path accept either.</summary>
+    public static (int protocolVersion, byte[]? nonce) DecodeChallenge(byte[] body)
+    {
+        var map = ParseLines(body);
+        return (GetInt(map, "proto", 0), SessionAuth.FromHex(Get(map, "nonce")));
+    }
+
     /// <summary>Encode the host's WELCOME: assignment, negotiated settings, input-timeline
     /// generation, and the candidate endpoints grouped by remote controller port.</summary>
     /// <param name="tokens">
