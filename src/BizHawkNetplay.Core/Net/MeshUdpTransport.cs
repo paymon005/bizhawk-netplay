@@ -422,8 +422,12 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             // flight). Guessing one candidate can blackhole the whole opening of the session
             // toward a NAT'd peer — the pre-NAT candidate silently ate the first ~300ms of
             // input in the first real-internet test. Send to every candidate until the first
-            // ack picks a winner.
-            foreach (var candidate in route.Candidates) SendFramed(framed, candidate);
+            // ack picks a winner. Deliberately NOT the learned endpoint: until it answers a
+            // probe it is only a claim, and input toward a claim is the amplifier
+            // AnAddressThatOnlyClaimsASeatIsProbedButNeverSentInput exists to forbid. A learned
+            // endpoint that ever carried input is preserved by the _lastSelected fallback above.
+            var candidates = route.Candidates;
+            for (int i = 0; i < candidates.Count; i++) SendFramed(framed, candidates[i]);
         }
     }
 
@@ -596,6 +600,16 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         return reports;
     }
 
+    /// <summary>Membership test over the advertised candidates, indexed rather than LINQ — this
+    /// sits on the per-frame send path.</summary>
+    private static bool IsRoutedCandidate(PeerRoute route, IPEndPoint endpoint)
+    {
+        var candidates = route.Candidates;
+        for (int i = 0; i < candidates.Count; i++)
+            if (candidates[i].Equals(endpoint)) return true;
+        return false;
+    }
+
     private IPEndPoint? SelectSendCandidate(PeerRoute route, long now)
     {
         // A learned endpoint outranks every advertised candidate, because it is the only one we have
@@ -638,8 +652,13 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         // Nothing is confirmed right now (start-up, or a repunch just cleared the liveness table).
         // Keep sending along the last path that actually worked: for an internet peer the first
         // advertised candidate is typically the pre-NAT address, which is exactly the one that
-        // does NOT work when the reflexive path was carrying the session.
-        if (_lastSelected.TryGetValue(route.RemotePort, out var last) && route.Candidates.Contains(last))
+        // does NOT work when the reflexive path was carrying the session. The learned endpoint
+        // counts as valid here even though it is never in Candidates — for a symmetric-NAT peer
+        // it is the ONLY address that works, and rejecting it stopped input to that peer entirely
+        // the moment its liveness lapsed.
+        if (_lastSelected.TryGetValue(route.RemotePort, out var last)
+            && (IsRoutedCandidate(route, last)
+                || (_learnedByPort.TryGetValue(route.RemotePort, out var learnedLast) && learnedLast.Equals(last))))
             return last;
 
         // Nothing has ever worked for this peer — no single candidate is a safe guess. Return
@@ -713,7 +732,10 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     }
 
     /// <summary>Forget confirmations only for one logical peer. Healthy routes keep their chosen
-    /// failover candidate while the silent peer is re-probed.</summary>
+    /// failover candidate while the silent peer is re-probed. The learned endpoint is cleared
+    /// too — for a symmetric-NAT peer it IS the path in use, and leaving its liveness standing
+    /// meant the "re-punching the input path" recovery re-probed everything except the one
+    /// address that had gone quiet.</summary>
     public void RequestRepunch(int remotePort)
     {
         foreach (var route in _routeTable.Routes)
@@ -724,6 +746,11 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
                 _alive.TryRemove(endpoint, out _);
                 _lastPunch.TryRemove(endpoint, out _);
             }
+        }
+        if (_learnedByPort.TryGetValue(remotePort, out var learned))
+        {
+            _alive.TryRemove(learned, out _);
+            _lastPunch.TryRemove(learned, out _);
         }
     }
 

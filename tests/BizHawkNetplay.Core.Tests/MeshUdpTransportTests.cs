@@ -826,6 +826,51 @@ public class MeshUdpTransportTests
         finally { host.Dispose(); peer.Dispose(); }
     }
 
+    /// <summary>
+    /// A repunch clears the liveness table to force aggressive re-probing — but for a
+    /// symmetric-NAT peer the path in use is the LEARNED endpoint, which is never among the
+    /// advertised candidates. Two regressions are pinned here at once: the learned endpoint's own
+    /// liveness must be cleared too (or the "re-punch" re-probes everything except the address
+    /// that went quiet), and the last-selected fallback must accept the learned endpoint (or
+    /// input to that peer stops entirely until a probe re-proves the path — the send below is a
+    /// single datagram, so if it is aimed at the dead advertised candidate it is simply lost).
+    /// </summary>
+    [Fact]
+    public void ARepunchKeepsInputFlowingAlongTheLearnedPath()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var peer = MeshUdpTransport.Bind(0);
+        try
+        {
+            // The advertised candidate is nowhere; the peer really sends from its own port.
+            host.SetPeerRoutes(new[] { new PeerRoute(1, new[] { Loop(UnboundPort(peer.LocalPort)) }) });
+            peer.SetPeers(new[] { Loop(host.LocalPort) });
+            host.SetPeerTokens(new[] { new KeyValuePair<int, byte[]>(1, Token(0xAB)) });
+            peer.SetLocalToken(Token(0xAB));
+
+            // Wait until the learned path is proved and carrying input, which anchors it as the
+            // host's last-selected path for seat 1.
+            var sw = Stopwatch.StartNew();
+            IPEndPoint? learned = null;
+            while (sw.ElapsedMilliseconds < 5000)
+            {
+                if (host.TryGetLearnedEndpoint(1, out var candidate) && host.IsEndpointAlive(candidate))
+                { learned = candidate; break; }
+                Thread.Sleep(10);
+            }
+            Assert.NotNull(learned);
+            host.Send([2]);
+            Assert.Equal(new byte[] { 2 }, WaitRecv(peer));
+
+            host.RequestRepunch(1);
+            Assert.False(host.IsEndpointAlive(learned!)); // the path in use is what gets re-probed
+
+            host.Send([3]); // sent before any probe can re-prove the path; must ride the fallback
+            Assert.Equal(new byte[] { 3 }, WaitRecv(peer));
+        }
+        finally { host.Dispose(); peer.Dispose(); }
+    }
+
     /// <summary>A wrong token must buy nothing: the endpoint stays unroutable and its input stays
     /// dropped. Otherwise the pin this replaces would have been traded for no protection at all.</summary>
     [Fact]
