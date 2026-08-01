@@ -278,6 +278,12 @@ public sealed partial class NetplayToolForm
             // the depth budgets FOR is replaying. Reporting 0 keeps every peer's negotiation honest
             // without needing a second field on the wire.
             _probeDepth = result.ReplayDeterministic ? result.MaxRollbackDepth : 0;
+            // What a repaired frame costs, from the two terms just measured: the frame itself,
+            // plus its share of a snapshot at the keyframe spacing the session will run. Seeds
+            // the strategy's cost cap so the first deep repair of a session is not the thing that
+            // discovers it — see RollbackTuning.SeedRepairPerFrameMs.
+            _probeRepairPerFrameMs = result.MedianFrameMs
+                + result.MedianSaveMs / Math.Max(1, RepairKeyframeInterval);
             Log($"rollback probe — {DescribeProbe(result, a)}");
             if (!result.ReplayDeterministic)
                 ConnLog("this core did not reproduce the same memory when the probe replayed the " +

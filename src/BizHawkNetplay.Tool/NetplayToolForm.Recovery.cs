@@ -561,6 +561,7 @@ public sealed partial class NetplayToolForm
         ChecksumAnchorInterval = ChecksumInterval,
         KeyframeInterval = RepairKeyframeInterval,
         RepairBudgetMs = RepairBudgetFrames * FrameMs(),
+        SeedRepairPerFrameMs = _probeRepairPerFrameMs,
         Clock = new StopwatchClock(),
     };
 

@@ -107,7 +107,11 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         _keyframeInterval = t.KeyframeInterval < 1 ? 1 : t.KeyframeInterval;
         _clock = t.Clock;
         _repairBudgetMs = _clock != null ? t.RepairBudgetMs : 0; // a budget with no clock is unmeasurable
-        _costCap = maxRollback; // no trimming until a repair has actually been timed
+        _costCap = maxRollback; // no trimming until a repair has actually been timed...
+        // ...unless the probe already measured what one costs. RecordRepairCost applies the same
+        // arithmetic a real sample would, so the cap starts correct rather than being discovered
+        // by paying for it once.
+        if (t.SeedRepairPerFrameMs > 0) RecordRepairCost(t.SeedRepairPerFrameMs);
 
         _neutral = new PortInput[_portCount];
         for (int p = 0; p < _portCount; p++)

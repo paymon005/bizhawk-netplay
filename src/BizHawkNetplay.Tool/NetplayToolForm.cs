@@ -319,6 +319,10 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private NetcodeChoice _netcodeChoice; // captured from the dropdown at start (host decides the mode)
     private SyncMode _mode = SyncMode.Lockstep;   // negotiated; drives which strategy the driver builds
     private int _probeDepth = -1;                 // cached capability-probe depth (frames); -1 = not measured
+    // What the probe measured one repaired frame to cost, at this session's keyframe spacing.
+    // 0 until a probe has run (a lockstep-only session never pays for one). Seeds the rollback
+    // strategy's cost cap so a cold session does not discover the figure by hitching on it.
+    private double _probeRepairPerFrameMs;
     // Whether the core reproduced the same memory on replay. Unlike depth this is a correctness
     // result, not a performance one, so forcing Rollback does not get to override it.
     private bool _replayDeterministic = true;

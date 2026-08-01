@@ -990,6 +990,39 @@ public class RollbackIntegrationTests
         AssertFinalizedCorrect(capped.b, upTo);
     }
 
+    /// <summary>
+    /// The cost cap used to be learned only from the first repair, so a cold session predicted to
+    /// the full ring depth and discovered what that cost by paying for it — one unavoidable hitch
+    /// per session, on the machines least able to afford one. The capability probe has already
+    /// measured the terms, so the session hands them over as a seed and the cap is right from
+    /// frame zero.
+    /// </summary>
+    [Fact]
+    public void CostCap_IsRightFromTheFirstFrameWhenTheProbeSeedsIt()
+    {
+        var unseeded = BuildRollback(LatencyLink.Pair(new Clock(), latency: 0).a, 0, tuning: new()
+        {
+            ElideConfirmedSaves = true,
+            RepairBudgetMs = 20.0,
+            Clock = new ManualClock(Enumerable.Repeat(0.0, 100)),
+        });
+        // No repair has run, so nothing has narrowed prediction: it will book the whole ring.
+        Assert.Equal(MaxRollback, unseeded.Rollback.CostCap);
+
+        // The same session told what the probe measured: 8ms a frame against a 20ms budget affords
+        // two, and the cap says so before a single frame has run.
+        var seeded = BuildRollback(LatencyLink.Pair(new Clock(), latency: 0).a, 0, tuning: new()
+        {
+            ElideConfirmedSaves = true,
+            RepairBudgetMs = 20.0,
+            SeedRepairPerFrameMs = 8.0,
+            Clock = new ManualClock(Enumerable.Repeat(0.0, 100)),
+        });
+        Assert.True(seeded.Rollback.CostCap < MaxRollback,
+            $"the seed should have narrowed the cap, stayed at {seeded.Rollback.CostCap}");
+        Assert.Equal(2, seeded.Rollback.CostCap);
+    }
+
     [Fact]
     public void SavestateRing_StaysBounded()
     {

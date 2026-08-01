@@ -80,6 +80,18 @@ public sealed class RollbackTuning
     /// <summary>Clock used to measure repair cost. Required for <see cref="RepairBudgetMs"/>.</summary>
     public IMonotonicClock? Clock { get; init; }
 
+    /// <summary>
+    /// Starting estimate for what one re-simulated frame costs, in milliseconds (0 = unmeasured).
+    ///
+    /// <see cref="RepairBudgetMs"/> only bites once a repair has actually been timed, so a cold
+    /// session predicted to the full ring depth and discovered the cost by paying it — the first
+    /// deep repair of every session was an unavoidable hitch, on the machines least able to
+    /// afford one. The capability probe has already measured both terms this is made of, seconds
+    /// earlier, so the cap can be right from frame zero instead. It is only a seed: the first
+    /// real measurement replaces it on the same conservative terms as any other sample.
+    /// </summary>
+    public double SeedRepairPerFrameMs { get; init; }
+
     /// <summary>The original behaviour: save every frame, no anchors, no cost ceiling.</summary>
     public static readonly RollbackTuning Legacy = new();
 }
