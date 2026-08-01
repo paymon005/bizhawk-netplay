@@ -734,8 +734,9 @@ public sealed partial class NetplayToolForm
             foreach (var link in noHostLeg)
             {
                 casualties.Add(link);
-                UiConnLog($"{link.Label} has no live UDP path to this host, so their input cannot " +
-                          "arrive and there is nothing to relay it over. Since protocol 14 a " +
+                UiConnLog($"{link.Label} has no two-way UDP path to this host — nothing this host " +
+                          "sent ever came back acknowledged — so session traffic cannot flow and " +
+                          "there is nothing to relay it over. Since protocol 14 a " +
                           "symmetric NAT alone should no longer do this — they would have announced " +
                           "a token and been recognised at whatever address they really arrive from — " +
                           "so suspect UDP blocked outright, or a router dropping the packet before " +
@@ -781,14 +782,24 @@ public sealed partial class NetplayToolForm
     /// <summary>An unordered port pair, normalised so (2,4) and (4,2) are the same edge.</summary>
     private static (int A, int B) Pair(int a, int b) => a < b ? (a, b) : (b, a);
 
-    /// <summary>Whether ANY endpoint of this peer has answered on UDP — i.e. whether the host has a
-    /// real mesh path to it, as distinct from the TCP control link it arrived on. The learned
-    /// endpoint counts: for a symmetric-NAT peer it is the ONLY address that will ever answer, so
-    /// leaving it out would flag exactly the peers the tokens just rescued.</summary>
+    /// <summary>Whether ANY endpoint of this peer has completed a round trip on UDP — i.e. whether
+    /// the host has a real mesh path to it, as distinct from the TCP control link it arrived on.
+    /// The learned endpoint counts: for a symmetric-NAT peer it is the ONLY address that will ever
+    /// answer, so leaving it out would flag exactly the peers the tokens just rescued.
+    ///
+    /// Round-trip proof, not mere liveness: for an advertised endpoint ANY inbound datagram marks
+    /// it alive — including the peer's own punches — so a one-way path (joiner reaches host, host
+    /// cannot reach joiner) used to pass this gate, and the session started with a relay running
+    /// over the very leg that was broken. An RTT sample exists only when a punch WE sent came back
+    /// acknowledged, which is the property the relay actually needs. Alive still matters: an old
+    /// sample from a path that has since died is history, not a route.</summary>
     private static bool LinkHasLiveMeshPath(MeshUdpTransport mesh, PeerLink link) =>
-        mesh.IsEndpointAlive(link.UdpEndpoint)
-        || (link.ReflexiveEndpoint != null && mesh.IsEndpointAlive(link.ReflexiveEndpoint))
-        || (mesh.TryGetLearnedEndpoint(link.RemotePort, out var learned) && mesh.IsEndpointAlive(learned));
+        HasProvenPath(mesh, link.UdpEndpoint)
+        || (link.ReflexiveEndpoint != null && HasProvenPath(mesh, link.ReflexiveEndpoint))
+        || (mesh.TryGetLearnedEndpoint(link.RemotePort, out var learned) && HasProvenPath(mesh, learned));
+
+    private static bool HasProvenPath(MeshUdpTransport mesh, IPEndPoint endpoint) =>
+        mesh.IsEndpointAlive(endpoint) && mesh.TryGetRttMs(endpoint, out _);
 
     /// <summary>
     /// Have the host forward input to joiners whose direct legs to the other joiners never opened.
