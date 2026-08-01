@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.28.0 – v0.28.2 | **17** | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
+| v0.29.0 | **18** | Three wire contracts moved at once. The mesh report names its silent edges, so the host relays exactly the broken joiner-to-joiner pairs instead of everything; port 0's input payload carries the console controls (Reset/Select/Pause/FDS, appended after the host pad's own); and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a different slice of the same RAM. Any one of the three would desync or misparse a mixed pair. |
+| v0.28.0 – v0.28.2 | 17 | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
 | v0.27.0 | 16 | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
 | v0.26.0 | 15 | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
 | v0.24.0 – v0.25.0 | 14 | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
@@ -23,6 +24,66 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.29.0 — protocol 18
+
+**Protocol 18 — everyone must update.** A v0.28.x peer and a v0.29.0 peer refuse each other at the
+handshake. Comes out of two review passes — one over everything that changed for 3+ players since
+v0.18.0, one external — plus the first real reports from untested cores (NESHawk with a FourScore,
+Atari 7800, Lynx).
+
+**Input coverage — two whole classes of controls were unreachable.**
+
+- **The console buttons get a seat.** The per-port layouts define every name a session can inject,
+  and the unprefixed player-0 controls were in none of them — so NOBODY in any session could press
+  Reset, Select, Pause, a 7800 difficulty switch, an FDS disk swap, or a disc tray. On the 7800,
+  Select is how most carts pick 1P/2P mode: sessions sat in the wrong mode and read as "the players
+  share controls". Console controls now ride the tail of port 0's layout — the host presses them
+  for everyone, and they apply from the synced stream on the same frame on every machine.
+- **NESHawk + FourScore seats follow the game's pad numbers.** NESHawk numbers FourScore slots by
+  plug (left = P1+P2), but the hardware serial — and every game — reads $4016 as pads 1 and 3 and
+  $4017 as 2 and 4, which is how QuickNES names them. Seat 2 used to inject a pad no 2-player game
+  polls, so that player's controls did nothing under NESHawk while QuickNES worked. Seats now map
+  onto the game's numbering, derived from the same sync settings the handshake already compares.
+- A 7800 unplugged port (one button literally named "P2 ") no longer counts as a usable seat, and
+  single-player hardware (Lynx, GB) is refused with the real reason — there is no second port —
+  instead of advice to configure one.
+
+**The desync checksum got honest about its coverage.**
+
+- **The stride rotation never rotated.** The sampling offset was `frame % stride`, checksum frames
+  are multiples of 300, and 300 shares every factor of the strides in use — so the offset was 0
+  forever and only 25% of N64 RDRAM was ever hashed, on every build since the stride existed. The
+  offset is now bit-mixed and actually rotates (hence the protocol bump: a v17 peer hashes a
+  different slice).
+- **A catch-up burst crossing a 300-frame boundary silently skipped that comparison** — lockstep
+  hashes the live state, and deferring past the boundary lost it. It now hashes mid-burst, while
+  the state still stands on the boundary.
+
+**The mesh learned which legs are actually broken.**
+
+- **The relay carries named pairs, not players.** A joiner short even one measured edge used to get
+  EVERYTHING relayed to it, doubling traffic on legs that worked and inflating the delay by a hop
+  those legs never took. The mesh report now names its silent edges and the relay carries exactly
+  the broken joiner-to-joiner pairs.
+- **A renumbered seat gets a fresh token.** A pre-GO casualty renumbers survivors into freed seats,
+  but the seat's token — and the endpoint peers had learned under it — outlived the move, so the
+  seat's next occupant could never rebind it and their direct traffic went to the wrong machine for
+  the whole session. Rotated on renumber; applying a changed token retires the stale binding.
+- **The reachability gate demands a round trip.** Any inbound datagram used to mark an advertised
+  endpoint alive, so a one-way path (joiner reaches host, host's replies lost — observed between
+  two instances behind one hotspot NAT) passed the v0.28.2 gate and started a session whose relay
+  ran over the broken leg. The gate now requires an acknowledged punch.
+- **Jitter is kept as a per-edge pair.** The aggregate took max(median) and max(high) from
+  different edges and subtracted them — systematically understating jitter, to zero in the worst
+  case — and the relay fold summed medians with no hop jitter at all. Both now carry the pairing
+  through, so a jittery third player is actually covered by the delay.
+- **The runtime remembers the relay.** The relayed-route figure used to die in the lobby;
+  WorstPingMs — feeding the rollback soft cap, the delay hint, and the mode-change floor — saw
+  only direct paths, so every relayed session was advised to lower its delay below what its own
+  route needed ("only needs delay 4" against a ~117ms relayed route, in every relayed session of
+  the night that reported it). The relayed route now competes for worst at runtime, on host and
+  joiner both.
 
 ### v0.28.2 — the lobby stops treating reachability as advice
 

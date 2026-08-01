@@ -60,7 +60,12 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // reflexive), with its identity following only once the HOST's proof has verified. The v16
     // asymmetry meant a joiner tricked into dialing a stranger still handed over its ROM hash and
     // sync fields (a filesystem path, hence a Windows username on N64) before anything was proved.
-    private const int Protocol = 17;
+    // 18: three wire contracts moved at once. The mesh report names its silent edges (count byte +
+    // port list after the fixed prefix), so the relay can carry exactly the broken pairs; port 0's
+    // input payload carries the console controls (Reset/Select/Pause/FDS) appended after the host
+    // pad's own; and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a
+    // different slice of the same RAM. Any one of the three would desync or misparse a mixed pair.
+    private const int Protocol = 18;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
