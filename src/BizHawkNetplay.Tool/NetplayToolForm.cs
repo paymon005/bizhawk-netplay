@@ -56,7 +56,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // follows only once the joiner's password proof has verified. A v15 peer sends its whole
     // identity up front and expects the same back, so the two disagree about the message sequence
     // rather than about a value — which is exactly what the version check exists to catch first.
-    private const int Protocol = 16;
+    // 17: the joiner's opening HELLO is the mirror — an intro (version, nonce, UDP port,
+    // reflexive), with its identity following only once the HOST's proof has verified. The v16
+    // asymmetry meant a joiner tricked into dialing a stranger still handed over its ROM hash and
+    // sync fields (a filesystem path, hence a Windows username on N64) before anything was proved.
+    private const int Protocol = 17;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

@@ -102,6 +102,47 @@ public static class HandshakeCodec
         return (GetInt(map, "proto", 0), SessionAuth.FromHex(Get(map, "nonce")));
     }
 
+    /// <summary>
+    /// The joiner's opening frame: the mirror of <see cref="EncodeChallenge"/>, closing the same
+    /// leak from the other side. A joiner used to ship its complete identity — ROM hash, core,
+    /// every sync field, on N64 including a filesystem path that contains a Windows username — as
+    /// its very first frame, before the far end had proved anything. A joiner tricked into dialing
+    /// an attacker's address (addresses are swapped over chat) handed all of that to a listener
+    /// that never knew the password. Only what the exchange structurally needs travels this early:
+    /// the protocol version (so a mismatched build fails with a sentence), the join nonce (the
+    /// proof cannot be computed without it), the UDP port for the input path, and the reflexive
+    /// candidate (both already implied by the traffic itself, neither an identity). The full
+    /// <see cref="Encode"/> HELLO follows once the host's proof has verified.
+    /// </summary>
+    public static byte[] EncodeJoinerIntro(int protocolVersion, byte[]? nonce, int udpPort,
+        IPEndPoint? reflexive = null)
+    {
+        var sb = new StringBuilder();
+        sb.Append("proto=").Append(protocolVersion).Append('\n');
+        sb.Append("nonce=").Append(nonce == null ? "" : SessionAuth.ToHex(nonce)).Append('\n');
+        sb.Append("udpport=").Append(udpPort).Append('\n');
+        if (reflexive != null)
+        {
+            sb.Append("refl=");
+            AppendEndpoint(sb, reflexive);
+            sb.Append('\n');
+        }
+        return Encoding.UTF8.GetBytes(sb.ToString());
+    }
+
+    /// <summary>Read a joiner's opening frame. Port handling matches <see cref="Decode"/>: out of
+    /// range becomes 0 rather than a throw, so a malformed announcement costs its author the greet
+    /// and nothing else.</summary>
+    public static (int protocolVersion, byte[]? nonce, int udpPort, IPEndPoint? reflexive)
+        DecodeJoinerIntro(byte[] body)
+    {
+        var map = ParseLines(body);
+        int udpPort = GetInt(map, "udpport", 0);
+        if (udpPort < 1 || udpPort > 65535) udpPort = 0;
+        IPEndPoint? reflexive = TryParseEndpoint(Get(map, "refl"), out var parsed) ? parsed : null;
+        return (GetInt(map, "proto", 0), SessionAuth.FromHex(Get(map, "nonce")), udpPort, reflexive);
+    }
+
     /// <summary>Encode the host's WELCOME: assignment, negotiated settings, input-timeline
     /// generation, and the candidate endpoints grouped by remote controller port.</summary>
     /// <param name="tokens">

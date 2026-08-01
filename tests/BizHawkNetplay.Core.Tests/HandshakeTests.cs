@@ -341,6 +341,49 @@ public class HandshakeTests
     }
 
     /// <summary>
+    /// The joiner's mirror of the challenge rule above: its opening frame is an intro — protocol
+    /// version, nonce, UDP port, reflexive candidate — and nothing more. It used to be the full
+    /// HELLO, so a joiner tricked into dialing an attacker's address (addresses are swapped over
+    /// chat) handed its ROM hash, core, and on N64 a filesystem path containing a Windows username
+    /// to a listener that had proved nothing. The identity now waits for the host's verified proof.
+    /// </summary>
+    [Fact]
+    public void TheJoinersOpeningFrameIsAnIntroAndCarriesNoIdentity()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var syncFields = new[]
+            {
+                new KeyValuePair<string, string>("txPath", @"C:\Users\somebody\AppData\gliden64.dll"),
+            };
+            var clientId = new PeerIdentity(16, "SECRETROMHASH", "Ares64", "2.11.1.0", "SYNCDIGEST",
+                new[] { "L0" }, true, 20, syncFields);
+
+            var client = Task.Run(() => Handshake.RunClientMulti(
+                clientCh, clientId, new SessionPreferences(2, false, "hunter2"), 47801));
+
+            var (type, body) = hostCh.Receive();
+            var text = System.Text.Encoding.UTF8.GetString(body);
+
+            Assert.Equal(ControlMessageType.Hello, type);
+            Assert.Contains("proto=16", text);      // so a wrong build fails by name, not by hanging
+            Assert.Contains("nonce=", text);        // the proof cannot be computed without it
+            Assert.Contains("udpport=47801", text); // the input path, not an identity
+
+            Assert.DoesNotContain("SECRETROMHASH", text);
+            Assert.DoesNotContain("Ares64", text);
+            Assert.DoesNotContain("SYNCDIGEST", text);
+            Assert.DoesNotContain("txPath", text);
+            Assert.DoesNotContain("somebody", text);
+
+            dispose();  // the joiner is now blocked on a challenge that is never coming
+            Assert.ThrowsAny<Exception>(() => client.GetAwaiter().GetResult());
+        }
+        finally { dispose(); }
+    }
+
+    /// <summary>
     /// A peer that has not proved the password learns nothing about what this host is running.
     ///
     /// The rejection reason names what failed to match — the ROM hash, the core, a sync setting —
