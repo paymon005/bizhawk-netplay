@@ -151,4 +151,36 @@ public class ControlChannelTests
         Assert.Equal(ControlMessageType.Checksum, type);
         Assert.Equal(new byte[] { 7, 8, 9 }, body);
     }
+
+    /// <summary>
+    /// A savestate is the one thing on this channel that may be enormous, and also the one thing
+    /// nobody may send before the handshake has reached the point of transferring one. Sizing the
+    /// allocation off the declared TYPE alone let an anonymous connection ask for 64 MiB, and get
+    /// it, for the cost of a five-byte header — repeatable per connection.
+    ///
+    /// The length is checked at the header, so a refusal never reads or allocates the body. The
+    /// authenticated case proves the check passed rather than the frame being read: with no body
+    /// behind the header it can only end at the end of the stream.
+    /// </summary>
+    [Fact]
+    public void ASavestateSizedFrameIsRefusedUntilThePeerHasAuthenticated()
+    {
+        var header = Header(ControlMessageType.State, 1_000_000);
+
+        var anonymous = new ControlChannel(new MemoryStream(header));
+        Assert.Throws<InvalidDataException>(() => anonymous.Receive());
+
+        var authenticated = new ControlChannel(new MemoryStream(header)) { Authenticated = true };
+        Assert.Throws<EndOfStreamException>(() => authenticated.Receive());
+    }
+
+    /// <summary>The small-frame ceiling is the same either way — only a state was ever allowed to
+    /// be large, so authenticating must not raise the bar for anything else.</summary>
+    [Fact]
+    public void AuthenticatingDoesNotRaiseTheCeilingForOrdinaryFrames()
+    {
+        var header = Header(ControlMessageType.Checksum, 1_000_000);
+        var channel = new ControlChannel(new MemoryStream(header)) { Authenticated = true };
+        Assert.Throws<InvalidDataException>(() => channel.Receive());
+    }
 }

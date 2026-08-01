@@ -243,6 +243,34 @@ public class HandshakeTests
     }
 
     /// <summary>
+    /// The other side of the pre-auth frame ceiling: a real state has to get through.
+    ///
+    /// Every other handshake test moves a state well under the 256 KiB that unauthenticated
+    /// connections are held to, so all of them would still pass if the handshake never unlocked the
+    /// savestate ceiling at all — and the first thing to notice would be an N64 session failing to
+    /// start. This one is deliberately over that line, and incompressible, so it stays over it after
+    /// the transfer deflates it.
+    /// </summary>
+    [Fact]
+    public void AStateLargerThanTheUnauthenticatedCeilingStillTransfers()
+    {
+        var (hostCh, clientCh, dispose) = TcpPair();
+        try
+        {
+            var hostState = new byte[512 * 1024];
+            new Random(99).NextBytes(hostState);
+
+            var hostTask = Task.Run(() =>
+                Handshake.RunHost(hostCh, Id(), new SessionPreferences(2, false), hostState, 47800));
+            var clientParams = Handshake.RunClient(clientCh, Id(), new SessionPreferences(2, false), 51000);
+            hostTask.GetAwaiter().GetResult();
+
+            Assert.Equal(hostState, clientParams.InitialState);
+        }
+        finally { dispose(); }
+    }
+
+    /// <summary>
     /// A rejection reason is text the far end chose, and it reaches the on-screen log and the
     /// session file. Unbounded and unfiltered, that let a peer write a quarter-megabyte per attempt
     /// to someone's disk, and embed newlines to forge log lines indistinguishable from this tool's

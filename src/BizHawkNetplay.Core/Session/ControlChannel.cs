@@ -67,8 +67,19 @@ public sealed class ControlChannel
     private static bool CarriesState(ControlMessageType type) =>
         type is ControlMessageType.State or ControlMessageType.Resync;
 
-    private static int MaxLengthFor(ControlMessageType type) =>
-        CarriesState(type) ? MaxFrameLength : MaxSmallFrameLength;
+    /// <summary>
+    /// Set once the peer on the other end has proved the session password.
+    ///
+    /// Until then the savestate ceiling does not apply, whatever a frame declares itself to be. A
+    /// state is the one thing on this channel that may be enormous, and it is also the one thing
+    /// nobody may send before the handshake has got that far — so an anonymous connection announcing
+    /// a 64 MiB State was declaring an allocation it had no standing to ask for, and getting it,
+    /// once per connection, for the cost of a five-byte header.
+    /// </summary>
+    public bool Authenticated { get; set; }
+
+    private int MaxLengthFor(ControlMessageType type) =>
+        CarriesState(type) && Authenticated ? MaxFrameLength : MaxSmallFrameLength;
 
     private readonly Stream _stream;
     private readonly object _writeLock = new();

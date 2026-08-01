@@ -222,6 +222,11 @@ public static class Handshake
             if (!SessionAuth.FixedTimeEquals(Encoding.UTF8.GetString(b), peerExpected))
                 throw new HandshakeException("session password mismatch (could not verify the host)");
         }
+
+        // The savestate-sized frame ceiling is unlocked here and nowhere else. Everything that may
+        // legitimately be large — the initial state, a resync — comes after this point, so before it
+        // a peer declaring 64 MiB is asking for an allocation it has no standing to ask for.
+        channel.Authenticated = true;
     }
 
     // ---- N-player (host-relay) handshake ---------------------------------------------
