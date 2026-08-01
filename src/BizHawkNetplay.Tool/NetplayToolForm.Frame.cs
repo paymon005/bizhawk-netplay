@@ -487,8 +487,17 @@ public sealed partial class NetplayToolForm
                     // the SHA fallback. That was one guaranteed late present every five seconds,
                     // logged as `hash` but paid for by the screen. Both peers quantise the checksum
                     // to the same interval boundary, so a one-tick deferral changes nothing about
-                    // what is compared.
-                    _checksumDue = true;
+                    // what is compared — with one exception. Lockstep hashes the LIVE state, so if
+                    // a catch-up burst is about to step another frame this same tick, deferring
+                    // past a boundary loses it: the next tick's head finds CurrentFrame one past
+                    // the interval and this machine never reports it, leaving the ledger entry
+                    // pending forever. Hash now in that one case, while the state still stands on
+                    // the boundary; the burst tick was already paying double core cost.
+                    if (anotherFrameDue && driver.Strategy is LockstepStrategy
+                        && driver.CurrentFrame % ChecksumInterval == 0)
+                        MaybeSendChecksum();
+                    else
+                        _checksumDue = true;
                     _fpsCount++;
                 }
             }
