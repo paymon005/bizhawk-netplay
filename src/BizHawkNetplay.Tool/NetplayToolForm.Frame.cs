@@ -35,6 +35,8 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private int _emuLoopTicksWindow;
     private bool _frameTickRunning;
+    /// <summary>A frame completed and its checksum has not been taken yet — see where it is set.</summary>
+    private bool _checksumDue;
     private int _timerTicksWindow;
 
     /// <summary>
@@ -284,6 +286,14 @@ public sealed partial class NetplayToolForm
             _adapter?.PumpAudio();
             audioMs = ElapsedMs(tickStart) - audioStart;
 
+            // Last tick's checksum, before this tick's frame — here its cost lands in the slack
+            // ahead of the frame decision instead of between the step and the present.
+            if (_checksumDue)
+            {
+                _checksumDue = false;
+                MaybeSendChecksum();
+            }
+
             // Say the moment EmuHawk's sound device stops or restarts, not just that it is down
             // when something else already went wrong. Sampling it on a slow tick reports the
             // aftermath: in the one log where this was caught, the device had been down for
@@ -460,7 +470,15 @@ public sealed partial class NetplayToolForm
                     framesThisTick++;
                     if (framesThisTick >= 2) committedSecondFrame = false;
                     _schedule.FrameCompleted(frameCoreMs);
-                    MaybeSendChecksum();
+                    // Deferred to the head of the NEXT tick rather than run here. On the fine
+                    // clock the present is EmuHawk's Render(), two statements after this callback
+                    // returns — so everything after the last frame step delays the picture by its
+                    // own cost, and a full-memory hash is 7ms on a strided domain and up to 38ms on
+                    // the SHA fallback. That was one guaranteed late present every five seconds,
+                    // logged as `hash` but paid for by the screen. Both peers quantise the checksum
+                    // to the same interval boundary, so a one-tick deferral changes nothing about
+                    // what is compared.
+                    _checksumDue = true;
                     _fpsCount++;
                 }
             }
@@ -803,23 +821,38 @@ public sealed partial class NetplayToolForm
     private readonly CounterWindow _pacingSavesTaken = new();
     private readonly CounterWindow _pacingSavesElided = new();
 
-    private void LogPacingSummary(double nowMs)
+    /// <summary>
+    /// Roll the once-a-second telemetry windows, whether or not anything is going to print them.
+    ///
+    /// These used to live inside LogPacingSummary, after its "not Verbose" return — so with the
+    /// checkbox off they never reset and accumulated for the whole session. Tick ten minutes with
+    /// Verbose off, turn it on, and the first line reported ten minutes of totals in a format whose
+    /// every other figure is per-second: emuloop in the tens of thousands, `gate worst` the worst
+    /// of the session, rollbacks a session count presented as one second's worth. The CounterWindow
+    /// case was worse still — its went-backwards heuristic for a replaced strategy only works if it
+    /// is Observed often enough to still be below a fresh counter, which with Verbose off it was
+    /// not. Rolling unconditionally costs four subtractions a second.
+    /// </summary>
+    private void RollTelemetryWindows(out string clockStr, out string rbStr, out string gateStr)
     {
-        if (!Verbose || nowMs - _lastPacingLogMs < 1000) return;
-        _lastPacingLogMs = nowMs;
-        var p = _lastPacing;
-        if (p.Ticks == 0) return;
-
-        string clockStr = $"clock emuloop {_emuLoopTicksWindow}/{_emuLoopCallsWindow} " +
-                          $"timer {_timerTicksWindow}, ";
+        clockStr = $"clock emuloop {_emuLoopTicksWindow}/{_emuLoopCallsWindow} " +
+                   $"timer {_timerTicksWindow}, ";
+        // The floor this session's judder cannot go below, printed beside it. A present happens at
+        // most once per tick that ran a frame, so when the run loop's period and the frame period
+        // disagree the difference HAS to show up as a gap — chasing judder past this is chasing
+        // BizHawk's paused-loop sleep, which nothing here can reach. Ticks that ran no frame are
+        // exactly (calls - ticks).
+        double judderFloorPct = _emuLoopTicksWindow > 0
+            ? 100.0 * Math.Max(0, _emuLoopCallsWindow - _emuLoopTicksWindow) / _emuLoopTicksWindow
+            : 0;
+        clockStr += $"judder floor {judderFloorPct:F0}%, ";
         _timerTicksWindow = 0;
         _emuLoopCallsWindow = 0;
         _emuLoopTicksWindow = 0;
 
-        string rbStr = "";
+        rbStr = "";
         if (_driver?.Strategy is RollbackStrategy rb)
         {
-            MaybeHintRollbackUnaffordable(rb);
             long rollbacks = _pacingRollbacks.Observe(rb.RollbackCount);
             long resim = _pacingResim.Observe(rb.FramesResimulated);
             // Snapshots actually taken versus elided. The elision rule turns rollback's steady
@@ -838,11 +871,27 @@ public sealed partial class NetplayToolForm
 
         // Worst frame decision since this line last printed, not since the window opened — see
         // _worstGateSinceLogMs for why the windowed figures could not see these at all.
-        string gateStr = $"gate worst {_worstGateSinceLogMs:F1}ms ({_gateSpikesSinceLog} over {GateSpikeMs:F0}ms), " +
-                         $"gc {_gcGateWindow0}/{_gcGateWindow1}/{_gcGateWindow2} in gate, ";
+        gateStr = $"gate worst {_worstGateSinceLogMs:F1}ms ({_gateSpikesSinceLog} over {GateSpikeMs:F0}ms), " +
+                  $"gc {_gcGateWindow0}/{_gcGateWindow1}/{_gcGateWindow2} in gate, ";
         _worstGateSinceLogMs = 0;
         _gateSpikesSinceLog = 0;
         _gcGateWindow0 = _gcGateWindow1 = _gcGateWindow2 = 0;
+    }
+
+    private void LogPacingSummary(double nowMs)
+    {
+        if (nowMs - _lastPacingLogMs < 1000) return;
+        _lastPacingLogMs = nowMs;
+        // Rolled and advised on EVERY cadence, printed only under Verbose. The advisory below is
+        // user-facing — it tells someone their machine cannot afford the netcode it is running —
+        // and it used to sit past the Verbose return, so the only people who could see it were the
+        // ones who had already ticked a debug checkbox.
+        if (_driver?.Strategy is RollbackStrategy costly) MaybeHintRollbackUnaffordable(costly);
+        RollTelemetryWindows(out string clockStr, out string rbStr, out string gateStr);
+        if (!Verbose) return;
+        var p = _lastPacing;
+        if (p.Ticks == 0) return;
+
         Log($"pacing: adv {p.AdvancedFps:F0} fps, present {p.PresentedFps:F0}, " +
             $"tick {p.TicksPerSecond:F0}/s (gap min {p.TickGapMinMs:F1} mean {p.TickGapMeanMs:F1} " +
             $"max {p.TickGapMaxMs:F1}ms), " +

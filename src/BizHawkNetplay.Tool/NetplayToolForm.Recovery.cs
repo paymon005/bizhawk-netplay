@@ -470,6 +470,9 @@ public sealed partial class NetplayToolForm
     private void RebaseFrameSchedule()
     {
         if (!_paceClock.IsRunning) _paceClock.Start();
+        // A checksum owed by the timeline that just ended must not be taken against the new one:
+        // the strategy is replaced by a rebuild, and the frame it described no longer exists.
+        _checksumDue = false;
         _schedule.RebaseTo(_paceClock.Elapsed.TotalMilliseconds);
         // The pause froze stepping but not the FPS sample clock — restart the sample so the
         // first post-resume status line doesn't read ~0 fps and flash "CPU-bound" (KI-7).
