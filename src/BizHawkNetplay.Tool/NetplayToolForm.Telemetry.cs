@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Threading;
+using BizHawkNetplay.Core.Net;
 using BizHawkNetplay.Core.Session;
 using BizHawkNetplay.Core.Sync;
 
@@ -14,19 +16,64 @@ public sealed partial class NetplayToolForm
     /// TCP's number is inflated by its queueing and retransmits. Since this figure both advises the
     /// player's input delay and sizes rollback's prediction horizon, measuring the wrong path costs
     /// real latency. Falls back to the TCP ping when no peer's ack carried a timestamp (older build).
+    ///
+    /// The relayed route competes for worst. The lobby sized the session's delay from it, but this
+    /// figure used to see only DIRECT paths — so on a relayed session every runtime consumer (the
+    /// rollback soft cap, the delay hint, the mode-change floor) reverted to the direct number and
+    /// the hint told the player to lower the delay below what the route they were actually riding
+    /// needed. Observed in every relayed session of the night that prompted this: delay 6-7 chosen
+    /// from ~117-129ms relayed routes, then "this link only needs delay 4" two seconds later.
     /// </summary>
     private double WorstPingMs(out bool udpMeasured)
     {
         udpMeasured = false;
         var mesh = _mesh;
+        double relayed = RelayedRouteRttMs(mesh);
         if (mesh != null && mesh.TryGetWorstRttMs(out double udp) && udp >= 0)
         {
             udpMeasured = true;
-            return udp;
+            return Math.Max(udp, relayed);
         }
         double ping = -1;
         lock (_pingLock) { foreach (var link in _peers) if (link.PingMs > ping) ping = link.PingMs; }
+        if (relayed > ping)
+        {
+            // Derived from live UDP leg measurements, not the TCP loop — say so.
+            udpMeasured = true;
+            return relayed;
+        }
         return ping;
+    }
+
+    /// <summary>
+    /// What the worst relayed route costs right now, or 0 when nothing rides the relay.
+    ///
+    /// Recomputed from the live per-leg readings on every call rather than stored once in the
+    /// lobby, so it follows the same drift every direct figure does. The host prices its carried
+    /// pairs exactly (both legs are its own). A joiner cannot see the host's far leg, so a silent
+    /// edge of its own is priced at twice its host leg — symmetric-network assumption, the
+    /// conservative direction for a figure whose consumers only ever raise delay from it.
+    /// </summary>
+    private double RelayedRouteRttMs(MeshUdpTransport? mesh)
+    {
+        if (mesh == null) return 0;
+        if (_isHost)
+        {
+            if (_relayPairs.Count == 0) return 0;
+            var legs = new Dictionary<int, LobbyRttSample>();
+            foreach (var edge in mesh.DescribeEdges())
+                if (edge.Measured) legs[edge.RemotePort] = new LobbyRttSample(edge.MedianMs, edge.HighMs);
+            return LobbyDelayPolicy.RelayRouteStats(legs, _relayPairs).MedianMs;
+        }
+
+        double hostLeg = -1;
+        bool anySilent = false;
+        foreach (var edge in mesh.DescribeEdges())
+        {
+            if (edge.RemotePort == 0) { if (edge.Measured) hostLeg = edge.MedianMs; }
+            else if (!edge.Measured) anySilent = true;
+        }
+        return anySilent && hostLeg > 0 ? 2 * hostLeg : 0;
     }
 
     /// <summary>
