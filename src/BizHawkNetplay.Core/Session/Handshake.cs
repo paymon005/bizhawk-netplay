@@ -275,6 +275,14 @@ public static class Handshake
             throw new HandshakeException($"expected HELLO from joiner, got {type}");
         var (joinerId, joinerPrefs, joinerUdpPort, joinNonce, joinerReflexive) = HandshakeCodec.Decode(body);
 
+        // Refused here, where a bad greet costs its author a seat. The codec turns an out-of-range
+        // port into 0, and this value goes straight into an IPEndPoint at the call sites — where a
+        // throw escapes the per-joiner handler and takes the whole lobby with it. A real build
+        // always knows the port it bound, so 0 means the announcement was malformed.
+        if (joinerUdpPort < 1 || joinerUdpPort > 65535)
+            throw new HandshakeException(
+                "the joiner did not announce a usable UDP port for its input path");
+
         var result = SessionNegotiator.Negotiate(hostId, joinerId, hostPrefs, joinerPrefs);
         if (!result.Accepted)
         {

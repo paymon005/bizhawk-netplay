@@ -327,7 +327,13 @@ public static class HandshakeCodec
         // delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge value
         // that would hang the host seeding that many neutral frames on the UI thread.
         var prefs = new SessionPreferences(ClampDelay(GetInt(map, "delay", 1)), Get(map, "rollback") == "1");
+        // Every other number here is clamped; this one was not, and it is the one that reaches an
+        // IPEndPoint constructor. A peer announcing udpport=70000 threw ArgumentOutOfRangeException
+        // out of the host's accept loop, past the per-joiner handler, and took the whole lobby down
+        // — every other player losing their seat for one bad greet. 0 means "no usable UDP
+        // endpoint", which the caller already has to handle for a peer that never discovered one.
         int udpPort = GetInt(map, "udpport", 0);
+        if (udpPort < 1 || udpPort > 65535) udpPort = 0;
         byte[]? nonce = SessionAuth.FromHex(Get(map, "nonce")); // null if missing/malformed
         // Absent or malformed is simply "not discovered" — STUN can be blocked, and a peer that
         // cannot name its public endpoint still plays over whatever candidates do work.
