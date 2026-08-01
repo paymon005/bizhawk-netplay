@@ -31,6 +31,10 @@ internal sealed partial class EmuHawkAdapter
     // dictionary by. Precomputed: ReadLocalInput runs every frame and must not be doing string work.
     private readonly string[][] _padButtonKeys;
     private readonly string[][] _padAxisKeys;
+    // Length of each port's leading run of real pad controls — everything past it is the console
+    // tail on port 0. Precomputed for the same per-frame reason as the key arrays.
+    private readonly int[] _playerButtonCount;
+    private readonly int[] _playerAxisCount;
     // The N64 stick gate: the stick is round, and the constraint clamps the (X,Y) VECTOR to radius
     // 127, without which a diagonal reaches ~180 — 42% past anything the hardware can produce, so a
     // game reading stick MAGNITUDE saturates its top bucket at about 70% deflection.
@@ -184,9 +188,18 @@ internal sealed partial class EmuHawkAdapter
         var direct = MovieInController;
         if (direct != null && MovieInCovers(direct, readPort))
         {
+            // The console tail (port 0 only, appended after the pad's own controls) is always read
+            // by ITS OWN name: a "My controls" remap swaps which pad's bindings drive the seat, and
+            // the machine's Reset/Select/Pause are not any pad's business. The player region stays
+            // positional — LayoutsLineUp guarantees the run lengths match — and the remap source
+            // simply has no index for the tail, so the fallback to the port's own name is exact.
             var readLayout = _layouts[readPort];
-            for (int i = 0; i < buttons.Length; i++) buttons[i] = direct.IsPressed(readLayout.Buttons[i]);
-            for (int j = 0; j < axes.Length; j++) axes[j] = direct.AxisValue(readLayout.Axes[j].Name);
+            for (int i = 0; i < buttons.Length; i++)
+                buttons[i] = direct.IsPressed(
+                    i < readLayout.Buttons.Count ? readLayout.Buttons[i] : layout.Buttons[i]);
+            for (int j = 0; j < axes.Length; j++)
+                axes[j] = direct.AxisValue(
+                    j < readLayout.Axes.Count ? readLayout.Axes[j].Name : layout.Axes[j].Name);
             return new PortInput(buttons, axes);
         }
 
@@ -194,17 +207,33 @@ internal sealed partial class EmuHawkAdapter
         try { pad = _apis.Joypad.Get(readPort + 1); } // Joypad ports are 1-based
         catch { pad = null; }
 
+        // The per-player dictionary is keyed by prefix-stripped tails and carries ONLY prefixed
+        // controls, so the console tail needs the unfiltered dictionary, keyed by full name.
+        IReadOnlyDictionary<string, object>? consolePad = null;
+        if (_playerButtonCount[port] < buttons.Length || _playerAxisCount[port] < axes.Length)
+            try { consolePad = _apis.Joypad.Get(); } catch { consolePad = null; }
+
         // Keys come back with the "P<n> " prefix stripped, which is why the remap works at all: two
         // ports that describe the same controls produce the same keys. Anything missing rests at
         // that axis's own Neutral rather than 0, which on an unsigned axis is a full deflection.
         var buttonKeys = _padButtonKeys[port];
         var axisKeys = _padAxisKeys[port];
         for (int i = 0; i < buttons.Length; i++)
-            buttons[i] = pad != null && pad.TryGetValue(buttonKeys[i], out var b) && b is bool on && on;
+        {
+            bool console = i >= _playerButtonCount[port];
+            var dict = console ? consolePad : pad;
+            var key = console ? layout.Buttons[i] : buttonKeys[i];
+            buttons[i] = dict != null && dict.TryGetValue(key, out var b) && b is bool on && on;
+        }
         for (int j = 0; j < axes.Length; j++)
-            axes[j] = pad != null && pad.TryGetValue(axisKeys[j], out var a) && a is int v
+        {
+            bool console = j >= _playerAxisCount[port];
+            var dict = console ? consolePad : pad;
+            var key = console ? layout.Axes[j].Name : axisKeys[j];
+            axes[j] = dict != null && dict.TryGetValue(key, out var a) && a is int v
                 ? v
                 : layout.Axes[j].Neutral;
+        }
         return new PortInput(buttons, axes);
     }
 
@@ -357,14 +386,35 @@ internal sealed partial class EmuHawkAdapter
 
     private static bool LayoutsLineUp(CoreLayout a, CoreLayout b)
     {
-        if (a.Buttons.Count != b.Buttons.Count || a.Axes.Count != b.Axes.Count) return false;
-        for (int i = 0; i < a.Buttons.Count; i++)
+        // Compare the PLAYER region only — the leading run of prefixed controls. Port 0 may carry
+        // the appended console controls after its pad's own (see AppendConsoleControls); those
+        // belong to the machine, are read locally by name, and must not disqualify a pad-for-pad
+        // remap whose pads line up perfectly.
+        int abtn = PlayerControlRun(a.Buttons), bbtn = PlayerControlRun(b.Buttons);
+        if (abtn != bbtn) return false;
+        int aax = PlayerAxisRun(a.Axes), bax = PlayerAxisRun(b.Axes);
+        if (aax != bax) return false;
+        for (int i = 0; i < abtn; i++)
             if (!string.Equals(StripPortPrefix(a.Buttons[i]), StripPortPrefix(b.Buttons[i]), StringComparison.Ordinal))
                 return false;
-        for (int i = 0; i < a.Axes.Count; i++)
+        for (int i = 0; i < aax; i++)
             if (!string.Equals(StripPortPrefix(a.Axes[i].Name), StripPortPrefix(b.Axes[i].Name), StringComparison.Ordinal))
                 return false;
         return true;
+    }
+
+    private static int PlayerControlRun(IReadOnlyList<string> names)
+    {
+        int run = 0;
+        while (run < names.Count && IsPlayerControl(names[run])) run++;
+        return run;
+    }
+
+    private static int PlayerAxisRun(IReadOnlyList<CoreAxisSpec> axes)
+    {
+        int run = 0;
+        while (run < axes.Count && IsPlayerControl(axes[run].Name)) run++;
+        return run;
     }
 
     /// <summary>"P2 X Axis" -> "X Axis". Mirrors ControllerDefinition's own <c>^P(\d+) </c>, which is
@@ -408,8 +458,8 @@ internal sealed partial class EmuHawkAdapter
     }
 
     /// <summary>
-    /// Leading run of ports that can actually carry input — a layout with no buttons and no axes
-    /// serializes to zero bytes and is a slot, not a controller.
+    /// Leading run of ports that can actually carry input — a layout with no real player controls
+    /// is a slot, not a controller.
     ///
     /// <see cref="BuildLayouts"/> allocates one slot per player number it finds anywhere in the
     /// core's flat control list, and those slots are not guaranteed to be populated. QuickNES
@@ -418,14 +468,38 @@ internal sealed partial class EmuHawkAdapter
     /// nothing to deserialize it into. Both ends agreed there was no input to exchange, no frame
     /// ever advanced, and the session died at frame 0 blaming the UDP path.
     ///
+    /// Counted by PLAYER controls rather than payload width, for two reasons. A7800Hawk's
+    /// UnpluggedController exposes a single button literally named "P2 " — an empty tail — which
+    /// gave the slot a nonzero payload and counted a seat wired to nothing. And port 0 may carry
+    /// the appended console controls (see <see cref="AppendConsoleControls"/>), which belong to the
+    /// machine, not to a pad.
+    ///
     /// The run is counted from port 0 and stops at the first empty slot, because ports are assigned
     /// contiguously: a usable port sitting behind an unusable one is unreachable anyway.
     /// </summary>
     private static int UsablePorts(CoreLayout[] layouts)
     {
         int usable = 0;
-        while (usable < layouts.Length && layouts[usable].PayloadByteWidth > 0) usable++;
+        while (usable < layouts.Length && HasPlayerControls(layouts[usable])) usable++;
         return usable;
+    }
+
+    private static bool HasPlayerControls(CoreLayout layout)
+    {
+        foreach (var b in layout.Buttons)
+            if (IsPlayerControl(b)) return true;
+        foreach (var a in layout.Axes)
+            if (IsPlayerControl(a.Name)) return true;
+        return false;
+    }
+
+    /// <summary>A control that belongs to a numbered pad and actually names something: it carries a
+    /// "P&lt;n&gt; " prefix with a non-empty tail. Console controls (Reset, Select, Pause) have no
+    /// prefix; A7800Hawk's unplugged port exposes a "P2 "-with-empty-tail placeholder.</summary>
+    private static bool IsPlayerControl(string control)
+    {
+        string stripped = StripPortPrefix(control);
+        return stripped.Length > 0 && !string.Equals(stripped, control, StringComparison.Ordinal);
     }
 
     private static CoreLayout[] BuildLayouts(ControllerDefinition def)
@@ -510,5 +584,61 @@ internal sealed partial class EmuHawkAdapter
             return reordered;
         }
         catch { return layouts; } // a settings read must never break loading a core
+    }
+
+    /// <summary>What the console channel carries and who holds it, or null when the core exposes no
+    /// console-level controls. Logged at session start.</summary>
+    public string? ConsoleControlsNote { get; private set; }
+
+    /// <summary>
+    /// Give the unprefixed, console-level controls a home on port 0 — the host's port.
+    ///
+    /// BuildLayouts groups controls by player number and player 0 — no prefix — got dropped
+    /// entirely, so NOBODY in a session could press Reset, Select, Pause, flip a difficulty
+    /// switch, or swap an FDS disk: the layouts carry every name a session can inject, and these
+    /// names were in none of them. On the 7800 that is not a papercut — Select is how most
+    /// carts choose 1P/2P mode, so sessions sat in the wrong game mode and read as "the players
+    /// share controls".
+    ///
+    /// Appended to the END of port 0's layout, after the pad's own controls: every machine builds
+    /// the same layouts, so the wire format and the handshake digest stay symmetric, and the seat
+    /// that captures port 0 — the host — is the one whose presses reach everyone. Console state is
+    /// applied from the synced input stream like any button, so a Reset resets every machine on
+    /// the same frame.
+    /// </summary>
+    private CoreLayout[] AppendConsoleControls(CoreLayout[] layouts)
+    {
+        try
+        {
+            if (layouts.Length == 0) return layouts;
+            var def = _emulator.ControllerDefinition;
+            var consoleButtons = new List<string>();
+            foreach (var b in def.BoolButtons)
+                if (SafePlayerNumber(def, b) == 0 && !IsPlayerControl(b) && b.Trim().Length > 0)
+                    consoleButtons.Add(b);
+            var consoleAxes = new List<CoreAxisSpec>();
+            foreach (var name in def.Axes.Keys)
+                if (SafePlayerNumber(def, name) == 0 && !IsPlayerControl(name) && name.Trim().Length > 0)
+                {
+                    var spec = def.Axes[name];
+                    consoleAxes.Add(new CoreAxisSpec(name, spec.Min, spec.Max, spec.Neutral));
+                }
+            if (consoleButtons.Count == 0 && consoleAxes.Count == 0) return layouts;
+
+            var port0Buttons = new List<string>(layouts[0].Buttons);
+            port0Buttons.AddRange(consoleButtons);
+            var port0Axes = new List<CoreAxisSpec>(layouts[0].Axes);
+            port0Axes.AddRange(consoleAxes);
+            var appended = (CoreLayout[])layouts.Clone();
+            appended[0] = new CoreLayout(port0Buttons, port0Axes);
+
+            var named = new List<string>(consoleButtons);
+            foreach (var a in consoleAxes) named.Add(a.Name);
+            ConsoleControlsNote = $"console controls ({string.Join(", ", named)}) ride the host's " +
+                                  "input stream — the host presses them for everyone, and they " +
+                                  "apply on the same frame on every machine.";
+            return appended;
+        }
+        catch { return layouts; } // never let a definition oddity break loading a core
     }
 }

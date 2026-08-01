@@ -65,17 +65,22 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         // allocating dictionary path until the audio path happened to hand MainForm over.
         _hostConfig = config;
         _movieSession = movieSession;
-        _layouts = ReorderLayoutsToGamePlayerNumbering(BuildLayouts(emulator.ControllerDefinition));
+        _layouts = AppendConsoleControls(
+            ReorderLayoutsToGamePlayerNumbering(BuildLayouts(emulator.ControllerDefinition)));
         _bindings = BuildBindings();
         _analogBinds = BuildAnalogBinds();
         _axisReversed = BuildAxisReversed();
         _remapCompatible = BuildRemapCompatibility();
         _padButtonKeys = new string[_layouts.Length][];
         _padAxisKeys = new string[_layouts.Length][];
+        _playerButtonCount = new int[_layouts.Length];
+        _playerAxisCount = new int[_layouts.Length];
         for (int p = 0; p < _layouts.Length; p++)
         {
             _padButtonKeys[p] = _layouts[p].Buttons.Select(StripPortPrefix).ToArray();
             _padAxisKeys[p] = _layouts[p].Axes.Select(a => StripPortPrefix(a.Name)).ToArray();
+            _playerButtonCount[p] = PlayerControlRun(_layouts[p].Buttons);
+            _playerAxisCount[p] = PlayerAxisRun(_layouts[p].Axes);
         }
         if (_hostConfig == null)
             try { _hostConfig = (_apis.Emulation as EmulationApi)?.ForbiddenConfigReference; } catch { }

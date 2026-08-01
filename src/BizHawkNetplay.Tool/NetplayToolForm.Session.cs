@@ -324,6 +324,8 @@ public sealed partial class NetplayToolForm
         // otherwise the renumbering is invisible until someone asks why P2's pad works at all.
         if (_adapter.SeatOrderNote != null)
             Log($"(note) {_adapter.SeatOrderNote}");
+        if (_adapter.ConsoleControlsNote != null)
+            Log($"(note) {_adapter.ConsoleControlsNote}");
 
         // The digital-stick-override note deliberately does NOT go here. It fires for any N64 setup
         // using BizHawk's default XInput binds, and measurement showed the override usually does not
