@@ -59,9 +59,9 @@ public sealed partial class NetplayToolForm
         // port numbers into endpoints. Say how many routes actually resulted — a relay that was
         // announced in the log but resolved to nothing is the failure this ordering exists to stop.
         RefreshRelayRoutes();
-        if (_relayPorts.Count > 0)
-            ConnLog($"relay resolved: {_mesh?.RelayRouteCount ?? 0} route(s) for {_relayPorts.Count} " +
-                    "relayed player(s).", (_mesh?.RelayRouteCount ?? 0) > 0 ? Color.DarkOrange : Color.Firebrick);
+        if (_relayPairs.Count > 0)
+            ConnLog($"relay resolved: {_mesh?.RelayRouteCount ?? 0} route(s) for {_relayPairs.Count} " +
+                    "relayed leg(s).", (_mesh?.RelayRouteCount ?? 0) > 0 ? Color.DarkOrange : Color.Firebrick);
         PrepareSessionDriver(mode);
     }
 

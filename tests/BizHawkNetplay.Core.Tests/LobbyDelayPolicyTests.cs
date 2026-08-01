@@ -170,25 +170,30 @@ public class LobbyDelayPolicyTests
     }
 
     /// <summary>
-    /// A relayed seat's input takes two hops, and the lobby only ever measured direct edges — an
+    /// A relayed leg's input takes two hops, and the lobby only ever measured direct edges — an
     /// edge that never opened (which is why the relay exists) contributed nothing at all. So the
     /// delay was sized from the worst DIRECT path while the affected players were not using one.
-    /// The relayed route's equivalent round-trip is the two host legs added together.
+    /// The relayed route's equivalent round-trip is the two host legs added together — and only
+    /// for the PAIRS actually being carried: pricing every pairing of a relayed seat charged the
+    /// delay for routes nobody rides.
     /// </summary>
     [Fact]
-    public void RelayRouteCostsBothHostLegs()
+    public void RelayRouteCostsBothHostLegsOfTheCarriedPair()
     {
-        // P1 is relayed. Its own leg is 40ms; the far seats are 60ms and 20ms. The worst route it
-        // can be given is 40 + 60, which is well past the 60ms worst DIRECT edge.
+        // The P1↔P2 edge is relayed. P1's host leg is 40ms, P2's is 60ms: the route costs 100.
+        // P3's 20ms leg is not part of any carried pair and must not appear anywhere.
         var legs = new Dictionary<int, double> { [1] = 40, [2] = 60, [3] = 20 };
-        Assert.Equal(100, LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 1 }));
+        Assert.Equal(100, LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 2)]));
 
-        // A seat is never relayed to itself, so a lone relayed seat with no far end costs nothing.
-        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(
-            new Dictionary<int, double> { [1] = 40 }, new[] { 1 }));
+        // Only the carried pair is priced: relaying P1↔P3 (40+20) must not charge for the worse
+        // pairing with P2 the way the old per-seat arithmetic did.
+        Assert.Equal(60, LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 3)]));
+
+        // Several carried legs: the worst one decides.
+        Assert.Equal(100, LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 3), (1, 2)]));
 
         // Nothing relayed: the session pays nothing for this.
-        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, new int[0]));
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, []));
     }
 
     [Fact]
@@ -204,10 +209,12 @@ public class LobbyDelayPolicyTests
             [4] = double.PositiveInfinity,
             [5] = 50,
         };
-        Assert.Equal(80, LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 1 }));
-        // A relayed seat whose OWN leg is unmeasured contributes nothing rather than a wild number.
-        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 2 }));
-        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(null!, new[] { 1 }));
+        Assert.Equal(80, LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 5)]));
+        // A pair with an unmeasured leg contributes nothing rather than a wild number.
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 2)]));
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, [(3, 5)]));
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 4)]));
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(null!, [(1, 5)]));
         Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, null!));
     }
 
@@ -218,7 +225,7 @@ public class LobbyDelayPolicyTests
     {
         var legs = new Dictionary<int, double> { [1] = 40, [2] = 60 };
         double direct = 60;
-        double relayed = LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 1 });
+        double relayed = LobbyDelayPolicy.RelayRouteRttMs(legs, [(1, 2)]);
 
         int fromDirect = LobbyDelayPolicy.Choose(direct, Frame60, SyncMode.Rollback, 1, 20).Frames;
         int fromRelayed = LobbyDelayPolicy.Choose(relayed, Frame60, SyncMode.Rollback, 1, 20).Frames;

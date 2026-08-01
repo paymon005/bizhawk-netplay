@@ -536,6 +536,54 @@ public class MeshUdpTransportTests
     }
 
     /// <summary>
+    /// The relay carries the EDGES the lobby named, not everything addressed to a relayed player.
+    /// A joiner short one leg used to get every other player's input relayed to it — doubling
+    /// traffic on legs that worked, and pricing the session's delay off a hop those legs were not
+    /// taking. Here the host relays only the P1↔P2 edge: input from P3 must keep riding its own
+    /// direct path and never appear as a relayed copy.
+    /// </summary>
+    [Fact]
+    public void RelayCarriesOnlyThePairsItWasInstalledFor()
+    {
+        var host = MeshUdpTransport.Bind(0);
+        var a = MeshUdpTransport.Bind(0);   // port 1 — cannot reach B
+        var b = MeshUdpTransport.Bind(0);   // port 2 — cannot reach A
+        var d = MeshUdpTransport.Bind(0);   // port 3 — all its legs work
+        try
+        {
+            var toA = new PeerRoute(1, new[] { Loop(a.LocalPort) });
+            var toB = new PeerRoute(2, new[] { Loop(b.LocalPort) });
+            var toD = new PeerRoute(3, new[] { Loop(d.LocalPort) });
+            host.SetPeerRoutes(new[] { toA, toB, toD });
+            a.SetPeers(new[] { Loop(host.LocalPort) });
+            b.SetPeers(new[] { Loop(host.LocalPort) });
+            d.SetPeers(new[] { Loop(host.LocalPort) });
+
+            // The host needs a live candidate for every peer before it can relay anything.
+            a.Send(Input(port: 1, 1));
+            b.Send(Input(port: 2, 1));
+            d.Send(Input(port: 3, 1));
+            for (int i = 0; i < 3; i++) Assert.NotNull(WaitRecv(host));
+
+            host.SetRelayRoutes(new[] { toA, toB });
+            host.SetRelayPairs([(1, 2)]);
+
+            // A's input is forwarded to B — that is the broken edge…
+            a.Send(Input(port: 1, 5));
+            Assert.Equal(Input(port: 1, 5), WaitRecv(host));
+            Assert.Equal(Input(port: 1, 5), WaitRecv(b));
+
+            // …but D's input is NOT forwarded to anyone: its legs work, and a relayed copy would
+            // be the old all-or-nothing behaviour back again.
+            d.Send(Input(port: 3, 6));
+            Assert.Equal(Input(port: 3, 6), WaitRecv(host));
+            AssertNoRecv(a);
+            AssertNoRecv(b);
+        }
+        finally { host.Dispose(); a.Dispose(); b.Dispose(); d.Dispose(); }
+    }
+
+    /// <summary>
     /// A relayed datagram must not be bounced back to the peer that sent it — a duplicate at best,
     /// and a loop if anything ever forwarded onward.
     ///

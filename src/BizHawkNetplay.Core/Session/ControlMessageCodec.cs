@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BizHawkNetplay.Core.Net;
 
 namespace BizHawkNetplay.Core.Session;
@@ -190,34 +191,48 @@ public static class ControlMessageCodec
 
     /// <summary>
     /// A joiner's report of its worst UDP mesh edge: generation, median and high-water round-trip
-    /// (microseconds on the wire, so sub-millisecond LAN figures survive the trip), and how many of
-    /// its edges actually answered. The counts matter as much as the timings — a report covering
-    /// 1 of 3 edges is not the same claim as one covering 3 of 3, and the host says so in the log
-    /// rather than presenting a partial measurement as a complete one.
+    /// (microseconds on the wire, so sub-millisecond LAN figures survive the trip), how many of
+    /// its edges actually answered, and WHICH remote ports stayed silent. The counts matter as much
+    /// as the timings — a report covering 1 of 3 edges is not the same claim as one covering 3 of 3
+    /// — and the identities matter as much as the counts: without them the host's relay had to be
+    /// all-or-nothing, forwarding everything to a joiner that was short one specific leg.
     /// </summary>
     public static byte[] EncodeMeshRtt(SessionGeneration generation, double medianMs, double highMs,
-        int measuredEdges, int totalEdges)
+        int measuredEdges, int totalEdges, IReadOnlyList<int>? silentPorts = null)
     {
         if (measuredEdges < 0 || totalEdges < 0 || measuredEdges > totalEdges)
             throw new ArgumentOutOfRangeException(nameof(measuredEdges));
-        var body = new byte[MeshRttSize];
+        int silent = silentPorts?.Count ?? 0;
+        if (silent > HandshakeCodec.MaxPlayers)
+            throw new ArgumentOutOfRangeException(nameof(silentPorts));
+        var body = new byte[MeshRttSize + 1 + silent];
         WriteGeneration(body, 0, generation);
         WriteInt32(body, 12, ToMicros(medianMs));
         WriteInt32(body, 16, ToMicros(highMs));
         WriteInt32(body, 20, measuredEdges);
         WriteInt32(body, 24, totalEdges);
+        body[MeshRttSize] = (byte)silent;
+        for (int i = 0; i < silent; i++)
+        {
+            int port = silentPorts![i];
+            if (port < 0 || port >= HandshakeCodec.MaxPlayers)
+                throw new ArgumentOutOfRangeException(nameof(silentPorts));
+            body[MeshRttSize + 1 + i] = (byte)port;
+        }
         return body;
     }
 
     public static bool TryDecodeMeshRtt(byte[] body, out SessionGeneration generation,
-        out double medianMs, out double highMs, out int measuredEdges, out int totalEdges)
+        out double medianMs, out double highMs, out int measuredEdges, out int totalEdges,
+        out int[] silentPorts)
     {
         generation = default;
         medianMs = 0;
         highMs = 0;
         measuredEdges = 0;
         totalEdges = 0;
-        if (body == null || body.Length != MeshRttSize || !TryReadGeneration(body, 0, out generation))
+        silentPorts = [];
+        if (body == null || body.Length < MeshRttSize + 1 || !TryReadGeneration(body, 0, out generation))
             return false;
         int medianMicros = ReadInt32(body, 12);
         int highMicros = ReadInt32(body, 16);
@@ -226,6 +241,17 @@ public static class ControlMessageCodec
         if (medianMicros < 0 || highMicros < 0 || measuredEdges < 0 || totalEdges < 0
             || measuredEdges > totalEdges || totalEdges > HandshakeCodec.MaxPlayers)
             return false;
+        int silent = body[MeshRttSize];
+        if (silent > HandshakeCodec.MaxPlayers || body.Length != MeshRttSize + 1 + silent)
+            return false;
+        var ports = new int[silent];
+        for (int i = 0; i < silent; i++)
+        {
+            int port = body[MeshRttSize + 1 + i];
+            if (port >= HandshakeCodec.MaxPlayers) return false;
+            ports[i] = port;
+        }
+        silentPorts = ports;
         medianMs = medianMicros / 1000.0;
         highMs = highMicros / 1000.0;
         if (medianMs > MaxMeshRttMs || highMs > MaxMeshRttMs) return false;

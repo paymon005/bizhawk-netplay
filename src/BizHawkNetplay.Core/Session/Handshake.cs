@@ -432,12 +432,13 @@ public static class Handshake
         if (type != ControlMessageType.MeshRtt)
             throw new HandshakeException($"expected a mesh RTT report from joiner, got {type}");
         if (!ControlMessageCodec.TryDecodeMeshRtt(body, out var reported, out double medianMs,
-                out double highMs, out int measuredEdges, out int totalEdges))
+                out double highMs, out int measuredEdges, out int totalEdges, out int[] silentPorts))
             throw new HandshakeException("joiner sent a malformed mesh RTT report");
         if (reported != generation)
             throw new HandshakeException(
                 $"mesh RTT generation mismatch: expected {generation}, got {reported}");
-        return new LobbyMeshSample(new LobbyRttSample(medianMs, highMs), measuredEdges, totalEdges);
+        return new LobbyMeshSample(new LobbyRttSample(medianMs, highMs), measuredEdges, totalEdges,
+            silentPorts);
     }
 
     /// <summary>Host: publish the authoritative delay once every edge has reported. Sent after the
@@ -607,7 +608,8 @@ public static class Handshake
                     ? measureMesh(hostUdpPort, peerRoutes, tokens)
                     : LobbyMeshSample.None;
                 channel.Send(ControlMessageType.MeshRtt, ControlMessageCodec.EncodeMeshRtt(
-                    generation, mesh.Rtt.MedianMs, mesh.Rtt.HighMs, mesh.MeasuredEdges, mesh.TotalEdges));
+                    generation, mesh.Rtt.MedianMs, mesh.Rtt.HighMs, mesh.MeasuredEdges,
+                    mesh.TotalEdges, mesh.SilentPorts));
                 continue;
             }
             if (type == ControlMessageType.InputDelay)

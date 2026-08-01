@@ -54,11 +54,13 @@ public readonly struct LobbyMeshSample
 {
     public static readonly LobbyMeshSample None = default;
 
-    public LobbyMeshSample(LobbyRttSample rtt, int measuredEdges, int totalEdges)
+    public LobbyMeshSample(LobbyRttSample rtt, int measuredEdges, int totalEdges,
+        IReadOnlyList<int>? silentPorts = null)
     {
         Rtt = rtt;
         MeasuredEdges = measuredEdges < 0 ? 0 : measuredEdges;
         TotalEdges = totalEdges < MeasuredEdges ? MeasuredEdges : totalEdges;
+        _silentPorts = silentPorts;
     }
 
     /// <summary>Worst edge's settled and high-water round-trip, on the UDP path input rides.</summary>
@@ -69,6 +71,17 @@ public readonly struct LobbyMeshSample
 
     /// <summary>How many edges this peer has in total.</summary>
     public int TotalEdges { get; }
+
+    private readonly IReadOnlyList<int>? _silentPorts;
+
+    /// <summary>
+    /// The remote ports of the edges that did NOT answer — the identities behind the counts.
+    /// Port 0 is the host. The counts alone forced the host's relay to be all-or-nothing: a joiner
+    /// short even one edge got everything relayed to it, and the delay was inflated by a relay hop
+    /// legs that worked were not taking. Naming the silent edges lets the relay cover exactly the
+    /// broken pairs.
+    /// </summary>
+    public IReadOnlyList<int> SilentPorts => _silentPorts ?? Array.Empty<int>();
 
     /// <summary>False when nothing answered — the caller must then fall back to its own probes
     /// rather than treat a zero as a fast link.</summary>
@@ -128,27 +141,24 @@ public static class LobbyDelayPolicy
     /// is simply the two host-leg round-trips added together — and that can approach twice the
     /// worst single leg, a whole frame or two of latency the delay never covered.
     ///
-    /// Deliberately conservative in the direction that costs latency rather than stalls: it takes
-    /// the worst pairing rather than an average. Only seats ACTUALLY being relayed are considered,
-    /// so a session with no relay pays nothing. Returns 0 when nothing is relayed or no leg was
-    /// measured, which folds away harmlessly.
+    /// Only the legs ACTUALLY being relayed are considered — a pair, not a seat: relaying the edge
+    /// between P2 and P4 says nothing about P2's working direct path to P3, and pricing every
+    /// pairing of a relayed seat (as this once did) charged the delay for routes nobody rides.
+    /// Returns 0 when nothing is relayed or no leg was measured, which folds away harmlessly.
     /// </summary>
     /// <param name="hostLegRttMs">Measured round-trip from the host to each seat, by port.</param>
-    /// <param name="relayedPorts">Seats whose input the host is forwarding.</param>
+    /// <param name="relayedPairs">The joiner-to-joiner edges the host is carrying, as port pairs.</param>
     public static double RelayRouteRttMs(
-        IReadOnlyDictionary<int, double> hostLegRttMs, IEnumerable<int> relayedPorts)
+        IReadOnlyDictionary<int, double> hostLegRttMs, IEnumerable<(int A, int B)> relayedPairs)
     {
-        if (hostLegRttMs == null || relayedPorts == null) return 0;
+        if (hostLegRttMs == null || relayedPairs == null) return 0;
         double worst = 0;
-        foreach (int relayed in relayedPorts)
+        foreach (var (a, b) in relayedPairs)
         {
-            if (!hostLegRttMs.TryGetValue(relayed, out double near) || !IsUsable(near)) continue;
-            foreach (var far in hostLegRttMs)
-            {
-                if (far.Key == relayed || !IsUsable(far.Value)) continue;
-                double route = near + far.Value;
-                if (route > worst) worst = route;
-            }
+            if (!hostLegRttMs.TryGetValue(a, out double near) || !IsUsable(near)) continue;
+            if (!hostLegRttMs.TryGetValue(b, out double far) || !IsUsable(far)) continue;
+            double route = near + far;
+            if (route > worst) worst = route;
         }
         return worst;
 

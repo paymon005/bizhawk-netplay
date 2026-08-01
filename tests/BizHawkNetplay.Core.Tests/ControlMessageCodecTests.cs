@@ -162,15 +162,30 @@ public class ControlMessageCodecTests
         // decision blind precisely where it should be cheapest, so the wire carries microseconds.
         var body = ControlMessageCodec.EncodeMeshRtt(Gen, medianMs: 0.375, highMs: 1.5,
             measuredEdges: 2, totalEdges: 3);
-        Assert.Equal(ControlMessageCodec.MeshRttSize, body.Length);
+        Assert.Equal(ControlMessageCodec.MeshRttSize + 1, body.Length); // trailing count byte, zero
 
         Assert.True(ControlMessageCodec.TryDecodeMeshRtt(body, out var generation,
-            out double medianMs, out double highMs, out int measured, out int total));
+            out double medianMs, out double highMs, out int measured, out int total, out var silent));
         Assert.Equal(Gen, generation);
         Assert.Equal(0.375, medianMs, 3);
         Assert.Equal(1.5, highMs, 3);
         Assert.Equal(2, measured);
         Assert.Equal(3, total);
+        Assert.Empty(silent);
+    }
+
+    [Fact]
+    public void MeshRtt_NamesItsSilentEdges()
+    {
+        // The silent-edge identities are what let the host relay exactly the broken pairs instead
+        // of everything addressed to an affected joiner.
+        var body = ControlMessageCodec.EncodeMeshRtt(Gen, 12.0, 20.0,
+            measuredEdges: 1, totalEdges: 3, silentPorts: new[] { 0, 2 });
+        Assert.Equal(ControlMessageCodec.MeshRttSize + 1 + 2, body.Length);
+
+        Assert.True(ControlMessageCodec.TryDecodeMeshRtt(body, out _, out _, out _,
+            out _, out _, out var silent));
+        Assert.Equal(new[] { 0, 2 }, silent);
     }
 
     [Fact]
@@ -178,25 +193,36 @@ public class ControlMessageCodecTests
     {
         var body = ControlMessageCodec.EncodeMeshRtt(Gen, 12.0, 20.0, 1, 1);
 
-        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(null!, out _, out _, out _, out _, out _));
-        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(new byte[27], out _, out _, out _, out _, out _));
-        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(new byte[29], out _, out _, out _, out _, out _));
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(null!, out _, out _, out _, out _, out _, out _));
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(new byte[27], out _, out _, out _, out _, out _, out _));
+        // The fixed prefix alone, with no count byte, is one byte short of a valid report.
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(new byte[28], out _, out _, out _, out _, out _, out _));
+
+        // A count byte that promises more silent ports than the body carries.
+        var truncated = ControlMessageCodec.EncodeMeshRtt(Gen, 12.0, 20.0, 1, 1);
+        truncated[ControlMessageCodec.MeshRttSize] = 2;
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(truncated, out _, out _, out _, out _, out _, out _));
+
+        // A silent port past the seat range.
+        var wildPort = ControlMessageCodec.EncodeMeshRtt(Gen, 12.0, 20.0, 1, 1, new[] { 1 });
+        wildPort[ControlMessageCodec.MeshRttSize + 1] = 0xFF;
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(wildPort, out _, out _, out _, out _, out _, out _));
 
         // Negative microseconds would decode as a negative RTT and could only lower the delay.
         var negative = (byte[])body.Clone();
         negative[12] = 0xFF;
-        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(negative, out _, out _, out _, out _, out _));
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(negative, out _, out _, out _, out _, out _, out _));
 
         // More edges measured than exist is a peer overstating its own coverage.
         var overCounted = ControlMessageCodec.EncodeMeshRtt(Gen, 1, 1, 1, 1);
         overCounted[23] = 5;
-        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(overCounted, out _, out _, out _, out _, out _));
+        Assert.False(ControlMessageCodec.TryDecodeMeshRtt(overCounted, out _, out _, out _, out _, out _, out _));
 
         // A high-water below the median is incoherent; clamp rather than report negative jitter.
         var inverted = ControlMessageCodec.EncodeMeshRtt(Gen, 40.0, 40.0, 1, 1);
         WriteBigEndian(inverted, 16, 1000); // high = 1ms, median stays 40ms
         Assert.True(ControlMessageCodec.TryDecodeMeshRtt(inverted, out _, out double median,
-            out double high, out _, out _));
+            out double high, out _, out _, out _));
         Assert.Equal(median, high, 3);
     }
 

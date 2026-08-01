@@ -183,9 +183,23 @@ public sealed partial class NetplayToolForm
     private void RefreshRelayRoutes()
     {
         if (_mesh == null) return;
-        if (_relayPorts.Count == 0) { try { _mesh.SetRelayRoutes([]); } catch { } return; }
-        var live = _peers.FindAll(p => _relayPorts.Contains(p.RemotePort));
-        try { _mesh.SetRelayRoutes(RoutesExcept(live, null)); } catch { }
+        if (_relayPairs.Count == 0)
+        {
+            try { _mesh.SetRelayRoutes([]); _mesh.SetRelayPairs(null); } catch { }
+            return;
+        }
+        // Every port that appears in a carried pair needs a resolvable route — input flows both
+        // ways along a broken edge. The pair filter is what keeps a player's OTHER, working legs
+        // off the relay.
+        var destinations = new HashSet<int>();
+        foreach (var (a, b) in _relayPairs) { destinations.Add(a); destinations.Add(b); }
+        var live = _peers.FindAll(p => destinations.Contains(p.RemotePort));
+        try
+        {
+            _mesh.SetRelayRoutes(RoutesExcept(live, null));
+            _mesh.SetRelayPairs(_relayPairs);
+        }
+        catch { }
     }
 
     /// <summary>Host: re-point our own mesh and re-send each joiner its candidate peer list (used
@@ -485,7 +499,7 @@ public sealed partial class NetplayToolForm
         // Same two lines EndSession clears, for the same reasons: a failed attempt still minted seat
         // tokens, and tokens must not outlive the control channel that authenticated them. Leaving
         // them behind let the next session reuse them via TokenForPort.
-        _relayPorts.Clear();
+        _relayPairs.Clear();
         _portTokens.Clear();
         try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
         ApplySessionHostOwnership(false);
@@ -559,7 +573,7 @@ public sealed partial class NetplayToolForm
         RestorePauseState();
         lock (_hashLock) { _checksums.Clear(); }
 
-        _relayPorts.Clear(); // a fresh session re-measures; nothing from the last one should carry
+        _relayPairs.Clear(); // a fresh session re-measures; nothing from the last one should carry
         _portTokens.Clear(); // tokens must not outlive the control channel that authenticated them
         _netcodeLabel.Text = "Netcode in use: —";
         _netcodeLabel.ForeColor = Color.DimGray;

@@ -464,7 +464,7 @@ public sealed partial class NetplayToolForm
         // the "Auto from ping" checkbox meant turning that checkbox off silently disabled the mesh
         // relay, so a session with an unopenable edge started with no viable route for it and no
         // way to say so. Only the delay ARITHMETIC below is a preference.
-        MeasureLobbyMesh(links, casualties, generation, players, attempt,
+        MeasureLobbyMesh(links, casualties, generation, players, attempt, autoDelay,
             ref worstRttMs, ref worstJitterMs);
         if (!DropCasualties(links, casualties, need, attempt)) return false;
 
@@ -641,7 +641,7 @@ public sealed partial class NetplayToolForm
     /// rollback repair — and it was invisible in the one topology where it matters most.
     /// </summary>
     private void MeasureLobbyMesh(List<PeerLink> links, List<PeerLink> casualties,
-        SessionGeneration generation, int players, int attempt,
+        SessionGeneration generation, int players, int attempt, bool autoDelay,
         ref double worstRttMs, ref double worstJitterMs)
     {
         var mesh = _mesh;
@@ -657,24 +657,42 @@ public sealed partial class NetplayToolForm
 
         int measuredEdges = 0, totalEdges = 0;
         var incomplete = new List<PeerLink>();   // joiners that could not open every direct leg
+        // The joiner-to-joiner edges that never opened, as unordered port pairs. Each report now
+        // NAMES its silent edges, so the relay can carry exactly these instead of everything
+        // addressed to an affected joiner — a joiner short one leg used to get all input relayed
+        // and the session's delay inflated by a hop its working legs were not taking.
+        var relayPairs = new HashSet<(int A, int B)>();
         double rtt = worstRttMs, jitter = worstJitterMs; // ref params cannot be captured below
         RunStartPhase(links, casualties, attempt, "we waited for its mesh measurement", link =>
         {
             var report = Handshake.HostWaitMeshRtt(link.Control, generation);
             totalEdges += report.TotalEdges;
             measuredEdges += report.MeasuredEdges;
-            // A joiner short of its own edge count has at least one direct leg that never opened.
-            //
-            // WHICH leg is not knowable from this report — it carries counts, not identities — and an
-            // earlier version of this comment asserted the host's own leg could not be the missing
-            // one "because it is connected to us". That was wrong: the connection proving it is TCP,
-            // and says nothing about whether UDP reaches us. See InstallMeshRelay for what that costs.
-            if (report.MeasuredEdges < report.TotalEdges) incomplete.Add(link);
+            if (report.MeasuredEdges < report.TotalEdges)
+            {
+                incomplete.Add(link);
+                bool namedAny = false;
+                foreach (int silentPort in report.SilentPorts)
+                {
+                    // The host leg is not a relayable pair: a relay to this joiner RUNS over that
+                    // leg, and a dead one makes the joiner a casualty below, not a relay customer.
+                    if (silentPort == 0 || silentPort == link.RemotePort) continue;
+                    relayPairs.Add(Pair(link.RemotePort, silentPort));
+                    namedAny = true;
+                }
+                // Backstop for a report that says edges are missing without naming them — that
+                // should not happen on this protocol, but an unnamed hole must fail toward the old
+                // over-delivery, not toward a leg silently carried by nobody.
+                if (!namedAny && report.SilentPorts.Count == 0)
+                    foreach (var other in links)
+                        if (!ReferenceEquals(other, link))
+                            relayPairs.Add(Pair(link.RemotePort, other.RemotePort));
+            }
             if (!report.HasMeasurement)
             {
                 UiConnLog($"{link.Label} could not measure any of its {report.TotalEdges} UDP edge(s) — " +
-                          "its direct paths have not opened yet, so the delay below covers only the " +
-                          "edges that did answer.", Color.DarkOrange);
+                          "its direct paths have not opened yet, so only the edges that did answer " +
+                          "are measured.", Color.DarkOrange);
                 return;
             }
             Fold(report.Rtt, ref rtt, ref jitter);
@@ -727,23 +745,27 @@ public sealed partial class NetplayToolForm
             return; // the caller drops them and reopens the lobby
         }
 
-        var relayedPorts = InstallMeshRelay(links, incomplete);
+        InstallMeshRelay(links, incomplete, relayPairs);
 
-        // The relay adds a hop, so the seats riding it are NOT covered by the worst direct edge the
+        // The relay adds a hop, so the legs riding it are NOT covered by the worst direct edge the
         // delay was about to be sized from — and an edge that never opened contributed nothing to
-        // that figure in the first place. Fold in what the relayed route actually costs, from the
-        // host's own legs, which are the two hops it is made of.
-        if (relayedPorts.Count > 0)
+        // that figure in the first place. Fold in what the relayed legs actually cost, from the
+        // host's own legs, which are the two hops each is made of.
+        if (relayPairs.Count > 0)
         {
             var hostLegs = new Dictionary<int, double>();
             foreach (var edge in mesh.DescribeEdges())
                 if (edge.Measured) hostLegs[edge.RemotePort] = edge.MedianMs;
-            double relayRttMs = LobbyDelayPolicy.RelayRouteRttMs(hostLegs, relayedPorts);
+            double relayRttMs = LobbyDelayPolicy.RelayRouteRttMs(hostLegs, relayPairs);
             if (relayRttMs > worstRttMs)
             {
-                UiConnLog($"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
+                UiConnLog(autoDelay
+                        ? $"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
                           $"direct path's ~{worstRttMs:F0}ms — sizing the delay from the relayed " +
-                          "figure, since that is the one those players are actually using.",
+                          "figure, since that is the one those players are actually using."
+                        : $"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
+                          $"direct path's ~{worstRttMs:F0}ms. Automatic delay is off, so nothing " +
+                          "sizes to that figure — check the manual delay covers it.",
                     Color.DarkOrange);
                 worstRttMs = relayRttMs;
             }
@@ -755,6 +777,9 @@ public sealed partial class NetplayToolForm
             if (sample.JitterMs > jitter) jitter = sample.JitterMs;
         }
     }
+
+    /// <summary>An unordered port pair, normalised so (2,4) and (4,2) are the same edge.</summary>
+    private static (int A, int B) Pair(int a, int b) => a < b ? (a, b) : (b, a);
 
     /// <summary>Whether ANY endpoint of this peer has answered on UDP — i.e. whether the host has a
     /// real mesh path to it, as distinct from the TCP control link it arrived on. The learned
@@ -782,53 +807,47 @@ public sealed partial class NetplayToolForm
     /// deterministic, shows up in the log, and cannot oscillate under packet loss; live failover is a
     /// harder problem and deliberately left alone.
     ///
-    /// Deliberately coarse: the report a joiner sends back still says HOW MANY of its edges answered,
-    /// not which, so a joiner short even one leg gets everything relayed to it. That over-delivers
-    /// rather than under-delivers, and a duplicate is free — input is keyed by (port, frame), so a
-    /// relayed copy arriving beside a direct one is discarded. Each joiner now NAMES its silent edges
-    /// in its own log, which is where a player needs them; narrowing the relay itself would mean
-    /// putting those names on the wire, for a bandwidth saving nobody has asked for.
+    /// Carries exactly the edges the reports named. This used to be all-or-nothing per joiner —
+    /// the report carried counts, not identities, so a joiner short ONE leg got every player's
+    /// input relayed to it and the session's delay was inflated by a hop its working legs were not
+    /// taking. Duplicates on the named legs are still free — input is keyed by (port, frame), so a
+    /// relayed copy arriving beside a late direct one is discarded.
     /// </summary>
-    /// <returns>The seats whose input this host will forward — what the delay has to cover an extra
-    /// hop for. Empty when nothing is being relayed.</returns>
-    private List<int> InstallMeshRelay(List<PeerLink> links, List<PeerLink> incomplete)
+    private void InstallMeshRelay(List<PeerLink> links, List<PeerLink> incomplete,
+        HashSet<(int A, int B)> pairs)
     {
-        // Relaying is pointless with one joiner: there is no other joiner for it to fail to reach,
-        // and the host's own input already goes to it directly.
-        bool worthRelaying = incomplete.Count > 0 && links.Count >= 2;
-
-        // Stored as PORTS, not as the routes themselves: endpoints change when someone rejoins, and
-        // RefreshRelayRoutes re-resolves these against the live peer list every time that happens.
+        // Stored as PORT PAIRS, not as the routes themselves: endpoints change when someone
+        // rejoins, and RefreshRelayRoutes re-resolves these against the live peer list every time
+        // that happens.
         //
         // Decided here on the lobby thread but RESOLVED later, on the UI thread, by
         // PrepareSessionHost. _peers belongs to the UI thread and is not filled until then, so
         // resolving here would resolve against an empty list — which is what this used to do,
         // leaving the relay holding nothing while the log below claimed it was carrying players.
-        var ports = new List<int>();
-        if (worthRelaying) foreach (var link in incomplete) ports.Add(link.RemotePort);
         InvokeUiBlocking(() =>
         {
-            _relayPorts.Clear();
-            foreach (int p in ports) _relayPorts.Add(p);
+            _relayPairs.Clear();
+            foreach (var p in pairs) _relayPairs.Add(p);
         });
 
-        if (incomplete.Count == 0) return ports;
-        if (!worthRelaying)
+        if (incomplete.Count == 0) return;
+        if (pairs.Count == 0)
         {
-            UiConnLog("a direct UDP path did not answer in the measurement window, but with one " +
-                      "joiner there is no other player to relay to — and the host's link, which is " +
-                      "the only one that carries anything here, has been checked and is live.",
+            UiConnLog("a direct UDP path did not answer in the measurement window, but no " +
+                      "joiner-to-joiner leg is affected — there is nothing for the host to relay, " +
+                      "and every player's host leg has been checked and is live.",
                 Color.DarkOrange);
-            return ports;
+            return;
         }
 
         // Every player still here has a live host leg — MeasureLobbyMesh makes that a precondition
         // rather than a warning, because a relay over a leg that does not exist is a stall dressed
         // up as a rescue. So this can now claim what it delivers without qualification.
-        UiConnLog($"relaying input through this host for {incomplete.Count} player(s) whose direct " +
-                  "paths to the other players did not open. They stay in the session; their input " +
-                  "takes one extra hop, which the delay below now accounts for.", Color.DarkOrange);
-        return ports;
+        var named = new List<string>();
+        foreach (var (a, b) in pairs) named.Add($"P{a + 1}↔P{b + 1}");
+        UiConnLog($"relaying input through this host for {pairs.Count} joiner-to-joiner leg(s) that " +
+                  $"did not open ({string.Join(", ", named)}). Those players stay in the session; " +
+                  "input on the named legs takes one extra hop.", Color.DarkOrange);
     }
 
     /// <summary>
@@ -902,10 +921,16 @@ public sealed partial class NetplayToolForm
 
         mesh.BeginRttBurst(MeshProbeWindowMs);
         Thread.Sleep(MeshProbeWindowMs);
+        // Name the silent edges in the report itself, not only in this side's log: the host can
+        // then relay exactly the broken legs instead of everything addressed to this joiner.
+        var silentPorts = new List<int>();
+        foreach (var edge in mesh.DescribeEdges())
+            if (!edge.Measured) silentPorts.Add(edge.RemotePort);
         if (!mesh.TryGetWorstRttStats(out double medianMs, out double highMs,
                 out int measuredRoutes, out int totalRoutes))
-            return new LobbyMeshSample(default, 0, routes.Count);
-        return new LobbyMeshSample(new LobbyRttSample(medianMs, highMs), measuredRoutes, totalRoutes);
+            return new LobbyMeshSample(default, 0, routes.Count, silentPorts);
+        return new LobbyMeshSample(new LobbyRttSample(medianMs, highMs), measuredRoutes, totalRoutes,
+            silentPorts);
     }
 
     /// <summary>Lobby RTT probe with the deadline on whichever pipe the link actually uses.</summary>

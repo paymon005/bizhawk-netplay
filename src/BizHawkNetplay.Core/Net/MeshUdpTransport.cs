@@ -73,6 +73,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private volatile RouteTable _routeTable = RouteTable.Empty;
     // Host only: peers to echo every other peer's input to, because their direct legs never opened.
     private volatile PeerRoute[] _relayRoutes = [];
+    private volatile HashSet<int>? _relayPairs;    // PairKey set; null = no filter
 
     // --- endpoint learning (the symmetric-NAT fix) ---------------------------------------------
     // Our own token, announced in THello, and the tokens we will accept from others. Both are
@@ -247,12 +248,31 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     public static MeshUdpTransport Bind(int localPort) => new(localPort);
 
     /// <summary>
-    /// Peers whose direct joiner-to-joiner paths did not open, so this node forwards every other
-    /// peer's input to them. Host only, decided once at session start; empty is the normal case and
-    /// costs a single array length check per received datagram.
+    /// Peers whose direct joiner-to-joiner paths did not open, so this node forwards input to them.
+    /// Host only, decided once at session start; empty is the normal case and costs a single array
+    /// length check per received datagram. Which authors are forwarded to which destinations is
+    /// governed by <see cref="SetRelayPairs"/>.
     /// </summary>
     public void SetRelayRoutes(IEnumerable<PeerRoute> routes) =>
         _relayRoutes = routes == null ? [] : routes.ToArray();
+
+    /// <summary>
+    /// The joiner-to-joiner edges this node is carrying, as unordered port pairs. The relay used to
+    /// be all-or-nothing per destination — a joiner short ONE direct leg got every other player's
+    /// input relayed to it, and the delay was then inflated by a relay hop the working legs were
+    /// not taking. With the pairs named, input from A is forwarded to B only when the A–B edge is
+    /// one the lobby actually decided to carry. Null means no filter (forward to every relay
+    /// route), which only tests and older call sites use.
+    /// </summary>
+    public void SetRelayPairs(IEnumerable<(int A, int B)>? pairs)
+    {
+        if (pairs == null) { _relayPairs = null; return; }
+        var set = new HashSet<int>();
+        foreach (var (a, b) in pairs) set.Add(PairKey(a, b));
+        _relayPairs = set;
+    }
+
+    private static int PairKey(int a, int b) => a < b ? (a << 8) | b : (b << 8) | a;
 
     /// <summary>How many peers are being relayed to — for the session log, and zero when the mesh
     /// is fully connected.</summary>
@@ -1102,9 +1122,13 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         }
         if (payloadType != RelayedInputType) return;   // not something we know how to address
 
+        var pairs = _relayPairs;
         foreach (var route in _relayRoutes)
         {
             if (route.RemotePort == payloadPort) continue;  // never bounce input back to its author
+            // Only the edges the lobby decided to carry: input from an author whose direct path to
+            // this destination works keeps riding that path alone.
+            if (pairs != null && !pairs.Contains(PairKey(payloadPort, route.RemotePort))) continue;
             var endpoint = SelectSendCandidate(route, now);
             if (endpoint == null) continue; // no live path to relay over yet; direct copies still flow
             SendFramed(buffer, 0, n, endpoint);

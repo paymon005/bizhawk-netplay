@@ -286,10 +286,10 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private SessionGeneration _pendingReconnectGeneration;
     private const double ReconnectTimeoutSeconds = 60.0;
     // Host session context stashed so a rejoiner can be re-greeted with the same identity/params.
-    // Host: the controller ports whose direct joiner-to-joiner legs did not open, so input to them is
-    // relayed. Kept as ports rather than routes because endpoints change on a rejoin — see
-    // RefreshRelayRoutes.
-    private readonly HashSet<int> _relayPorts = [];
+    // Host: the joiner-to-joiner edges that did not open, as unordered port pairs, so input on those
+    // legs — and only those — is relayed. Kept as ports rather than routes because endpoints change
+    // on a rejoin — see RefreshRelayRoutes.
+    private readonly HashSet<(int A, int B)> _relayPairs = [];
     // Volatile: written on the UI thread when hosting starts, read by the reconnect accept loop when
     // it re-greets a returning joiner.
     private volatile PeerIdentity? _hostIdentity;
