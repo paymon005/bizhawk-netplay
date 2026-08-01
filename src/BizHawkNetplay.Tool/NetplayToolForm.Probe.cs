@@ -235,9 +235,12 @@ public sealed partial class NetplayToolForm
         return new CapabilityProbe(a, new StopwatchClock(), samples: ProbeSamplesFor(a))
             .Run(budget, budget * 0.25,
                 elideConfirmedSaves: true, repairBudgetMs: RepairBudgetFrames * budget,
-                // Same constant the session's tuning uses. A depth solved against a different
-                // snapshot spacing than the one the repair will run is a depth nothing checked.
-                keyframeInterval: RepairKeyframeInterval);
+                // 0 = the probe picks the spacing that buys THIS core the most depth, and reports
+                // it back; the session is then required to run that value (see
+                // _sessionKeyframeInterval). It used to be one constant chosen from N64
+                // measurements, which is the right answer for N64 and the wrong one wherever the
+                // snapshot does not dominate the frame.
+                keyframeInterval: 0);
     }
 
     /// <summary>
@@ -282,8 +285,12 @@ public sealed partial class NetplayToolForm
             // plus its share of a snapshot at the keyframe spacing the session will run. Seeds
             // the strategy's cost cap so the first deep repair of a session is not the thing that
             // discovers it — see RollbackTuning.SeedRepairPerFrameMs.
+            // The spacing the depth above was solved against. The session MUST run this exact
+            // value: a depth checked against one snapshot spacing says nothing about a repair
+            // performed at another.
+            _sessionKeyframeInterval = result.KeyframeInterval;
             _probeRepairPerFrameMs = result.MedianFrameMs
-                + result.MedianSaveMs / Math.Max(1, RepairKeyframeInterval);
+                + result.MedianSaveMs / Math.Max(1, _sessionKeyframeInterval);
             _probeSaveMs = result.MedianSaveMs;
             Log($"rollback probe — {DescribeProbe(result, a)}");
             if (!result.ReplayDeterministic)

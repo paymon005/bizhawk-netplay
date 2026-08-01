@@ -92,6 +92,59 @@ public class CapabilityProbeTests
         Assert.True(depth >= ProbeResult.RollbackDepthThreshold);
     }
 
+    /// <summary>
+    /// The snapshot spacing was one constant for every core, taken from N64 measurements. What
+    /// makes wide spacing pay is the snapshot dominating the frame — nearly 3:1 on N64, well under
+    /// 1:1 on the Hawk cores, where the walk-back is pure loss. Both terms are measured by the
+    /// time the question is asked, so the machine picks its own.
+    /// </summary>
+    [Fact]
+    public void SolveKeyframeInterval_PicksTheSpacingEachCoreActuallyWants()
+    {
+        const double budget = 16.683, headroom = 16.683 * 0.25;
+
+        // N64: save 6.084 against a 1.966ms frame. Spacing pays, and the measured knee is 2 —
+        // past 3 the walk-back costs more frames than the snapshots it avoids.
+        int n64 = CapabilityProbe.SolveKeyframeInterval(budget, headroom, 1.966, 1.966, 1.505, 6.084,
+            elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+        Assert.InRange(n64, 2, 3);
+        // And it must beat the every-frame spacing it replaced, or there was no reason to solve it.
+        Assert.True(
+            CapabilityProbe.SolveMaxDepth(budget, headroom, 1.966, 1.966, 1.505, 6.084, true, 2 * budget, n64) >
+            CapabilityProbe.SolveMaxDepth(budget, headroom, 1.966, 1.966, 1.505, 6.084, true, 2 * budget, 1),
+            "the solved spacing should buy more depth than snapshotting every frame");
+
+        // A light core (GPGX-shaped): the save is a fraction of the frame, so the arithmetic still
+        // offers a couple more frames of depth for the walk-back — but at depths in the twenties,
+        // which nothing will ever predict to. Past the useful ceiling the extra replayed frames
+        // per repair are pure loss, so the cheaper spacing wins.
+        int light = CapabilityProbe.SolveKeyframeInterval(budget, headroom, 1.2, 1.2, 0.2, 0.4,
+            elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+        Assert.Equal(1, light);
+        Assert.True(
+            CapabilityProbe.SolveMaxDepth(budget, headroom, 1.2, 1.2, 0.2, 0.4, true, 2 * budget, 1)
+                >= CapabilityProbe.UsefulDepthCeiling,
+            "the premise is that this core is already past the ceiling at every spacing");
+    }
+
+    /// <summary>The probe solves the spacing when asked to (0) and reports the value back, because
+    /// the session is then required to run exactly that — a depth checked at one spacing says
+    /// nothing about a repair performed at another.</summary>
+    [Fact]
+    public void Run_ReportsTheKeyframeIntervalItSolvedAgainst()
+    {
+        var emu = new FakeEmuAdapter(portCount: 2);
+        var clock = new ManualClock(Enumerable.Repeat(0.05, 400));
+
+        var asked = new CapabilityProbe(emu, clock, samples: 20)
+            .Run(16.639, 4.0, elideConfirmedSaves: true, repairBudgetMs: 33.0, keyframeInterval: 3);
+        Assert.Equal(3, asked.KeyframeInterval); // an explicit request is still honoured
+
+        var solved = new CapabilityProbe(emu, clock, samples: 20)
+            .Run(16.639, 4.0, elideConfirmedSaves: true, repairBudgetMs: 33.0, keyframeInterval: 0);
+        Assert.InRange(solved.KeyframeInterval, 1, CapabilityProbe.MaxKeyframeInterval);
+    }
+
     [Fact]
     public void Run_DisqualifiesACoreThatDoesNotReproduceOnReplay()
     {

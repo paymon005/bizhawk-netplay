@@ -560,29 +560,32 @@ public sealed partial class NetplayToolForm
     {
         ElideConfirmedSaves = true,
         ChecksumAnchorInterval = ChecksumInterval,
-        KeyframeInterval = RepairKeyframeInterval,
+        KeyframeInterval = _sessionKeyframeInterval,
         RepairBudgetMs = RepairBudgetFrames * FrameMs(),
         SeedRepairPerFrameMs = _probeRepairPerFrameMs,
         Clock = new StopwatchClock(),
     };
 
     /// <summary>
-    /// Snapshot every other predicted frame rather than every one.
+    /// How many predicted frames apart this session's snapshots sit, solved by the capability
+    /// probe from THIS core's measured save and frame costs
+    /// (<see cref="CapabilityProbe.SolveKeyframeInterval"/>).
     ///
     /// The snapshot is what a repair spends its budget on: measured on N64 over eight stationary
-    /// runs, a repaired frame costs 9.24ms of which 6.82ms is the snapshot and 2.41ms is the frame.
-    /// Halving the snapshots costs at most one extra re-simulated frame per correction, and buys a
-    /// frame of prediction depth — worth about 17ms of hideable one-way latency.
+    /// runs, a repaired frame costs 9.24ms of which 6.82ms is the snapshot and 2.41ms is the
+    /// frame. Spacing them apart costs at most one extra re-simulated frame per correction and
+    /// buys prediction depth — worth about 17ms of hideable one-way latency per frame gained.
     ///
-    /// The second effect is the one that shows up as feel rather than as a number. A worst-case
-    /// repair at this depth costs ~27ms against ~31.5ms before, which is the first time it fits
-    /// inside <see cref="TickBudgetMs"/> (~28.4ms at 60Hz). Until now every max-depth correction
-    /// overran its own tick and landed as a hitch.
+    /// It was the constant 2 for every core, which is N64's answer: that ratio is nearly 3:1 there
+    /// and well under 1:1 on the Hawk cores, where the walk-back is pure loss. The probe measures
+    /// both terms anyway and the depth model already takes the spacing exactly, so the machine
+    /// picks its own. The value MUST be the one the probe solved against — a depth checked at one
+    /// spacing says nothing about a repair performed at another — so it is written only there.
     ///
-    /// Not raised further on purpose: past 3 the walk-back to the nearest keyframe costs more
-    /// frames than the snapshots it avoids, and the measured depth goes back down.
+    /// 1 until a probe has run, which is also what a lockstep-only session (that never pays for
+    /// one) correctly gets: snapshot every predicted frame, the original behaviour.
     /// </summary>
-    private const int RepairKeyframeInterval = 2;
+    private int _sessionKeyframeInterval = 1;
 
     // Reflection flags for reaching EmuHawk internals (Tools/LuaConsole members aren't all public).
     private const System.Reflection.BindingFlags AnyInstance =

@@ -34,7 +34,9 @@ public sealed class CapabilityProbe
     /// more than a single frame period on it. 0 keeps the original one-frame ceiling.</param>
     /// <param name="keyframeInterval">Snapshot spacing the session will run
     /// (see <see cref="Sync.RollbackTuning.KeyframeInterval"/>). MUST match it: a depth solved
-    /// against a different spacing was never checked against the repair the session will perform.</param>
+    /// against a different spacing was never checked against the repair the session will perform.
+    /// Pass 0 to have the probe pick the spacing that buys this machine the most depth and report
+    /// it back in <see cref="ProbeResult.KeyframeInterval"/> — which the session must then run.</param>
     public ProbeResult Run(double frameBudgetMs, double headroomMs,
         bool elideConfirmedSaves = false, double repairBudgetMs = 0, int keyframeInterval = 1)
     {
@@ -111,6 +113,13 @@ public sealed class CapabilityProbe
         double solveFrame = solveFromRepair ? repair.MarginalFrameMs : medianFrame;
         double solveLoad = solveFromRepair ? repair.ImpliedLoadMs : medianLoad;
         double solveSave = solveFromRepair ? repair.MarginalSaveMs : medianSave;
+
+        // 0 means "you choose": the caller has no per-core figure to reason from, and by this point
+        // the probe does. Everything below — the verdict, the marginal reading, the value the
+        // session is required to run — then uses the spacing this machine actually wants.
+        if (keyframeInterval < 1)
+            keyframeInterval = SolveKeyframeInterval(frameBudgetMs, headroomMs, medianLiveFrame,
+                solveFrame, solveLoad, solveSave, elideConfirmedSaves, repairBudgetMs);
 
         int depth = SolveMaxDepth(
             frameBudgetMs, headroomMs, medianLiveFrame, solveFrame, solveLoad, solveSave,
@@ -331,6 +340,64 @@ public sealed class CapabilityProbe
         }
         return DepthSearchCeiling;
     }
+
+    /// <summary>
+    /// Widest snapshot spacing the solver may choose.
+    ///
+    /// A hard stop rather than a natural knee, because depth alone does not tell the whole story.
+    /// <see cref="SolveMaxDepth"/> asks whether the WORST repair fits the budget, and wider
+    /// spacing keeps buying depth by that test — but every correction, including the shallow ones
+    /// that make up most of them, pays the full walk-back of up to N-1 extra replayed frames. So
+    /// the typical repair keeps getting dearer after the point where the deepest one stops being
+    /// the constraint. Measured on N64 with the repair's own marginal terms, the depth itself
+    /// turns over past 3; the isolated terms are optimistic enough to keep climbing, which is
+    /// exactly the direction a cap should not trust.
+    /// </summary>
+    internal const int MaxKeyframeInterval = 3;
+
+    /// <summary>
+    /// The snapshot spacing that buys this machine the most prediction depth, for terms it has
+    /// just measured.
+    ///
+    /// The spacing used to be one constant for every core, chosen from N64 measurements. That is
+    /// the right answer for N64 and the wrong one elsewhere: what makes wide spacing pay is the
+    /// snapshot dominating the frame, and the ratio that decides it runs from about 3:1 on N64 to
+    /// well under 1:1 on the Hawk cores, where the walk-back is pure loss. Both terms are already
+    /// measured by the time this is asked, and <see cref="SolveMaxDepth"/> already models the
+    /// spacing exactly, so the machine can simply be asked which one it wants.
+    ///
+    /// Ties go to the SMALLER interval, and depth is counted only up to
+    /// <see cref="UsefulDepthCeiling"/>. Both rules exist for the same reason: wider spacing keeps
+    /// buying depth long after the depth stops being reachable, while every correction — including
+    /// the shallow ones that are most of them — pays the walk-back for it. On a light core the
+    /// arithmetic offers depth 21 against 19 for an extra replayed frame per repair, and neither
+    /// number is a depth anything will ever predict to. Taking the cheaper one is free.
+    /// </summary>
+    internal static int SolveKeyframeInterval(
+        double frameBudgetMs, double headroomMs,
+        double liveFrameMs, double repairFrameMs, double loadMs, double saveMs,
+        bool elideConfirmedSaves, double repairBudgetMs)
+    {
+        int best = 1;
+        int bestDepth = -1;
+        for (int n = 1; n <= MaxKeyframeInterval; n++)
+        {
+            int depth = Math.Min(UsefulDepthCeiling, SolveMaxDepth(frameBudgetMs, headroomMs,
+                liveFrameMs, repairFrameMs, loadMs, saveMs, elideConfirmedSaves, repairBudgetMs, n));
+            if (depth > bestDepth) { bestDepth = depth; best = n; }
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// Depth past which more is not worth paying for, when choosing a snapshot spacing.
+    ///
+    /// A session clamps its ring to a comparable figure so re-simulation cost and memory stay
+    /// bounded, and time-sync trims the live horizon well below it — so depth beyond this is
+    /// arithmetic, not latency anyone will hide. Kept deliberately in step with the tool's ring
+    /// clamp; the two disagreeing costs nothing worse than a slightly conservative spacing.
+    /// </summary>
+    internal const int UsefulDepthCeiling = 16;
 
     /// <summary>Frames replayed on each side of the determinism check. Long enough for a divergence
     /// to spread into main memory, short enough that the whole check is a fraction of a second.</summary>
