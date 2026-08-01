@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.26.0 | **15** | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
+| v0.27.0 | **16** | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
+| v0.26.0 | 15 | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
 | v0.24.0 – v0.25.0 | 14 | WELCOME carries per-seat mesh tokens and peers announce themselves with them over UDP. An older build sends no token, so its packets stay unroutable to anyone whose NAT rewrote the source port — silent one-way input loss rather than a refusal, hence the bump. |
 | v0.21.0 – v0.23.0 | 13 | Resync and reconnect states are deflated on the wire. |
 | v0.20.0 | 12 | The lobby measures every UDP mesh edge and the host publishes the settled delay in its own control frame (`MeshRtt` / `InputDelay`), which an older build neither sends nor expects. |
@@ -21,6 +22,26 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.27.0 — what a stranger can reach before they have proved anything
+
+**Protocol 16 — everyone must update.** A v0.26.0 peer and a v0.27.0 peer refuse each other at the
+handshake. The host's opening greeting is now a challenge rather than its whole identity, so the
+two builds disagree about the message sequence; the version check catches that first and says so.
+
+Comes out of a security review of what an open port exposes. The headline is a second, separate way
+to point this machine at a stranger — v0.26.0 closed one, and missed this one. A single 22-byte UDP
+datagram naming any address turned on the full input stream toward it, about 72 KB/s, from someone
+who had sent 22 bytes and nothing else, re-aimable at will. Alongside it, the host's greeting no longer
+hands its ROM, core, sync settings and — on N64 — a path containing the Windows username to anyone
+who opens a socket; a peer's claim about its own public address is checked against where it actually
+reaches you from; and several places where a peer chose how much this tool wrote to your disk are
+now bounded.
+
+Two things this release does **not** change, both stated plainly in the notes: sessions with no
+password remain open by design, which makes the identity split a speed bump rather than a gate on
+them; and a joiner still imports a savestate from its host, which on waterbox cores reaches
+BizHawk's own state reader. That one is upstream and is recorded as KI-13.
 
 ### v0.26.0 — a crash, an amplifier, and a relay that talked to itself
 
