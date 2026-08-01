@@ -591,6 +591,32 @@ internal sealed partial class EmuHawkAdapter
     public string? ConsoleControlsNote { get; private set; }
 
     /// <summary>
+    /// True when the core has controls but NONE carry a player prefix — single-player hardware
+    /// modelled as one unnumbered surface (Lynx: "Up"/"A"/"Option 1"; Gambatte GB likewise). Such a
+    /// core has no second seat to give a remote player, so hosting is refused; this flag lets the
+    /// refusal say "single-player hardware" instead of advising the impossible.
+    /// </summary>
+    public bool AllControlsUnprefixed
+    {
+        get
+        {
+            var def = _emulator.ControllerDefinition;
+            bool any = false;
+            foreach (var b in def.BoolButtons)
+            {
+                any = true;
+                if (IsPlayerControl(b)) return false;
+            }
+            foreach (var a in def.Axes.Keys)
+            {
+                any = true;
+                if (IsPlayerControl(a)) return false;
+            }
+            return any;
+        }
+    }
+
+    /// <summary>
     /// Give the unprefixed, console-level controls a home on port 0 — the host's port.
     ///
     /// BuildLayouts groups controls by player number and player 0 — no prefix — got dropped

@@ -36,7 +36,15 @@ public sealed partial class NetplayToolForm
             int portCount = _adapter.PortCount; // controller ports the core exposes (N64 = 4, Genesis = 2…)
             if (_hostRadio.Checked && portCount < 2)
             {
-                Log($"this core exposes only {portCount} controller port — configure at least 2 controllers to host netplay.");
+                // A Lynx or Game Boy names its whole surface without player numbers because the
+                // hardware seats exactly one player — there is no second port to configure, so
+                // advising "configure 2 controllers" would be advising the impossible.
+                Log(_adapter.AllControlsUnprefixed
+                    ? "this core is single-player hardware — its controls carry no player numbers, " +
+                      "so there is no second seat to give a remote player. Netplay needs a core " +
+                      "with at least 2 controller ports."
+                    : $"this core exposes only {portCount} controller port — configure at least 2 " +
+                      "controllers to host netplay.");
                 SetBusy(false); return;
             }
             // The host picks how many of those ports to actually fill (e.g. 2-player on an N64's 4);
