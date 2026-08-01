@@ -51,6 +51,25 @@ public sealed class ControlChannel
 {
     private const int MaxFrameLength = 64 * 1024 * 1024; // 64 MiB ceiling (states are ~1 MiB)
 
+    /// <summary>
+    /// Ceiling for every message type that is NOT a whole savestate.
+    ///
+    /// The 64MiB cap exists for states, and applying it uniformly meant a Ping could declare 64MiB
+    /// and have it allocated before anything looked at the type. Worse for the text bodies: the
+    /// handshake decoders split them into lines and build dictionaries two or three separate times,
+    /// so a 64MiB WELCOME was several hundred megabytes of transient strings on the joiner. These
+    /// bodies are around a kilobyte in practice; refusing at the header costs one comparison and
+    /// never allocates.
+    /// </summary>
+    private const int MaxSmallFrameLength = 256 * 1024;
+
+    /// <summary>Whether this message type may legitimately carry a whole-core savestate.</summary>
+    private static bool CarriesState(ControlMessageType type) =>
+        type is ControlMessageType.State or ControlMessageType.Resync;
+
+    private static int MaxLengthFor(ControlMessageType type) =>
+        CarriesState(type) ? MaxFrameLength : MaxSmallFrameLength;
+
     private readonly Stream _stream;
     private readonly object _writeLock = new();
 
@@ -73,8 +92,9 @@ public sealed class ControlChannel
     public void Send(ControlMessageType type, byte[] body)
     {
         if (body == null) body = [];
-        if (body.Length > MaxFrameLength)
-            throw new ArgumentException($"Frame body {body.Length} exceeds cap");
+        if (body.Length > MaxLengthFor(type))
+            throw new ArgumentException(
+                $"Frame body {body.Length} exceeds the {MaxLengthFor(type)}-byte cap for {type}");
         var header = new byte[5];
         header[0] = (byte)type;
         WriteInt32BE(header, 1, body.Length);
@@ -92,8 +112,10 @@ public sealed class ControlChannel
         var header = ReadFully(5);
         var type = (ControlMessageType)header[0];
         int len = ReadInt32BE(header, 1);
-        if (len < 0 || len > MaxFrameLength)
-            throw new InvalidDataException($"Frame length {len} out of range");
+        int max = MaxLengthFor(type);
+        if (len < 0 || len > max)
+            throw new InvalidDataException(
+                $"Frame length {len} out of range for {type} (max {max})");
         var body = len == 0 ? [] : ReadBody(len);
         return (type, body);
     }

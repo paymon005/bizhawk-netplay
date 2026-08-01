@@ -232,6 +232,15 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// is fully connected.</summary>
     public int RelayRouteCount => _relayRoutes.Length;
 
+    /// <summary>The candidates actually installed for one seat, after filtering and the global cap.
+    /// Empty for a seat with no route. Exposed so the filtering rules can be asserted.</summary>
+    public IReadOnlyList<IPEndPoint> RouteCandidates(int remotePort)
+    {
+        foreach (var route in _routeTable.Routes)
+            if (route.RemotePort == remotePort) return route.Candidates;
+        return Array.Empty<IPEndPoint>();
+    }
+
     /// <summary>
     /// Synthetic port numbers for punch targets admitted while a lobby is already up start here.
     /// Far above any real seat, so a placeholder can never land on — and evict — a port the lobby
@@ -278,6 +287,36 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// route, so an endpoint advertised twice is probed and sent to only once. Repeated entries for the
     /// same remote port are merged in their original order.
     /// </summary>
+    /// <summary>
+    /// An address this socket can actually send to, and should be willing to.
+    ///
+    /// The socket is bound IPv4, so a v6 candidate makes SendTo raise — and candidates arrive from
+    /// the wire, redistributed by the host to every joiner. Multicast, broadcast and 0.0.0.0 parse
+    /// as perfectly good endpoints and are never a peer: the punch loop probes every candidate four
+    /// times a second and the no-confirmed-path fallback broadcasts input to all of them, so an
+    /// unroutable candidate is not merely useless but something the tool can be talked into
+    /// pointing at a third party. Filtered here rather than in the codec, because it is this
+    /// socket's address family that decides it — the codec stays able to represent what it is given.
+    /// </summary>
+    private static bool IsRoutableUnicastV4(IPEndPoint endpoint)
+    {
+        if (endpoint.AddressFamily != AddressFamily.InterNetwork) return false;
+        if (endpoint.Port is <= 0 or > 65535) return false;
+        var address = endpoint.Address;
+        if (address.Equals(IPAddress.Any) || address.Equals(IPAddress.Broadcast)) return false;
+        byte first = address.GetAddressBytes()[0];
+        if ((first & 0xF0) == 0xE0) return false;   // 224.0.0.0/4 multicast
+        if (first == 255) return false;             // 255.0.0.0/8 — never a unicast peer
+        return true;
+    }
+
+    /// <summary>
+    /// Total candidates the table will hold, across every route. The punch loop and the
+    /// no-confirmed-path broadcast both scale with this, so it is bounded rather than trusted —
+    /// four players advertising three addresses each is twelve.
+    /// </summary>
+    private const int MaxRoutedEndpoints = 64;
+
     public void SetPeerRoutes(IEnumerable<PeerRoute> routes)
     {
         if (routes == null) throw new ArgumentNullException(nameof(routes));
@@ -298,6 +337,11 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             }
             foreach (var endpoint in route.Candidates)
             {
+                // Dropped, not thrown: an unroutable or surplus candidate degrades exactly as one
+                // that never answers already does, and a route table arriving from a peer must
+                // never be able to end the session.
+                if (!IsRoutableUnicastV4(endpoint)) continue;
+                if (endpoints.Count >= MaxRoutedEndpoints) break;
                 if (!globallySeen.Add(endpoint)) continue;
                 candidates.Add(endpoint);
                 endpoints.Add(endpoint);

@@ -609,6 +609,41 @@ public class MeshUdpTransportTests
         finally { host.Dispose(); b.Dispose(); c.Dispose(); }
     }
 
+    /// <summary>
+    /// Candidates arrive from the wire and are redistributed by the host, so the route table must
+    /// refuse the ones this socket can never send to — a v6 address raises on SendTo, and
+    /// multicast/broadcast/0.0.0.0 are never a peer but WOULD be probed four times a second and
+    /// broadcast to. It also bounds the total, because both of those costs scale with it.
+    /// </summary>
+    [Fact]
+    public void RoutesRefuseUnroutableCandidatesAndAreBounded()
+    {
+        var mesh = MeshUdpTransport.Bind(0);
+        try
+        {
+            var good = Loop(47800);
+            mesh.SetPeerRoutes(new[]
+            {
+                new PeerRoute(1, new[]
+                {
+                    good,
+                    new IPEndPoint(IPAddress.Parse("224.0.0.1"), 47800),   // multicast
+                    new IPEndPoint(IPAddress.Broadcast, 47800),
+                    new IPEndPoint(IPAddress.Any, 47800),
+                    new IPEndPoint(IPAddress.Parse("::1"), 47800),          // wrong address family
+                }),
+            });
+            Assert.Equal(new[] { good }, mesh.RouteCandidates(1));
+
+            // A peer claiming hundreds of candidates cannot turn this socket into a packet engine.
+            var flood = new List<IPEndPoint>();
+            for (int i = 0; i < 500; i++) flood.Add(Loop(20000 + i));
+            mesh.SetPeerRoutes(new[] { new PeerRoute(1, flood) });
+            Assert.InRange(mesh.RouteCandidates(1).Count, 1, 64);
+        }
+        finally { mesh.Dispose(); }
+    }
+
     /// <summary>An input datagram as the codec lays it out, far enough to be addressable: type 1,
     /// then the author's seat, then a tail that stands in for the payload.</summary>
     private static byte[] Input(byte port, byte tail) => [1, port, tail];

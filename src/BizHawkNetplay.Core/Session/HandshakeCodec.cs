@@ -136,11 +136,47 @@ public static class HandshakeCodec
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
+    /// <summary>
+    /// Largest candidate list one route may carry.
+    ///
+    /// A peer advertises a LAN address, a reflexive address and occasionally a second interface —
+    /// three or four in practice. The cap is not about those: nothing bounded this at all, and the
+    /// candidates feed the punch loop, which probes every one of them four times a second, and the
+    /// no-confirmed-path fallback, which broadcasts input to every one of them. A WELCOME claiming
+    /// a million endpoints turned the receiving joiner into a packet engine aimed wherever the
+    /// sender chose. Extra candidates past the cap are dropped, which degrades exactly as a
+    /// candidate that never answers already does.
+    /// </summary>
+    public const int MaxCandidatesPerRoute = 8;
+
+    /// <summary>
+    /// Largest text control body worth parsing.
+    ///
+    /// Not a guess: a peer may legitimately send MaxSyncFields entries, and a peer on a build with
+    /// different truncation rules may send values longer than MaxSyncFieldChars — the decoder's job
+    /// is to CAP those, gracefully, so a core with verbose sync settings still connects with a
+    /// truncated explanation rather than failing the handshake. A megabyte is an order of magnitude
+    /// above anything that shape can produce and still 64× below the control channel's savestate
+    /// ceiling, which is what used to apply here: a 64MiB WELCOME was several hundred megabytes of
+    /// transient strings on the joiner, because these bodies get split and dictionary-built two or
+    /// three separate times each.
+    /// </summary>
+    public const int MaxTextBodyBytes = 1024 * 1024;
+
+    private static void RefuseOversizedText(byte[] body)
+    {
+        if (body.Length > MaxTextBodyBytes)
+            throw new FormatException(
+                $"control body of {body.Length} bytes exceeds the {MaxTextBodyBytes}-byte limit for " +
+                "a text frame");
+    }
+
     /// <summary>Decode grouped peer routes, combining repeated groups and skipping malformed
     /// candidate endpoints. Invalid remote controller ports are ignored as untrusted input.</summary>
     public static List<PeerRoute> DecodeRoutes(byte[] body)
     {
         if (body == null) throw new ArgumentNullException(nameof(body));
+        RefuseOversizedText(body);
 
         var byPort = new Dictionary<int, List<IPEndPoint>>();
         var seenByPort = new Dictionary<int, HashSet<IPEndPoint>>();
@@ -163,7 +199,7 @@ public static class HandshakeCodec
                 order.Add(remotePort);
             }
             var seen = seenByPort[remotePort];
-            for (int i = 1; i < fields.Length; i++)
+            for (int i = 1; i < fields.Length && candidates.Count < MaxCandidatesPerRoute; i++)
                 if (TryParseEndpoint(fields[i], out var candidate) && seen.Add(candidate))
                     candidates.Add(candidate);
         }
@@ -203,6 +239,7 @@ public static class HandshakeCodec
     public static MeshTokens DecodeTokens(byte[] body)
     {
         if (body == null) throw new ArgumentNullException(nameof(body));
+        RefuseOversizedText(body);
         byte[]? local = null;
         var peers = new Dictionary<int, byte[]>();
         foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
@@ -245,6 +282,8 @@ public static class HandshakeCodec
     /// <summary>Decode a PeerList body into endpoints, skipping any malformed line (untrusted input).</summary>
     public static List<IPEndPoint> DecodeEndpoints(byte[] body)
     {
+        if (body == null) throw new ArgumentNullException(nameof(body));
+        RefuseOversizedText(body);
         var list = new List<IPEndPoint>();
         foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
         {
@@ -426,6 +465,7 @@ public static class HandshakeCodec
 
     private static Dictionary<string, string> ParseLines(byte[] body)
     {
+        RefuseOversizedText(body);
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var line in Encoding.UTF8.GetString(body).Split('\n'))
         {
