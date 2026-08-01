@@ -26,10 +26,16 @@ public sealed class ReliableUdpStream : Stream
     private const byte SegFin = 0x03;
 
     private const int Mss = 1024;         // payload bytes per DATA segment (outer framing kept < MTU)
-    private const int Window = 128;       // segments in flight (flow control): 128 KiB
+    private const int Window = 128;       // segments in flight, ceiling (flow control): 128 KiB
     private const int RtoStartMs = 500;   // initial retransmit timeout
     private const int RtoMaxMs = 1500;    // backoff ceiling
     private const int DeadRetries = 40;   // consecutive fruitless retransmits of the base -> fault
+
+    /// <summary>
+    /// Floor for the loss-adapted window below. Matches <see cref="RtoBurst"/>: no point offering
+    /// the link fewer segments than a single timer burst re-drives anyway.
+    /// </summary>
+    private const int MinWindow = RtoBurst;
 
     /// <summary>
     /// How much reassembled data may wait for a reader before the sender is made to wait instead.
@@ -51,6 +57,12 @@ public sealed class ReliableUdpStream : Stream
     private long _baseSentTicks;          // when _sendBase was last (re)sent
     private int _rtoMs = RtoStartMs;
     private int _baseRetries;             // consecutive retransmits of _sendBase with no progress
+    // Loss-adapted window (guarded by _gate): Write may burst a full 128-segment window at line
+    // rate, and on a constrained uplink that burst IS the loss — the queue overflows, the tail
+    // drops, and repair proceeds at RtoBurst per timeout. Halve what may be in flight when the
+    // timer fires (evidence of sustained loss, unlike a fast retransmit's single hole), grow it
+    // back one segment per progressing ACK. TCP's shape, at this protocol's scale.
+    private int _effectiveWindow = Window;
     private bool _finSent;
     private uint _finSeq;                 // seq marking end-of-stream (all data seq < _finSeq)
 
@@ -129,11 +141,11 @@ public sealed class ReliableUdpStream : Stream
             lock (_gate)
             {
                 // Flow control: block while the window is full, until ACKs free it (or the link faults).
-                while (!_faulted && !_closed && _unacked.Count >= Window)
+                while (!_faulted && !_closed && _unacked.Count >= _effectiveWindow)
                     Monitor.Wait(_gate, 1000);
                 ThrowIfBroken();
 
-                while (i < end && _unacked.Count < Window)
+                while (i < end && _unacked.Count < _effectiveWindow)
                 {
                     int n = Math.Min(Mss, end - i);
                     var seg = new byte[5 + n];
@@ -157,6 +169,8 @@ public sealed class ReliableUdpStream : Stream
         if (count == 0) return 0;
         int timeoutMs = _readTimeoutMs; // snapshot: one window per Read call
         long deadline = timeoutMs > 0 ? NowMs() + timeoutMs : long.MaxValue;
+        int result;
+        byte[]? ack = null;
         lock (_gate)
         {
             while (true)
@@ -182,16 +196,25 @@ public sealed class ReliableUdpStream : Stream
                     _readableBytes -= written;
                     // Space just came free: take whatever the cap was holding back, so a sender
                     // stalled by backpressure is released on this read rather than on a timeout.
+                    // And if that advanced the base, SAY so — the acknowledgement is the only
+                    // channel the sender is told through, and without one here its next progress
+                    // waits for its own RTO retransmit to provoke a fresh cumulative ACK,
+                    // collapsing a capped transfer to ~Window per RTO.
+                    uint baseBefore = _rcvBase;
                     DrainToReadable();
-                    return written;
+                    if (_rcvBase != baseBefore) ack = MakeAck();
+                    result = written;
+                    break;
                 }
-                if (_finReceived && _rcvBase >= _rcvFinSeq) return 0; // clean EOF
+                if (_finReceived && _rcvBase >= _rcvFinSeq) { result = 0; break; } // clean EOF
                 ThrowIfBroken();
                 long remaining = deadline - NowMs();
                 if (remaining <= 0) throw new IOException("reliable UDP read timed out");
                 Monitor.Wait(_gate, (int)Math.Min(1000, remaining));
             }
         }
+        if (ack != null) _send(ack); // outside the lock, as every other send here is
+        return result;
     }
 
     // ---------------------------------------------------------------- datagram plumbing
@@ -278,6 +301,7 @@ public sealed class ReliableUdpStream : Stream
             _rtoMs = RtoStartMs;
             _duplicateAcks = 0;
             _lastAckValue = ack;
+            if (_effectiveWindow < Window) _effectiveWindow++; // recover the halved window gradually
             Monitor.PulseAll(_gate); // wake a Write blocked on the window
             return null;
         }
@@ -335,11 +359,33 @@ public sealed class ReliableUdpStream : Stream
 
     private const int RtoBurst = 16; // segments resent from the base per timeout (covers a run of losses)
 
+    /// <summary>
+    /// How long the retransmit thread keeps re-driving unacked tail data and the FIN after
+    /// Dispose. Room for the tail to be repaired (a burst per RTO) plus a few FIN re-drives;
+    /// against a peer that is simply gone, the sends land nowhere and the thread exits at the
+    /// deadline. Bounded so a hard teardown never holds a thread for long — and Dispose itself
+    /// never blocks; the linger runs out here in the background.
+    /// </summary>
+    private const int CloseLingerMs = 2000;
+    private long _lingerDeadline;         // guarded by _gate; 0 until Close arms it
+
     private void RetransmitLoop()
     {
         var batch = new List<byte[]>(RtoBurst);
-        while (!_closed && !_faulted)
+        while (!_faulted)
         {
+            if (_closed)
+            {
+                // Closed is not done: Close() queues a FIN, and "sent once" is not "delivered" on
+                // the link this exists for. Keep the timer alive within the linger so a lost tail
+                // or lost FIN is re-driven instead of stranding the peer on a read timeout it
+                // will misreport as a network fault.
+                lock (_gate)
+                {
+                    bool lingering = _finSent && _lingerDeadline != 0 && NowMs() < _lingerDeadline;
+                    if (!lingering) break;
+                }
+            }
             Thread.Sleep(50);
             batch.Clear();
             byte[]? refin = null;
@@ -357,6 +403,7 @@ public sealed class ReliableUdpStream : Stream
                     }
                     _baseSentTicks = now;
                     _rtoMs = Math.Min(RtoMaxMs, _rtoMs * 2);
+                    _effectiveWindow = Math.Max(MinWindow, _effectiveWindow / 2); // sustained loss: back off
                     if (++_baseRetries >= DeadRetries) { _faulted = true; Monitor.PulseAll(_gate); }
                 }
                 // Re-drive a pending FIN whose ACK may have been lost (only once data is all acked).
@@ -398,6 +445,10 @@ public sealed class ReliableUdpStream : Stream
                 _finSeq = _nextSeq; // ends after all data queued so far
                 fin = MakeFin();
             }
+            // Arm the retransmit thread's linger BEFORE _closed is set (base.Close() below runs
+            // Dispose), so there is no instant where the loop can see closed-without-deadline
+            // and exit with the FIN unrepaired.
+            if (_lingerDeadline == 0) _lingerDeadline = NowMs() + CloseLingerMs;
         }
         if (fin != null) { try { _send(fin); } catch { /* best effort */ } }
         base.Close();

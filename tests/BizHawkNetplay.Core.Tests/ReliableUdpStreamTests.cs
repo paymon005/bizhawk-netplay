@@ -119,6 +119,69 @@ public class ReliableUdpStreamTests
         Assert.Equal(blob, received);
     }
 
+    /// <summary>
+    /// Close() queues a FIN, and on the link this stream exists for "sent once" is not
+    /// "delivered". The retransmit thread used to die the moment Close ran (Close → Dispose →
+    /// _closed), so a lost tail segment or lost FIN was never resent: the peer blocked on a
+    /// reorder hole or a missing EOF until its read timeout, and a clean refusal was misreported
+    /// as a network fault. The close now lingers briefly to re-drive both.
+    /// </summary>
+    [Fact]
+    public void ACloseSurvivesLoss_TailAndFinAreRedriven()
+    {
+        using var link = new LossyLink(seed: 42, drop: 0.3);
+        var (a, b) = link.Connect();
+        b.ReadTimeout = 15_000;
+
+        var blob = new byte[8 * 1024];
+        new Random(99).NextBytes(blob);
+        a.Write(blob, 0, blob.Length);
+        a.Dispose(); // the host's pattern: write the last message, close, move on
+
+        var received = new byte[blob.Length];
+        int total = 0;
+        while (total < received.Length)
+        {
+            int n = b.Read(received, total, received.Length - total);
+            Assert.True(n > 0, "EOF before the full transfer arrived");
+            total += n;
+        }
+        Assert.Equal(0, b.Read(new byte[1], 0, 1)); // clean EOF, which requires the FIN to arrive
+        Assert.Equal(blob, received);
+    }
+
+    /// <summary>
+    /// When a Read frees space under the readable-bytes cap, the sender must be told with an ACK
+    /// then and there. Without one, its only notice is its own RTO retransmit provoking a fresh
+    /// cumulative ACK, so a capped transfer collapses to roughly one repair burst per RTO — this
+    /// exact transfer took tens of seconds rather than well under ten.
+    /// </summary>
+    [Fact]
+    public void BackpressureReleaseIsAnnouncedNotTimedOut()
+    {
+        const int Cap = 16 * 1024;
+        using var link = new LossyLink(seed: 5, drop: 0.0, maxReadable: Cap);
+        var (a, b) = link.Connect();
+        b.ReadTimeout = 20_000;
+
+        var blob = new byte[Cap * 32]; // 512 KiB through a 16 KiB ceiling
+        new Random(4321).NextBytes(blob);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var writer = new Thread(() => { a.Write(blob, 0, blob.Length); a.Flush(); }) { IsBackground = true };
+        writer.Start();
+
+        var received = new byte[blob.Length];
+        int total = 0;
+        while (total < received.Length)
+            total += b.Read(received, total, Math.Min(4096, received.Length - total));
+
+        Assert.True(writer.Join(20_000), "the writer never completed");
+        Assert.Equal(blob, received);
+        Assert.True(sw.ElapsedMilliseconds < 8000,
+            $"transfer took {sw.ElapsedMilliseconds}ms — backpressure release is waiting on the retransmit timer");
+    }
+
     [Fact]
     public void ReorderBuffer_DeliversInOrder_NoThreads()
     {
