@@ -631,6 +631,22 @@ public sealed partial class NetplayToolForm
 
         try
         {
+            // Same argument as the movie above, and the same gate is responsible: MainForm's
+            // AvFrameAdvance is inside the frame-advance block a session suppresses, so an AVI/WAV
+            // capture records nothing at all — silently, producing a valid-looking empty file.
+            if (AviCaptureActive())
+            {
+                ConnLog("an A/V capture is running (File → AVI/WAV Writer). Netplay steps the core " +
+                        "itself, so the writer would never see the frames actually played and the " +
+                        "file would come out empty. Stop the capture, then start again.",
+                    Color.Firebrick);
+                return true;
+            }
+        }
+        catch { /* capture state unreachable — not a reason to refuse a session */ }
+
+        try
+        {
             int lua = RunningLuaScripts();
             if (lua > 0)
                 Log($"WARNING: {lua} Lua script(s) running — Lua can set input, load states, or call " +
@@ -638,6 +654,21 @@ public sealed partial class NetplayToolForm
         }
         catch { /* best-effort — ignore */ }
         return false;
+    }
+
+    /// <summary>Whether EmuHawk is writing an A/V capture. The field is private, so this is
+    /// by-name reflection like the Lua probe below; any failure reports "no capture", because a
+    /// diagnostic that cannot read the state must not be the thing that refuses a session.</summary>
+    private bool AviCaptureActive()
+    {
+        try
+        {
+            object? mf = MainForm;
+            if (mf == null) return false;
+            var field = mf.GetType().GetField("_currAviWriter", AnyInstance);
+            return field?.GetValue(mf) != null;
+        }
+        catch { return false; }
     }
 
     /// <summary>Count Lua scripts in the RUNNING state, only if the Lua Console is already open (never

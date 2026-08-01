@@ -110,6 +110,76 @@ internal sealed partial class EmuHawkAdapter
     /// silence far faster than we can pump. Nulling EmuHawk's input pin (see EnableAudio) makes its
     /// call early-return, leaving the device ours to feed here.
     /// </summary>
+    // EmuHawk's per-frame host-input bookkeeping, which lives inside the run loop's frame-advance
+    // block and therefore never runs while a session owns stepping. Resolved once, best-effort.
+    private static readonly FieldInfo? InputManagerField =
+        typeof(BizHawk.Client.EmuHawk.MainForm)
+            .GetField("InputManager", BindingFlags.Instance | BindingFlags.NonPublic);
+    private object? _inputManager;
+    private MethodInfo? _stickyIncrementLoops;
+    private object? _stickyAutofire;
+    private MethodInfo? _clickyFrameTick;
+    private object? _clickyVirtualPad;
+    private bool _hostInputBookkeepingResolved;
+
+    /// <summary>Whether EmuHawk's own per-frame input bookkeeping could be reached. False means
+    /// <see cref="AdvanceHostInputBookkeeping"/> is doing nothing and the caller should say so.</summary>
+    public bool HostInputBookkeepingAvailable { get; private set; }
+
+    /// <summary>
+    /// Advance the two pieces of host-side input state that MainForm normally ticks once per frame.
+    ///
+    /// Both live inside the <c>BlockFrameAdvance</c> gate, so during a session neither runs — and
+    /// both are stateful. <c>StickyAutofireController.IncrementLoops</c> is the only thing that
+    /// advances an autofire pattern, and <c>IsPressed</c> merely peeks, so a sticky-autofire button
+    /// reads whatever value it held when the session began, forever. <c>ClickyVirtualPadController
+    /// .FrameTick</c> is a Clear(), so a Virtual Pad click sticks for the rest of the session —
+    /// which looks exactly like a desync from the chair.
+    ///
+    /// Determinism is unaffected either way: both sit upstream of the controller we read, so their
+    /// resolved value is captured and shipped to peers like any other input. This restores two
+    /// features, it does not change what the wire carries.
+    /// </summary>
+    public void AdvanceHostInputBookkeeping()
+    {
+        if (!_hostInputBookkeepingResolved) ResolveHostInputBookkeeping();
+        if (!HostInputBookkeepingAvailable) return;
+        try
+        {
+            bool lagged = false;
+            try { lagged = _emulator.CanPollInput() && _emulator.AsInputPollable().IsLagFrame; }
+            catch { /* a core without lag polling simply never reports one */ }
+            _stickyIncrementLoops!.Invoke(_stickyAutofire, new object[] { lagged });
+            _clickyFrameTick!.Invoke(_clickyVirtualPad, null);
+        }
+        catch
+        {
+            // One failure retires it: this runs per frame and a throwing reflection call every
+            // frame would cost more than the features are worth.
+            HostInputBookkeepingAvailable = false;
+        }
+    }
+
+    private void ResolveHostInputBookkeeping()
+    {
+        _hostInputBookkeepingResolved = true;
+        try
+        {
+            _inputManager = _mainForm == null ? null : InputManagerField?.GetValue(_mainForm);
+            if (_inputManager == null) return;
+            var type = _inputManager.GetType();
+            _stickyAutofire = type.GetProperty("StickyAutofireController")?.GetValue(_inputManager);
+            _clickyVirtualPad = type.GetProperty("ClickyVirtualPadController")?.GetValue(_inputManager);
+            _stickyIncrementLoops = _stickyAutofire?.GetType()
+                .GetMethod("IncrementLoops", new[] { typeof(bool) });
+            _clickyFrameTick = _clickyVirtualPad?.GetType()
+                .GetMethod("FrameTick", Type.EmptyTypes);
+            HostInputBookkeepingAvailable =
+                _stickyIncrementLoops != null && _clickyFrameTick != null;
+        }
+        catch { HostInputBookkeepingAvailable = false; }
+    }
+
     public void PumpAudio()
     {
         if (!_audioReady) return;

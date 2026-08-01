@@ -466,6 +466,11 @@ public sealed partial class NetplayToolForm
                     coreMs += frameCoreMs;
                     _pacing.AddFrame(frameCoreMs, rendered: !anotherFrameDue);
                     driver.CompleteFrame();
+                    // EmuHawk ticks these once per frame inside the block our BlockFrameAdvance
+                    // suppresses, so during a session nothing advances them: sticky autofire freezes
+                    // on one pattern value and a Virtual Pad click never clears. Upstream of what we
+                    // capture, so this restores two features without changing what the wire carries.
+                    _adapter!.AdvanceHostInputBookkeeping();
                     steppedThisTick = true;
                     framesThisTick++;
                     if (framesThisTick >= 2) committedSecondFrame = false;
