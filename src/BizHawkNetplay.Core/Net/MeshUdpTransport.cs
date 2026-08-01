@@ -585,13 +585,23 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         measuredRoutes = 0;
         var edges = DescribeEdges();
         totalRoutes = edges.Count;
+        // Jitter is a PER-EDGE property — an edge's own high-water minus its own median — and it
+        // has to be maximised as a pair. Taking max(median) and max(high) independently, as this
+        // once did, subtracts figures from different edges: a steady 80/80 edge beside a swingy
+        // 20/70 one aggregated to (80, 80), reporting zero jitter while one edge swung 50ms, and
+        // the delay sized from it stalled on every swing. The aggregate high is therefore
+        // reconstructed as worst-median + worst-edge-jitter — always at least any single edge's
+        // requirement, which is what one session-wide figure has to be.
+        double worstJitterMs = 0;
         foreach (var edge in edges)
         {
             if (!edge.Measured) continue;
             measuredRoutes++;
             if (edge.MedianMs > medianMs) medianMs = edge.MedianMs;
-            if (edge.HighMs > highMs) highMs = edge.HighMs;
+            double edgeJitter = edge.HighMs - edge.MedianMs;
+            if (edgeJitter > worstJitterMs) worstJitterMs = edgeJitter;
         }
+        if (measuredRoutes > 0) highMs = medianMs + worstJitterMs;
         return measuredRoutes > 0;
     }
 

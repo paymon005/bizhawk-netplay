@@ -152,15 +152,37 @@ public static class LobbyDelayPolicy
         IReadOnlyDictionary<int, double> hostLegRttMs, IEnumerable<(int A, int B)> relayedPairs)
     {
         if (hostLegRttMs == null || relayedPairs == null) return 0;
-        double worst = 0;
+        var samples = new Dictionary<int, LobbyRttSample>();
+        foreach (var leg in hostLegRttMs)
+            if (leg.Value >= 0 && !double.IsNaN(leg.Value) && !double.IsInfinity(leg.Value))
+                samples[leg.Key] = new LobbyRttSample(leg.Value, leg.Value);
+        return RelayRouteStats(samples, relayedPairs).MedianMs;
+    }
+
+    /// <summary>
+    /// As <see cref="RelayRouteRttMs"/>, but carrying jitter through the route arithmetic too. A
+    /// relayed route swings when EITHER hop swings, so its jitter is the two legs' jitters added —
+    /// pricing the route by medians alone re-created for relays exactly the under-delay the
+    /// per-edge jitter pairing fixed for direct edges. The result's median is the worst carried
+    /// route's round trip and its jitter the worst carried route's combined swing, maximised
+    /// independently: one session delay must cover both, whichever pairs they come from. A default
+    /// (zero-median) sample means nothing usable was measured.
+    /// </summary>
+    public static LobbyRttSample RelayRouteStats(
+        IReadOnlyDictionary<int, LobbyRttSample> hostLegs, IEnumerable<(int A, int B)> relayedPairs)
+    {
+        if (hostLegs == null || relayedPairs == null) return default;
+        double worstRtt = 0, worstJitter = 0;
         foreach (var (a, b) in relayedPairs)
         {
-            if (!hostLegRttMs.TryGetValue(a, out double near) || !IsUsable(near)) continue;
-            if (!hostLegRttMs.TryGetValue(b, out double far) || !IsUsable(far)) continue;
-            double route = near + far;
-            if (route > worst) worst = route;
+            if (!hostLegs.TryGetValue(a, out var near) || !IsUsable(near.MedianMs)) continue;
+            if (!hostLegs.TryGetValue(b, out var far) || !IsUsable(far.MedianMs)) continue;
+            double route = near.MedianMs + far.MedianMs;
+            if (route > worstRtt) worstRtt = route;
+            double swing = near.JitterMs + far.JitterMs;
+            if (swing > worstJitter) worstJitter = swing;
         }
-        return worst;
+        return worstRtt > 0 ? new LobbyRttSample(worstRtt, worstRtt + worstJitter) : default;
 
         static bool IsUsable(double ms) =>
             ms >= 0 && !double.IsNaN(ms) && !double.IsInfinity(ms);

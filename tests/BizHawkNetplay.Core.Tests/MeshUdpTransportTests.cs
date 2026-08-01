@@ -1179,6 +1179,42 @@ public class MeshUdpTransportTests
         finally { sender.Dispose(); }
     }
 
+    /// <summary>
+    /// Jitter is a per-edge pair, and the aggregate must not subtract figures from different
+    /// edges. A steady 80/80 edge beside a swingy ~20/70 one used to aggregate to (80, 80) — zero
+    /// jitter reported while one edge swung 50ms, and the delay sized from that stalled on every
+    /// swing. The aggregate high is worst-median plus worst-EDGE-jitter, wherever each comes from.
+    /// </summary>
+    [Fact]
+    public void WorstRttStats_KeepEachEdgesOwnJitterPairing()
+    {
+        var sender = MeshUdpTransport.Bind(0);
+        try
+        {
+            var steady = Loop(40011);
+            var swingy = Loop(40012);
+            sender.SetPeerRoutes(new[]
+            {
+                new PeerRoute(1, new[] { steady }),
+                new PeerRoute(2, new[] { swingy }),
+            });
+
+            foreach (double sample in new double[] { 80, 80, 80, 80 }) sender.RecordRtt(steady, sample);
+            foreach (double sample in new double[] { 19, 20, 21, 70 }) sender.RecordRtt(swingy, sample);
+
+            Assert.True(sender.TryGetWorstRttStats(out double medianMs, out double highMs,
+                out int measured, out int total));
+            Assert.Equal(2, measured);
+            Assert.Equal(2, total);
+
+            // Worst median is the steady edge's 80; worst per-edge jitter is the swingy edge's
+            // 70 − 20.5 = 49.5. The old independent maxima reported high = 80, i.e. jitter 0.
+            Assert.Equal(80, medianMs, 3);
+            Assert.Equal(129.5, highMs, 3);
+        }
+        finally { sender.Dispose(); }
+    }
+
     [Fact]
     public void RttBurst_MeasuresEveryEdgeBeforeAnyInputFlows()
     {

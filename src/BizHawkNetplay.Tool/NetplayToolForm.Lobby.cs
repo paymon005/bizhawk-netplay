@@ -754,10 +754,14 @@ public sealed partial class NetplayToolForm
         // host's own legs, which are the two hops each is made of.
         if (relayPairs.Count > 0)
         {
-            var hostLegs = new Dictionary<int, double>();
+            var hostLegs = new Dictionary<int, LobbyRttSample>();
             foreach (var edge in mesh.DescribeEdges())
-                if (edge.Measured) hostLegs[edge.RemotePort] = edge.MedianMs;
-            double relayRttMs = LobbyDelayPolicy.RelayRouteRttMs(hostLegs, relayPairs);
+                if (edge.Measured) hostLegs[edge.RemotePort] = new LobbyRttSample(edge.MedianMs, edge.HighMs);
+            var relayed = LobbyDelayPolicy.RelayRouteStats(hostLegs, relayPairs);
+            double relayRttMs = relayed.MedianMs;
+            // The route swings when either hop swings, so its combined jitter competes for the
+            // session-wide worst independently of whether its round trip does.
+            if (relayed.JitterMs > worstJitterMs) worstJitterMs = relayed.JitterMs;
             if (relayRttMs > worstRttMs)
             {
                 UiConnLog(autoDelay

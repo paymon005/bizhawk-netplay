@@ -218,6 +218,39 @@ public class LobbyDelayPolicyTests
         Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, null!));
     }
 
+    /// <summary>
+    /// A relayed route swings when EITHER hop swings, so its jitter is both legs' jitters added.
+    /// Pricing the route by medians alone re-created for relays the same under-delay the per-edge
+    /// jitter pairing fixed for direct edges.
+    /// </summary>
+    [Fact]
+    public void RelayRouteCarriesBothHopsJitter()
+    {
+        var legs = new Dictionary<int, LobbyRttSample>
+        {
+            [1] = new(40, 55),   // 15ms swing
+            [2] = new(60, 70),   // 10ms swing
+            [3] = new(20, 20),   // steady
+        };
+
+        var route = LobbyDelayPolicy.RelayRouteStats(legs, [(1, 2)]);
+        Assert.Equal(100, route.MedianMs, 3);
+        Assert.Equal(25, route.JitterMs, 3);   // 15 + 10, not either alone and not zero
+
+        // Worst round trip and worst combined swing may come from DIFFERENT pairs: the session's
+        // one delay has to cover both. P1↔P2 has the worst RTT (100), P1↔P1-like pairing doesn't
+        // exist, and P1↔P3's swing (15) loses to P1↔P2's (25) — but give P3 a huge swing and its
+        // pair must win the jitter while P1↔P2 keeps the RTT.
+        legs[3] = new(20, 80);   // 60ms swing
+        var mixed = LobbyDelayPolicy.RelayRouteStats(legs, [(1, 2), (1, 3)]);
+        Assert.Equal(100, mixed.MedianMs, 3);       // from (1,2)
+        Assert.Equal(75, mixed.JitterMs, 3);        // from (1,3): 15 + 60
+
+        // Nothing carried, or a leg unusable: a default sample, which folds away harmlessly.
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteStats(legs, []).MedianMs, 3);
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteStats(legs, [(1, 9)]).MedianMs, 3);
+    }
+
     /// <summary>The point of measuring it: a relayed route buys real frames of delay that the worst
     /// direct edge alone would not have.</summary>
     [Fact]
