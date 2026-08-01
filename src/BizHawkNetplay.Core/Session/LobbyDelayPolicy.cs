@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace BizHawkNetplay.Core.Session;
 
@@ -114,6 +115,45 @@ public static class LobbyDelayPolicy
         int final = Math.Max(manualFloor, cappedAutomatic);
         return new LobbyDelayChoice(final, automatic, hasEstimate: true,
             wasCapped: automatic > automaticMaximum && final < automatic);
+    }
+
+    /// <summary>
+    /// Equivalent round-trip of the worst RELAYED route, from the host's own legs.
+    ///
+    /// When a joiner's direct path to another joiner never opens, its input goes through the host
+    /// instead — two hops. The lobby measures DIRECT edges, and an edge that never opened
+    /// contributes nothing, so the delay was sized from the worst direct path while the affected
+    /// players were not using a direct path at all. A relayed one-way is the near leg's one-way
+    /// plus the far leg's, so as a round-trip (which is what <see cref="Choose"/> halves again) it
+    /// is simply the two host-leg round-trips added together — and that can approach twice the
+    /// worst single leg, a whole frame or two of latency the delay never covered.
+    ///
+    /// Deliberately conservative in the direction that costs latency rather than stalls: it takes
+    /// the worst pairing rather than an average. Only seats ACTUALLY being relayed are considered,
+    /// so a session with no relay pays nothing. Returns 0 when nothing is relayed or no leg was
+    /// measured, which folds away harmlessly.
+    /// </summary>
+    /// <param name="hostLegRttMs">Measured round-trip from the host to each seat, by port.</param>
+    /// <param name="relayedPorts">Seats whose input the host is forwarding.</param>
+    public static double RelayRouteRttMs(
+        IReadOnlyDictionary<int, double> hostLegRttMs, IEnumerable<int> relayedPorts)
+    {
+        if (hostLegRttMs == null || relayedPorts == null) return 0;
+        double worst = 0;
+        foreach (int relayed in relayedPorts)
+        {
+            if (!hostLegRttMs.TryGetValue(relayed, out double near) || !IsUsable(near)) continue;
+            foreach (var far in hostLegRttMs)
+            {
+                if (far.Key == relayed || !IsUsable(far.Value)) continue;
+                double route = near + far.Value;
+                if (route > worst) worst = route;
+            }
+        }
+        return worst;
+
+        static bool IsUsable(double ms) =>
+            ms >= 0 && !double.IsNaN(ms) && !double.IsInfinity(ms);
     }
 
     /// <summary>

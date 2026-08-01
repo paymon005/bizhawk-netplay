@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using BizHawkNetplay.Core.Session;
 using Xunit;
 
@@ -166,6 +167,64 @@ public class LobbyDelayPolicyTests
             Assert.Equal(1, LobbyDelayPolicy.DelayForModeChange(mode, mode, 1, 200, 20));
             Assert.Equal(9, LobbyDelayPolicy.DelayForModeChange(mode, mode, 9, 5, 20));
         }
+    }
+
+    /// <summary>
+    /// A relayed seat's input takes two hops, and the lobby only ever measured direct edges — an
+    /// edge that never opened (which is why the relay exists) contributed nothing at all. So the
+    /// delay was sized from the worst DIRECT path while the affected players were not using one.
+    /// The relayed route's equivalent round-trip is the two host legs added together.
+    /// </summary>
+    [Fact]
+    public void RelayRouteCostsBothHostLegs()
+    {
+        // P1 is relayed. Its own leg is 40ms; the far seats are 60ms and 20ms. The worst route it
+        // can be given is 40 + 60, which is well past the 60ms worst DIRECT edge.
+        var legs = new Dictionary<int, double> { [1] = 40, [2] = 60, [3] = 20 };
+        Assert.Equal(100, LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 1 }));
+
+        // A seat is never relayed to itself, so a lone relayed seat with no far end costs nothing.
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(
+            new Dictionary<int, double> { [1] = 40 }, new[] { 1 }));
+
+        // Nothing relayed: the session pays nothing for this.
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, new int[0]));
+    }
+
+    [Fact]
+    public void RelayRouteIgnoresLegsItCannotTrust()
+    {
+        // An unmeasured or nonsensical leg must not be folded in as though it were a measurement,
+        // and must not poison the routes that WERE measured.
+        var legs = new Dictionary<int, double>
+        {
+            [1] = 30,
+            [2] = -1,                        // never answered
+            [3] = double.NaN,
+            [4] = double.PositiveInfinity,
+            [5] = 50,
+        };
+        Assert.Equal(80, LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 1 }));
+        // A relayed seat whose OWN leg is unmeasured contributes nothing rather than a wild number.
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 2 }));
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(null!, new[] { 1 }));
+        Assert.Equal(0, LobbyDelayPolicy.RelayRouteRttMs(legs, null!));
+    }
+
+    /// <summary>The point of measuring it: a relayed route buys real frames of delay that the worst
+    /// direct edge alone would not have.</summary>
+    [Fact]
+    public void RelayRouteRaisesTheChosenDelay()
+    {
+        var legs = new Dictionary<int, double> { [1] = 40, [2] = 60 };
+        double direct = 60;
+        double relayed = LobbyDelayPolicy.RelayRouteRttMs(legs, new[] { 1 });
+
+        int fromDirect = LobbyDelayPolicy.Choose(direct, Frame60, SyncMode.Rollback, 1, 20).Frames;
+        int fromRelayed = LobbyDelayPolicy.Choose(relayed, Frame60, SyncMode.Rollback, 1, 20).Frames;
+        Assert.True(fromRelayed > fromDirect,
+            $"relayed route ({relayed}ms) should need more delay than the worst direct edge " +
+            $"({direct}ms), got {fromRelayed} vs {fromDirect}");
     }
 
     [Fact]

@@ -711,7 +711,27 @@ public sealed partial class NetplayToolForm
             return; // the caller drops them and reopens the lobby
         }
 
-        InstallMeshRelay(links, incomplete);
+        var relayedPorts = InstallMeshRelay(links, incomplete);
+
+        // The relay adds a hop, so the seats riding it are NOT covered by the worst direct edge the
+        // delay was about to be sized from — and an edge that never opened contributed nothing to
+        // that figure in the first place. Fold in what the relayed route actually costs, from the
+        // host's own legs, which are the two hops it is made of.
+        if (relayedPorts.Count > 0)
+        {
+            var hostLegs = new Dictionary<int, double>();
+            foreach (var edge in mesh.DescribeEdges())
+                if (edge.Measured) hostLegs[edge.RemotePort] = edge.MedianMs;
+            double relayRttMs = LobbyDelayPolicy.RelayRouteRttMs(hostLegs, relayedPorts);
+            if (relayRttMs > worstRttMs)
+            {
+                UiConnLog($"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
+                          $"direct path's ~{worstRttMs:F0}ms — sizing the delay from the relayed " +
+                          "figure, since that is the one those players are actually using.",
+                    Color.DarkOrange);
+                worstRttMs = relayRttMs;
+            }
+        }
 
         static void Fold(LobbyRttSample sample, ref double rtt, ref double jitter)
         {
@@ -753,7 +773,9 @@ public sealed partial class NetplayToolForm
     /// in its own log, which is where a player needs them; narrowing the relay itself would mean
     /// putting those names on the wire, for a bandwidth saving nobody has asked for.
     /// </summary>
-    private void InstallMeshRelay(List<PeerLink> links, List<PeerLink> incomplete)
+    /// <returns>The seats whose input this host will forward — what the delay has to cover an extra
+    /// hop for. Empty when nothing is being relayed.</returns>
+    private List<int> InstallMeshRelay(List<PeerLink> links, List<PeerLink> incomplete)
     {
         // Relaying is pointless with one joiner: there is no other joiner for it to fail to reach,
         // and the host's own input already goes to it directly.
@@ -774,14 +796,14 @@ public sealed partial class NetplayToolForm
             foreach (int p in ports) _relayPorts.Add(p);
         });
 
-        if (incomplete.Count == 0) return;
+        if (incomplete.Count == 0) return ports;
         if (!worthRelaying)
         {
             UiConnLog("a direct UDP path did not answer in the measurement window, but with one " +
                       "joiner there is no other player to relay to — and the host's link, which is " +
                       "the only one that carries anything here, has been checked and is live.",
                 Color.DarkOrange);
-            return;
+            return ports;
         }
 
         // Every player still here has a live host leg — MeasureLobbyMesh makes that a precondition
@@ -789,8 +811,8 @@ public sealed partial class NetplayToolForm
         // up as a rescue. So this can now claim what it delivers without qualification.
         UiConnLog($"relaying input through this host for {incomplete.Count} player(s) whose direct " +
                   "paths to the other players did not open. They stay in the session; their input " +
-                  "takes one extra hop, so expect a little more delay on those legs than the lobby " +
-                  "measured.", Color.DarkOrange);
+                  "takes one extra hop, which the delay below now accounts for.", Color.DarkOrange);
+        return ports;
     }
 
     /// <summary>
