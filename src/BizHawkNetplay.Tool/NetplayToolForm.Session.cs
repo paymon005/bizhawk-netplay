@@ -89,9 +89,28 @@ public sealed partial class NetplayToolForm
     private void ApplyInitialState(SessionParams sp)
     {
         if (sp.InitialState == null) return;
+        LogStateImportTrust();
         _adapter!.ImportState(sp.InitialState);
         Log($"imported {sp.InitialState.Length / 1024}KiB host state");
     }
+
+    /// <summary>
+    /// Say once, before the first host state is loaded, what loading it means.
+    ///
+    /// Not a prompt and not a refusal: a joiner that declines the state cannot join, so a dialog
+    /// would be a choice between joining and not joining wearing a security control's clothes. See
+    /// <see cref="StateImportTrust"/> for why this cannot be fixed from here at all, and for what
+    /// the control-frame MAC did narrow it to.
+    /// </summary>
+    private void LogStateImportTrust()
+    {
+        if (_stateTrustLogged) return;
+        _stateTrustLogged = true;
+        if (StateImportTrust.Advisory(_isHost, _passwordBox.Text.Length > 0) is { } advisory)
+            ConnLog(advisory, Color.DarkSlateBlue);
+    }
+
+    private bool _stateTrustLogged;
 
     private bool DriverPreparedFor(SessionGeneration generation, SyncMode mode) =>
         _sessionDriverPrepared && _driver != null && _driver.Generation == generation && _mode == mode;
@@ -383,6 +402,7 @@ public sealed partial class NetplayToolForm
         _audioDevWasUp = true;   // a fresh session starts assuming sound is up; the edge reports otherwise
         _presentHint.Reset();
         _hashDiagLogged = false;
+        _stateTrustLogged = false;   // said once per SESSION: the next host may not be this one
         _lastTickClockMs = -1;
         _lastPresentClockMs = -1;
         // Per-session, not per-window: a spike from a previous session must not be reported as

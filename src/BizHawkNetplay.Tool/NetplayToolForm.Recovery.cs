@@ -542,6 +542,7 @@ public sealed partial class NetplayToolForm
                     Color.DarkSlateBlue);
             Status($"applying {state.Length / 1024}KiB host resync epoch {generation.Epoch}…",
                 Color.DarkOrange);
+            LogStateImportTrust();   // a resync is the other path that loads the host's bytes
             _adapter!.ImportState(state);
             SetGeneration(generation);
             _sessionDelay = inputDelay;

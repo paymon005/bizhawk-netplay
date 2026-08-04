@@ -339,6 +339,25 @@ sounds. What remains open is the upstream half, which no wire change here can to
 still imports its host's savestate, and a savestate is a trusted-input format all the way down
 into the cores. Join people you know, or set a password.
 
+*Re-verified 2026-08-04 against v0.34.0: the exposure is unchanged.* The three `ImportState` call
+sites are still the two joiner-side ones and the restore of this machine's own pre-join state, so
+nothing added since has given a host a peer's bytes to run. What v0.34.0 adds is not a fix but an
+end to the silence — a joiner says once, before the first host state loads, what a savestate can
+set (memory, page permissions, the stack pointer of the emulated machine), and distinguishes the
+two cases the MAC created: with a password only the host can reach that parser; without one the key
+derives from public nonces, so integrity holds only against blind off-path injection. Deliberately
+not a prompt. A joiner that declines the state cannot join, so a dialog would be a choice between
+joining and not joining wearing a security control's clothes (`StateImportTrust`).
+
+**Why this stays open, and what was rejected.** The obvious mitigation is to avoid the join-time
+import: the host sends its state's digest, the joiner hashes its own, and the transfer is skipped
+when they match — provably safe, since equal SHA-256 means identical bytes, and it would skip a
+multi-megabyte transfer on a fresh start. It was rejected *as a security measure* because it does
+not close the finding: a hostile host can report a bad checksum, force a resync, and the resync
+path imports unconditionally because by then the states genuinely do differ. That makes it a
+performance feature wearing a security fix's clothes, bought on the most delicate path in the
+codebase. Worth revisiting on its own merits as an optimisation; not worth claiming as this.
+
 **KI-14 (validation) — divergence learning replaced the VI-register guess; two machines above
 native is what remains.** The v0.30 exclusion read `VI_ORIGIN` and skipped the buffer being
 scanned out — structurally insufficient, since the plugin writes back to the buffer it just
