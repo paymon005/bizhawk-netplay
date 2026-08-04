@@ -239,21 +239,21 @@ public sealed partial class NetplayToolForm
             // The first boundaries of a generation are the divergence-learning window (see
             // DivergenceLearner): the bucket variant forces the state visit, which costs the
             // pre-anchor hitch a few times right after a rebuild hitch already happened.
-            if (rb.LastChecksumFrame < DivergenceLearner.LearnRounds * ChecksumInterval)
+            if (rb.LastChecksumFrame < DivergenceLearner.LearnRounds * _checksumInterval)
             {
                 _divergenceBuckets ??= new uint[ControlMessageCodec.DivergenceBuckets];
-                if (!rb.TryConfirmedChecksumWithBuckets(ChecksumInterval, _divergenceBuckets,
+                if (!rb.TryConfirmedChecksumWithBuckets(_checksumInterval, _divergenceBuckets,
                         out frame, out hash, out bucketsFilled)) return;
             }
-            else if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
+            else if (!rb.TryConfirmedChecksum(_checksumInterval, out frame, out hash)) return;
             _lastHashMs += ElapsedMs(hashStart);
         }
         else
         {
             frame = _driver.CurrentFrame;
-            if (frame % ChecksumInterval != 0) return;
+            if (frame % _checksumInterval != 0) return;
             long hashStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (DivergenceLearner.IsLearnFrame(frame, ChecksumInterval))
+            if (DivergenceLearner.IsLearnFrame(frame, _checksumInterval))
             {
                 _divergenceBuckets ??= new uint[ControlMessageCodec.DivergenceBuckets];
                 bucketsFilled = _adapter!.TryHashMainMemoryBuckets(frame, _divergenceBuckets, out hash);
@@ -290,7 +290,7 @@ public sealed partial class NetplayToolForm
         // The divergence vector travels beside the checksum it describes — same boundary, same
         // state — so the host can see WHICH buckets disagree, not merely that some byte does.
         // Sent only for learn frames; steady state carries nothing extra.
-        if (bucketsFilled && DivergenceLearner.IsLearnFrame(frame, ChecksumInterval))
+        if (bucketsFilled && DivergenceLearner.IsLearnFrame(frame, _checksumInterval))
         {
             if (_isHost)
                 RecordDivergence(CurrentConnectionAttempt, generation, _localPort, frame,

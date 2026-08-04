@@ -78,6 +78,7 @@ public sealed partial class NetplayToolForm
         foreach (int seat in sp.VacatedSeats)
             if (seat != sp.LocalPort && seat >= 0 && seat < sp.PlayerCount) _vacatedPorts.Add(seat);
         _vacatedCount = _vacatedPorts.Count;
+        _checksumInterval = sp.ChecksumInterval; // the host measured and published; we quantize to it
         SetGeneration(sp.Generation);
         _meshOthers = new List<PeerRoute>(sp.PeerRoutes);
         _mesh?.ApplyTokens(sp.Tokens);

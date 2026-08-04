@@ -495,7 +495,7 @@ public sealed partial class NetplayToolForm
                     // pending forever. Hash now in that one case, while the state still stands on
                     // the boundary; the burst tick was already paying double core cost.
                     if (anotherFrameDue && driver.Strategy is LockstepStrategy
-                        && driver.CurrentFrame % ChecksumInterval == 0)
+                        && driver.CurrentFrame % _checksumInterval == 0)
                         MaybeSendChecksum();
                     else
                         _checksumDue = true;

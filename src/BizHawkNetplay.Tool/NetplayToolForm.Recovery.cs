@@ -38,7 +38,7 @@ public sealed partial class NetplayToolForm
             // the resync loop that above-native N64 used to be. A REAL desync in this window is
             // caught by the learner's own share cap (TooBroadToMask ends the suppression with a
             // verdict), and by the very next boundary past the window regardless.
-            if (DivergenceLearner.IsLearnFrame(frame, ChecksumInterval))
+            if (DivergenceLearner.IsLearnFrame(frame, _checksumInterval))
             {
                 if (Verbose) BeginInvokeUi(() =>
                     Log($"checksum frame {frame}: peers disagree during the learning window — " +
@@ -140,7 +140,7 @@ public sealed partial class NetplayToolForm
             {
                 var mask = learner.MaskBuckets;
                 int effectiveFrom =
-                    (DivergenceLearner.LearnRounds + MaskEffectiveMargin) * ChecksumInterval;
+                    (DivergenceLearner.LearnRounds + MaskEffectiveMargin) * _checksumInterval;
                 try { _adapter?.SetLearnedExclusion(mask, effectiveFrom); } catch { }
                 var body = ControlMessageCodec.EncodeExclusionMask(generation, effectiveFrom, mask);
                 foreach (var link in _peers)
@@ -723,13 +723,13 @@ public sealed partial class NetplayToolForm
     /// <summary>
     /// How this peer spends its savestate budget. Purely local — see <see cref="RollbackTuning"/>
     /// for why none of it is negotiated. The anchor interval MUST track
-    /// <see cref="ChecksumInterval"/>, since eliding snapshots would otherwise take the checksum's
+    /// <see cref="_checksumInterval"/>, since eliding snapshots would otherwise take the checksum's
     /// own state with them and stop desync detection without saying so.
     /// </summary>
     private RollbackTuning RollbackTuningForSession() => new()
     {
         ElideConfirmedSaves = true,
-        ChecksumAnchorInterval = ChecksumInterval,
+        ChecksumAnchorInterval = _checksumInterval,
         KeyframeInterval = _sessionKeyframeInterval,
         RepairBudgetMs = RepairBudgetFrames * FrameMs(),
         SeedRepairPerFrameMs = _probeRepairPerFrameMs,

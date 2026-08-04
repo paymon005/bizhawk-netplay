@@ -125,6 +125,22 @@ public sealed partial class NetplayToolForm
             AllowHandshakeClients();
             if (_hostRadio.Checked)
             {
+                // Size the session's checksum cadence from what a hash actually costs HERE, now
+                // that the fast paths made most of them cheap. Timed on the second call — the
+                // first pays one-time reflection and scratch allocation that steady state never
+                // sees. The figure is a session agreement published in WELCOME; see ChecksumCadence.
+                try
+                {
+                    _adapter.HashMainMemory(0);
+                    var hashTimer = System.Diagnostics.Stopwatch.StartNew();
+                    _adapter.HashMainMemory(0);
+                    double hashMs = hashTimer.Elapsed.TotalMilliseconds;
+                    _checksumInterval = ChecksumCadence.Choose(hashMs, lobbyFrameMs);
+                    Log($"desync checksum every {_checksumInterval} frames " +
+                        $"(~{_checksumInterval * lobbyFrameMs / 1000:F1}s) — one hash measured {hashMs:F1}ms");
+                }
+                catch { _checksumInterval = ChecksumCadence.DefaultIntervalFrames; }
+
                 _mesh = MeshUdpTransport.Bind(port); _transport = WrapSimLatency(_mesh);
                 var state = _adapter.ExportState();
                 // Not reporting the compressed size here: it would mean deflating the whole state a
@@ -457,11 +473,13 @@ public sealed partial class NetplayToolForm
                 // A survivor of a restart already has the state, and the host has not stepped the
                 // core since exporting it — only the assignment and the routes have changed.
                 Handshake.HostSendAssignment(link.Control, link.RemotePort, players, delay, mode,
-                    generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players));
+                    generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players),
+                    vacatedPorts: null, checksumInterval: _checksumInterval);
                 return;
             }
             Handshake.HostSendStart(link.Control, link.RemotePort, players, delay, mode, state,
-                generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players));
+                generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players),
+                vacatedPorts: null, checksumInterval: _checksumInterval);
             link.HoldsState = true;
         });
         if (!DropCasualties(links, casualties, need, attempt)) return false;

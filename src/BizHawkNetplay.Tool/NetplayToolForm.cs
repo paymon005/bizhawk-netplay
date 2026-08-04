@@ -91,7 +91,17 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // report a desync that is not there, which is what the version refusal pre-empts.
     private const int Protocol = 21;
     private const int DefaultPort = 47800;
-    private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
+
+    /// <summary>
+    /// The session's checksum cadence. Once a hard-coded 300 (~5s at 60fps), sized for the era
+    /// when a full-memory hash was a 7-38ms hitch; the fast hash paths made that five seconds of
+    /// deliberate detection latency for a cost that no longer exists. The host measures one hash
+    /// at session start and lets <see cref="ChecksumCadence"/> choose, then publishes the figure
+    /// in WELCOME — it is a session AGREEMENT, since peers quantize checksums to interval
+    /// boundaries and mismatched intervals would never complete a comparison. Written on the UI
+    /// thread before the lobby thread starts, and by the joiner when WELCOME lands.
+    /// </summary>
+    private int _checksumInterval = ChecksumCadence.DefaultIntervalFrames;
 
     /// <summary>
     /// How many frame periods one rollback repair may spend. Requiring it to fit inside a single

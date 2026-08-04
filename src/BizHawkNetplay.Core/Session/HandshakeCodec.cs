@@ -152,13 +152,17 @@ public static class HandshakeCodec
     public static byte[] EncodeWelcome(
         int assignedPort, int playerCount, int inputDelay, SyncMode mode,
         SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null,
-        MeshTokens? tokens = null, IEnumerable<int>? vacatedPorts = null)
+        MeshTokens? tokens = null, IEnumerable<int>? vacatedPorts = null,
+        int checksumInterval = ChecksumCadence.DefaultIntervalFrames)
     {
         if (!generation.IsValid) throw new ArgumentException("A valid session generation is required", nameof(generation));
         var sb = new StringBuilder();
         sb.Append("port=").Append(assignedPort).Append('\n');
         sb.Append("players=").Append(playerCount).Append('\n');
         sb.Append("delay=").Append(inputDelay).Append('\n');
+        // The session's checksum cadence — an agreement, not a preference: peers quantize to
+        // interval boundaries, so two peers on different intervals never complete a comparison.
+        sb.Append("ckint=").Append(checksumInterval).Append('\n');
         sb.Append("mode=").Append(mode == SyncMode.Rollback ? "rollback" : "lockstep").Append('\n');
         sb.Append("session=").Append(generation.SessionId.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("epoch=").Append(generation.Epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -357,6 +361,16 @@ public static class HandshakeCodec
     {
         var token = SessionAuth.FromHex(hex);
         return token != null && token.Length == TokenBytes ? token : null;
+    }
+
+    /// <summary>Read the <c>ckint=</c> line of a WELCOME. Absent (an old shape) or out of the
+    /// sane range (malformed/hostile) falls back to the historical default — a wrong figure here
+    /// would not merely misbehave, it would silently stop desync detection completing.</summary>
+    public static int DecodeChecksumInterval(byte[] body)
+    {
+        var map = ParseLines(body);
+        int interval = GetInt(map, "ckint", ChecksumCadence.DefaultIntervalFrames);
+        return ChecksumCadence.IsAcceptable(interval) ? interval : ChecksumCadence.DefaultIntervalFrames;
     }
 
     /// <summary>Read the <c>vacated=</c> line of a WELCOME: the seats that are permanently empty.
