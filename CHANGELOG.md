@@ -28,6 +28,37 @@ fault — the alternative is a session that appears to work and silently loses i
 
 ## Notable releases
 
+### v0.32.1 — corrections from an external review (protocol 21, mixes with v0.32.0)
+
+An independent review of v0.31.0 found several things the internal one missed. No wire change, so
+v0.32.1 and v0.32.0 still play together — but v0.32.0 masks memory automatically where this build
+asks first, so run the same build on both machines for N64.
+
+- **On a link core the checksum watched one Game Boy of four.** `MemoryDomainList.MainMemory` falls
+  back to the first registered domain, and GBHawkLink/3x/4x/GGHawkLink register `Main RAM A/B/C/D`
+  nominating none — so divergence on any machine but the first was invisible. Those cores are now
+  refused until the checksum can cover every machine. This is the counterexample to the previous
+  release's "no incorrect assumption found" verdict, which is retracted in KNOWN-ISSUES.
+- **The integrity tag sat outside the deadline meant to stop hangs.** A peer that sent a complete
+  body and stopped held the reader forever. Body and tag are now one timed read; queue accounting
+  counts the tag too.
+- **Ownership failed open.** The session claimed to own the timeline before proving frame advance
+  was blocked and the savestate hooks were installed, logging and carrying on if either failed.
+  Both are now proven first (BlockFrameAdvance is read back), a failure undoes its partial
+  acquisition, and the session refuses with the reason.
+- **Two of BizHawk's four per-frame input ticks were missing** — one-frame button overrides never
+  expired and ordinary autofire phase never advanced. All four now run in upstream's order.
+- **A punched drop ended 3-4 player sessions**; it now vacates the seat like any other leave. And
+  outage reporting looked only at the worst edge, which serialized overlapping failures — every
+  silent leg is now reported independently.
+- **A desync now says who disagreed**, including when the host is the outlier about to overwrite
+  three agreeing players with its own state. The authority policy is unchanged; the case is no
+  longer invisible.
+- **The N64 exclusion mask became opt-in.** Excluding memory is only sound while the excluded bytes
+  are never read back, and Rice copies rendered data into RDRAM when emulated code reads
+  framebuffer memory. Masking now requires both an explicit experimental opt-in and above-native
+  rendering; measurement and address-level logging stay unconditional.
+
 ### v0.32.0 — protocol 21
 
 **Protocol 21 — everyone must update.** The N64/heavy-core release: the desync checksum now

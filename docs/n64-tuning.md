@@ -39,19 +39,24 @@ above native those bytes are produced by your GPU rather than by the emulated co
 between machines and land inside the region the desync checksum reads. Resyncing cannot fix it,
 because the next frame reproduces it.
 
-**Since v0.32.0 (protocol 21) the excluded region is measured, not guessed.** Right after every
-session start or resync all machines hold byte-identical memory, so over the first three checksum
-boundaries the peers compare per-block hashes of RDRAM; blocks that disagree on identical states
-can only be machine-produced — the GPU write-back — and the host publishes them as a mask every
-later checksum skips. The learn round's verdict appears in the log (`measured which memory is
-machine-produced: N% …`), the checksum line names what is skipped (`-maskNr/NKiB`), and at native
-resolution the round concludes with nothing to mask and nothing changes. A real desync spreads far
-past any framebuffer's footprint, blows the mask's 25% cap, and is refused rather than hidden.
+**The divergent region is measured, not guessed.** Right after every session start or resync all
+machines hold byte-identical memory, so over the first three checksum boundaries the peers compare
+per-block hashes of RDRAM; blocks that disagree on identical states can only be machine-produced.
+The log names them as addresses, which is worth having whatever you do next.
 
-**This has not yet been confirmed on two machines above native** — it is built and unit-tested,
-not yet watched at 800×600 on real hardware. KI-14 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md) lists
-exactly what to read off the first session that tries it. Until then, native remains the setting
-with fifteen thousand frames of evidence behind it.
+**Excluding them is opt-in, and it is a trade rather than a fix.** Rice copies rendered data back
+into RDRAM when the emulated CPU reads framebuffer memory — so on a game that reads its own
+framebuffer, those bytes are real game-visible state and masking them means a genuine divergence
+there goes undetected. Most games never read it; some do, and nothing here can tell which yours is.
+So the mask only applies when **both**: you tick *Allow above-native N64 (experimental)* on the
+Diagnostics tab, and the session is actually above native. At native nothing is ever excluded. Both
+players must match the setting — a peer that declines keeps hashing everything and will read as a
+desync against one that does not, with a log line saying so.
+
+**Native resolution is still the setting that needs no trade**, and the one with fifteen thousand
+frames of evidence behind it. Above native with the opt-in has not yet been confirmed on two
+machines at all; KI-14 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md) lists what to read off the first
+session that tries it.
 
 Note also what none of this buys: a higher resolution still costs frame time (see the sweep below),
 and on a heavy core that is the budget rollback depth comes out of. The mask removes a correctness
@@ -77,9 +82,9 @@ Savestate cost stays flat at ~5.9 ms throughout, as it should: state size does n
 render. An earlier independent sweep of the Rice column landed within 0.05 ms at three of the four
 points, so this is a replication rather than a single run.
 
-The performance boundary is somewhere past 800×600. The desync boundary should be gone as of
-protocol 21's measured mask — pending the two-machine confirmation above — so once that lands, the
-resolution question becomes a frame-cost question alone.
+The desync boundary is native unless you take the experimental opt-in above, and the performance
+boundary is somewhere past 800×600 — so native remains the setting that satisfies both without a
+trade.
 
 ## `render: false` saves nothing here
 

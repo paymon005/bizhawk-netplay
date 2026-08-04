@@ -28,9 +28,52 @@ confirmed word-for-word, so nobody has to re-verify these:
   tool targets (MAME/Arcade is, and stays sampled; divergence learning degrades to absent there,
   by design).
 
-No incorrect assumption was found anywhere in the codebase. The same review produced the
-v0.31.0/v0.32.0 work: vacated seats, live relay failover, the control-frame MAC, divergence
-learning, and the measured checksum cadence.
+**That verdict was too strong, and an external review found the counterexample.** Verifying that
+each domain TYPE lands on the right hash path is not the same question as whether `MainMemory` is
+the whole machine — and on the link cores it is not. `MemoryDomainList.MainMemory` falls back to
+the first registered domain, and GBHawkLink/3x/4x/GGHawkLink register `Main RAM A/B/C/D` (or
+`L`/`R`) nominating none, so the checksum read one Game Boy of up to four and divergence on any
+other machine was invisible. Those cores are now refused (`MainMemoryCoverage`). The lesson worth
+keeping: an audit answers only the question it asked, and "the paths are right" was never the same
+claim as "the coverage is right".
+
+## Open findings from the 2026-08-04 external review
+
+Confirmed against source, not yet fixed — each is a wire or identity change, and they are the
+substance of the next release rather than this one's hotfixes:
+
+- **KI-16 (open) — "same BizHawk build" is not actually verified.** `CoreVersion` is
+  `Assembly.GetName().Version`, not the release, Git hash, developer-build flag or the selected
+  native plugin's identity, all of which BizHawk exposes in `VersionInfo`. Two different builds can
+  pass the handshake. Needs a versioned build manifest.
+- **KI-17 (open) — content and firmware identity is incomplete.** `RomHash` is `GameInfo.Hash`,
+  which BizHawk permits to be CRC32/MD5/SHA-1; the PSX quick identifier hashes the TOC and the
+  first 26 sectors only, multi-disc sets identify from disc one, and firmware/BIOS is not compared
+  at all. PSX and other firmware/disc systems should be treated as experimental until a canonical
+  content manifest exists.
+- **KI-18 (open) — `deterministic` is hardcoded true.** `Probe.cs` passes a constant, so
+  `SessionNegotiator`'s determinism rejection is dead code. That is defensible for Mupen (which
+  always reports false and syncs fine in practice) and wrong to generalize: bsnes, Ares64 and MAME
+  answer conditionally, and BizHawk calls the flag a contract. Should request deterministic loading
+  and fail closed, with Mupen an explicit named exception.
+- **KI-19 (open) — sync settings fail open.** `SyncSettingsBlob()` returns `""` on any read or
+  serialization failure, so two peers that both fail to read theirs match. "No sync settings" and
+  "could not read them" must be different outcomes. N64's `VideoSizeX/Y` are ordinary settings and
+  not compared at all, which is why above-native is a per-session opt-in rather than a checked
+  configuration.
+- **KI-20 (open) — recovery always assumes the host is correct.** The host's state is distributed
+  on every resync, so a lone-diverged host can overwrite three agreeing joiners. The partition is
+  now recorded and the case is named in the log (`DesyncPartition`), but the policy is unchanged;
+  choosing a different authority needs majority reconstruction and a wire change.
+- **KI-21 (open) — UDP input is not author-bound.** Input datagrams are unauthenticated and the
+  author is taken from a payload byte, so an admitted peer can submit another seat's input and
+  first-write-wins keeps it. The control channel is authenticated (v0.31.0); the input path is not.
+- **KI-22 (open) — the product says 2-4 players, the runtime permits 8.** `MaxPlayers` is 8 and
+  PSX/adapters can reach it, entering a topology nothing has tested.
+
+The same review produced the v0.31.0/v0.32.0 work and the v0.32.1 hotfixes: vacated seats, live
+relay failover, the control-frame MAC, divergence learning, the measured checksum cadence, and then
+the corrections above.
 
 ## Status
 

@@ -5,6 +5,27 @@ What is planned, what is deliberately not, and what is blocked on measurement ra
 For issues in what already ships, see [KNOWN-ISSUES.md](KNOWN-ISSUES.md). For what each release
 changed, see [CHANGELOG.md](CHANGELOG.md).
 
+## Next release: identity and verification, not speed
+
+An external review (2026-08-04) reframed the priorities, and the reframing is right. The netcode is
+strong; what is weak is knowing that two peers are running the same thing and that the checksum
+sees the whole machine. In rough order — the details are KI-16 through KI-22 in
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md):
+
+1. **A build and content manifest.** BizHawk release + Git hash + native plugin identity; canonical
+   ROM/disc/firmware digests. Today two different builds can pass the handshake, and PSX identifies
+   a multi-disc set from disc one's TOC.
+2. **Determinism qualified rather than assumed**, with Mupen a named exception instead of a blanket
+   `true`; sync-settings reads that fail closed.
+3. **A checksum over every state-bearing domain**, which is what unblocks the link cores this
+   release refuses.
+4. **Author-bound UDP input.** The control channel is authenticated; the input path is not, and the
+   author is a payload byte.
+5. **Majority-aware recovery.** The partition is recorded now; acting on it needs reconstruction.
+
+Faster checksums and deeper rollback come after those. A faster checksum over the wrong bytes is
+worse than a slow one, because it is confidently green.
+
 ## Needs people, not code
 
 These are the gaps that cannot be closed from one desk. They are listed first because they are the

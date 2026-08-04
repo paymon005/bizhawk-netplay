@@ -287,7 +287,10 @@ Honest gaps, worth knowing before relying on it:
   because it is the rendezvous for everyone else.
 - **Symmetric NAT has never been tested on a real network.** The path that handles it is built and
   unit-tested; no session has been played across an actual symmetric NAT.
-- **Movies, TAStudio and Lua are not blocked** during a session. You are warned; avoid them.
+- **A recording or playing movie, TAStudio and A/V capture are refused** at session start — the
+  session steps the core itself, so a recorder never sees the frames actually played. **Lua is not
+  blocked**, only warned about: a script can set input, load state or advance frames, any of which
+  desyncs a session. Avoid it.
 - **The N64 Rice video plugin renders some games incorrectly.** That is a BizHawk plugin issue rather
   than a netplay one, but it looks like a netplay fault from the chair.
 
