@@ -246,28 +246,20 @@ public sealed class CapabilityProbe
         }
     }
 
-    /// <summary>
-    /// Largest depth d such that: normalFrame + load + d*(sim + save) &lt;= budget - headroom.
-    /// A repair reloads once, then re-simulates and re-saves d frames. Returns 0 if even a
-    /// single-frame repair overruns. Original signature, preserved exactly.
-    /// </summary>
-    internal static int SolveMaxDepth(
-        double frameBudgetMs, double headroomMs,
-        double normalFrameMs, double loadMs, double saveMs) =>
-        SolveMaxDepth(frameBudgetMs, headroomMs, normalFrameMs, loadMs, saveMs,
-            elideConfirmedSaves: false, repairBudgetMs: 0);
-
-    /// <summary>As the six-argument form, charging one frame cost for both roles. Kept because most
-    /// callers and every test written before the live frame was measured separately pass one.</summary>
-    internal static int SolveMaxDepth(
-        double frameBudgetMs, double headroomMs,
-        double normalFrameMs, double loadMs, double saveMs,
-        bool elideConfirmedSaves, double repairBudgetMs) =>
-        SolveMaxDepth(frameBudgetMs, headroomMs, normalFrameMs, normalFrameMs, loadMs, saveMs,
-            elideConfirmedSaves, repairBudgetMs);
+    /// <summary>Depth past which the answer stops meaning anything; only reached by cores whose
+    /// state operations are effectively free, where any of these numbers is already ample.</summary>
+    private const int DepthSearchCeiling = 4096;
 
     /// <summary>
-    /// As above, but modelling the two things the original formula left out.
+    /// Largest prediction depth d whose repair still fits the budget: a repair reloads once, then
+    /// re-simulates and re-snapshots its way back to the present. Returns 0 if even a single-frame
+    /// repair overruns.
+    ///
+    /// This grew one overload per thing the original formula left out, and ended up as four
+    /// signatures where only the widest did any work. They are collapsed here onto optional
+    /// parameters carrying the same defaults the forwarders supplied, because a forwarder whose
+    /// only job is to re-supply a constant is a place for the constant to drift away from the
+    /// documentation next to it. What each argument models:
     ///
     /// <b>Steady state.</b> The old arithmetic only ever charged for savestates taken during a
     /// repair, and silently ignored that rollback also takes one every ordinary frame whether or
@@ -275,36 +267,24 @@ public sealed class CapabilityProbe
     /// the whole story — N64 measures save 6.1ms against a 2.0ms frame, so nearly half the frame
     /// budget was going on insurance the formula never counted. A core that cannot afford that
     /// recurring cost has no usable depth however the repair sum works out, so it is checked first.
-    /// Elision removes the cost rather than accounting for it.
+    /// <paramref name="elideConfirmedSaves"/> removes the cost rather than accounting for it.
     ///
     /// <b>Repair budget.</b> Requiring a repair to fit inside a single frame period is stricter than
     /// it needs to be now that the frame tick can absorb a short overrun. Passing an explicit budget
     /// buys real depth on a heavy core; the frames re-simulated are still charged at the full
     /// sim+save rate, because a correction generally confirms only the frames near its own and
-    /// leaves the rest of the window predicted — and therefore still worth anchoring.
+    /// leaves the rest of the window predicted — and therefore still worth anchoring. 0 keeps the
+    /// original one-frame ceiling.
     ///
     /// <b>Two frame costs.</b> A repair re-simulates with rendering off; the live frame renders.
     /// Charging one figure for both was wrong in the direction that matters — the live frame is the
     /// dearer of the two, and it appears in the steady-state check and in what the repair has left
-    /// to spend, so a single cheap number inflated the answer twice.
-    /// </summary>
-    internal static int SolveMaxDepth(
-        double frameBudgetMs, double headroomMs,
-        double liveFrameMs, double repairFrameMs, double loadMs, double saveMs,
-        bool elideConfirmedSaves, double repairBudgetMs) =>
-        SolveMaxDepth(frameBudgetMs, headroomMs, liveFrameMs, repairFrameMs, loadMs, saveMs,
-            elideConfirmedSaves, repairBudgetMs, keyframeInterval: 1);
-
-    /// <summary>Depth past which the answer stops meaning anything; only reached by cores whose
-    /// state operations are effectively free, where any of these numbers is already ample.</summary>
-    private const int DepthSearchCeiling = 4096;
-
-    /// <summary>
-    /// As above, and modelling the snapshot spacing the session will actually run
-    /// (<see cref="Sync.RollbackTuning.KeyframeInterval"/>).
+    /// to spend, so a single cheap number inflated the answer twice. Callers with only one
+    /// measurement pass it as both.
     ///
-    /// With a snapshot on every predicted frame the repair sum is a straight line and the old
-    /// division was exact. Spacing them apart bends it, in two ways that pull opposite:
+    /// <b>Snapshot spacing</b> (<see cref="Sync.RollbackTuning.KeyframeInterval"/>). With a snapshot
+    /// on every predicted frame the repair sum is a straight line and a division was exact. Spacing
+    /// them apart bends it, in two ways that pull opposite:
     ///
     ///   * a repair restarts from the newest keyframe at or before its target, so it re-simulates
     ///     up to N-1 frames MORE than its depth;
@@ -321,7 +301,7 @@ public sealed class CapabilityProbe
     internal static int SolveMaxDepth(
         double frameBudgetMs, double headroomMs,
         double liveFrameMs, double repairFrameMs, double loadMs, double saveMs,
-        bool elideConfirmedSaves, double repairBudgetMs, int keyframeInterval)
+        bool elideConfirmedSaves = false, double repairBudgetMs = 0, int keyframeInterval = 1)
     {
         double steadyMs = liveFrameMs + (elideConfirmedSaves ? 0 : saveMs);
         if (steadyMs > frameBudgetMs - headroomMs) return 0;

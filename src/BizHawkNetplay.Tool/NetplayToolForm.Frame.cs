@@ -483,7 +483,8 @@ public sealed partial class NetplayToolForm
                     // Deferred to the head of the NEXT tick rather than run here. On the fine
                     // clock the present is EmuHawk's Render(), two statements after this callback
                     // returns — so everything after the last frame step delays the picture by its
-                    // own cost, and a full-memory hash is 7ms on a strided domain and up to 38ms on
+                    // own cost, and a full-memory hash is ~2ms where a raw block can be reached,
+                    // 7ms on a domain that has to be sampled by word, and up to 38ms on
                     // the SHA fallback. That was one guaranteed late present every five seconds,
                     // logged as `hash` but paid for by the screen. Both peers quantise the checksum
                     // to the same interval boundary, so a one-tick deferral changes nothing about

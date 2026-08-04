@@ -220,6 +220,68 @@ input. Worth reporting upstream; nothing here can make it safe.
   Joining people you know is the mitigation; a MAC over control frames is the fix, and it is not
   written.
 
+*Re-verified 2026-08-04 against v0.29.0, and one thing is worth correcting: the fix is cheaper than
+the sentence above implies.* All three `ImportState` call sites are still what the finding says —
+`Recovery.cs` is gated on `!_isHost`, `Session.cs` is the join path, `Reconnect.cs` restores this
+machine's own pre-join state — so the host is still not exposed. But `SessionAuth.ProofPair`
+**already derives a 32-byte key** from the password and both nonces, uses it for the proofs and
+drops it. A MAC over control frames therefore needs no new exchange, no second KDF pass and no
+extra handshake round trip: it needs the key kept and the frames framed. The cost is a protocol
+bump, not a design.
+
+**KI-14 (open) — the framebuffer exclusion skips the wrong buffer, and is expected to be
+insufficient on its own.** Protocol 19 excludes the span `VI_ORIGIN` names, on the reasoning that
+this is where the GPU-produced bytes desyncing every checksum above native land. The exclusion
+machinery is right — the span threads through all five hash paths, is folded into the hash so peers
+cannot compare unlike byte sets, is word-aligned so it survives the core's `addr ^ 3` swizzle, and
+the arithmetic is unit-tested (`VideoFramebufferTests`).
+
+The span it is given is the part that is wrong. `VI_ORIGIN` names the buffer being **scanned out**;
+the plugin writes back to the buffer it just **rendered**, which in a double-buffered game — nearly
+all of them — is the other one. So the block holding fresh GPU bytes is typically still in the hash,
+and N64 above native should be expected to keep disagreeing. No register fixes this: the render
+target's address is set by an RDP display-list command and lives inside the video plugin, not in
+anything `N64_MEMORY` exposes (`RDRAM, PI_REG, SI_REG, VI_REG, RI_REG, AI_REG`, plus saves and ROM).
+
+Nor can it be found from one machine. The obvious local test — render a frame, roll back, render it
+again with video off, diff RAM — is dead because `render: false` saves nothing on Mupen64Plus/Rice:
+the plugin does its video work regardless of the flag, which `docs/n64-tuning.md` measured across
+all twelve probe runs. Two machines are the only instrument that can see this.
+
+So this stays open, and KI-15 is its fix rather than a follow-up. What is worth doing meanwhile:
+- **The checksum line names the exclusion**, as `-fb@2048KiB+150KiB` beside the path. Its absence on
+  N64 means the VI registers were not describing a picture and nothing was skipped at all.
+- **If anyone tries 800×600**, the useful report is whether checksums disagreed *every* time or only
+  sometimes, with the log kept. Every time is the predicted result; sometimes would be surprising and
+  informative.
+
+**KI-15 (open) — a desync says the hashes differ, never which bytes.** The checksum is one 32-bit
+number over all of main memory, so every disagreement looks identical: the same resync, the same
+log line, whether the cause is a determinism bug in the core, a stray write, or a video plugin
+resolving pixels into RAM. KI-14 exists because of that blindness — the framebuffer was reasoned to
+be the divergent region from what plugins are known to do, not measured to be.
+
+The fix is a **bucketed divergence map**: both peers hash main memory in ~256 blocks of ~32KiB and
+exchange the vector, and the host compares them. A few kilobytes, on a path that is about to carry a
+whole savestate anyway.
+
+Run **on a mismatch** it is a diagnostic — every desync report becomes an address range instead of
+"they differ". Run **at session start** it is the fix for KI-14, and a better one than reading
+registers: right after a joiner imports the host's state the two machines are byte-identical, so
+running a few frames on identical inputs and comparing blocks says exactly which ones are
+machine-dependent. That is measured rather than inferred, and it is core-, plugin- and
+game-agnostic — which matters, because where a game puts its framebuffers is game-specific and can
+move between scenes, so no fixed rule and no per-game table would hold.
+
+It should also be self-disabling: at native resolution the write-back bytes already agree (15,000+
+frames of evidence above), so the learned mask would come out empty and nothing changes for the
+sessions that work today.
+
+The hazard is that a learned mask could swallow a real determinism bug, so it needs bounding: log
+the excluded ranges and their total, refuse a mask above some fraction of RAM (a framebuffer is
+~2–15%; anything near half is a broken core, not a GPU), and re-learn rather than resync-loop if
+divergence later appears outside it.
+
 ## Fixed (2026-07-27, v0.11.3)
 
 **KI-9 — the arrival-based watchdog could sleep through an unrepairable freeze.**

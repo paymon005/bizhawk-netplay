@@ -56,6 +56,22 @@ difference between "works for us" and "works".
   repaired frame costs, and a 16.7 MiB state moves at memory bandwidth — 2.9 GB/s written, measured
   identically across ten games, both plugins and every resolution. A smaller or incremental state
   would be the real win and needs core support BizHawk does not expose.
+
+  *Read against the 2.11.1 source (2026-08-04), part of that figure is a copy we could skip.*
+  `N64.SaveStateBinary` is `api.SaveState(SaveStatePrivateBuff)` followed by
+  `writer.Write(buff, 0, used)` — so every snapshot moves the state **twice**: native code fills the
+  core's own 16 MiB buffer, then that buffer is copied into ours. The second copy is roughly a
+  millisecond of the six. Removing it means calling `mupen64plusApi.SaveState` by reflection and
+  hand-rolling the saveram/lag/frame tail that `SaveStateBinary` appends — i.e. trading the proven
+  `IStatable` round-trip, which is also the format the resync path ships over the wire, for about
+  20% of the dominant cost. Written down rather than done; the ratio is not obviously worth the
+  seam.
+
+- **The desync checksum is no longer the heavy-core hitch it was.** Protocol 19 reaches the raw
+  block behind a delegate-wrapped domain, so N64 hashes all 8 MiB by memcpy (~2 ms) where it used to
+  sample a quarter of it one word at a time (~7 ms). That is a hitch removed every five seconds and
+  four times the coverage. What remains unmeasured is the figure itself on real hardware — the
+  numbers above are the model, and the session log's `checksum:` line reports the truth.
 - **Where N64's frame cost comes from** is mostly render resolution: a controlled sweep puts it at
   2.4 ms at 320×240 and 7.7 ms at 2880×2160. Whether resolution accounts for *all* of the 1.6–12 ms
   swing seen across one evening's sessions is still open — the top of that range is above anything

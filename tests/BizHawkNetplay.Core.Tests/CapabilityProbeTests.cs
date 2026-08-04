@@ -14,7 +14,7 @@ public class CapabilityProbeTests
         // NES-class: ~0.2ms frame, tiny state -> very fast save/load.
         int depth = CapabilityProbe.SolveMaxDepth(
             frameBudgetMs: 16.639, headroomMs: 4.0,
-            normalFrameMs: 0.2, loadMs: 0.05, saveMs: 0.05);
+            liveFrameMs: 0.2, repairFrameMs: 0.2, loadMs: 0.05, saveMs: 0.05);
         // available = 16.639 - 4 - 0.2 - 0.05 = 12.389 ; perFrame = 0.25 -> ~49
         Assert.True(depth >= ProbeResult.RollbackDepthThreshold);
         Assert.Equal(49, depth);
@@ -26,7 +26,7 @@ public class CapabilityProbeTests
         // N64/PSX-class: expensive frame and multi-millisecond state ops.
         int depth = CapabilityProbe.SolveMaxDepth(
             frameBudgetMs: 16.639, headroomMs: 4.0,
-            normalFrameMs: 8.0, loadMs: 6.0, saveMs: 6.0);
+            liveFrameMs: 8.0, repairFrameMs: 8.0, loadMs: 6.0, saveMs: 6.0);
         Assert.True(depth < ProbeResult.RollbackDepthThreshold);
     }
 
@@ -35,19 +35,20 @@ public class CapabilityProbeTests
     {
         int depth = CapabilityProbe.SolveMaxDepth(
             frameBudgetMs: 16.639, headroomMs: 4.0,
-            normalFrameMs: 20.0, loadMs: 1.0, saveMs: 1.0);
+            liveFrameMs: 20.0, repairFrameMs: 20.0, loadMs: 1.0, saveMs: 1.0);
         Assert.Equal(0, depth);
     }
 
     [Fact]
-    public void SolveMaxDepth_LegacyOverload_MatchesTheExplicitModel()
+    public void SolveMaxDepth_OmittedArgumentsMeanNoElisionAndNoRepairBudget()
     {
-        // The five-argument form must stay exactly what it always was: no elision, one frame period
-        // of repair budget. Every existing caller depends on that.
+        // The optional arguments that replaced the shorter overloads must carry exactly what those
+        // overloads supplied: no elision, one frame period of repair budget. This is the only thing
+        // pinning those defaults, and a caller that omits them is relying on them.
         foreach (var (frame, load, save) in new[] { (0.2, 0.05, 0.05), (2.0, 1.5, 6.0), (8.0, 6.0, 6.0) })
             Assert.Equal(
-                CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save),
-                CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save,
+                CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save),
+                CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save,
                     elideConfirmedSaves: false, repairBudgetMs: 0));
     }
 
@@ -61,14 +62,14 @@ public class CapabilityProbeTests
         const double frame = 6.0, load = 0.5, save = 8.0;
         const double generousRepair = 2 * 16.639;
 
-        Assert.Equal(0, CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save,
+        Assert.Equal(0, CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save,
             elideConfirmedSaves: false, repairBudgetMs: generousRepair));
-        Assert.True(CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save,
+        Assert.True(CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save,
             elideConfirmedSaves: true, repairBudgetMs: generousRepair) > 0);
 
         // With no repair budget the gate is redundant — the repair sum already returns 0 — so it
-        // can never change an answer the original five-argument form gave.
-        Assert.Equal(0, CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save));
+        // can never change an answer the plain unelided model gave.
+        Assert.Equal(0, CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save));
     }
 
     [Fact]
@@ -79,14 +80,14 @@ public class CapabilityProbeTests
         const double budget = 16.683, headroom = 16.683 * 0.25;
         const double frame = 1.966, load = 1.505, save = 6.084;
 
-        Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom, frame, load, save));
+        Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom, frame, frame, load, save));
 
         // Elision alone doesn't move the repair sum — it removes the recurring tax, not the cost of
         // re-simulating. Allowing a repair two frame periods is what buys the depth.
-        Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom, frame, load, save,
+        Assert.Equal(1, CapabilityProbe.SolveMaxDepth(budget, headroom, frame, frame, load, save,
             elideConfirmedSaves: true, repairBudgetMs: 0));
 
-        int depth = CapabilityProbe.SolveMaxDepth(budget, headroom, frame, load, save,
+        int depth = CapabilityProbe.SolveMaxDepth(budget, headroom, frame, frame, load, save,
             elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
         Assert.Equal(3, depth);
         Assert.True(depth >= ProbeResult.RollbackDepthThreshold);
@@ -201,9 +202,9 @@ public class CapabilityProbeTests
         const double budget = 16.683, headroom = 16.683 * 0.25;
         const double load = 1.6, save = 6.0;
 
-        int fast = CapabilityProbe.SolveMaxDepth(budget, headroom, 1.863, load, save,
+        int fast = CapabilityProbe.SolveMaxDepth(budget, headroom, 1.863, 1.863, load, save,
             elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
-        int slow = CapabilityProbe.SolveMaxDepth(budget, headroom, 3.582, load, save,
+        int slow = CapabilityProbe.SolveMaxDepth(budget, headroom, 3.582, 3.582, load, save,
             elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
 
         Assert.True(fast >= ProbeResult.RollbackDepthThreshold, $"fast end should qualify, got {fast}");
@@ -298,8 +299,8 @@ public class CapabilityProbeTests
         const double budget = 16.683, headroom = 16.683 * 0.25;
         const double repairFrame = 4.25, load = 1.6, save = 6.0;
 
-        int asIfRenderWereFree = CapabilityProbe.SolveMaxDepth(budget, headroom, repairFrame, load, save,
-            elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
+        int asIfRenderWereFree = CapabilityProbe.SolveMaxDepth(budget, headroom, repairFrame, repairFrame,
+            load, save, elideConfirmedSaves: true, repairBudgetMs: 2 * budget);
         Assert.Equal(2, asIfRenderWereFree);
 
         // A dearer video plugin buys fewer repaired frames with the same repair budget...
@@ -339,10 +340,10 @@ public class CapabilityProbeTests
     }
 
     [Fact]
-    public void SolveMaxDepth_KeyframeSpacingIsExactlyTheOldModelAtOne()
+    public void SolveMaxDepth_DefaultsToASnapshotOnEveryPredictedFrame()
     {
-        // The search must be the division it replaces wherever a snapshot is taken every frame,
-        // or every existing caller quietly changes answer.
+        // Omitting the spacing must mean one, or every caller that does so quietly changes answer:
+        // the search is only the division it replaced while a snapshot is taken every frame.
         foreach (var (frame, load, save) in new[] { (0.2, 0.05, 0.05), (2.0, 1.5, 6.0), (8.0, 6.0, 6.0) })
             foreach (bool elide in new[] { false, true })
                 foreach (double repairBudget in new[] { 0.0, 33.366 })
@@ -620,17 +621,5 @@ public class CapabilityProbeTests
         Assert.Empty(emu.LiveStates);
         Assert.True(emu.SaveCount > 20, $"the repair passes should dominate the saves, got {emu.SaveCount}");
         Assert.Equal(emu.SaveCount, emu.ReleaseCount);
-    }
-
-    [Fact]
-    public void SolveMaxDepth_OneFrameCostIsExactlyTheSameCostTwice()
-    {
-        // The shorter overloads must stay a special case of the long one, not an approximation:
-        // every caller and test written before the live frame was measured separately relies on it.
-        foreach (var (frame, load, save) in new[] { (0.2, 0.05, 0.05), (2.0, 1.5, 6.0), (8.0, 6.0, 6.0) })
-            foreach (bool elide in new[] { false, true })
-                Assert.Equal(
-                    CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, load, save, elide, 33.0),
-                    CapabilityProbe.SolveMaxDepth(16.639, 4.0, frame, frame, load, save, elide, 33.0));
     }
 }

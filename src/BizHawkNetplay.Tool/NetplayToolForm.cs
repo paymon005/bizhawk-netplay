@@ -65,7 +65,13 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // input payload carries the console controls (Reset/Select/Pause/FDS) appended after the host
     // pad's own; and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a
     // different slice of the same RAM. Any one of the three would desync or misparse a mixed pair.
-    private const int Protocol = 18;
+    // 19: the desync checksum changed which bytes it reads, twice over. A delegate-wrapped domain
+    // whose peek closes over a pointer — N64's RDRAM — is now memcpied and hashed whole instead of
+    // sampled one word at a time, so a v18 peer hashes a quarter of the RAM this one hashes all of;
+    // and the span the video hardware is scanning out is skipped on every path, which is what lets
+    // N64 run above native resolution without disagreeing at every checksum. Either alone would
+    // make a mixed pair report a desync that is not there.
+    private const int Protocol = 19;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

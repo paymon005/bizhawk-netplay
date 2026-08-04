@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using BizHawkNetplay.Core.Input;
 
 namespace BizHawkNetplay.Core.Net;
@@ -105,47 +104,6 @@ public sealed class InputPacketCodec
     public int LastSizeMismatchPort { get; private set; } = -1;
     public int LastSizeMismatchExpected { get; private set; }
     public int LastSizeMismatchObserved { get; private set; }
-
-    /// <summary>
-    /// Encode a contiguous, ascending window of (frame, payload) for one port. Frames must be
-    /// consecutive; payloads must match the port's fixed size.
-    /// </summary>
-    public byte[] EncodeInput(byte port, IReadOnlyList<KeyValuePair<int, byte[]>> window)
-    {
-        if (window == null) throw new ArgumentNullException(nameof(window));
-        if (window.Count == 0) throw new ArgumentException("Empty window", nameof(window));
-        if (window.Count > byte.MaxValue) throw new ArgumentException("Window too large", nameof(window));
-        int payloadSize = _payloadSizes[port];
-        // Unreachable in a session the driver accepted — it refuses the configuration up front so
-        // this cannot fire mid-play — but an oversized datagram would be dropped somewhere out on
-        // the path, silently, so it is worth refusing loudly at the only place that builds one.
-        if (HeaderSize + window.Count * payloadSize > MaxDatagramBytes)
-            throw new ArgumentException(
-                $"Window of {window.Count} frames × {payloadSize} bytes exceeds the " +
-                $"{MaxDatagramBytes}-byte datagram limit for port {port}", nameof(window));
-
-        int baseFrame = window[0].Key;
-        var buffer = new byte[HeaderSize + window.Count * payloadSize];
-        buffer[0] = TypeInput;
-        buffer[1] = port;
-        WriteUInt64(buffer, 2, _generation.SessionId);
-        WriteInt32(buffer, 10, _generation.Epoch);
-        WriteInt32(buffer, 14, baseFrame);
-        buffer[18] = (byte)window.Count;
-
-        int offset = HeaderSize;
-        for (int i = 0; i < window.Count; i++)
-        {
-            var kv = window[i];
-            if (kv.Key != baseFrame + i)
-                throw new ArgumentException($"Window not contiguous at index {i} (frame {kv.Key})");
-            if (kv.Value.Length != payloadSize)
-                throw new ArgumentException($"Payload size {kv.Value.Length} != expected {payloadSize} for port {port}");
-            Buffer.BlockCopy(kv.Value, 0, buffer, offset, payloadSize);
-            offset += payloadSize;
-        }
-        return buffer;
-    }
 
     /// <summary>
     /// Allocate a datagram of exactly the right size and write its header, leaving the payload area

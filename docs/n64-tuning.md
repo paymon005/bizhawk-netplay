@@ -27,17 +27,42 @@ determinism was not requested rather than that the core will diverge. You will s
 log, the session runs, and the periodic checksum is what actually guards you. In practice it stays in
 sync.
 
-## Run at native resolution
+## Resolution and desyncs
 
-Above native resolution, **N64 desyncs at every checksum**.
+Historically, above native resolution **N64 desynced at every checksum**.
 
 Measured over a long two-machine session: at 800×600 every single checksum disagreed, in lockstep
 *and* in rollback; at native resolution the same pair ran 15,000+ frames with every checksum agreeing.
 
-The cause is not the netcode. Rice and GLideN64 resolve their framebuffer back into RDRAM, and above
-native those bytes are produced by your GPU rather than by the emulated core — so they differ between
-machines and land inside the region the desync checksum reads. Resyncing cannot fix it, because the
-next frame reproduces it. The tool says so after the second consecutive disagreement.
+The cause was never the netcode. Rice and GLideN64 resolve their framebuffer back into RDRAM, and
+above native those bytes are produced by your GPU rather than by the emulated core — so they differ
+between machines and land inside the region the desync checksum reads. Resyncing cannot fix it,
+because the next frame reproduces it.
+
+**Protocol 19 skips some of those bytes, and it is not expected to be enough.** The checksum now
+reads the VI registers, works out the span the video hardware is scanning out, and excludes it —
+the machinery for excluding a span is in place and correct, and the session log names what it
+skipped beside the checksum path, as `-fb@2048KiB+150KiB`.
+
+The trouble is which span. `VI_ORIGIN` names the buffer being **scanned out**, while the plugin
+writes back to the buffer it just **rendered** — the other one, in any double-buffered game, which
+is nearly all of them. So the block still holding fresh GPU-produced bytes is usually the one still
+in the hash. Reading a different register does not fix it: the render target's address is set by an
+RDP display-list command and lives in the video plugin, not in any register BizHawk exposes.
+
+**So keep running native.** Above it, expect checksums to still disagree. If you try 800×600 anyway,
+the useful thing is to say whether they disagreed *every* time or only sometimes, and to keep the
+log.
+
+The real fix is to stop guessing at the region and measure it: after a joiner imports the host's
+state the two machines are byte-identical, so running a few frames and comparing per-block hashes
+says exactly which blocks are machine-dependent, whatever the game, plugin or resolution. That is
+KI-15 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md), and it is what would make this section say something
+different.
+
+Note also what none of this buys: a higher resolution still costs frame time (see the sweep below),
+and on a heavy core that is the budget rollback depth comes out of. This is a correctness barrier,
+not a performance one.
 
 ## What resolution costs
 
@@ -59,8 +84,9 @@ Savestate cost stays flat at ~5.9 ms throughout, as it should: state size does n
 render. An earlier independent sweep of the Rice column landed within 0.05 ms at three of the four
 points, so this is a replication rather than a single run.
 
-Since the desync boundary is *native* and the performance boundary is somewhere past 800×600, native
-is the setting that satisfies both.
+The desync boundary is native and the performance boundary is somewhere past 800×600, so native is
+still the setting that satisfies both. Protocol 19 is a first move at the first of those, not a
+removal of it — see above.
 
 ## `render: false` saves nothing here
 

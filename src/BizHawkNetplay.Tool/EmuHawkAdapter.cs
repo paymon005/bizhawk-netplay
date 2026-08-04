@@ -50,6 +50,14 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     private PropertyInfo? _domainArrayProp;
     private bool _domainBulkCapable;
     private Type? _domainAccessResolvedFor;   // domain type the three fields above describe
+    // The raw block behind a delegate-wrapped domain, and the closure type it was found on. See
+    // ResolveDelegateClosurePointer — this is what puts N64's RDRAM on the memcpy path.
+    private FieldInfo? _domainClosurePtrField;
+    private Type? _domainClosureOwner;
+    private bool _closurePathRejected;        // a contents spot-check disagreed; never trust it again
+    // The VI register block, resolved lazily alongside main memory (N64 only; null everywhere else).
+    private MemoryDomain? _viRegisters;
+    private bool _viRegistersResolved;
 
     public EmuHawkAdapter(ApiContainer apis, IEmulator emulator, IStatable statable,
         Config? config = null, IMovieSession? movieSession = null)
@@ -301,12 +309,26 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// reporting a phantom desync (v15 did exactly that: the path selection below changed which
     /// bytes some cores hash).
     ///
-    /// Four ways in, because domains differ in what they expose — see
+    /// Five ways in, because domains differ in what they expose — see
     /// <see cref="ResolveDomainAccess"/> for how one is chosen. The paths need not agree with each
     /// other about byte order or coverage: both peers run the same core, so both take the same
-    /// path. Selection is a pure function of the domain's type, never of measured speed — a fast
-    /// machine and a slow machine must hash the same bytes. Falls back to the portable API path if
-    /// the domain service isn't reachable at all.
+    /// path. Selection is a pure function of the domain's type and size, never of measured speed
+    /// or of what memory contains — a fast machine and a slow machine must hash the same bytes.
+    /// Falls back to the portable API path if the domain service isn't reachable at all.
+    ///
+    /// The fifth (<c>ptr*</c>) is the one that matters on a heavy core: N64's RDRAM is a
+    /// <see cref="MemoryDomainDelegate"/> built around a pointer BizHawk already has, so reaching
+    /// that pointer moves the domain from the sampling by-word path onto the same memcpy the plain
+    /// native cores use — ~2ms for all 8MiB where sampling a quarter of it cost ~7ms. That is both
+    /// a hitch removed every <c>ChecksumInterval</c> and four times the coverage, so a narrow
+    /// divergence is caught at the next checksum instead of whenever the rotation happens to land
+    /// on it.
+    ///
+    /// Whatever the path, the span the video hardware is scanning out is skipped — see
+    /// <see cref="TryGetFramebufferSpan"/>, which is what stops N64 desyncing at every checksum
+    /// above native resolution. Both the path and that span are folded into the value, so a peer
+    /// that resolved either differently produces an obviously different hash rather than a
+    /// plausible one.
     /// </summary>
     public uint HashMainMemory(int salt = 0)
     {
@@ -329,23 +351,55 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                     domain.Enter();
                     try
                     {
+                        // Bytes the video hardware wrote back into RAM, which above native
+                        // resolution are produced by the GPU and therefore differ between machines.
+                        // Skipped by every path below; see TryGetFramebufferSpan.
+                        bool excluded = TryGetFramebufferSpan(size, out long exStart, out long exEnd);
+                        if (!excluded) { exStart = 0; exEnd = 0; }
+
                         var data = DomainDataPointer(domain);
                         var array = DomainDataArray(domain);
+                        var closure = data == IntPtr.Zero && array == null
+                            ? DomainClosurePointer(domain, length)
+                            : IntPtr.Zero;
                         if (data != IntPtr.Zero)
                         {
                             // Pointer-backed domain: a straight memcpy, then hash the buffer. The
                             // domain never changes size mid-session, so this allocates once.
                             if (_hashScratch.Length != length) _hashScratch = new byte[length];
                             Marshal.Copy(data, _hashScratch, 0, length);
-                            result = Fnv1a64(_hashScratch, length);
+                            result = Fnv1a64(_hashScratch, length, PathPtr, exStart, exEnd);
                             how = "ptr";
                         }
                         else if (array != null && array.Length >= length)
                         {
                             // Array-backed domain (the Hawk cores' RAM): the bytes are already
                             // managed, so hash them where they sit. No copy at all.
-                            result = Fnv1a64(array, length);
+                            result = Fnv1a64(array, length, PathArray, exStart, exEnd);
                             how = "arr";
+                        }
+                        else if (closure != IntPtr.Zero)
+                        {
+                            // A delegate-wrapped pointer (N64's RDRAM). Same memcpy as the `ptr`
+                            // path once the block has been found — see ResolveDelegateClosurePointer
+                            // for how, and why the copy is spot-checked against the domain itself
+                            // before its answer is believed.
+                            if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                            Marshal.Copy(closure, _hashScratch, 0, length);
+                            if (ClosureBufferDisagrees(domain, _hashScratch, length))
+                            {
+                                // The pointer is not this domain's memory after all. Fall back for
+                                // this hash and every later one rather than reporting bytes that
+                                // were never compared to anything.
+                                _closurePathRejected = true;
+                                result = HashByWord(domain, size, salt, exStart, exEnd, out int fallbackStride);
+                                how = fallbackStride > 1 ? $"word/{fallbackStride}" : "word";
+                            }
+                            else
+                            {
+                                result = Fnv1a64(_hashScratch, length, PathClosure, exStart, exEnd);
+                                how = "ptr*";
+                            }
                         }
                         else if (_domainBulkCapable)
                         {
@@ -357,14 +411,16 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                             // at the next checksum instead of up to stride intervals late.
                             if (_hashScratch.Length != length) _hashScratch = new byte[length];
                             domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch);
-                            result = Fnv1a64(_hashScratch, length);
+                            result = Fnv1a64(_hashScratch, length, PathBulk, exStart, exEnd);
                             how = "bulk";
                         }
                         else
                         {
-                            result = HashByWord(domain, size, salt, out int stride);
+                            result = HashByWord(domain, size, salt, exStart, exEnd, out int stride);
                             how = stride > 1 ? $"word/{stride}" : "word";
                         }
+                        if (excluded)
+                            how += $" -fb@{exStart / 1024}KiB+{(exEnd - exStart) / 1024}KiB";
                     }
                     finally { domain.Exit(); }
                     // Report the cost the first time so a regression here is attributable rather
@@ -432,6 +488,8 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         _domainDataProp = null;
         _domainArrayProp = null;
         _domainBulkCapable = false;
+        _domainClosurePtrField = null;
+        _domainClosureOwner = null;
         try
         {
             var prop = type.GetProperty("Data", BindingFlags.Public | BindingFlags.Instance);
@@ -446,13 +504,123 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
             _domainBulkCapable = bulk != null
                 && bulk.DeclaringType != typeof(MemoryDomain)
                 && bulk.DeclaringType != typeof(MemoryDomainDelegate);
+
+            if (_domainDataProp == null && _domainArrayProp == null && !_domainBulkCapable)
+                ResolveDelegateClosurePointer(domain);
         }
         catch
         {
             _domainDataProp = null;
             _domainArrayProp = null;
             _domainBulkCapable = false;
+            _domainClosurePtrField = null;
+            _domainClosureOwner = null;
         }
+    }
+
+    /// <summary>
+    /// Find the raw block behind a <see cref="MemoryDomainDelegate"/> whose peek is a closure over a
+    /// pointer — which is the shape N64's RDRAM has, and the reason the checksum used to take the
+    /// slowest path available to it.
+    ///
+    /// BizHawk's N64 builds every domain by asking mupen for a pointer
+    /// (<c>api.get_memory_ptr</c>) and then wrapping it in per-byte peek/poke lambdas that do the
+    /// core's <c>addr ^ 3</c> swizzle. The pointer is therefore right there, captured in the
+    /// closure, but invisible to the <c>Data</c>-property probe above — so an 8MiB domain was read
+    /// one delegate call per word, which is why <see cref="HashByWord"/> had to sample rather than
+    /// read it all: ~7ms for a quarter of RDRAM, against ~2ms for all of it by memcpy.
+    ///
+    /// Matched on SHAPE, never on name: the closure is compiler-generated
+    /// (<c>&lt;&gt;c__DisplayClass80_0</c>), and its name is not a contract — a recompile may
+    /// renumber it. What is stable is that it captures exactly one <see cref="IntPtr"/> and an
+    /// integer equal to the domain's size. Requiring exactly one pointer field is what keeps this
+    /// from guessing between two of them.
+    ///
+    /// Acceptance is deliberately a pure function of the domain's TYPE and SIZE, never of what
+    /// memory happens to contain. Both peers must take the same path or they would hash unlike
+    /// byte sets, and a rule that read RAM contents could answer differently on two machines that
+    /// merely reached this point at different moments. The contents ARE checked — see
+    /// <see cref="ClosureBufferDisagrees"/> — but only ever to reject.
+    /// </summary>
+    private void ResolveDelegateClosurePointer(MemoryDomain domain)
+    {
+        if (domain is not MemoryDomainDelegate del) return;
+        var target = del.Peek?.Target;
+        if (target == null) return;
+        var owner = target.GetType();
+
+        FieldInfo? pointer = null;
+        bool sizeAgrees = false;
+        foreach (var field in owner.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            if (field.FieldType == typeof(IntPtr))
+            {
+                if (pointer != null) return;   // two candidates: refuse rather than pick one
+                pointer = field;
+            }
+            else if (field.FieldType == typeof(int) || field.FieldType == typeof(long))
+            {
+                try
+                {
+                    if (Convert.ToInt64(field.GetValue(target)) == domain.Size) sizeAgrees = true;
+                }
+                catch { /* not a value we can compare; it simply doesn't corroborate */ }
+            }
+        }
+        if (pointer == null || !sizeAgrees) return;
+        _domainClosurePtrField = pointer;
+        _domainClosureOwner = owner;
+    }
+
+    /// <summary>
+    /// The block <see cref="ResolveDelegateClosurePointer"/> found, re-read per hash for the same
+    /// reason <see cref="DomainDataPointer"/> is: the domain object outlives a savestate load, and
+    /// caching an address across one would hash freed memory. Zero once the path has been rejected.
+    /// </summary>
+    private IntPtr DomainClosurePointer(MemoryDomain domain, int length)
+    {
+        if (_closurePathRejected || _domainClosurePtrField == null || length <= 0) return IntPtr.Zero;
+        if (domain is not MemoryDomainDelegate del) return IntPtr.Zero;
+        var target = del.Peek?.Target;
+        if (target == null || target.GetType() != _domainClosureOwner) return IntPtr.Zero;
+        try { return (IntPtr)(_domainClosurePtrField.GetValue(target) ?? IntPtr.Zero); }
+        catch { return IntPtr.Zero; }
+    }
+
+    /// <summary>Aligned words spot-checked against the domain before the copied block is believed.</summary>
+    private const int ClosureProbeWords = 256;
+
+    /// <summary>
+    /// Does the copied block disagree with what the domain itself reports?
+    ///
+    /// The swizzle means byte order within a word is permuted, so this compares each sampled word
+    /// as an unordered set of four bytes — true whatever permutation the core applies, and false as
+    /// soon as the pointer is the wrong block. A word whose four bytes are all equal cannot
+    /// distinguish anything, so it is skipped: on mostly-zero RAM the check would otherwise
+    /// "pass" against any pointer at all.
+    ///
+    /// Only ever used to REJECT. A sample that discriminates nothing leaves the path in use, which
+    /// is safe precisely because acceptance was decided structurally — see
+    /// <see cref="ResolveDelegateClosurePointer"/>.
+    /// </summary>
+    private static bool ClosureBufferDisagrees(MemoryDomain domain, byte[] buffer, int length)
+    {
+        int words = length / 4;
+        if (words == 0) return false;
+        int step = Math.Max(1, words / ClosureProbeWords);
+        for (long w = 0; w < words; w += step)
+        {
+            long at = w * 4;
+            int a0 = domain.PeekByte(at), a1 = domain.PeekByte(at + 1),
+                a2 = domain.PeekByte(at + 2), a3 = domain.PeekByte(at + 3);
+            if (a0 == a1 && a1 == a2 && a2 == a3) continue;      // discriminates nothing
+            int b0 = buffer[at], b1 = buffer[at + 1], b2 = buffer[at + 2], b3 = buffer[at + 3];
+            if (a0 + a1 + a2 + a3 != b0 + b1 + b2 + b3) return true;
+            if ((a0 ^ a1 ^ a2 ^ a3) != (b0 ^ b1 ^ b2 ^ b3)) return true;
+            if (Math.Max(Math.Max(a0, a1), Math.Max(a2, a3))
+                != Math.Max(Math.Max(b0, b1), Math.Max(b2, b3))) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -491,6 +659,106 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         catch { return null; }
     }
 
+    // --- The video framebuffer, and why the checksum must skip it -------------------
+
+    /// <summary>
+    /// N64's VI register block, or null on every other core. Resolved once.
+    ///
+    /// Named rather than probed because the name IS the identification: only BizHawk's N64 exposes
+    /// a domain called this, so finding it is what says "this core scans a framebuffer out of main
+    /// memory". <see cref="IMemoryDomains"/> offers a by-name indexer and a <c>Has</c>, so nothing
+    /// here reaches past the public surface.
+    /// </summary>
+    private MemoryDomain? ViRegisterDomain()
+    {
+        if (_viRegistersResolved) return _viRegisters;
+        _viRegistersResolved = true;
+        try
+        {
+            var domains = _memoryDomains;
+            if (domains != null && domains.Has(ViDomainName)) _viRegisters = domains[ViDomainName];
+        }
+        catch { _viRegisters = null; }
+        return _viRegisters;
+    }
+
+    private const string ViDomainName = "VI Register";
+
+    // Offsets within the VI register block, in mupen64plus's own order. The domain is big-endian
+    // and swizzled, which together mean PeekUint returns the register's value as the core holds it.
+    private const int ViStatusOffset = 0x00;   // bits 1..0 select the pixel size
+    private const int ViOriginOffset = 0x04;   // RDRAM address currently being scanned out
+    private const int ViWidthOffset = 0x08;    // pixels per line in the framebuffer
+    private const int ViVStartOffset = 0x28;   // active field, in half-lines
+    private const int ViYScaleOffset = 0x34;   // 2.10 fixed point vertical scale
+    private const int ViRegisterBytes = 0x38;  // fourteen registers
+
+    /// <summary>
+    /// The span of main memory the video hardware is scanning out, which the desync checksum must
+    /// not read.
+    ///
+    /// <b>Why this exists.</b> N64 desyncs at every checksum above native resolution, and it is not
+    /// the netcode: Rice and GLideN64 resolve their framebuffer back into RDRAM, and above native
+    /// those bytes are produced by your GPU rather than by the emulated core. They differ between
+    /// two machines that are otherwise in perfect agreement, they land inside the region the
+    /// checksum hashes, and resyncing cannot help because the next frame reproduces them. That is
+    /// what has forced every N64 session to native resolution.
+    ///
+    /// <b>Why it is safe to skip them.</b> Which pixels the GPU produced is not emulated state that
+    /// anything downstream consumes — the core re-renders the picture from scratch every frame. The
+    /// bytes excluded here are an output, not a cause.
+    ///
+    /// <b>Why both peers exclude the same range.</b> Every value read here is a VI register, which
+    /// is written by the game's own CPU code and carried in the savestate. Two peers standing on
+    /// the same state read the same registers and compute the same span, so this needs no
+    /// negotiation — only a protocol bump, so a peer that computes it differently refuses rather
+    /// than reporting a phantom desync. The bounds are folded into the hash as well, so a
+    /// disagreement is loud rather than plausible.
+    ///
+    /// <b>What it does not cover.</b> One buffer, the one being scanned out. A double-buffered game
+    /// is also rendering into another, and framebuffer emulation can write elsewhere again. If a
+    /// session still disagrees above native, that is the reason, and the bucketed divergence map in
+    /// KNOWN-ISSUES is what would say so instead of leaving it to be guessed at.
+    ///
+    /// The arithmetic is <see cref="VideoFramebuffer"/>; this reads the registers and hands them
+    /// over. Nothing below the four peeks knows what a memory domain is, which is the only reason
+    /// any of it can be tested.
+    /// </summary>
+    private bool TryGetFramebufferSpan(long mainMemorySize, out long start, out long endExclusive)
+    {
+        start = 0;
+        endExclusive = 0;
+        var vi = ViRegisterDomain();
+        if (vi == null || vi.Size < ViRegisterBytes) return false;
+
+        try
+        {
+            // The block is big-endian and swizzled, which together mean PeekUint hands back each
+            // register exactly as the core holds it. Everything past these four reads is arithmetic
+            // over plain integers and lives in Core, where it can be tested — see VideoFramebuffer.
+            uint status, origin, width, vStart, yScale;
+            vi.Enter();
+            try
+            {
+                status = vi.PeekUint(ViStatusOffset, bigEndian: true);
+                origin = vi.PeekUint(ViOriginOffset, bigEndian: true);
+                width = vi.PeekUint(ViWidthOffset, bigEndian: true);
+                vStart = vi.PeekUint(ViVStartOffset, bigEndian: true);
+                yScale = vi.PeekUint(ViYScaleOffset, bigEndian: true);
+            }
+            finally { vi.Exit(); }
+
+            return VideoFramebuffer.TryResolve(
+                status, origin, width, vStart, yScale, mainMemorySize, out start, out endExclusive);
+        }
+        catch
+        {
+            start = 0;
+            endExclusive = 0;
+            return false;
+        }
+    }
+
     /// <summary>
     /// How many 32-bit words one checksum may read. N64's RDRAM measured ~13.5ns per word read, so
     /// this budget is roughly 7ms — under half a frame, where reading all 2M words took 28ms.
@@ -499,13 +767,19 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     private const int HashWordBudget = 512 * 1024;
 
     /// <summary>
-    /// Hash a domain that has no raw backing block, reading a 32-bit word at a time.
+    /// Hash a domain whose raw backing block cannot be reached, reading a 32-bit word at a time.
     ///
-    /// N64's RDRAM is a <c>MemoryDomainDelegate</c>: there is no pointer to copy, and every read —
-    /// byte or word — goes through a delegate. <c>BulkPeekByte</c> is one such call PER BYTE (8
-    /// million of them, 34ms for 8MiB); reading words measured 28ms, because PeekUint on this
-    /// domain is itself composed from byte reads. There is no fast path, so the only remaining
-    /// lever is reading less.
+    /// This was written for N64's RDRAM, a <c>MemoryDomainDelegate</c> where every read — byte or
+    /// word — goes through a delegate. <c>BulkPeekByte</c> is one such call PER BYTE (8 million of
+    /// them, 34ms for 8MiB); reading words measured 28ms, because PeekUint on this domain is itself
+    /// composed from byte reads. With no pointer to copy, the only remaining lever was reading less.
+    ///
+    /// There IS a pointer, as it turns out — captured in the peek closure, and taken by
+    /// <see cref="ResolveDelegateClosurePointer"/>, which moves N64 onto the memcpy path and hashes
+    /// all of RDRAM for a third of what sampling a quarter of it cost. So this is now the fallback
+    /// for a delegate domain whose block could not be found or could not be trusted, rather than
+    /// the path the heaviest core in the set was stuck on. It is kept because that case is real:
+    /// a domain closing over something other than a single pointer still has to be hashed somehow.
     ///
     /// Above <see cref="HashWordBudget"/> the domain is therefore sampled with a stride. To avoid
     /// permanently ignoring the unsampled words, the starting offset rotates with the frame the
@@ -527,7 +801,8 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// exactly <c>stride</c>. Emulation divergence spreads across memory within a few frames, so
     /// in practice this costs detection latency rather than detection.
     /// </summary>
-    private static uint HashByWord(MemoryDomain domain, long size, int salt, out int stride)
+    private static uint HashByWord(MemoryDomain domain, long size, int salt,
+        long exStart, long exEnd, out int stride)
     {
         long words = size / 4;
         stride = words <= HashWordBudget
@@ -541,14 +816,24 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         // a slice it didn't. A peer reading a different slice produces an obviously different hash
         // rather than a plausible one.
         h = (h ^ (((ulong)(uint)stride << 32) | (uint)offset)) * prime;
+        h = SeedWithPath(h, PathWord, exStart, exEnd);
 
         for (long w = offset; w < words; w += stride)
-            h = (h ^ domain.PeekUint(w * 4, false)) * prime;
+        {
+            long at = w * 4;
+            // Both bounds are word-aligned, so a whole word is either in the excluded span or out
+            // of it — the sample never has to split one.
+            if (at >= exStart && at < exEnd) continue;
+            h = (h ^ domain.PeekUint(at, false)) * prime;
+        }
 
         // Trailing bytes past the last whole word, only when reading everything anyway.
         if (stride == 1)
             for (long a = words * 4; a < size; a++)
+            {
+                if (a >= exStart && a < exEnd) continue;
                 h = (h ^ domain.PeekByte(a)) * prime;
+            }
 
         return (uint)(h ^ (h >> 32));
     }
@@ -574,16 +859,54 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// on the same bytes, so the result is identical wherever it's computed — that, not collision
     /// resistance, is the property desync detection needs.
     /// </summary>
-    private static uint Fnv1a64(byte[] data, int length)
+    private static uint Fnv1a64(byte[] data, int length, int pathTag, long exStart, long exEnd)
     {
-        const ulong prime = 1099511628211UL;
-        ulong h = 14695981039346656037UL;
-        int i = 0;
-        for (int limit = length - 7; i < limit; i += 8)
-            h = (h ^ BitConverter.ToUInt64(data, i)) * prime;
-        for (; i < length; i++)
-            h = (h ^ data[i]) * prime;
+        ulong h = SeedWithPath(14695981039346656037UL, pathTag, exStart, exEnd);
+        if (exEnd > exStart)
+        {
+            h = FoldRange(h, data, 0, (int)Math.Min(length, exStart));
+            h = FoldRange(h, data, (int)Math.Min(length, exEnd), length);
+        }
+        else h = FoldRange(h, data, 0, length);
         // Fold the high half down so a divergence up there can't vanish in the truncation.
         return (uint)(h ^ (h >> 32));
     }
+
+    private static ulong FoldRange(ulong h, byte[] data, int from, int to)
+    {
+        const ulong prime = 1099511628211UL;
+        int i = from;
+        for (int limit = to - 7; i < limit; i += 8)
+            h = (h ^ BitConverter.ToUInt64(data, i)) * prime;
+        for (; i < to; i++)
+            h = (h ^ data[i]) * prime;
+        return h;
+    }
+
+    /// <summary>
+    /// Which hash path ran, and which bytes it skipped, folded into the seed.
+    ///
+    /// Same argument as the stride and offset in <see cref="HashByWord"/>, extended to cover the
+    /// two things that now also decide what a checksum describes. Two peers are expected to agree
+    /// on both — the path is chosen from the domain's type and size, the excluded span from
+    /// registers carried in the savestate — and if they ever did not, the point is that the
+    /// resulting values must not be comparable. A visible disagreement resyncs and names the paths
+    /// in the log; a plausible one would compare unlike byte sets forever.
+    /// </summary>
+    private static ulong SeedWithPath(ulong h, int pathTag, long exStart, long exEnd)
+    {
+        const ulong prime = 1099511628211UL;
+        h = (h ^ (uint)pathTag) * prime;
+        h = (h ^ (ulong)exStart) * prime;
+        h = (h ^ (ulong)exEnd) * prime;
+        return h;
+    }
+
+    /// <summary>Identifies the route a hash took, so two peers on different ones cannot compare
+    /// their results as though they described the same bytes. See <see cref="SeedWithPath"/>.</summary>
+    private const int PathPtr = 1;
+    private const int PathArray = 2;
+    private const int PathBulk = 3;
+    private const int PathWord = 4;
+    private const int PathClosure = 5;
 }
