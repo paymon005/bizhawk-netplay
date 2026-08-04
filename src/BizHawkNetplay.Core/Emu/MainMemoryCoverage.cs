@@ -16,9 +16,17 @@ namespace BizHawkNetplay.Core.Emu;
 /// resync that should have fired never does. On a 4-player link cable that is three quarters of
 /// the emulated state unwatched.
 ///
-/// Bucketing memory does not help — it slices the same one domain more finely. The honest fix is a
-/// checksum over every state-bearing domain, which is a wire change; until then a session on such
-/// a core is refused rather than run with detection that cannot see most of the machine.
+/// Bucketing memory does not help — it slices the same one domain more finely. The fix is to hash
+/// the sibling machines too, which <see cref="SiblingMachines"/> names and the adapter folds into
+/// the same checksum. These cores were refused outright for one release while that was built.
+///
+/// <b>Why the siblings and not every domain.</b> "Hash everything registered" is the tempting
+/// generalisation and it is wrong. A domain list also holds ROM (constant, and megabytes of it),
+/// video registers (which is how N64's checksum became coupled to render resolution in the first
+/// place), and a System Bus whose regions MAME's own source describes as having side effects — a
+/// checksum that reads it would be changing the state it is measuring. The sibling machines are
+/// the same KIND of domain as the one already being hashed, which is what makes including them a
+/// coverage fix rather than a change of policy about what the checksum watches.
 ///
 /// <b>Detected by shape, not by a core list.</b> A machine-suffixed name is one whose last
 /// whitespace-separated token is a single letter, with at least one sibling sharing the prefix and
@@ -47,8 +55,16 @@ public static class MainMemoryCoverage
         return false;
     }
 
-    /// <summary>The sibling machines whose memory a single-machine checksum is missing, for the
-    /// refusal message — naming them is what makes the refusal actionable rather than cryptic.</summary>
+    /// <summary>
+    /// The sibling machines whose memory a <c>MainMemory</c>-only checksum misses — the domains the
+    /// hash has to fold in as well, and the ones a diagnostic names.
+    ///
+    /// <b>Sorted by machine letter, and that is load-bearing.</b> The hash folds these in sequence,
+    /// so it is order-sensitive; two peers that enumerated their domain list in different orders
+    /// would compute different values for identical states and report a permanent desync. Sorting
+    /// on the letter rather than trusting <c>IMemoryDomains</c>'s iteration order costs nothing and
+    /// removes the question.
+    /// </summary>
     public static List<string> SiblingMachines(string? mainMemoryName, IEnumerable<string>? domainNames)
     {
         var siblings = new List<string>();
@@ -61,6 +77,7 @@ public static class MainMemoryCoverage
                 || !string.Equals(prefix, otherPrefix, StringComparison.Ordinal)) continue;
             if (!siblings.Contains(name)) siblings.Add(name);
         }
+        siblings.Sort(StringComparer.Ordinal);
         return siblings;
     }
 

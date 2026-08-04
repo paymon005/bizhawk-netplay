@@ -85,4 +85,32 @@ public class MainMemoryCoverageTests
         Assert.False(MainMemoryCoverage.IsSingleMachineSlice("Main RAM 1", ["Main RAM 2"])); // digit, not a machine letter
         Assert.Empty(MainMemoryCoverage.SiblingMachines(null, null));
     }
+
+    [Fact]
+    public void SiblingsComeBackInAFixedOrderWhateverTheDomainListSays()
+    {
+        // The checksum folds these in sequence, so the order is part of the hash. Two peers whose
+        // IMemoryDomains happened to enumerate differently would compute different values for
+        // byte-identical states and report a desync that does not exist — and it would be permanent,
+        // because nothing about a resync would change the enumeration order.
+        string[] forwards = ["Main RAM A", "Main RAM B", "Main RAM C", "Main RAM D", "ROM"];
+        string[] backwards = ["ROM", "Main RAM D", "Main RAM C", "Main RAM B", "Main RAM A"];
+
+        var fromForwards = MainMemoryCoverage.SiblingMachines("Main RAM A", forwards);
+        var fromBackwards = MainMemoryCoverage.SiblingMachines("Main RAM A", backwards);
+
+        Assert.Equal(new[] { "Main RAM B", "Main RAM C", "Main RAM D" }, fromForwards);
+        Assert.Equal(fromForwards, fromBackwards);
+    }
+
+    [Fact]
+    public void TheSiblingListNeverIncludesTheDomainAlreadyBeingHashed()
+    {
+        // Folding the primary in twice would be harmless for detection but would make the value
+        // depend on which machine MainMemory resolved to, which is not something both peers are
+        // guaranteed to agree on for the same reason the coverage bug existed in the first place.
+        string[] domains = ["Main RAM A", "Main RAM B", "Main RAM C"];
+        foreach (var primary in domains)
+            Assert.DoesNotContain(primary, MainMemoryCoverage.SiblingMachines(primary, domains));
+    }
 }

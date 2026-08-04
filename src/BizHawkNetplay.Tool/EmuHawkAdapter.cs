@@ -354,97 +354,32 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                 long size = domain.Size;
                 if (size > 0 && size <= int.MaxValue)
                 {
-                    int length = (int)size;
                     var timer = Stopwatch.StartNew();
-                    string how;
-                    uint result;
-                    ResolveDomainAccess(domain);
-                    // Waterbox-backed domains only expose their memory while activated, and the
-                    // Monitor variants guard it with a lock; Enter/Exit is a no-op for the plain
-                    // native cores.
-                    domain.Enter();
-                    try
-                    {
-                        // Bytes some machine produced for itself — GPU output a video plugin
-                        // resolved back into console RAM — which the hash must skip or two
-                        // perfectly synchronized peers disagree forever. The learned mask (built
-                        // by measurement; see DivergenceLearner) outranks the VI-register guess it
-                        // replaced; the guess remains the pre-learn default.
-                        var (exclusions, exclusionSeed, exclusionTag) = ResolveExclusions(size, salt);
+                    uint result = HashOneDomain(domain, salt, buckets, applyExclusions: true,
+                        out bucketsFilled, out string how);
 
-                        var data = DomainDataPointer(domain);
-                        var array = DomainDataArray(domain);
-                        var closure = data == IntPtr.Zero && array == null
-                            ? DomainClosurePointer(domain, length)
-                            : IntPtr.Zero;
-                        if (data != IntPtr.Zero)
-                        {
-                            // Pointer-backed domain: a straight memcpy, then hash the buffer. The
-                            // domain never changes size mid-session, so this allocates once.
-                            if (_hashScratch.Length != length) _hashScratch = new byte[length];
-                            Marshal.Copy(data, _hashScratch, 0, length);
-                            result = Fnv1a64(_hashScratch, length, PathPtr, exclusions, exclusionSeed);
-                            bucketsFilled = FillBuckets(_hashScratch, length, buckets);
-                            how = "ptr";
-                        }
-                        else if (array != null && array.Length >= length)
-                        {
-                            // Array-backed domain (the Hawk cores' RAM): the bytes are already
-                            // managed, so hash them where they sit. No copy at all.
-                            result = Fnv1a64(array, length, PathArray, exclusions, exclusionSeed);
-                            bucketsFilled = FillBuckets(array, length, buckets);
-                            how = "arr";
-                        }
-                        else if (closure != IntPtr.Zero)
-                        {
-                            // A delegate-wrapped pointer (N64's RDRAM). Same memcpy as the `ptr`
-                            // path once the block has been found — see ResolveDelegateClosurePointer
-                            // for how, and why the copy is spot-checked against the domain itself
-                            // before its answer is believed.
-                            if (_hashScratch.Length != length) _hashScratch = new byte[length];
-                            Marshal.Copy(closure, _hashScratch, 0, length);
-                            if (ClosureBufferDisagrees(domain, _hashScratch, length))
-                            {
-                                // The pointer is not this domain's memory after all. Fall back for
-                                // this hash and every later one rather than reporting bytes that
-                                // were never compared to anything.
-                                _closurePathRejected = true;
-                                result = HashByWord(domain, size, salt, exclusions, out int fallbackStride);
-                                how = fallbackStride > 1 ? $"word/{fallbackStride}" : "word";
-                            }
-                            else
-                            {
-                                result = Fnv1a64(_hashScratch, length, PathClosure, exclusions, exclusionSeed);
-                                bucketsFilled = FillBuckets(_hashScratch, length, buckets);
-                                how = "ptr*";
-                            }
-                        }
-                        else if (_domainBulkCapable)
-                        {
-                            // A real BulkPeekByte override — one memcpy or one native call for the
-                            // whole domain. This is what rescues the waterbox function-backed
-                            // domains (the Nyma cores), whose per-byte reads each take a monitor
-                            // round-trip: the full domain now costs about what a 1/16 stride
-                            // sample used to, and a divergence narrower than the stride is caught
-                            // at the next checksum instead of up to stride intervals late.
-                            if (_hashScratch.Length != length) _hashScratch = new byte[length];
-                            domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch);
-                            result = Fnv1a64(_hashScratch, length, PathBulk, exclusions, exclusionSeed);
-                            bucketsFilled = FillBuckets(_hashScratch, length, buckets);
-                            how = "bulk";
-                        }
-                        else
-                        {
-                            result = HashByWord(domain, size, salt, exclusions, out int stride);
-                            how = stride > 1 ? $"word/{stride}" : "word";
-                        }
-                        how += exclusionTag;
+                    // A core that emulates several machines registers one Main RAM per machine and
+                    // nominates none, so MainMemory resolves to the FIRST — machine A, with B/C/D
+                    // never read. Folding the siblings in is what makes a divergence confined to
+                    // another player's Game Boy visible at all; see MainMemoryCoverage for why it
+                    // is the siblings rather than every registered domain.
+                    //
+                    // Sequence-sensitive on purpose, over a list sorted by machine letter: the fold
+                    // is what makes "A diverged" distinguishable from "B diverged", and the sort is
+                    // what stops two peers folding in different orders.
+                    var siblings = SiblingMachineDomains();
+                    for (int i = 0; i < siblings.Count; i++)
+                    {
+                        uint other = HashOneDomain(siblings[i], salt, null, applyExclusions: false,
+                            out _, out _);
+                        result = (result ^ other) * 16777619u;
                     }
-                    finally { domain.Exit(); }
+                    if (siblings.Count > 0) how += $" +{siblings.Count}mach";
+
                     // Report the cost the first time so a regression here is attributable rather
                     // than showing up as an unexplained slow tick.
                     if (HashDiagnostic == null)
-                        HashDiagnostic = $"checksum: {how} domain '{domain.Name}' {length / 1024}KiB " +
+                        HashDiagnostic = $"checksum: {how} domain '{domain.Name}' {size / 1024}KiB " +
                             $"in {timer.Elapsed.TotalMilliseconds:F1}ms";
                     return result;
                 }
@@ -471,6 +406,147 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                 $" — SHA over '{name}' {domainSize / 1024}KiB took {shaTimer.Elapsed.TotalMilliseconds:F1}ms";
         return h;
     }
+
+    /// <summary>
+    /// Hash exactly one domain, by whichever of the five paths its type affords.
+    ///
+    /// Split out of <see cref="HashMainMemoryCore"/> so a multi-machine core can run it once per
+    /// machine. Exclusions and the divergence buckets belong to the PRIMARY domain only, which is
+    /// why they are parameters rather than read here: the framebuffer mask is an N64 concept and
+    /// N64 has one machine, so no core has ever needed both at once — and a sibling silently
+    /// inheriting the primary's mask ranges would exclude arbitrary bytes of another machine.
+    /// </summary>
+    private uint HashOneDomain(MemoryDomain domain, int salt, uint[]? buckets, bool applyExclusions,
+        out bool bucketsFilled, out string how)
+    {
+        bucketsFilled = false;
+        long size = domain.Size;
+        int length = (int)size;
+        uint result;
+        ResolveDomainAccess(domain);
+        // Waterbox-backed domains only expose their memory while activated, and the
+        // Monitor variants guard it with a lock; Enter/Exit is a no-op for the plain
+        // native cores.
+        domain.Enter();
+        try
+        {
+            // Bytes some machine produced for itself — GPU output a video plugin
+            // resolved back into console RAM — which the hash must skip or two
+            // perfectly synchronized peers disagree forever. The learned mask (built
+            // by measurement; see DivergenceLearner) outranks the VI-register guess it
+            // replaced; the guess remains the pre-learn default.
+            var (exclusions, exclusionSeed, exclusionTag) = applyExclusions
+                ? ResolveExclusions(size, salt)
+                : (Array.Empty<long>(), 0UL, "");
+
+            var data = DomainDataPointer(domain);
+            var array = DomainDataArray(domain);
+            var closure = data == IntPtr.Zero && array == null
+                ? DomainClosurePointer(domain, length)
+                : IntPtr.Zero;
+            if (data != IntPtr.Zero)
+            {
+                // Pointer-backed domain: a straight memcpy, then hash the buffer. The
+                // domain never changes size mid-session, so this allocates once.
+                if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                Marshal.Copy(data, _hashScratch, 0, length);
+                result = Fnv1a64(_hashScratch, length, PathPtr, exclusions, exclusionSeed);
+                bucketsFilled = FillBuckets(_hashScratch, length, buckets);
+                how = "ptr";
+            }
+            else if (array != null && array.Length >= length)
+            {
+                // Array-backed domain (the Hawk cores' RAM): the bytes are already
+                // managed, so hash them where they sit. No copy at all.
+                result = Fnv1a64(array, length, PathArray, exclusions, exclusionSeed);
+                bucketsFilled = FillBuckets(array, length, buckets);
+                how = "arr";
+            }
+            else if (closure != IntPtr.Zero)
+            {
+                // A delegate-wrapped pointer (N64's RDRAM). Same memcpy as the `ptr`
+                // path once the block has been found — see ResolveDelegateClosurePointer
+                // for how, and why the copy is spot-checked against the domain itself
+                // before its answer is believed.
+                if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                Marshal.Copy(closure, _hashScratch, 0, length);
+                if (ClosureBufferDisagrees(domain, _hashScratch, length))
+                {
+                    // The pointer is not this domain's memory after all. Fall back for
+                    // this hash and every later one rather than reporting bytes that
+                    // were never compared to anything.
+                    _closurePathRejected = true;
+                    result = HashByWord(domain, size, salt, exclusions, out int fallbackStride);
+                    how = fallbackStride > 1 ? $"word/{fallbackStride}" : "word";
+                }
+                else
+                {
+                    result = Fnv1a64(_hashScratch, length, PathClosure, exclusions, exclusionSeed);
+                    bucketsFilled = FillBuckets(_hashScratch, length, buckets);
+                    how = "ptr*";
+                }
+            }
+            else if (_domainBulkCapable)
+            {
+                // A real BulkPeekByte override — one memcpy or one native call for the
+                // whole domain. This is what rescues the waterbox function-backed
+                // domains (the Nyma cores), whose per-byte reads each take a monitor
+                // round-trip: the full domain now costs about what a 1/16 stride
+                // sample used to, and a divergence narrower than the stride is caught
+                // at the next checksum instead of up to stride intervals late.
+                if (_hashScratch.Length != length) _hashScratch = new byte[length];
+                domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch);
+                result = Fnv1a64(_hashScratch, length, PathBulk, exclusions, exclusionSeed);
+                bucketsFilled = FillBuckets(_hashScratch, length, buckets);
+                how = "bulk";
+            }
+            else
+            {
+                result = HashByWord(domain, size, salt, exclusions, out int stride);
+                how = stride > 1 ? $"word/{stride}" : "word";
+            }
+            how += exclusionTag;
+        }
+        finally { domain.Exit(); }
+        return result;
+    }
+
+    /// <summary>
+    /// Every OTHER machine's main memory on a multi-machine core, in a fixed order. Empty — and
+    /// therefore free — for every ordinary core, which is all of them but the link cables.
+    ///
+    /// Resolved once. The domain objects are stable for a core's lifetime (BizHawk mutates them in
+    /// place on a state load rather than replacing them), which is the same property the access
+    /// resolution above relies on.
+    /// </summary>
+    private List<MemoryDomain> SiblingMachineDomains()
+    {
+        if (_siblingMachines != null) return _siblingMachines;
+        // Through MainMemoryDomain() rather than the field, so the service is resolved first: an
+        // early caller would otherwise cache an empty list permanently and the siblings would never
+        // be hashed again for the rest of the session.
+        var primary = MainMemoryDomain();
+        _siblingMachines = new List<MemoryDomain>();
+        try
+        {
+            var domains = _memoryDomains;
+            if (domains == null || primary == null) return _siblingMachines;
+            var names = new List<string>();
+            foreach (var d in domains) names.Add(d.Name);
+            foreach (var siblingName in MainMemoryCoverage.SiblingMachines(primary.Name, names))
+            {
+                var found = domains[siblingName];
+                // Skip anything unhashable rather than throwing: a sibling that cannot be read is a
+                // coverage gap the diagnostic reports, not a reason to lose the checksum entirely.
+                if (found != null && found.Size > 0 && found.Size <= int.MaxValue)
+                    _siblingMachines.Add(found);
+            }
+        }
+        catch { _siblingMachines = new List<MemoryDomain>(); }
+        return _siblingMachines;
+    }
+
+    private List<MemoryDomain>? _siblingMachines;
 
     /// <summary>Which checksum path ran and what it cost, filled in on the first hash of a session.
     /// Null until then. Logged once so a regression here can't hide as a generic slow tick.</summary>
@@ -667,10 +743,10 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// <summary>
     /// Why the desync checksum cannot see this core's whole machine, or null when it can.
     ///
-    /// Non-null only on the link cores, where <c>MainMemory</c> is one emulated Game Boy's RAM and
-    /// the others are never hashed — see <see cref="MainMemoryCoverage"/> for what that costs a
-    /// 3-4 player session. The session refuses rather than running with detection blind to most of
-    /// the state it is meant to be guarding.
+    /// Null now for the link cores too: <see cref="SiblingMachineDomains"/> folds every emulated
+    /// machine's RAM into the checksum, so the blindness this used to refuse over is gone. It
+    /// returns a refusal only if a sibling machine is registered but unreadable — the same gap for
+    /// the same reason, arrived at a different way, and still not something to run a session on.
     /// </summary>
     public string? MainMemoryCoverageGap()
     {
@@ -682,15 +758,24 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
             var names = new List<string>();
             foreach (var d in domains) names.Add(d.Name);
             if (!MainMemoryCoverage.IsSingleMachineSlice(domain.Name, names)) return null;
-            var siblings = MainMemoryCoverage.SiblingMachines(domain.Name, names);
-            return $"this core emulates more than one machine, and the desync checksum can only " +
-                   $"read '{domain.Name}' — {string.Join(", ", siblings)} would never be checked. " +
-                   "A divergence confined to another player's machine would be invisible: every " +
-                   "checksum would agree while the session was already broken. Netplay refuses " +
-                   "rather than run with detection blind to most of the state it is guarding.";
+
+            var expected = MainMemoryCoverage.SiblingMachines(domain.Name, names);
+            var hashed = SiblingMachineDomains();
+            if (hashed.Count == expected.Count) return null;   // every machine is covered
+
+            var missing = new List<string>(expected);
+            foreach (var d in hashed) missing.Remove(d.Name);
+            return $"this core emulates more than one machine and {string.Join(", ", missing)} " +
+                   "cannot be read, so a divergence confined to that machine would be invisible — " +
+                   "every checksum would agree while the session was already broken. Netplay " +
+                   "refuses rather than run with detection blind to part of the state it guards.";
         }
         catch { return null; } // a probe that cannot answer must not be the thing that refuses
     }
+
+    /// <summary>How many emulated machines the checksum covers, for the session log. 1 on every
+    /// ordinary core; 2-4 on a link cable.</summary>
+    public int HashedMachineCount => 1 + SiblingMachineDomains().Count;
 
     /// <summary>Main memory as a raw domain, resolved once. Null if the service isn't offered.</summary>
     private MemoryDomain? MainMemoryDomain()

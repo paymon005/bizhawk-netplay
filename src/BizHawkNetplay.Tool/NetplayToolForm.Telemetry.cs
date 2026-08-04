@@ -304,6 +304,12 @@ public sealed partial class NetplayToolForm
         {
             _hashDiagLogged = true;
             Log(_adapter.HashDiagnostic);
+            // Worth saying out loud on the cores where it is not 1: a link cable emulates several
+            // whole machines, and for one release those cores were refused precisely because the
+            // checksum could only see the first of them.
+            int machines = _adapter.HashedMachineCount;
+            if (machines > 1)
+                Log($"checksum covers all {machines} emulated machines' main memory");
         }
         if (_forceDesyncOnce)
         {
