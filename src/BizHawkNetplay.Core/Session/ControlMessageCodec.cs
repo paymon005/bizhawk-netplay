@@ -259,6 +259,31 @@ public static class ControlMessageCodec
         return true;
     }
 
+    public const int SeatVacatedSize = 13;
+
+    /// <summary>A seat that is now permanently empty: the generation the decision was made at
+    /// (so a stale copy can be retired) and the controller port. See
+    /// <see cref="ControlMessageType.SeatVacated"/>.</summary>
+    public static byte[] EncodeSeatVacated(SessionGeneration generation, int port)
+    {
+        if (port < 0 || port >= HandshakeCodec.MaxPlayers)
+            throw new ArgumentOutOfRangeException(nameof(port));
+        var body = new byte[SeatVacatedSize];
+        WriteGeneration(body, 0, generation);
+        body[12] = (byte)port;
+        return body;
+    }
+
+    public static bool TryDecodeSeatVacated(byte[] body, out SessionGeneration generation, out int port)
+    {
+        generation = default;
+        port = 0;
+        if (body == null || body.Length != SeatVacatedSize || !TryReadGeneration(body, 0, out generation))
+            return false;
+        port = body[12];
+        return port < HandshakeCodec.MaxPlayers;
+    }
+
     /// <summary>The host's authoritative delay, sent after the mesh round and before READY.</summary>
     public static byte[] EncodeInputDelay(SessionGeneration generation, int delay)
     {

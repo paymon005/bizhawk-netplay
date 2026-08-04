@@ -19,6 +19,10 @@ public sealed class InputPipeline
     private readonly Dictionary<int, PortInput>[] _byFrame; // per port: frame -> input
     private readonly int[] _frontier;                       // per port: contiguous-known frame, -1 if none
     private readonly bool[] _isLocal;
+    // A vacated port answers every query with its stored neutral and never waits on the network —
+    // see Vacate for what that means and why it is only ever safe on a fresh timeline.
+    private readonly bool[] _vacated;
+    private readonly PortInput?[] _vacatedNeutral;
     // How far PruneBefore has already swept, so the ordinary call removes one frame instead of
     // reading every key of every port's map. See PruneBefore.
     private int _prunedBelow;
@@ -32,12 +36,42 @@ public sealed class InputPipeline
         _byFrame = new Dictionary<int, PortInput>[portCount];
         _frontier = new int[portCount];
         _isLocal = new bool[portCount];
+        _vacated = new bool[portCount];
+        _vacatedNeutral = new PortInput?[portCount];
         for (int p = 0; p < portCount; p++)
         {
             _byFrame[p] = new Dictionary<int, PortInput>();
             _frontier[p] = -1;
         }
     }
+
+    /// <summary>
+    /// Mark a port as permanently empty: its player left, and the session continues without them.
+    /// From here the port answers every frame with <paramref name="neutral"/>, its frontier reads
+    /// as unbounded (so nothing ever waits on it), and arriving input for it is ignored.
+    ///
+    /// Only ever safe on a FRESH timeline — at driver construction, before any frame has run.
+    /// Vacating a port mid-timeline is a desync by construction: peers hear about the leave at
+    /// different frames, so the frames in between would hold predicted repeat-last input on one
+    /// machine and neutral on another, and no correction ever arrives to reconcile them (the
+    /// leaver is gone — there is nobody left to send the input the prediction disagrees with).
+    /// That is why the tool routes every vacate through the authoritative-rebuild machinery:
+    /// everyone lands on one state at a new generation with the seat empty from frame 0.
+    /// </summary>
+    public void Vacate(int port, PortInput neutral)
+    {
+        if (port < 0 || port >= _portCount) throw new ArgumentOutOfRangeException(nameof(port));
+        _vacated[port] = true;
+        _vacatedNeutral[port] = neutral ?? throw new ArgumentNullException(nameof(neutral));
+        _byFrame[port].Clear();
+        // MaxValue makes every frontier comparison come out "never waiting on this port" without
+        // a special case: AllConfirmed passes, MinFrontier ignores it, rollback's horizon never
+        // measures against it. TryGet below is the one reader that needs to know more than that.
+        _frontier[port] = int.MaxValue;
+    }
+
+    /// <summary>Whether a port has been vacated (see <see cref="Vacate"/>).</summary>
+    public bool IsVacated(int port) => _vacated[port];
 
     public int PortCount => _portCount;
 
@@ -66,6 +100,9 @@ public sealed class InputPipeline
         if (port < 0 || port >= _portCount) throw new ArgumentOutOfRangeException(nameof(port));
         if (frame < 0) throw new ArgumentOutOfRangeException(nameof(frame));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        // A vacated port's input is neutral by definition; a straggler datagram from the departed
+        // player must not resurrect a frontier deliberately parked at the ceiling.
+        if (_vacated[port]) return;
 
         var map = _byFrame[port];
         if (!map.ContainsKey(frame))
@@ -78,8 +115,11 @@ public sealed class InputPipeline
         _frontier[port] = next - 1;
     }
 
-    public bool TryGet(int port, int frame, out PortInput input) =>
-        _byFrame[port].TryGetValue(frame, out input!);
+    public bool TryGet(int port, int frame, out PortInput input)
+    {
+        if (_vacated[port]) { input = _vacatedNeutral[port]!; return true; }
+        return _byFrame[port].TryGetValue(frame, out input!);
+    }
 
     /// <summary>True when every port has confirmed input at <paramref name="frame"/> (lockstep gate).</summary>
     public bool AllConfirmed(int frame)
@@ -98,7 +138,8 @@ public sealed class InputPipeline
         var ports = new PortInput[_portCount];
         for (int p = 0; p < _portCount; p++)
         {
-            if (!_byFrame[p].TryGetValue(frame, out var value))
+            // Through TryGet, not the map, so a vacated port merges as its neutral.
+            if (!TryGet(p, frame, out var value))
                 throw new InvalidOperationException($"No input for port {p} at frame {frame}");
             ports[p] = value;
         }

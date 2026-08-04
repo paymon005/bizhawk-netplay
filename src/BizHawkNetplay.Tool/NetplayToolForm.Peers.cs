@@ -251,12 +251,28 @@ public sealed partial class NetplayToolForm
                         && generation == CurrentGeneration)
                         BeginInvokePeer(link, () => ResumeResyncAsJoiner(generation));
                 }
+                else if (type == ControlMessageType.SeatVacated)
+                {
+                    // Host -> joiner only: a seat is permanently empty; the rebuild follows.
+                    if (!_isHost && ControlMessageCodec.TryDecodeSeatVacated(body,
+                            out var generation, out int vacatedPort))
+                        BeginInvokePeer(link, () => OnSeatVacated(generation, vacatedPort));
+                }
                 else if (type == ControlMessageType.Bye)
                 {
                     int attempt = link.Attempt;
                     BeginInvokeUi(() =>
                     {
-                        if (IsConnectionAttemptCurrent(attempt) && _peers.Contains(link))
+                        if (!IsConnectionAttemptCurrent(attempt) || !_peers.Contains(link)) return;
+                        // A joiner leaving a 3-4 player session cleanly costs its own seat, not the
+                        // session: the survivors carry on around the empty seat (GGPO's disconnect
+                        // model). Everything else keeps the old behaviour — a 2-player Bye, the
+                        // host leaving (a joiner's only peer IS the host), or a leave landing in
+                        // the middle of a recovery whose barriers a departure would tangle.
+                        if (_isHost && _playerCount > 2 && _peers.Count >= 2
+                            && !_phase.IsRebuilding && !_phase.AwaitingRejoin)
+                            OnPeerLeftGracefully(link);
+                        else
                             EndSession($"{link.Label} left the session");
                     });
                     return;

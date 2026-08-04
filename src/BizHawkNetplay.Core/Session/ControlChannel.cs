@@ -36,6 +36,11 @@ public enum ControlMessageType : byte
     // reach only the joiners, so without this round nobody ever measures a joiner-to-joiner edge.
     MeshRtt = 21,
     InputDelay = 22,    // host -> joiner: the authoritative delay, once every edge has reported
+    // Host -> joiner: [generation:12][port:1] — the named seat is permanently empty and the
+    // session continues without its player. Sent BEFORE the rebuild that makes it true (the
+    // control channel is ordered), so every peer rebuilds with the seat already neutral; the
+    // generation is the one current when the vacate was decided, purely to retire stale copies.
+    SeatVacated = 23,
 }
 
 /// <summary>

@@ -99,6 +99,7 @@ public sealed class FrameDriver : IDisposable
     private readonly long[] _lastGapRequestMs;
     private readonly int[] _newestRemoteFrame; // highest frame ever decoded per port (-1 = none)
     private readonly long[] _holeFirstSeenMs;  // send-clock ms when a beyond-window hole appeared (-1 = none)
+    private readonly bool[] _vacated;          // port permanently empty; see VacatePort
 
     /// <param name="strategyFactory">Builds the sync strategy over the shared pipeline (the swap point).</param>
     /// <param name="localPort">The controller port this instance owns and sources locally.</param>
@@ -167,6 +168,7 @@ public sealed class FrameDriver : IDisposable
         _lastGapRequestMs = new long[ports];
         _newestRemoteFrame = new int[ports];
         _holeFirstSeenMs = new long[ports];
+        _vacated = new bool[ports];
         for (int p = 0; p < ports; p++)
         {
             _lastGapRequestMs[p] = -GapRequestIntervalMs;
@@ -222,12 +224,35 @@ public sealed class FrameDriver : IDisposable
     /// committing a two-frame presentation burst.</summary>
     public bool NextFrameFullyConfirmed => _pipeline.AllConfirmed(CurrentFrame + 1);
 
+    /// <summary>
+    /// Mark a remote port as permanently empty: its player left and the session continues without
+    /// them. The pipeline answers neutral for it forever, and every per-port network mechanism —
+    /// UDP-silence liveness, gap requests, the unrepaired-hole backstop — stops watching it, since
+    /// each of them would otherwise read an empty seat as a broken link and end the session.
+    ///
+    /// Callers vacate on a FRESH driver only (at construction, before any frame runs) — see
+    /// <see cref="InputPipeline.Vacate"/> for why a mid-timeline vacate is a desync by
+    /// construction. The local port cannot be vacated; a peer with no seat has no driver.
+    /// </summary>
+    public void VacatePort(int port)
+    {
+        if (port < 0 || port >= _vacated.Length) throw new ArgumentOutOfRangeException(nameof(port));
+        if (port == _localPort)
+            throw new ArgumentException("the local port cannot be vacated", nameof(port));
+        _vacated[port] = true;
+        _pipeline.Vacate(port, PortInput.Neutral(_adapter.GetControllerLayout(port)));
+        _lastRemoteInputStamp[port] = 0;   // 0 = "never heard", which the silence scan skips
+        _holeFirstSeenMs[port] = -1;
+        _newestRemoteFrame[port] = -1;
+    }
+
     /// <summary>Rebase UDP-silence tracking at GO. A driver may be seeded before READY, and time
     /// spent waiting at the barrier must not look like an active-session input outage.</summary>
     public void ResetRemoteInputLiveness()
     {
         long now = Stopwatch.GetTimestamp();
-        for (int p = 0; p < _lastRemoteInputStamp.Length; p++) _lastRemoteInputStamp[p] = now;
+        for (int p = 0; p < _lastRemoteInputStamp.Length; p++)
+            if (!_vacated[p]) _lastRemoteInputStamp[p] = now; // an empty seat must stay unwatched
     }
 
     /// <summary>
@@ -240,7 +265,8 @@ public sealed class FrameDriver : IDisposable
         _started = true;
         var neutral = PortInput.Neutral(_adapter.GetControllerLayout(_localPort));
         long now = Stopwatch.GetTimestamp();
-        for (int p = 0; p < _lastRemoteInputStamp.Length; p++) _lastRemoteInputStamp[p] = now;
+        for (int p = 0; p < _lastRemoteInputStamp.Length; p++)
+            if (!_vacated[p]) _lastRemoteInputStamp[p] = now; // an empty seat must stay unwatched
         for (int f = 0; f < _delay; f++)
             ProduceLocal(f, neutral);
         SendWindow(force: true);
@@ -408,6 +434,10 @@ public sealed class FrameDriver : IDisposable
             }
             int port = window.Port;
             if (port == _localPort) continue;      // never let the wire override our own port
+            // A vacated port's input is neutral by definition. The generation check above already
+            // rejects the departed player's stragglers; this guard is for the datagram that would
+            // otherwise re-stamp liveness and put an empty seat back under the silence watchdog.
+            if (_vacated[port]) continue;
 
             // Any well-decoded frame from a remote port proves that port's UDP path is alive,
             // including a redundant frame we already hold during a lockstep stall.
@@ -529,7 +559,11 @@ public sealed class FrameDriver : IDisposable
         long now = _sendClock.ElapsedMilliseconds;
         for (int p = 0; p < _lastGapRequestMs.Length; p++)
         {
-            if (p == _localPort) continue;
+            // The vacated guard is not merely a skip of pointless work: a vacated frontier is
+            // int.MaxValue, and `frontier + _redundancy` below would wrap negative — making the
+            // beyond-window-hole test permanently true and the KI-9 backstop end the session for
+            // a hole in a seat nobody occupies.
+            if (p == _localPort || _vacated[p]) continue;
             int frontier = _pipeline.ConfirmedFrontier(p);
             // Depth alone is NOT a sufficient trigger: with time-sync enabled the soft cap
             // stalls us only ~(latency+2) frames past the frontier — far shallower than the

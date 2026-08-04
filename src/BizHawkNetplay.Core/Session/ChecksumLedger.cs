@@ -43,11 +43,22 @@ public sealed class ChecksumLedger
     /// caller only ever records for the live generation, so anything else is a dead timeline.
     /// </summary>
     public ChecksumOutcome Record(SessionGeneration generation, int sourcePort, int frame, uint hash, int playerCount)
+        => Record(generation, sourcePort, frame, hash, playerCount, playerCount);
+
+    /// <summary>
+    /// As above, with the port range and the report count that resolves a frame stated apart.
+    /// They diverge the moment a seat is vacated: the session still spans
+    /// <paramref name="portRange"/> controller ports — reports arrive tagged with their original
+    /// port numbers — but only <paramref name="expectedReports"/> players exist to report, and
+    /// waiting for the full range would leave every frame pending forever.
+    /// </summary>
+    public ChecksumOutcome Record(SessionGeneration generation, int sourcePort, int frame, uint hash,
+        int portRange, int expectedReports)
     {
         // Defensive, never throwing: Record runs on control-reader threads under the caller's
         // lock — a nonsense player count must degrade to "nothing resolves", not an exception.
-        if (playerCount < 1) return ChecksumOutcome.Pending;
-        if (sourcePort < 0 || sourcePort >= playerCount) return ChecksumOutcome.Pending;
+        if (portRange < 1 || expectedReports < 1) return ChecksumOutcome.Pending;
+        if (sourcePort < 0 || sourcePort >= portRange) return ChecksumOutcome.Pending;
 
         if (!_byGeneration.TryGetValue(generation, out var frames))
         {
@@ -62,7 +73,7 @@ public sealed class ChecksumLedger
         reports[sourcePort] = hash;
 
         var outcome = ChecksumOutcome.Pending;
-        if (reports.Count >= playerCount)
+        if (reports.Count >= expectedReports)
         {
             outcome = ChecksumOutcome.Agreement;
             bool haveFirst = false;

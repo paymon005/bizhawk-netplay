@@ -152,7 +152,7 @@ public static class HandshakeCodec
     public static byte[] EncodeWelcome(
         int assignedPort, int playerCount, int inputDelay, SyncMode mode,
         SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null,
-        MeshTokens? tokens = null)
+        MeshTokens? tokens = null, IEnumerable<int>? vacatedPorts = null)
     {
         if (!generation.IsValid) throw new ArgumentException("A valid session generation is required", nameof(generation));
         var sb = new StringBuilder();
@@ -167,6 +167,21 @@ public static class HandshakeCodec
             if (local.Length != TokenBytes)
                 throw new ArgumentException($"A token must be exactly {TokenBytes} bytes", nameof(tokens));
             sb.Append("mytok=").Append(SessionAuth.ToHex(local)).Append('\n');
+        }
+        if (vacatedPorts != null)
+        {
+            // Sent to a REJOINER: a player returning to a session that has already lost someone
+            // for good must build its driver with those seats empty, or its own liveness watchdog
+            // reads the silence as a broken link and ends the session it just rejoined.
+            var vacated = new List<int>();
+            foreach (int port in vacatedPorts)
+            {
+                if (port < 0 || port >= MaxPlayers)
+                    throw new ArgumentOutOfRangeException(nameof(vacatedPorts));
+                vacated.Add(port);
+            }
+            if (vacated.Count > 0)
+                sb.Append("vacated=").Append(string.Join(",", vacated)).Append('\n');
         }
         sb.Append(Encoding.UTF8.GetString(EncodeRoutes(peerRoutes ?? Array.Empty<PeerRoute>())));
         if (tokens != null) sb.Append(Encoding.UTF8.GetString(EncodeTokens(tokens.Peers)));
@@ -342,6 +357,25 @@ public static class HandshakeCodec
     {
         var token = SessionAuth.FromHex(hex);
         return token != null && token.Length == TokenBytes ? token : null;
+    }
+
+    /// <summary>Read the <c>vacated=</c> line of a WELCOME: the seats that are permanently empty.
+    /// Malformed or out-of-range entries are skipped (untrusted input); absent means none.</summary>
+    public static List<int> DecodeVacatedSeats(byte[] body)
+    {
+        if (body == null) throw new ArgumentNullException(nameof(body));
+        RefuseOversizedText(body);
+        var seats = new List<int>();
+        foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (!line.StartsWith("vacated=", StringComparison.Ordinal)) continue;
+            foreach (var field in line.Substring(8).Split(','))
+                if (int.TryParse(field, NumberStyles.Integer, CultureInfo.InvariantCulture, out int port)
+                    && port >= 0 && port < MaxPlayers && !seats.Contains(port))
+                    seats.Add(port);
+        }
+        return seats;
     }
 
     /// <summary>Encode a set of peer UDP endpoints (one "ip:port" per line) for the PeerList body.</summary>

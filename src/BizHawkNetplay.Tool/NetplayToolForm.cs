@@ -71,7 +71,12 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // and the span the video hardware is scanning out is skipped on every path, which is what lets
     // N64 run above native resolution without disagreeing at every checksum. Either alone would
     // make a mixed pair report a desync that is not there.
-    private const int Protocol = 19;
+    // 20: a session outlives its players. A graceful leave or an expired rejoin wait vacates the
+    // seat instead of ending the session: SeatVacated (type 23) travels ahead of the rebuild, the
+    // WELCOME grows a `vacated=` line for a rejoiner entering a session that already lost someone,
+    // and the host's checksum quorum shrinks to the active player count. A v19 peer neither sends
+    // nor understands any of it — it would end the session on the very leave this build survives.
+    private const int Protocol = 20;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 
@@ -301,6 +306,12 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // legs — and only those — is relayed. Kept as ports rather than routes because endpoints change
     // on a rejoin — see RefreshRelayRoutes.
     private readonly HashSet<(int A, int B)> _relayPairs = [];
+    // Seats whose players left for good — a graceful leave, or a rejoin wait that expired. The
+    // session carries on around them: their ports read neutral forever, and every rebuilt driver
+    // re-vacates them (see MarkSeatVacated / CreateDriver). UI-thread only; the count below is the
+    // copy the control-reader threads read for the checksum quorum.
+    private readonly HashSet<int> _vacatedPorts = [];
+    private volatile int _vacatedCount;
     // Volatile: written on the UI thread when hosting starts, read by the reconnect accept loop when
     // it re-greets a returning joiner.
     private volatile PeerIdentity? _hostIdentity;

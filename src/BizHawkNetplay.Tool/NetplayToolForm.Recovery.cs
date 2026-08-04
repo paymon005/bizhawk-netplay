@@ -22,7 +22,10 @@ public sealed partial class NetplayToolForm
         {
             if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_isHost
                 || generation != CurrentGeneration) return;
-            outcome = _checksums.Record(generation, sourcePort, frame, hash, _playerCount);
+            // Vacated seats never report; waiting for the full seat count would leave every frame
+            // pending forever the moment someone left for good.
+            outcome = _checksums.Record(generation, sourcePort, frame, hash, _playerCount,
+                _playerCount - _vacatedCount);
         }
         if (outcome == ChecksumOutcome.Pending) return;
         if (outcome == ChecksumOutcome.Mismatch)
@@ -538,16 +541,55 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private FrameDriver CreateDriver()
     {
-        if (_mode == SyncMode.Rollback)
-            return new FrameDriver(_adapter!, _transport!,
+        var driver = _mode == SyncMode.Rollback
+            ? new FrameDriver(_adapter!, _transport!,
                 p => new RollbackStrategy(p, _adapter!, _localPort, _rollbackDepth, FrameMs(),
                     RollbackTuningForSession()),
                 _localPort, _sessionDelay, redundancy: 8, rollbackWindow: _rollbackDepth,
-                portCount: _playerCount, generation: CurrentGeneration);
+                portCount: _playerCount, generation: CurrentGeneration)
+            : new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
+                _localPort, _sessionDelay, redundancy: 8, portCount: _playerCount,
+                generation: CurrentGeneration);
 
-        return new FrameDriver(_adapter!, _transport!, p => new LockstepStrategy(p),
-            _localPort, _sessionDelay, redundancy: 8, portCount: _playerCount,
-            generation: CurrentGeneration);
+        // Re-vacate the empty seats on every rebuild, while the driver is still fresh — the one
+        // moment a vacate is safe (see InputPipeline.Vacate). Without this, the first resync after
+        // a player left would resurrect their seat as a port the watchdogs wait on forever.
+        foreach (int port in _vacatedPorts)
+            if (port != _localPort && port < _playerCount) driver.VacatePort(port);
+        return driver;
+    }
+
+    /// <summary>
+    /// Record that a seat's player is gone for good, and keep every consumer consistent: the live
+    /// driver stops watching the port (safe — every caller reaches this either in the same UI
+    /// callback that immediately rebuilds, or with the driver frozen at frame 0), the relay stops
+    /// carrying its legs, and the checksum quorum shrinks so frames still resolve.
+    /// </summary>
+    private void MarkSeatVacated(int port)
+    {
+        if (port == _localPort || port < 0 || port >= _playerCount) return;
+        if (!_vacatedPorts.Add(port)) return;
+        _vacatedCount = _vacatedPorts.Count;
+        _relayPairs.RemoveWhere(pair => pair.A == port || pair.B == port);
+        _portTokens.Remove(port); // no rejoin path into a vacated seat; the token dies with it
+        try { _driver?.VacatePort(port); } catch { /* a rebuild re-applies it regardless */ }
+    }
+
+    /// <summary>Joiner: the host says a seat is permanently empty. Arrives ordered ahead of the
+    /// rebuild that makes it true, so the set is in place when the new baseline lands.</summary>
+    private void OnSeatVacated(SessionGeneration generation, int port)
+    {
+        if (!_phase.IsActive || _isHost) return;
+        // Decided at the host's then-current generation; by the time it lands ours is either the
+        // same (leave flow: sent before the BEGIN) or one behind (timeout flow: our BEGIN already
+        // announced the next). Anything else is a dead timeline's copy.
+        if (generation != CurrentGeneration && generation != CurrentGeneration.Next()) return;
+        if (port == _localPort || port < 0 || port >= _playerCount) return;
+        MarkSeatVacated(port);
+        _meshOthers.RemoveAll(route => route.RemotePort == port);
+        ApplyJoinerMesh();
+        ConnLog($"P{port + 1} left the session — their seat stays empty and play continues with " +
+                $"{_playerCount - _vacatedCount} of {_playerCount} players.", Color.DarkSlateBlue);
     }
 
     /// <summary>

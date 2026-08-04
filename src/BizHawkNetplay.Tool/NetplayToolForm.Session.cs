@@ -53,6 +53,7 @@ public sealed partial class NetplayToolForm
     {
         _peers.Clear(); _peers.AddRange(links);
         _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
+        _vacatedPorts.Clear(); _vacatedCount = 0; // a fresh lobby always fills every seat
         SetGeneration(generation);
         _mesh?.SetPeerRoutes(RoutesExcept(links, null));
         // The lobby decided WHICH ports to relay for; this is the first moment _peers can turn those
@@ -71,6 +72,12 @@ public sealed partial class NetplayToolForm
         ApplyInitialState(sp);
         _peers.Clear(); _peers.Add(hostLink);
         _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
+        // Non-empty only when rejoining a session that already lost someone for good — the driver
+        // must be built with those seats vacated or its watchdogs read their silence as a fault.
+        _vacatedPorts.Clear();
+        foreach (int seat in sp.VacatedSeats)
+            if (seat != sp.LocalPort && seat >= 0 && seat < sp.PlayerCount) _vacatedPorts.Add(seat);
+        _vacatedCount = _vacatedPorts.Count;
         SetGeneration(sp.Generation);
         _meshOthers = new List<PeerRoute>(sp.PeerRoutes);
         _mesh?.ApplyTokens(sp.Tokens);
@@ -180,9 +187,11 @@ public sealed partial class NetplayToolForm
         else if (_phase.IsActive)
         {
             bool stalled = _driver?.IsStalled == true;
+            int active = _playerCount - _vacatedCount;
             text = stalled
                 ? "Waiting for input from another player…"
-                : $"Lobby live — game running with {_playerCount} player(s).";
+                : $"Lobby live — game running with {active} player(s)" +
+                  (_vacatedCount > 0 ? $" ({_vacatedCount} seat(s) empty)." : ".");
             color = stalled ? Color.DarkOrange : Color.DarkGreen;
             flash = stalled;
         }

@@ -20,6 +20,104 @@ public sealed partial class NetplayToolForm
     // ------------------------------------------------------------------ reconnect
 
     /// <summary>
+    /// A joiner left cleanly (Bye) in a 3+ player session: retire its link, vacate its seat, and
+    /// rebuild the survivors onto one baseline with the seat empty from frame 0. The rebuild is
+    /// the same authoritative-state flow a settings change uses — a vacate must never be applied
+    /// mid-timeline, because peers hear about it at different frames and the frames in between
+    /// would disagree about the leaver's input with nobody left to send the correction (see
+    /// InputPipeline.Vacate). Caller has already checked role, player count, and recovery phase.
+    /// </summary>
+    private void OnPeerLeftGracefully(PeerLink link)
+    {
+        int port = link.RemotePort;
+        _peers.Remove(link);
+        // Same retirement OnPeerLinkLost performs, for the same reasons (KI-4: a writer left
+        // spinning on its signal forever).
+        _retiredLinks.Add(link);
+        link.WriterRunning = false;
+        try { link.OutboundSignal.Set(); } catch { }
+        try { link.Tcp?.Close(); } catch { }
+        if (link.ControlStream != null)
+        {
+            try { link.ControlStream.Dispose(); } catch { }
+            _mesh?.CloseControl(link.UdpEndpoint);
+        }
+
+        MarkSeatVacated(port);
+        RedistributeMesh(); // forget the leaver's endpoints; survivors get corrected routes
+        ConnLog($"{link.Label} left the session — their seat stays empty and play continues with " +
+                $"{1 + _peers.Count} of {_playerCount} players.", Color.DarkSlateBlue);
+
+        // Tell every survivor BEFORE the rebuild traffic. The per-link writer preserves order, so
+        // each one holds the vacate when the new baseline lands and rebuilds with the seat empty.
+        var vacatedBody = ControlMessageCodec.EncodeSeatVacated(CurrentGeneration, port);
+        foreach (var survivor in _peers)
+            QueueControl(survivor, ControlMessageType.SeatVacated, vacatedBody);
+
+        // A deliberate reconfiguration, not a desync — it must not spend the resync budget.
+        ShipAuthoritativeState($"P{port + 1} left", isSettingsChange: true);
+    }
+
+    /// <summary>
+    /// The rejoin wait expired with survivors still standing: vacate the seat and resume them,
+    /// instead of ending a session that two or three people are still in. The survivors have been
+    /// frozen since the drop, holding this generation's BEGIN and waiting for its state — so the
+    /// held baseline ships now, preceded by the vacate, and the ordinary applied/resume barrier
+    /// releases everyone. Ending remains the outcome when nobody is left to continue with.
+    /// </summary>
+    private void VacateSeatAfterRejoinTimeout(int port)
+    {
+        if (!_phase.IsActive || !_isHost || !_phase.AwaitingRejoin) return;
+        if (_peers.Count == 0 || _playerCount <= 2)
+        {
+            EndSession("no rejoin within the timeout");
+            return;
+        }
+        var state = _reconnectState;
+        var generation = _reconnectGeneration;
+        if (state == null || !generation.IsValid || generation != CurrentGeneration)
+        {
+            EndSession("no rejoin within the timeout");
+            return;
+        }
+
+        MarkSeatVacated(port); // the frozen driver stops watching the port; safe at frame 0
+        _phase.EndAwaitingRejoin(); // the accept loop exits on this; IsRebuilding keeps frames held
+        _reconnectPort = -1;
+        _reconnectState = null;
+        _reconnectGeneration = default;
+        _reconnectThread = null;
+        RedistributeMesh();
+        ConnLog($"P{port + 1} did not return within {ReconnectTimeoutSeconds:F0}s — their seat is " +
+                $"now empty and play continues with {1 + _peers.Count} of {_playerCount} players.",
+            Color.DarkOrange);
+
+        int attempt = CurrentConnectionAttempt;
+        var vacatedBody = ControlMessageCodec.EncodeSeatVacated(generation, port);
+        var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
+        foreach (var survivor in _peers)
+        {
+            QueueControl(survivor, ControlMessageType.SeatVacated, vacatedBody);
+            GraceForStateTransfer(survivor, state.Length);
+            survivor.AwaitingAppliedEpoch = generation.Epoch;
+            Interlocked.Exchange(ref survivor.AppliedDeadlineTicks, StateApplyDeadlineTicks(state.Length));
+            if (!QueueControl(survivor, ControlMessageType.Resync, stateBody, ok =>
+                {
+                    if (!ok) BeginInvokeUi(() =>
+                    {
+                        if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
+                            && CurrentGeneration == generation)
+                            EndSession("post-timeout resync transfer failed");
+                    });
+                }))
+            {
+                EndSession("post-timeout resync transfer could not be queued");
+                return;
+            }
+        }
+    }
+
+    /// <summary>
     /// A peer's control link dropped unexpectedly (not a clean Bye). The host holds the session
     /// open and waits for it to rejoin into the same port; a joiner that lost the host just ends
     /// (the host is the hub — the user rejoins with the Join button). One drop at a time.
@@ -244,8 +342,11 @@ public sealed partial class NetplayToolForm
                 {
                     BeginInvokeUi(() =>
                     {
+                        // With survivors still standing the seat is vacated and play resumes; the
+                        // session only ends when nobody is left to continue with (or at 2 players,
+                        // where "continue" would mean playing alone).
                         if (IsConnectionAttemptCurrent(attempt) && _phase.AwaitingRejoin)
-                            EndSession("no rejoin within the timeout");
+                            VacateSeatAfterRejoinTimeout(freedPort);
                     });
                     return;
                 }
@@ -322,6 +423,10 @@ public sealed partial class NetplayToolForm
             // Minted here rather than on the sending thread below: the seat's token is the same one
             // the survivors already hold, and _portTokens stays single-threaded that way.
             var rejoinTokens = TokensFor(freedPort, _playerCount);
+            // Snapshotted on the UI thread for the same reason as the tokens: the rejoiner must
+            // build its driver with the already-empty seats vacated, or its own watchdogs read the
+            // silence there as a broken link.
+            var rejoinVacated = new List<int>(_vacatedPorts);
             Status($"P{freedPort + 1} rejoined — sending epoch {generation.Epoch} " +
                 $"({state.Length / 1024}KiB)…", Color.DarkOrange);
 
@@ -333,7 +438,7 @@ public sealed partial class NetplayToolForm
                 {
                     ConfigureStateTransferTimeouts(tcp, state.Length);
                     Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
-                        generation, meshPeers, rejoinTokens);
+                        generation, meshPeers, rejoinTokens, rejoinVacated);
                     Handshake.HostWaitReady(channel, generation);
                     try { tcp.ReceiveTimeout = 0; tcp.SendTimeout = 0; } catch { }
                     BeginInvokeUi(() =>
@@ -496,11 +601,13 @@ public sealed partial class NetplayToolForm
         try { if (_timerResRaised) { timeEndPeriod(1); _timerResRaised = false; } } catch { }
         TeardownNetwork();
         if (!wasActive) RestorePreJoinState();
-        // Same two lines EndSession clears, for the same reasons: a failed attempt still minted seat
+        // Same lines EndSession clears, for the same reasons: a failed attempt still minted seat
         // tokens, and tokens must not outlive the control channel that authenticated them. Leaving
         // them behind let the next session reuse them via TokenForPort.
         _relayPairs.Clear();
         _portTokens.Clear();
+        _vacatedPorts.Clear();
+        _vacatedCount = 0;
         try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
         ApplySessionHostOwnership(false);
         RestorePauseState(); // undo the freeze from OnGo, unless it was already paused before it
@@ -575,6 +682,8 @@ public sealed partial class NetplayToolForm
 
         _relayPairs.Clear(); // a fresh session re-measures; nothing from the last one should carry
         _portTokens.Clear(); // tokens must not outlive the control channel that authenticated them
+        _vacatedPorts.Clear(); // vacated seats belong to the session that lost them
+        _vacatedCount = 0;
         _netcodeLabel.Text = "Netcode in use: —";
         _netcodeLabel.ForeColor = Color.DimGray;
         SetLobbyPhase("", Color.DimGray); // back to "Not connected", and stop flashing
