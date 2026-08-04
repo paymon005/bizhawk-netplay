@@ -170,10 +170,21 @@ public sealed partial class NetplayToolForm
         if (!_phase.IsActive) return;
         if (!_peers.Contains(link)) return; // reader/writer can both report the same broken link
 
-        // A punched link has no TCP to re-accept a rejoin on — the reconnect wait can't help it,
-        // so recovery is a fresh punch, not a 60s hold.
+        // A punched link has no TCP to re-accept a rejoin on, so the 60-second hold cannot help
+        // it. That is a reason not to WAIT for them — not a reason to end a session three other
+        // people are still in. At 3+ players the seat is vacated and play continues, exactly as a
+        // graceful leave does; only at 2 players (where continuing means playing alone) or as a
+        // joiner losing the host does the session end.
         if (link.Tcp == null)
         {
+            if (_isHost && _playerCount > 2 && _peers.Count >= 2
+                && !_phase.IsRebuilding && !_phase.AwaitingRejoin)
+            {
+                ConnLog($"{link.Label}'s punched link dropped ({why}) — a punched link has no rejoin " +
+                        "path, so their seat is vacated and play continues.", Color.DarkOrange);
+                OnPeerLeftGracefully(link);
+                return;
+            }
             EndSession($"lost connection to {link.Label}: {why} (punched link — no TCP rejoin path)");
             return;
         }

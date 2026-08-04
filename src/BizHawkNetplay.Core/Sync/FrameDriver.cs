@@ -380,6 +380,36 @@ public sealed class FrameDriver : IDisposable
         return port >= 0;
     }
 
+    /// <summary>
+    /// How long EVERY remote port has been silent, into a caller-owned array indexed by port
+    /// (negative for ports that are local, vacated, or never heard from).
+    ///
+    /// <see cref="TryGetMostSilentRemotePort"/> reports only the worst, which serializes
+    /// overlapping outages: with two legs dead the second is invisible until the first recovers or
+    /// kills the session, so its relay is never asked for. Recovery has to be able to act on each
+    /// edge independently, which means seeing each edge.
+    ///
+    /// Allocation-free by design — this runs on the frame tick.
+    /// </summary>
+    public void GetRemoteSilenceSeconds(double[] into)
+    {
+        if (into == null) throw new ArgumentNullException(nameof(into));
+        long now = Stopwatch.GetTimestamp();
+        for (int p = 0; p < into.Length; p++)
+        {
+            if (p >= _lastRemoteInputStamp.Length || p == _localPort || _vacated[p]
+                || _lastRemoteInputStamp[p] == 0)
+            {
+                into[p] = -1;
+                continue;
+            }
+            into[p] = (now - _lastRemoteInputStamp[p]) / (double)Stopwatch.Frequency;
+        }
+    }
+
+    /// <summary>Remote ports this driver tracks — the length a caller's silence array needs.</summary>
+    public int PortCount => _lastRemoteInputStamp.Length;
+
     /// <summary>Find the remote controller port whose valid input has been silent longest.</summary>
     public bool TryGetMostSilentRemotePort(out int port, out TimeSpan silence)
     {

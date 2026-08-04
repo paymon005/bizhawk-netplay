@@ -193,6 +193,35 @@ public class VacatedSeatTests
         }
     }
 
+    [Fact]
+    public void EverySilentEdgeIsVisible_NotOnlyTheWorst()
+    {
+        // Overlapping outages: reporting only the most-silent port serialized them, so a second
+        // dead leg stayed invisible until the first recovered or killed the session — and its
+        // relay was therefore never asked for. A 4-player session has three legs per peer and is
+        // correspondingly likelier to lose two at once.
+        var emu = new FakeEmuAdapter(portCount: 4);
+        var hub = new RecordingHub();
+        hub.Connect([hub]);
+        var driver = new FrameDriver(emu, hub, p => new LockstepStrategy(p),
+            localPort: 0, delay: 2, redundancy: 8, portCount: 4);
+        driver.Start();
+        driver.ResetRemoteInputLiveness(); // ports 1..3 all "just heard from"
+
+        var silence = new double[driver.PortCount];
+        driver.GetRemoteSilenceSeconds(silence);
+        Assert.Equal(4, driver.PortCount);
+        Assert.True(silence[0] < 0, "the local port is not an edge");
+        for (int p = 1; p < 4; p++)
+            Assert.True(silence[p] >= 0, $"port {p} should be tracked");
+
+        // A vacated seat drops out of the scan entirely — its silence is by design, not an outage.
+        driver.VacatePort(2);
+        driver.GetRemoteSilenceSeconds(silence);
+        Assert.True(silence[2] < 0, "a vacated seat must not read as a silent edge");
+        Assert.True(silence[1] >= 0 && silence[3] >= 0, "the live edges are still tracked");
+    }
+
     // ---- wire ----------------------------------------------------------------------
 
     [Fact]

@@ -103,8 +103,12 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>Silent legs already reported to the host this outage, so the reliable channel is
-    /// not asked to carry the same fact twice. Cleared when input recovers or a session begins.</summary>
+    /// not asked to carry the same fact twice. An entry is dropped as soon as ITS leg recovers —
+    /// per edge, not globally, or one healthy leg would re-arm reporting for a still-dead one.</summary>
     private readonly HashSet<int> _outageReportedPorts = new();
+
+    /// <summary>Per-port silence, reused every tick so the scan allocates nothing.</summary>
+    private double[] _silenceScratch = new double[4];
 
     private void CheckUdpInputProgress()
     {
@@ -124,26 +128,47 @@ public sealed partial class NetplayToolForm
         double seconds = silence.TotalSeconds;
         if (seconds < UdpRepunchAfterSeconds)
         {
+            // The worst edge is under the threshold, so every edge is — the per-edge scan below is
+            // unreachable this tick, and the latches have to be cleared here or a leg that goes
+            // silent again later would never be reported a second time.
+            _outageReportedPorts.Clear();
             if (_udpWarningActive)
             {
                 _udpWarningActive = false;
-                _outageReportedPorts.Clear(); // the leg came back; a future outage is a new report
                 Log("UDP input path recovered");
             }
             return;
         }
 
         // Live relay failover, joiner side: past the repunch threshold but before the kill, tell
-        // the host which leg is starving us — it is the only party that can carry the pair, and
-        // we are the only party that can see the leg is dead. Decision rule in Core: RelayFailover.
-        if (!_isHost && _peers.Count > 0
-            && RelayFailover.ShouldReport(seconds, port, _outageReportedPorts.Contains(port)))
+        // the host which legs are starving us — it is the only party that can carry a pair, and we
+        // are the only party that can see a leg is dead. Decision rule in Core: RelayFailover.
+        //
+        // EVERY silent edge, not just the worst. Reporting only the worst serialized overlapping
+        // outages: with two legs down the second was invisible until the first recovered or killed
+        // the session, so its relay was never asked for — precisely the two-edge failure a
+        // 4-player session is twice as likely to meet as a 3-player one.
+        if (!_isHost && _peers.Count > 0)
         {
-            _outageReportedPorts.Add(port); // the host installs permanently; once is enough
-            QueueControl(_peers[0], ControlMessageType.InputOutage,
-                ControlMessageCodec.EncodeInputOutage(CurrentGeneration, port));
-            Log($"reported the silent leg to the host: no UDP input from P{port + 1} for " +
-                $"{seconds:F1}s — asking for a relay");
+            if (_silenceScratch.Length < _driver.PortCount)
+                _silenceScratch = new double[_driver.PortCount];
+            _driver.GetRemoteSilenceSeconds(_silenceScratch);
+            for (int p = 0; p < _driver.PortCount; p++)
+            {
+                double silent = _silenceScratch[p];
+                if (silent < 0) continue;
+                if (silent < RelayFailover.ReportAfterSeconds)
+                {
+                    _outageReportedPorts.Remove(p); // this leg is healthy; a future outage is new
+                    continue;
+                }
+                if (!RelayFailover.ShouldReport(silent, p, _outageReportedPorts.Contains(p))) continue;
+                _outageReportedPorts.Add(p); // the host installs permanently; once is enough
+                QueueControl(_peers[0], ControlMessageType.InputOutage,
+                    ControlMessageCodec.EncodeInputOutage(CurrentGeneration, p));
+                Log($"reported the silent leg to the host: no UDP input from P{p + 1} for " +
+                    $"{silent:F1}s — asking for a relay");
+            }
         }
 
         double nowMs = _paceClock.Elapsed.TotalMilliseconds;
