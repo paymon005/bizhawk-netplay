@@ -5,6 +5,33 @@ adversarial review of the v0.10.0 rewrite (F1–F9, P1–P2, KI-1–KI-7) has be
 live in the git history (`git log --grep KI-`, `--grep "review finding"`) and in the v0.10.0 /
 v0.10.1 release notes.
 
+## 2026-08-04 review: every BizHawk-facing assumption verified against source
+
+A full line-by-line review of the codebase, with every claim about BizHawk checked against the
+exact installed revision (2.11.1, commit `bdddf4a` — the local sparse clone at
+`..\bizhawk-src`, reflection over the installed DLLs, and GitHub raw at the pinned commit). All
+confirmed word-for-word, so nobody has to re-verify these:
+
+- **AllowInput**: `FormBase { BlocksInputWhenFocused: false }` matches BEFORE
+  `IExternalToolForm => AllowInput.None` — the focus-override mechanism is sound as documented.
+- **Run loop**: `Tools.GeneralUpdateActiveExtTools(); StepRunLoop_Core(); Render();` are
+  consecutive — the fine clock's placement claim is exact.
+- **Throttle.Step**: the paused branch is an unconditional `Thread.Sleep(15)` — the ~66Hz tick
+  ceiling is real and unreachable from this side of the seam.
+- **`Joypad.Get`** is exactly `_movieSession.MovieIn.ToDictionary(n)` — capture reads what local
+  play feeds the core.
+- **`IEmulator.FrameAdvance`** docs require `GetSamples()` after every advance "even when
+  renderSound = false" — the blip_buf discipline in `RunFramesInvisible` is required, not caution.
+- **Memory domains** (all 19 subclasses in the installed DLLs audited): the checksum's five paths
+  classify every one correctly. The only types that land on the slow sampled word path are
+  `MemoryDomainUshortArray` and `MAMEMemoryDomain` — neither is MainMemory on the consoles this
+  tool targets (MAME/Arcade is, and stays sampled; divergence learning degrades to absent there,
+  by design).
+
+No incorrect assumption was found anywhere in the codebase. The same review produced the
+v0.31.0/v0.32.0 work: vacated seats, live relay failover, the control-frame MAC, divergence
+learning, and the measured checksum cadence.
+
 ## Status
 
 Entries below are a mix: some are open work (KI-11), some are validation records kept because the
