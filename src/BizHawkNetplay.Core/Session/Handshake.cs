@@ -274,10 +274,14 @@ public static class Handshake
     public sealed class JoinerGreeting
     {
         public JoinerGreeting(PeerIdentity id, SessionPreferences prefs, int udpPort,
-            IPEndPoint? reflexive = null)
+            IPEndPoint? reflexive = null, string? warning = null)
         {
-            Id = id; Prefs = prefs; UdpPort = udpPort; Reflexive = reflexive;
+            Id = id; Prefs = prefs; UdpPort = udpPort; Reflexive = reflexive; Warning = warning;
         }
+
+        /// <summary>Something the negotiator accepted but wants said out loud — a video-settings
+        /// difference, today. Null when there is nothing to report.</summary>
+        public string? Warning { get; }
         public PeerIdentity Id { get; }
         public SessionPreferences Prefs { get; }
         public int UdpPort { get; }
@@ -351,7 +355,7 @@ public static class Handshake
             throw new HandshakeException(result.RejectReason ?? "rejected");
         }
 
-        return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort, joinerReflexive);
+        return new JoinerGreeting(joinerId, joinerPrefs, joinerUdpPort, joinerReflexive, result.Warning);
     }
 
     /// <summary>
@@ -508,7 +512,7 @@ public static class Handshake
         ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
         Action<SessionParams>? beforeReady = null, Action? afterGreet = null,
         Func<int, IReadOnlyList<PeerRoute>, MeshTokens, int, LobbyMeshSample>? measureMesh = null,
-        IPEndPoint? localReflexive = null)
+        IPEndPoint? localReflexive = null, Action<string>? onWarning = null)
     {
         var joinNonce = SessionAuth.NewNonce();
         channel.Send(ControlMessageType.Hello,
@@ -516,7 +520,7 @@ public static class Handshake
                 localReflexive));
 
         int hostUdpPort = GreetHost(channel, clientId, clientPrefs, joinNonce, localUdpPort,
-            localReflexive);
+            localReflexive, onWarning);
         afterGreet?.Invoke();
 
         return ReceiveStartData(channel, hostUdpPort, beforeReady, measureMesh);
@@ -533,7 +537,7 @@ public static class Handshake
     /// </summary>
     private static int GreetHost(
         ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, byte[] joinNonce,
-        int localUdpPort, IPEndPoint? localReflexive = null)
+        int localUdpPort, IPEndPoint? localReflexive = null, Action<string>? onWarning = null)
     {
         var (type, body) = channel.Receive();
         if (type == ControlMessageType.Error)
@@ -570,6 +574,9 @@ public static class Handshake
         var result = SessionNegotiator.Negotiate(clientId, hostId, clientPrefs, hostPrefs);
         if (!result.Accepted)
             throw new HandshakeException(result.RejectReason ?? "rejected");
+        // Accepted, but not silently: the joiner negotiates against the host on its own side, so
+        // without this it would be the one peer never told what the difference was.
+        if (result.Warning != null) onWarning?.Invoke(result.Warning);
 
         return hostUdpPort;
     }

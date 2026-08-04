@@ -171,16 +171,17 @@ public sealed partial class NetplayToolForm
         // so the negotiator (which needs both peers to opt in) settles on lockstep for free.
         int depth = wantRollback ? MeasureRollbackDepth(a) : 0;
 
-        // Determinism: a core reporting non-deterministic usually means "determinism was not
-        // requested" rather than "this will diverge" — N64 with no movie loaded says it and syncs
-        // fine in practice. That report is therefore not treated as a refusal; the session runs and
-        // the periodic checksum catches a genuine divergence, which is the check that actually
-        // proves anything. Formerly a Diagnostics opt-in that defaulted to on, so this is the same
-        // behaviour with one less box to tick.
-        const bool deterministic = true;
+        // Determinism was a hardcoded `true` here, on the reasoning that a core reporting
+        // non-deterministic usually means "determinism was not requested" rather than "this will
+        // diverge" — which is exactly right for N64, the core this tool is mostly used with, and
+        // wrong for most of the others. Reading the 2.11.1 cores rather than the doc comment shows
+        // the majority seed their clock from DateTime.Now when the flag is false, so two peers begin
+        // with different times. DeterminismPolicy holds that finding and its one named exception.
         return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
-            a.SyncSettingsDigest, layouts, deterministic, maxRollbackDepth: depth,
-            syncSettingsFields: a.SyncSettingsFields);
+            a.SyncSettingsDigest, layouts, a.QualifiesDeterministic, maxRollbackDepth: depth,
+            syncSettingsFields: a.SyncSettingsFields,
+            syncSettingsReadable: a.SyncSettingsReadable,
+            videoSettings: a.VideoSettingsDiagnostic());
     }
 
     /// <summary>Map the "My controls" dropdown to an input-source port: P1..P4 (0..3) or -1 (assigned port).</summary>

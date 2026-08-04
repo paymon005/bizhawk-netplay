@@ -45,6 +45,12 @@ public static class HandshakeCodec
         sb.Append("sync=").Append(id.SyncSettingsDigest).Append('\n');
         sb.Append("layouts=").Append(string.Join(",", id.PortLayoutDigests)).Append('\n');
         sb.Append("det=").Append(id.Deterministic ? '1' : '0').Append('\n');
+        // Absent on a peer predating this field, and the decoder reads absence as TRUE for that
+        // reason: an old build could read its settings, it simply never said so. Only an explicit
+        // "0" — a peer that tried and failed — refuses.
+        sb.Append("sread=").Append(id.SyncSettingsReadable ? '1' : '0').Append('\n');
+        if (id.VideoSettings.Length > 0)
+            sb.Append("video=").Append(Escape(id.VideoSettings)).Append('\n');
         sb.Append("depth=").Append(id.MaxRollbackDepth).Append('\n');
         sb.Append("delay=").Append(prefs.InputDelay).Append('\n');
         sb.Append("rollback=").Append(prefs.WantRollback ? '1' : '0').Append('\n');
@@ -522,7 +528,9 @@ public static class HandshakeCodec
             layouts,
             Get(map, "det") == "1",
             GetInt(map, "depth", 0),
-            DecodeSyncFields(body));
+            DecodeSyncFields(body),
+            Get(map, "sread") != "0",
+            Unescape(Get(map, "video")));
 
         // The remote's password is never on the wire — prefs carries only delay/rollback here. Clamp
         // delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge value

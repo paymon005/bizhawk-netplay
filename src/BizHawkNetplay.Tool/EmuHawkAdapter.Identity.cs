@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using BizHawk.Emulation.Common;
+using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Session;
 
 namespace BizHawkNetplay.Tool;
@@ -138,15 +139,49 @@ internal sealed partial class EmuHawkAdapter
     private SettingsAdapter ReadOnlySettings() =>
         new(_emulator, () => false, _ => { }, () => false, _ => { });
 
-    private string SyncSettingsBlob()
+    private string SyncSettingsBlob() => TryGetSyncSettingsBlob(out string blob) ? blob : "";
+
+    /// <summary>
+    /// The core's sync settings as JSON, and whether reading them worked.
+    ///
+    /// The two answers used to be one. "This core has no sync settings" and "this core's settings
+    /// threw" both returned an empty string, an empty string hashes to a constant, and so two peers
+    /// that both failed to read produced matching digests — the handshake's most important
+    /// comparison passing precisely because it had nothing to compare. False here now refuses the
+    /// session (see <c>SessionNegotiator</c>); a core with genuinely no sync settings still returns
+    /// true with an empty blob, because that is an answer rather than a failure.
+    /// </summary>
+    public bool TryGetSyncSettingsBlob(out string blob)
     {
+        blob = "";
         try
         {
             var settings = ReadOnlySettings();
-            if (!settings.HasSyncSettings) return "";
-            return Newtonsoft.Json.JsonConvert.SerializeObject(settings.GetSyncSettings());
+            if (!settings.HasSyncSettings) return true;
+            blob = Newtonsoft.Json.JsonConvert.SerializeObject(settings.GetSyncSettings());
+            return true;
         }
-        catch { return ""; } // never let a settings read break the handshake — fall back to the coarse digest
+        catch { return false; }
+    }
+
+    /// <summary>True when this core's sync settings can be read at all — the value the handshake
+    /// carries so a failure on either side refuses instead of matching.</summary>
+    public bool SyncSettingsReadable => TryGetSyncSettingsBlob(out _);
+
+    /// <summary>
+    /// Whether this core qualifies as deterministic for netplay: its own flag, or a named exception
+    /// to it. See <see cref="DeterminismPolicy"/> — the exception exists because Mupen64Plus reports
+    /// false unconditionally and reads it back nowhere, while nearly every other core that reports
+    /// false is telling you it seeded its clock from the wall.
+    /// </summary>
+    public bool QualifiesDeterministic =>
+        DeterminismPolicy.Qualifies(VerifyDeterministicMode(), CoreName);
+
+    /// <summary>The refusal to show the player when this core does not qualify, or null.</summary>
+    public string? DeterminismGap()
+    {
+        try { return DeterminismPolicy.Refusal(VerifyDeterministicMode(), CoreName); }
+        catch { return null; } // a reflection failure must not itself refuse the session
     }
 
     /// <summary>

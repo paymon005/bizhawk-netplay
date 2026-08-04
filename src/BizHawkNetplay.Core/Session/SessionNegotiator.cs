@@ -29,12 +29,14 @@ public sealed class SessionPreferences
 /// <summary>The agreed session parameters, or a rejection with a human-readable reason.</summary>
 public sealed class NegotiationResult
 {
-    private NegotiationResult(bool accepted, string? reason, SyncMode mode, int inputDelay)
+    private NegotiationResult(bool accepted, string? reason, SyncMode mode, int inputDelay,
+        string? warning = null)
     {
         Accepted = accepted;
         RejectReason = reason;
         Mode = mode;
         InputDelay = inputDelay;
+        Warning = warning;
     }
 
     public bool Accepted { get; }
@@ -42,11 +44,20 @@ public sealed class NegotiationResult
     public SyncMode Mode { get; }
     public int InputDelay { get; }
 
+    /// <summary>
+    /// Something worth saying about an ACCEPTED session — a difference real enough to name but not
+    /// to refuse over. Null when there is nothing to say.
+    ///
+    /// Separate from <see cref="RejectReason"/> because the two are opposite in kind, and folding a
+    /// warning into a reason is how a warning ends up either unprinted or mistaken for a refusal.
+    /// </summary>
+    public string? Warning { get; }
+
     public static NegotiationResult Reject(string reason) =>
         new(false, reason, SyncMode.Lockstep, 0);
 
-    public static NegotiationResult Accept(SyncMode mode, int inputDelay) =>
-        new(true, null, mode, inputDelay);
+    public static NegotiationResult Accept(SyncMode mode, int inputDelay, string? warning = null) =>
+        new(true, null, mode, inputDelay, warning);
 }
 
 /// <summary>
@@ -78,6 +89,23 @@ public static class SessionNegotiator
         if (!string.Equals(local.CoreVersion, remote.CoreVersion, StringComparison.Ordinal))
             return NegotiationResult.Reject(
                 $"core version mismatch ({local.CoreVersion} vs {remote.CoreVersion}) — use the same BizHawk build");
+
+        // Before comparing the digests, establish that they mean anything.
+        //
+        // A settings read that threw produced an empty blob, and an empty blob hashes to a constant.
+        // So two peers who both failed to read their own settings produced the SAME digest and this
+        // comparison passed — the check silently inverted itself in exactly the circumstance it
+        // existed for. It has to fail closed, because the digest is the only thing standing between
+        // a plugin or region difference and a desync twenty minutes in.
+        if (!local.SyncSettingsReadable)
+            return NegotiationResult.Reject(
+                "this core's sync settings could not be read, so there is nothing to compare against " +
+                "the other player — and a difference there (video plugin, region, CPU core) desyncs " +
+                "without warning. Reload the ROM and try again.");
+        if (!remote.SyncSettingsReadable)
+            return NegotiationResult.Reject(
+                "the other player's core could not report its sync settings, so the two configurations " +
+                "cannot be compared. Ask them to reload the ROM and try again.");
 
         if (!string.Equals(local.SyncSettingsDigest, remote.SyncSettingsDigest, StringComparison.Ordinal))
             return NegotiationResult.Reject(DescribeSyncSettingsMismatch(local, remote));
@@ -114,7 +142,7 @@ public static class SessionNegotiator
         bool rollbackViable = worstDepth >= ProbeResult.RollbackDepthThreshold;
 
         var mode = (bothWant && rollbackViable) ? SyncMode.Rollback : SyncMode.Lockstep;
-        return NegotiationResult.Accept(mode, inputDelay);
+        return NegotiationResult.Accept(mode, inputDelay, DescribeVideoDifference(local, remote));
     }
 
     /// <summary>How many differing settings to name before summarising the rest. Six fits a log line
@@ -135,6 +163,28 @@ public static class SessionNegotiator
     /// comparison that could not see one is the same sentence as a genuine match and must not read
     /// like it.
     /// </summary>
+    /// <summary>
+    /// Name a video-settings difference on a session that is otherwise going ahead.
+    ///
+    /// These settings are not part of any core's sync settings, so nothing compared them and a
+    /// difference first announced itself as a desync. On N64 they are the render resolution and
+    /// plugin, and above native resolution the plugin resolves its framebuffer back into RDRAM —
+    /// GPU-produced bytes that two machines need not agree on.
+    ///
+    /// A warning rather than a refusal, deliberately. Whether a difference matters depends on
+    /// whether the game reads its own framebuffer, which is a property of the game rather than of
+    /// the numbers, and plenty of sessions run fine mismatched. What was unacceptable was silence.
+    /// </summary>
+    private static string? DescribeVideoDifference(PeerIdentity local, PeerIdentity remote)
+    {
+        if (local.VideoSettings.Length == 0 || remote.VideoSettings.Length == 0) return null;
+        if (string.Equals(local.VideoSettings, remote.VideoSettings, StringComparison.Ordinal)) return null;
+        return $"video settings differ — you: {local.VideoSettings}; them: {remote.VideoSettings}. " +
+               "These are not part of the core's sync settings, so they were not required to match. " +
+               "On a game that reads its own framebuffer they can desync you; matching them on both " +
+               "machines is the safe choice.";
+    }
+
     private static string DescribeSyncSettingsMismatch(PeerIdentity local, PeerIdentity remote)
     {
         const string headline = "core sync-settings mismatch";

@@ -191,6 +191,7 @@ public sealed partial class NetplayToolForm
                     initialStateApplied = true;
                 }, measureMesh: (_, peerRoutes, tokens, localPort) => MeasureJoinerMesh(host, peerRoutes, tokens, localPort),
                    localReflexive: AwaitLocalReflexive(),
+                   onWarning: w => UiConnLog(w, Color.DarkOrange),
                    afterGreet: () =>
                 {
                     if (!greetDeadline.TryComplete())

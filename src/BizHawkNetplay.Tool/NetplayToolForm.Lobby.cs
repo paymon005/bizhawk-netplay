@@ -27,8 +27,6 @@ public sealed partial class NetplayToolForm
         {
             _adapter = new EmuHawkAdapter(APIs, _emulator, _statable, Config, MovieSession);
             _adapter.InputSourcePort = InputSourceFromCombo(); // read your normal pad, whatever port you're assigned
-            if (!_adapter.VerifyDeterministicMode())
-                Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
             if (!_adapter.HasBindings)
                 Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
@@ -39,6 +37,29 @@ public sealed partial class NetplayToolForm
             if (coverageGap != null)
             {
                 ConnLog(coverageGap, Color.Firebrick);
+                SetBusy(false); return;
+            }
+
+            // Refused here rather than warned about, and refused before the handshake so the reason
+            // names the setting to change instead of arriving as a peer's rejection. This used to be
+            // a log line nobody could act on ("desyncs are likely") over a flag that was then thrown
+            // away and reported to the handshake as `true` regardless.
+            var determinismGap = _adapter.DeterminismGap();
+            if (determinismGap != null)
+            {
+                ConnLog(determinismGap, Color.Firebrick);
+                SetBusy(false); return;
+            }
+
+            // Same shape, different failure: the settings the handshake compares could not be read,
+            // so there would be nothing to compare. Caught locally because both peers failing is the
+            // case that used to LOOK like agreement.
+            if (!_adapter.SyncSettingsReadable)
+            {
+                ConnLog("this core's sync settings could not be read, so they cannot be checked " +
+                        "against the other player's — and a difference there (video plugin, region, " +
+                        "CPU core) desyncs without warning. Reload the ROM and try again.",
+                    Color.Firebrick);
                 SetBusy(false); return;
             }
 
@@ -268,6 +289,10 @@ public sealed partial class NetplayToolForm
                     {
                         greet = WithAbsoluteSocketDeadline(tcp, HandshakeReceiveTimeoutMs,
                             () => Handshake.HostGreet(channel, id, prefs, udpLocalPort));
+                        // Accepted, with something worth saying: a video-settings difference is not
+                        // part of any core's sync settings, so nothing refused it and nothing used to
+                        // mention it either.
+                        if (greet.Warning != null) UiConnLog(greet.Warning, Color.DarkOrange);
                     }
                     catch (Exception ex)
                     {
@@ -639,6 +664,7 @@ public sealed partial class NetplayToolForm
         {
             try { admission.Control.ReadTimeout = HandshakeReceiveTimeoutMs; } catch { }
             greet = Handshake.HostGreet(channel, id, prefs, udpLocalPort);
+            if (greet.Warning != null) UiConnLog(greet.Warning, Color.DarkOrange);
             if (!greetDeadline.TryComplete())
                 throw new TimeoutException($"authentication exceeded the {HandshakeReceiveTimeoutMs / 1000}-second deadline");
             try { admission.Control.ReadTimeout = Timeout.Infinite; } catch { }
@@ -1145,7 +1171,8 @@ public sealed partial class NetplayToolForm
                             Color.DarkGreen);
                     }, measureMesh: (hostUdpPort, peerRoutes, tokens, localPort) =>
                         MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes, tokens, localPort),
-                       localReflexive: AwaitLocalReflexive());
+                       localReflexive: AwaitLocalReflexive(),
+                       onWarning: w => UiConnLog(w, Color.DarkOrange));
                 }
                 catch (Exception ex) when (greetDeadline.Expired)
                 {

@@ -19,8 +19,12 @@ public sealed class PeerIdentity
         IReadOnlyList<string> portLayoutDigests,
         bool deterministic,
         int maxRollbackDepth,
-        IReadOnlyList<KeyValuePair<string, string>>? syncSettingsFields = null)
+        IReadOnlyList<KeyValuePair<string, string>>? syncSettingsFields = null,
+        bool syncSettingsReadable = true,
+        string? videoSettings = null)
     {
+        SyncSettingsReadable = syncSettingsReadable;
+        VideoSettings = videoSettings ?? "";
         SyncSettingsFields = syncSettingsFields ?? Array.Empty<KeyValuePair<string, string>>();
         ProtocolVersion = protocolVersion;
         RomHash = romHash ?? "";
@@ -49,7 +53,35 @@ public sealed class PeerIdentity
     /// </summary>
     public IReadOnlyList<KeyValuePair<string, string>> SyncSettingsFields { get; }
 
+    /// <summary>
+    /// False when this peer TRIED to read its core's sync settings and could not.
+    ///
+    /// The distinction this draws is the whole point. A core with no sync settings and a core whose
+    /// settings threw both produced an empty blob, and an empty blob hashes to a constant — so two
+    /// peers who each failed to read their own settings produced identical digests and the handshake
+    /// congratulated them on matching. The one case where the check was most needed was the one case
+    /// it could not fail.
+    ///
+    /// True for a peer that has no sync settings to read, which is a real answer rather than a
+    /// missing one, and true for peers predating this field.
+    /// </summary>
+    public bool SyncSettingsReadable { get; }
+
+    /// <summary>
+    /// Settings that change what lands in main memory without being part of the core's sync settings
+    /// — N64's render resolution and plugin, in practice. Advisory: carried so a mismatch can be
+    /// NAMED in the log rather than discovered as a desync, but not a refusal, because what counts
+    /// as too high is a property of the game and the plugin rather than of the numbers. Empty when
+    /// the core exposes nothing of the kind.
+    /// </summary>
+    public string VideoSettings { get; }
+
     public IReadOnlyList<string> PortLayoutDigests { get; }
+
+    /// <summary>
+    /// Whether this peer's core qualifies as deterministic — the core's own flag, or a named
+    /// exception to it. See <c>DeterminismPolicy</c> for why the flag is not simply passed through.
+    /// </summary>
     public bool Deterministic { get; }
 
     /// <summary>This peer's capability-probe result (§5); rollback needs both peers to qualify.</summary>

@@ -10,9 +10,11 @@ public class SessionNegotiatorTests
     private static PeerIdentity Id(
         int protocol = 1, string rom = "ROMHASH", string core = "GPGX",
         string coreVer = "2.11.1.0", string sync = "SYNC1",
-        bool deterministic = true, int depth = 20, string layout = "L0")
+        bool deterministic = true, int depth = 20, string layout = "L0",
+        bool syncReadable = true, string? video = null)
         => new(protocol, rom, core, coreVer, sync,
-            new[] { layout, "L1" }, deterministic, depth);
+            new[] { layout, "L1" }, deterministic, depth,
+            syncSettingsReadable: syncReadable, videoSettings: video);
 
     private static SessionPreferences Pref(int delay = 2, bool rollback = false, string password = "")
         => new(delay, rollback, password);
@@ -220,5 +222,83 @@ public class SessionNegotiatorTests
         Assert.Contains("Setting00 (yours a, theirs b)", r.RejectReason);
         Assert.Contains("and 6 more", r.RejectReason);
         Assert.DoesNotContain("Setting11", r.RejectReason);
+    }
+
+    // ---------------------------------------------------------------- KI-19
+
+    [Fact]
+    public void AnUnreadableSyncSettingsBlobRefusesInsteadOfMatchingItself()
+    {
+        // The failure this exists for: both peers failed to read their settings, both fell back to
+        // an empty blob, and an empty blob hashes to a constant — so the digests MATCHED and the
+        // comparison passed at precisely the moment it had nothing to compare.
+        var r = SessionNegotiator.Negotiate(
+            Id(syncReadable: false), Id(syncReadable: false), Pref(), Pref());
+
+        Assert.False(r.Accepted);
+        Assert.Contains("could not be read", r.RejectReason);
+    }
+
+    [Fact]
+    public void EitherSideFailingToReadItsSettingsIsEnoughToRefuse()
+    {
+        var mine = SessionNegotiator.Negotiate(Id(syncReadable: false), Id(), Pref(), Pref());
+        Assert.False(mine.Accepted);
+        Assert.Contains("this core", mine.RejectReason);
+
+        var theirs = SessionNegotiator.Negotiate(Id(), Id(syncReadable: false), Pref(), Pref());
+        Assert.False(theirs.Accepted);
+        Assert.Contains("other player", theirs.RejectReason);
+    }
+
+    [Fact]
+    public void ACoreWithNoSyncSettingsAtAllStillPasses()
+    {
+        // "Nothing to read" is an answer; only "tried and failed" refuses. Otherwise every core
+        // without sync settings would become unplayable.
+        var r = SessionNegotiator.Negotiate(
+            Id(sync: "EMPTY"), Id(sync: "EMPTY"), Pref(), Pref());
+        Assert.True(r.Accepted);
+    }
+
+    [Fact]
+    public void DifferingVideoSettingsWarnWithoutRefusing()
+    {
+        var r = SessionNegotiator.Negotiate(
+            Id(video: "800x600, plugin Rice"), Id(video: "320x240, plugin Rice"), Pref(), Pref());
+
+        Assert.True(r.Accepted);          // not part of any core's sync settings; not ours to forbid
+        Assert.NotNull(r.Warning);
+        Assert.Contains("800x600", r.Warning);
+        Assert.Contains("320x240", r.Warning);
+    }
+
+    [Fact]
+    public void MatchingOrAbsentVideoSettingsSayNothing()
+    {
+        Assert.Null(SessionNegotiator.Negotiate(
+            Id(video: "320x240"), Id(video: "320x240"), Pref(), Pref()).Warning);
+        // A core exposing none, or a peer predating the field, must not produce a warning about a
+        // difference nobody can see.
+        Assert.Null(SessionNegotiator.Negotiate(Id(video: "320x240"), Id(), Pref(), Pref()).Warning);
+        Assert.Null(SessionNegotiator.Negotiate(Id(), Id(), Pref(), Pref()).Warning);
+    }
+
+    [Fact]
+    public void TheIdentityFieldsSurviveTheHandshakeRoundTrip()
+    {
+        // Both new fields cross the wire, and absence decodes as "readable" so a peer predating
+        // them is not refused for never having said so.
+        var id = Id(syncReadable: false, video: "800x600, plugin Rice (InN64Resolution=False)");
+        var encoded = HandshakeCodec.Encode(id, Pref(), 47800, null);
+        var (decoded, _, _, _, _) = HandshakeCodec.Decode(encoded);
+
+        Assert.False(decoded.SyncSettingsReadable);
+        Assert.Equal(id.VideoSettings, decoded.VideoSettings);
+
+        var plain = HandshakeCodec.Encode(Id(), Pref(), 47800, null);
+        var (decodedPlain, _, _, _, _) = HandshakeCodec.Decode(plain);
+        Assert.True(decodedPlain.SyncSettingsReadable);
+        Assert.Equal("", decodedPlain.VideoSettings);
     }
 }
