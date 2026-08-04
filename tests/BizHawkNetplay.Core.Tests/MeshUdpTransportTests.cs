@@ -14,6 +14,45 @@ using Xunit;
 namespace BizHawkNetplay.Core.Tests;
 
 /// <summary>
+/// A mesh bound for a test, with input authentication already wired.
+///
+/// Input datagrams carry a per-pair tag (see <see cref="MeshPairKeyring"/>), so a mesh with no
+/// keyring sends nothing and accepts nothing. Almost every test in this file is about routing —
+/// which endpoint a datagram reaches, which candidate is selected, whether a relay forwards — and
+/// those tests predate seat-consistent numbering: each one numbers its peers 0,1,2… from its own
+/// point of view, so seat 2 as seen by one node is not seat 2 as seen by another.
+///
+/// Rather than renumber thirty tests that are not about authorship, this fixture hands out a ring
+/// where every pair — including a seat paired with itself — shares one key. Any (author, recipient)
+/// combination then verifies, and the routing tests keep testing routing.
+///
+/// The tests that ARE about authorship mint a real ring with <see cref="MeshPairKeyring.Mint"/> and
+/// narrow it with <see cref="MeshPairKeyring.For"/>, which is what production does.
+/// </summary>
+internal static class TestMesh
+{
+    private static readonly MeshPairKeyring Uniform = BuildUniform();
+
+    private static MeshPairKeyring BuildUniform()
+    {
+        var key = new byte[MeshPairKeyring.KeyBytes];
+        for (int i = 0; i < key.Length; i++) key[i] = (byte)(i * 7 + 1);
+        var all = new Dictionary<int, byte[]>();
+        for (int a = 0; a < 8; a++)
+            for (int b = a; b < 8; b++)
+                all[MeshPairKeyring.PairKey(a, b)] = key;
+        return new MeshPairKeyring(all);
+    }
+
+    public static MeshUdpTransport Bind(int localUdpPort, int seat = 0)
+    {
+        var mesh = MeshUdpTransport.Bind(localUdpPort);
+        mesh.ApplyTokens(new MeshTokens(null, null, Uniform), seat);
+        return mesh;
+    }
+}
+
+/// <summary>
 /// Give a mesh one logical peer per endpoint.
 ///
 /// This used to sit on <see cref="MeshUdpTransport"/> itself, as a compatibility shim for callers
@@ -63,9 +102,9 @@ public class MeshUdpTransportTests
     [Fact]
     public void EachPeerReceivesFromEveryOther()
     {
-        var a = MeshUdpTransport.Bind(0);
-        var b = MeshUdpTransport.Bind(0);
-        var c = MeshUdpTransport.Bind(0);
+        var a = TestMesh.Bind(0);
+        var b = TestMesh.Bind(0);
+        var c = TestMesh.Bind(0);
         try
         {
             a.SetPeers(new[] { Loop(b.LocalPort), Loop(c.LocalPort) });
@@ -83,8 +122,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void SetPeerRoutes_GloballyDeduplicatesCandidates()
     {
-        var sender = MeshUdpTransport.Bind(0);
-        var receiver = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
+        var receiver = TestMesh.Bind(0);
         try
         {
             var receiverEndpoint = Loop(receiver.LocalPort);
@@ -107,10 +146,10 @@ public class MeshUdpTransportTests
     [Fact]
     public void Routes_SelectBestLiveCandidate_ThenFailOver_AndIgnoreDeadRtt()
     {
-        var sender = MeshUdpTransport.Bind(0);
-        var fast = MeshUdpTransport.Bind(0);
-        var backup = MeshUdpTransport.Bind(0);
-        var otherPeer = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
+        var fast = TestMesh.Bind(0);
+        var backup = TestMesh.Bind(0);
+        var otherPeer = TestMesh.Bind(0);
         try
         {
             var senderEndpoint = Loop(sender.LocalPort);
@@ -190,9 +229,9 @@ public class MeshUdpTransportTests
         // still answering keepalives must take over the input path well before that window
         // expires; pinned sends into the black hole for the full 8s lose the race against the
         // UDP-lost session watchdog.
-        var sender = MeshUdpTransport.Bind(0);
-        var fast = MeshUdpTransport.Bind(0);
-        var backup = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
+        var fast = TestMesh.Bind(0);
+        var backup = TestMesh.Bind(0);
         try
         {
             var senderEndpoint = Loop(sender.LocalPort);
@@ -238,9 +277,9 @@ public class MeshUdpTransportTests
         // opening toward a NAT'd peer (the first real-internet session lost ~300ms of input to
         // the unreachable pre-NAT candidate this way). Until a path confirms, input must go to
         // every candidate — whichever one is real receives from frame zero.
-        var sender = MeshUdpTransport.Bind(0);
-        var unreachableFirst = MeshUdpTransport.Bind(0);
-        var reachable = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
+        var unreachableFirst = TestMesh.Bind(0);
+        var reachable = TestMesh.Bind(0);
         try
         {
             var unreachableEndpoint = Loop(unreachableFirst.LocalPort);
@@ -263,9 +302,9 @@ public class MeshUdpTransportTests
         // nothing confirmed, input must keep riding the last path that actually worked — not
         // fall back to the first advertised candidate, which for an internet peer is typically
         // the unreachable pre-NAT address.
-        var sender = MeshUdpTransport.Bind(0);
-        var unreachableFirst = MeshUdpTransport.Bind(0);
-        var working = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
+        var unreachableFirst = TestMesh.Bind(0);
+        var working = TestMesh.Bind(0);
         try
         {
             var senderEndpoint = Loop(sender.LocalPort);
@@ -293,8 +332,8 @@ public class MeshUdpTransportTests
         // the joiner's endpoint (the "pasted code"), the mesh punch confirms both ways, and the
         // ordinary handshake — state transfer included — runs over reliable control streams
         // carried on the SAME sockets the session's input will use. No TCP anywhere.
-        var host = MeshUdpTransport.Bind(0);
-        var joiner = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var joiner = TestMesh.Bind(0);
         try
         {
             var hostEndpoint = Loop(host.LocalPort);
@@ -328,8 +367,8 @@ public class MeshUdpTransportTests
         // state allocated. Liveness half: because the sender's reliable layer retransmits, a
         // stream opened LATE (the host pastes the code a moment after the joiner starts talking)
         // still converges — nothing is lost, just delayed.
-        var host = MeshUdpTransport.Bind(0);
-        var joiner = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var joiner = TestMesh.Bind(0);
         try
         {
             var hostEndpoint = Loop(host.LocalPort);
@@ -359,9 +398,9 @@ public class MeshUdpTransportTests
     [Fact]
     public void ForeignSenderIsIgnored()
     {
-        var a = MeshUdpTransport.Bind(0);
-        var b = MeshUdpTransport.Bind(0);
-        var stranger = MeshUdpTransport.Bind(0);
+        var a = TestMesh.Bind(0);
+        var b = TestMesh.Bind(0);
+        var stranger = TestMesh.Bind(0);
         try
         {
             a.SetPeers(new[] { Loop(b.LocalPort) }); // a trusts only b
@@ -400,9 +439,9 @@ public class MeshUdpTransportTests
     {
         // With no input ever sent, the punch loop alone must open + confirm a direct path both ways
         // (this is the keepalive/rendezvous behaviour that holds NAT mappings during a lockstep stall).
-        var a = MeshUdpTransport.Bind(0);
-        var b = MeshUdpTransport.Bind(0);
-        var c = MeshUdpTransport.Bind(0);
+        var a = TestMesh.Bind(0);
+        var b = TestMesh.Bind(0);
+        var c = TestMesh.Bind(0);
         try
         {
             var aeps = new[] { Loop(b.LocalPort), Loop(c.LocalPort) };
@@ -436,7 +475,7 @@ public class MeshUdpTransportTests
     {
         const int Delay = 2, Redundancy = 8, Target = 150, Players = 3;
         var t = new MeshUdpTransport[Players];
-        for (int i = 0; i < Players; i++) t[i] = MeshUdpTransport.Bind(0);
+        for (int i = 0; i < Players; i++) t[i] = TestMesh.Bind(0, seat: i);   // the seat its driver authors as
         // Wire the mesh: each peer sends to / accepts from every other.
         for (int i = 0; i < Players; i++)
         {
@@ -504,9 +543,9 @@ public class MeshUdpTransportTests
     [Fact]
     public void HostRelaysInputBetweenJoinersThatCannotReachEachOther()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var a = MeshUdpTransport.Bind(0);
-        var c = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0, seat: 0);
+        var a = TestMesh.Bind(0, seat: 1);
+        var c = TestMesh.Bind(0, seat: 2);
         try
         {
             var toA = new PeerRoute(1, new[] { Loop(a.LocalPort) });
@@ -545,10 +584,10 @@ public class MeshUdpTransportTests
     [Fact]
     public void RelayCarriesOnlyThePairsItWasInstalledFor()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var a = MeshUdpTransport.Bind(0);   // port 1 — cannot reach B
-        var b = MeshUdpTransport.Bind(0);   // port 2 — cannot reach A
-        var d = MeshUdpTransport.Bind(0);   // port 3 — all its legs work
+        var host = TestMesh.Bind(0, seat: 0);
+        var a = TestMesh.Bind(0, seat: 1);   // port 1 — cannot reach B
+        var b = TestMesh.Bind(0, seat: 2);   // port 2 — cannot reach A
+        var d = TestMesh.Bind(0, seat: 3);   // port 3 — all its legs work
         try
         {
             var toA = new PeerRoute(1, new[] { Loop(a.LocalPort) });
@@ -596,8 +635,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void RelayNeverEchoesBackToTheSender()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var a = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0, seat: 0);
+        var a = TestMesh.Bind(0, seat: 1);
         try
         {
             var toA = new PeerRoute(1, new[] { Loop(a.LocalPort) });
@@ -628,9 +667,9 @@ public class MeshUdpTransportTests
     [Fact]
     public void RelayForwardsAGapRequestToThePeerThatOwnsTheInput()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var b = MeshUdpTransport.Bind(0);
-        var c = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0, seat: 0);
+        var b = TestMesh.Bind(0, seat: 1);
+        var c = TestMesh.Bind(0, seat: 2);
         try
         {
             var toB = new PeerRoute(1, new[] { Loop(b.LocalPort) });
@@ -666,7 +705,7 @@ public class MeshUdpTransportTests
     [Fact]
     public void RoutesRefuseUnroutableCandidatesAndAreBounded()
     {
-        var mesh = MeshUdpTransport.Bind(0);
+        var mesh = TestMesh.Bind(0);
         try
         {
             var good = Loop(47800);
@@ -713,8 +752,11 @@ public class MeshUdpTransportTests
     private static int UnboundPort(int seed) => 20000 + (seed % 1000);
 
     /// <summary>A THello on the wire: the mesh envelope, then the seat token being claimed.</summary>
+    /// <summary>A THello built by hand, as a peer that is not one of our transports would send it.
+    /// The version byte is 3 as of the release that made input datagrams name their author — an
+    /// envelope from an older build is dropped unread, which is the point of the byte.</summary>
     private static byte[] HelloFrame(byte[] token) =>
-        new byte[] { (byte)'B', (byte)'H', (byte)'N', (byte)'P', 2, 0x40 }.Concat(token).ToArray();
+        new byte[] { (byte)'B', (byte)'H', (byte)'N', (byte)'P', 3, 0x40 }.Concat(token).ToArray();
 
     /// <summary>Whether an input datagram (envelope type 0x10) arrived on this socket, ignoring the
     /// punch probes that a claimed address legitimately attracts.</summary>
@@ -747,7 +789,7 @@ public class MeshUdpTransportTests
     [Fact]
     public void AnAddressThatOnlyClaimsASeatIsProbedButNeverSentInput()
     {
-        var host = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
         var claimer = new System.Net.Sockets.Socket(
             System.Net.Sockets.AddressFamily.InterNetwork,
             System.Net.Sockets.SocketType.Dgram,
@@ -789,8 +831,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void AClaimDoesNotDisplaceALearnedEndpointThatIsStillAnswering()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         var usurper = new System.Net.Sockets.Socket(
             System.Net.Sockets.AddressFamily.InterNetwork,
             System.Net.Sockets.SocketType.Dgram,
@@ -844,8 +886,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void RotatingASeatTokenRetiresItsLearnedBinding()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         var replacement = new System.Net.Sockets.Socket(
             System.Net.Sockets.AddressFamily.InterNetwork,
             System.Net.Sockets.SocketType.Dgram,
@@ -908,8 +950,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void AnUnadvertisedEndpointIsLearnedFromItsTokenAndNotBefore()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         try
         {
             // What the peer advertised: a port it does not send from. Nothing else is routable.
@@ -951,8 +993,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void ARepunchKeepsInputFlowingAlongTheLearnedPath()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         try
         {
             // The advertised candidate is nowhere; the peer really sends from its own port.
@@ -998,8 +1040,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void WorstRttSeesAPeerReachableOnlyAtItsLearnedEndpoint()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         try
         {
             // Everything this peer advertised is wrong; it really arrives from somewhere else.
@@ -1029,8 +1071,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void AWrongTokenLearnsNothing()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         try
         {
             int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
@@ -1056,8 +1098,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void ALearnedPeerIsProbedAndNamedAsLearnedInTheEdgeReport()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         try
         {
             int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
@@ -1093,8 +1135,8 @@ public class MeshUdpTransportTests
     [Fact]
     public void ARouteRefreshKeepsWhatWasLearnedButLosingTheSeatForgetsIt()
     {
-        var host = MeshUdpTransport.Bind(0);
-        var peer = MeshUdpTransport.Bind(0);
+        var host = TestMesh.Bind(0);
+        var peer = TestMesh.Bind(0);
         try
         {
             int wrongPort = peer.LocalPort == 65000 ? 64999 : peer.LocalPort + 1;
@@ -1145,7 +1187,7 @@ public class MeshUdpTransportTests
     [Fact]
     public void WorstRttStats_TakeEachPeersBestPathThenTheWorstPeer_AndReportCoverage()
     {
-        var sender = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
         try
         {
             var fast = Loop(40001);
@@ -1188,7 +1230,7 @@ public class MeshUdpTransportTests
     [Fact]
     public void WorstRttStats_KeepEachEdgesOwnJitterPairing()
     {
-        var sender = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
         try
         {
             var steady = Loop(40011);
@@ -1218,9 +1260,9 @@ public class MeshUdpTransportTests
     [Fact]
     public void RttBurst_MeasuresEveryEdgeBeforeAnyInputFlows()
     {
-        var a = MeshUdpTransport.Bind(0);
-        var b = MeshUdpTransport.Bind(0);
-        var c = MeshUdpTransport.Bind(0);
+        var a = TestMesh.Bind(0);
+        var b = TestMesh.Bind(0);
+        var c = TestMesh.Bind(0);
         try
         {
             a.SetPeers(new[] { Loop(b.LocalPort), Loop(c.LocalPort) });
@@ -1253,7 +1295,7 @@ public class MeshUdpTransportTests
     [Fact]
     public void RttBurst_StartsEachCandidatesSampleWindowOver()
     {
-        var sender = MeshUdpTransport.Bind(0);
+        var sender = TestMesh.Bind(0);
         try
         {
             var peer = Loop(40010);

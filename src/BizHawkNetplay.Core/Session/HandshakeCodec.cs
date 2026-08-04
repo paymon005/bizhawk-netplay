@@ -189,6 +189,7 @@ public static class HandshakeCodec
         }
         sb.Append(Encoding.UTF8.GetString(EncodeRoutes(peerRoutes ?? Array.Empty<PeerRoute>())));
         if (tokens != null) sb.Append(Encoding.UTF8.GetString(EncodeTokens(tokens.Peers)));
+        if (tokens != null) sb.Append(Encoding.UTF8.GetString(EncodePairKeys(tokens.Pairs)));
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
@@ -329,6 +330,29 @@ public static class HandshakeCodec
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 
+    /// <summary>
+    /// Encode the per-pair input keys, one <c>pk=&lt;a&gt;:&lt;b&gt;:&lt;hex&gt;</c> line each.
+    ///
+    /// Unlike <c>tok=</c> lines, these are NOT the same for every recipient, and that asymmetry is
+    /// the security property: see <see cref="MeshPairKeyring.For"/>. The caller passes an already
+    /// narrowed ring; this function does not filter, because a filter here would be a second place
+    /// to get it right.
+    /// </summary>
+    private static byte[] EncodePairKeys(MeshPairKeyring pairs)
+    {
+        if (pairs == null) throw new ArgumentNullException(nameof(pairs));
+        var sb = new StringBuilder();
+        foreach (var kv in pairs.Entries)
+        {
+            int a = (kv.Key >> 8) & 0xFF, b = kv.Key & 0xFF;
+            if (a >= MaxPlayers || b >= MaxPlayers)
+                throw new ArgumentOutOfRangeException(nameof(pairs), $"Port must be between 0 and {MaxPlayers - 1}");
+            sb.Append("pk=").Append(a).Append(':').Append(b).Append(':')
+              .Append(SessionAuth.ToHex(kv.Value)).Append('\n');
+        }
+        return Encoding.UTF8.GetBytes(sb.ToString());
+    }
+
     /// <summary>Decode the token section of any body that carries one — <c>mytok=</c> becomes
     /// <see cref="MeshTokens.Local"/>, the <c>tok=</c> lines become <see cref="MeshTokens.Peers"/>.
     /// Malformed or wrong-length entries are skipped (untrusted input); last entry per port wins.</summary>
@@ -338,12 +362,25 @@ public static class HandshakeCodec
         RefuseOversizedText(body);
         byte[]? local = null;
         var peers = new Dictionary<int, byte[]>();
+        var pairs = new Dictionary<int, byte[]>();
         foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
         {
             var line = raw.Trim();
             if (line.StartsWith("mytok=", StringComparison.Ordinal))
             {
                 local = ValidToken(line.Substring(6));
+                continue;
+            }
+            if (line.StartsWith("pk=", StringComparison.Ordinal))
+            {
+                var parts = line.Substring(3).Split(':');
+                if (parts.Length != 3) continue;
+                if (!int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out int a) ||
+                    !int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int b) ||
+                    a < 0 || b < 0 || a >= MaxPlayers || b >= MaxPlayers || a == b)
+                    continue;
+                var key = SessionAuth.FromHex(parts[2]);
+                if (key is { Length: MeshPairKeyring.KeyBytes }) pairs[MeshPairKeyring.PairKey(a, b)] = key;
                 continue;
             }
             if (!line.StartsWith("tok=", StringComparison.Ordinal)) continue;
@@ -354,7 +391,7 @@ public static class HandshakeCodec
                 continue;
             if (ValidToken(line.Substring(colon + 1)) is { } token) peers[port] = token;
         }
-        return new MeshTokens(local, peers);
+        return new MeshTokens(local, peers, new MeshPairKeyring(pairs));
     }
 
     private static byte[]? ValidToken(string hex)

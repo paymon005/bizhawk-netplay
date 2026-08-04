@@ -81,7 +81,7 @@ public sealed partial class NetplayToolForm
         _checksumInterval = sp.ChecksumInterval; // the host measured and published; we quantize to it
         SetGeneration(sp.Generation);
         _meshOthers = new List<PeerRoute>(sp.PeerRoutes);
-        _mesh?.ApplyTokens(sp.Tokens);
+        _mesh?.ApplyTokens(sp.Tokens, sp.LocalPort);
         ApplyJoinerMesh();
         PrepareSessionDriver(sp.Mode);
     }

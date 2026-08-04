@@ -304,14 +304,31 @@ public sealed partial class NetplayToolForm
         return token;
     }
 
+    /// <summary>
+    /// The session's full pair-key table, minted once and kept for as long as the session lives.
+    ///
+    /// Minted for every seat the session could hold rather than for the seats currently filled: a
+    /// rejoining player and a seat renumbering both have to find their keys already there, and a
+    /// key minted late is a key some peer was told about and another was not.
+    /// </summary>
+    private MeshPairKeyring? _pairKeys;
+
+    private MeshPairKeyring PairKeys(int players)
+        => _pairKeys ??= MeshPairKeyring.Mint(Math.Max(players, HandshakeCodec.MaxPlayers));
+
     /// <summary>Host: the mesh identity handed to the peer in <paramref name="port"/> — its own
-    /// token plus every other seat's, including seat 0 (us), which is never listed as a route.</summary>
+    /// token plus every other seat's, including seat 0 (us), which is never listed as a route, and
+    /// the pair keys for the pairs this seat is in and no others.</summary>
     private MeshTokens TokensFor(int port, int players)
     {
         var peers = new Dictionary<int, byte[]>();
         for (int p = 0; p < players; p++)
             if (p != port) peers[p] = TokenForPort(p);
-        return new MeshTokens(TokenForPort(port), peers);
+        // Seat 0 is us, and only us: the host keeps the WHOLE table because it is the only node that
+        // relays, and relaying means re-tagging a datagram for a destination the author could not
+        // reach. Every other seat gets the narrow view — that narrowing is the security property.
+        var pairs = port == 0 ? PairKeys(players) : PairKeys(players).For(port);
+        return new MeshTokens(TokenForPort(port), peers, pairs);
     }
 
     /// <summary>Host: point our mesh at every currently-connected joiner's candidate endpoints.</summary>
@@ -660,6 +677,7 @@ public sealed partial class NetplayToolForm
         // them behind let the next session reuse them via TokenForPort.
         _relayPairs.Clear();
         _portTokens.Clear();
+        _pairKeys = null;      // and neither may the keys that made input provable
         _vacatedPorts.Clear();
         _vacatedCount = 0;
         try { _adapter?.DisableAudio(); } catch { } // restore EmuHawk's normal audio wiring
@@ -736,6 +754,7 @@ public sealed partial class NetplayToolForm
 
         _relayPairs.Clear(); // a fresh session re-measures; nothing from the last one should carry
         _portTokens.Clear(); // tokens must not outlive the control channel that authenticated them
+        _pairKeys = null;    // and neither may the keys that made input provable
         _vacatedPorts.Clear(); // vacated seats belong to the session that lost them
         _vacatedCount = 0;
         _netcodeLabel.Text = "Netcode in use: —";

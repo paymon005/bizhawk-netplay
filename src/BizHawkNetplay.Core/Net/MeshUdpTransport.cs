@@ -30,8 +30,20 @@ namespace BizHawkNetplay.Core.Net;
 public sealed class MeshUdpTransport : ITransport, IDisposable
 {
     private static readonly byte[] Magic = [(byte)'B', (byte)'H', (byte)'N', (byte)'P'];
-    private const byte Version = 2; // bumped: datagrams now carry a type byte (input vs punch)
+    private const byte Version = 3; // bumped: input datagrams now name and prove their author
     private const int HeaderSize = 6; // MAGIC(4) + version(1) + type(1)
+
+    /// <summary>
+    /// Input datagrams carry two more fields than the rest: the author's seat, and a tag proving it.
+    ///
+    /// Only <see cref="TInput"/> needs them. A punch and its ack prove themselves by echoing eight
+    /// blinded bytes; a control segment rides the reliable stream, whose frames the control channel
+    /// authenticates end to end. Input was the one path where the author was a byte anybody could
+    /// write — see <see cref="MeshPairKeyring"/>.
+    /// </summary>
+    private const int InputHeaderSize = HeaderSize + 1 + MeshPairKeyring.TagBytes; // + author(1) + tag(8)
+    private const int AuthorOffset = HeaderSize;
+    private const int TagOffset = HeaderSize + 1;
 
     private const byte TInput = 0x10;
     private const byte TCtrlSeg = 0x20; // reliable control-stream segment (punched-joiner admission)
@@ -74,6 +86,21 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     // Host only: peers to echo every other peer's input to, because their direct legs never opened.
     private volatile PeerRoute[] _relayRoutes = [];
     private volatile HashSet<int>? _relayPairs;    // PairKey set; null = no filter
+
+    // --- input authorship (KI-21) ---------------------------------------------------------------
+    // Which seat WE are, so a datagram can name its author and a received one can be checked against
+    // the pair key only this node and that author share. -1 until the session assigns it: an unset
+    // seat must not silently behave like seat 0, which would have every joiner verifying as the host.
+    private volatile int _localSeat = -1;
+    // One tagger per thread that needs one. HMACSHA256 carries state across Transform calls, so the
+    // frame thread (Send) and the socket thread (receive, relay) cannot share one. Swapped wholesale
+    // when keys are redistributed and deliberately NOT disposed on swap — the other thread may be
+    // inside the old one, and letting the finalizer reclaim a handful of session-scoped HMACs is the
+    // cheap side of that trade.
+    private volatile MeshTagger? _sendTagger;
+    private volatile MeshTagger? _recvTagger;
+    private long _inputUnauthenticated;   // arrived, failed the tag or the author check
+    private long _inputUnkeyed;           // could not be sent: no key for that pair
 
     // --- endpoint learning (the symmetric-NAT fix) ---------------------------------------------
     // Our own token, announced in THello, and the tokens we will accept from others. Both are
@@ -432,17 +459,34 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     public void Send(byte[] datagram)
     {
         if (datagram == null) throw new ArgumentNullException(nameof(datagram));
-        int framedLength = HeaderSize + datagram.Length;
+        int framedLength = InputHeaderSize + datagram.Length;
         var framed = _inputFrameScratch;
         if (framed.Length < framedLength) _inputFrameScratch = framed = new byte[framedLength];
         Buffer.BlockCopy(Magic, 0, framed, 0, 4);
         framed[4] = Version;
         framed[5] = TInput;
-        Buffer.BlockCopy(datagram, 0, framed, HeaderSize, datagram.Length);
+        int author = _localSeat;
+        framed[AuthorOffset] = (byte)author;
+        Buffer.BlockCopy(datagram, 0, framed, InputHeaderSize, datagram.Length);
+        var tagger = _sendTagger;
         var table = _routeTable;
         long now = Clock.ElapsedMilliseconds;
         foreach (var route in table.Routes)
         {
+            // The tag is recipient-specific, so the buffer is re-tagged in place per route rather
+            // than framed once and blasted. That is what stops a datagram we sent to one peer from
+            // being replayed at another as if we had addressed it there — and it is why the host can
+            // relay only by re-tagging, which is exactly the point at which it re-asserts the author.
+            if (author < 0 || tagger == null ||
+                !tagger.TryComputeTag(author, route.RemotePort, framed, InputHeaderSize,
+                    datagram.Length, framed, TagOffset))
+            {
+                // No key for this pair: the peer would drop whatever we sent, so sending it would
+                // only look like a working link. Counted, because this is a distribution bug and the
+                // symptom otherwise reads as a silent network fault.
+                Interlocked.Increment(ref _inputUnkeyed);
+                continue;
+            }
             var endpoint = SelectSendCandidate(route, now);
             if (endpoint != null)
             {
@@ -903,7 +947,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     private void ReceiveLoop()
     {
-        // Must stay above InputPacketCodec.MaxDatagramBytes + HeaderSize (1206) and above the
+        // Must stay above InputPacketCodec.MaxDatagramBytes + InputHeaderSize (1215) and above the
         // reliable stream's segment size. A datagram larger than this buffer does not truncate: the
         // socket raises a size error, the loop below can only skip it, and the OS has already
         // discarded the data — so the sender's input would vanish permanently while every other
@@ -1032,8 +1076,36 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         }
 
         if (type != TInput) return; // unknown type from a future build — ignore
-        var payload = new byte[n - HeaderSize];
-        Buffer.BlockCopy(buffer, HeaderSize, payload, 0, payload.Length);
+        if (n < InputHeaderSize) return;
+
+        // Who this claims to be from, and the proof. Until the proof checks out nothing here is
+        // acted on: not enqueued for the frame loop, not relayed, not counted as input. An admitted
+        // peer holds every seat's membership token, so before this the seat byte was a claim any of
+        // them could have written — a peer could put another player's port in a datagram and the
+        // receiver would attribute the input there. The key is one only this pair holds.
+        int author = buffer[AuthorOffset];
+        int payloadLength = n - InputHeaderSize;
+        var tagger = _recvTagger;
+        int seat = _localSeat;
+        if (seat < 0 || tagger == null ||
+            !tagger.Verify(author, seat, buffer, InputHeaderSize, payloadLength, buffer, TagOffset))
+        {
+            Interlocked.Increment(ref _inputUnauthenticated);
+            return;
+        }
+
+        // The codec's own port byte has to agree with the authenticated author. They are different
+        // fields serving different layers, and only for input do they mean the same thing — a gap
+        // request's port names the seat being ASKED, not the asker, so it is left alone.
+        if (payloadLength >= 2 && buffer[InputHeaderSize] == RelayedInputType &&
+            buffer[InputHeaderSize + 1] != author)
+        {
+            Interlocked.Increment(ref _inputUnauthenticated);
+            return;
+        }
+
+        var payload = new byte[payloadLength];
+        Buffer.BlockCopy(buffer, InputHeaderSize, payload, 0, payload.Length);
         EnqueueInput(payload);
         RelayInput(buffer, n, known);
     }
@@ -1108,9 +1180,10 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private void RelayInput(byte[] buffer, int n, IPEndPoint from)
     {
         if (_relayRoutes.Length == 0) return;
-        if (n < HeaderSize + 2) return;          // too short to carry the codec's type and port
-        byte payloadType = buffer[HeaderSize];
-        byte payloadPort = buffer[HeaderSize + 1];
+        if (n < InputHeaderSize + 2) return;     // too short to carry the codec's type and port
+        byte payloadType = buffer[InputHeaderSize];
+        byte payloadPort = buffer[InputHeaderSize + 1];
+        byte author = buffer[AuthorOffset];
         long now = Clock.ElapsedMilliseconds;
 
         // A gap request is ADDRESSED: exactly one peer owns the input it asks for, and that peer
@@ -1125,7 +1198,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             {
                 if (route.RemotePort != payloadPort) continue;
                 var target = SelectSendCandidate(route, now);
-                if (target != null) SendFramed(buffer, 0, n, target);
+                if (target != null) ForwardRetagged(buffer, n, author, route.RemotePort, target);
                 return;
             }
             return;
@@ -1141,8 +1214,42 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             if (pairs != null && !pairs.Contains(PairKey(payloadPort, route.RemotePort))) continue;
             var endpoint = SelectSendCandidate(route, now);
             if (endpoint == null) continue; // no live path to relay over yet; direct copies still flow
-            SendFramed(buffer, 0, n, endpoint);
+            ForwardRetagged(buffer, n, author, route.RemotePort, endpoint);
         }
+    }
+
+    // Re-tagging scratch. Touched only from the socket thread, which is the only thread that
+    // relays — the send path has its own for the same reason.
+    private byte[] _relayScratch = new byte[2048];
+
+    /// <summary>
+    /// Forward an already-verified datagram to a peer it was not tagged for, re-tagging it on the
+    /// way.
+    ///
+    /// The forwarded copy keeps the ORIGINAL author byte and gets a tag under the author's key with
+    /// this destination — which the host can produce because it is the only node holding the whole
+    /// pair table. So the destination cannot tell a relayed datagram from a direct one, and does not
+    /// need to: either way the tag says the author wrote it.
+    ///
+    /// Note what the host is asserting. It verified the incoming tag before this was called, so
+    /// re-tagging passes on a fact it checked rather than one it invented. A dishonest host could
+    /// forge here — and could equally forge by distributing a state, which it already does on every
+    /// resync. The host is the session's authority; this changes nothing about that.
+    /// </summary>
+    private void ForwardRetagged(byte[] buffer, int n, int author, int destPort, IPEndPoint to)
+    {
+        var tagger = _recvTagger;
+        if (tagger == null) return;
+        var scratch = _relayScratch;
+        if (scratch.Length < n) _relayScratch = scratch = new byte[n];
+        Buffer.BlockCopy(buffer, 0, scratch, 0, n);
+        if (!tagger.TryComputeTag(author, destPort, scratch, InputHeaderSize, n - InputHeaderSize,
+                scratch, TagOffset))
+        {
+            Interlocked.Increment(ref _inputUnkeyed);
+            return;
+        }
+        SendFramed(scratch, 0, n, to);
     }
 
     // The input codec's payload type byte, mirrored here so the relay can address a datagram
@@ -1196,11 +1303,34 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     /// <summary>Adopt a whole mesh identity at once — who we announce ourselves as and who we will
     /// accept. The two always arrive together from the control channel, so they are applied together.</summary>
-    public void ApplyTokens(MeshTokens? tokens)
+    /// <summary>
+    /// Install this peer's whole mesh identity: the token it announces, the tokens it accepts, and
+    /// the pair keys that make its input datagrams provable.
+    ///
+    /// <paramref name="localSeat"/> has no default on purpose. It is both the author this node
+    /// signs as and the recipient it verifies as, so a wrong value does not degrade — it makes every
+    /// datagram in both directions fail its tag. Defaulting it to 0 would have every joiner quietly
+    /// verifying as though it were the host.
+    /// </summary>
+    public void ApplyTokens(MeshTokens? tokens, int localSeat)
     {
         SetLocalToken(tokens?.Local);
         SetPeerTokens(tokens?.Peers);
+        _localSeat = localSeat;
+        var ring = tokens?.Pairs ?? MeshPairKeyring.None;
+        _sendTagger = ring.CreateTagger();
+        _recvTagger = ring.CreateTagger();
     }
+
+    /// <summary>Input datagrams dropped because the author could not be proved — a forgery, a peer
+    /// whose keys we lack, or a truncated packet. Nonzero on a healthy network means a key
+    /// distribution bug; nonzero with everything else healthy means someone is writing packets.</summary>
+    public long InputUnauthenticated => Interlocked.Read(ref _inputUnauthenticated);
+
+    /// <summary>Datagrams NOT sent because this node holds no key for the pair. Always a wiring
+    /// fault: it is counted rather than sent untagged so it surfaces as itself instead of as an
+    /// unexplained one-way silence.</summary>
+    public long InputUnkeyed => Interlocked.Read(ref _inputUnkeyed);
 
     /// <summary>Endpoints learned from a token that no advertised candidate matched — i.e. peers
     /// whose real address only became knowable by being told. Zero on a well-behaved network.</summary>

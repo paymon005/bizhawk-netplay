@@ -189,7 +189,7 @@ public sealed partial class NetplayToolForm
                         PrepareSessionJoiner(ready, peerLink);
                     });
                     initialStateApplied = true;
-                }, measureMesh: (_, peerRoutes, tokens) => MeasureJoinerMesh(host, peerRoutes, tokens),
+                }, measureMesh: (_, peerRoutes, tokens, localPort) => MeasureJoinerMesh(host, peerRoutes, tokens, localPort),
                    localReflexive: AwaitLocalReflexive(),
                    afterGreet: () =>
                 {

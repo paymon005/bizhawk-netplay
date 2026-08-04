@@ -507,7 +507,7 @@ public static class Handshake
     public static SessionParams RunClientMulti(
         ControlChannel channel, PeerIdentity clientId, SessionPreferences clientPrefs, int localUdpPort,
         Action<SessionParams>? beforeReady = null, Action? afterGreet = null,
-        Func<int, IReadOnlyList<PeerRoute>, MeshTokens, LobbyMeshSample>? measureMesh = null,
+        Func<int, IReadOnlyList<PeerRoute>, MeshTokens, int, LobbyMeshSample>? measureMesh = null,
         IPEndPoint? localReflexive = null)
     {
         var joinNonce = SessionAuth.NewNonce();
@@ -578,7 +578,7 @@ public static class Handshake
     /// that exact generation, then remain blocked until the host releases the same generation.</summary>
     private static SessionParams ReceiveStartData(
         ControlChannel channel, int hostUdpPort, Action<SessionParams>? beforeReady,
-        Func<int, IReadOnlyList<PeerRoute>, MeshTokens, LobbyMeshSample>? measureMesh = null)
+        Func<int, IReadOnlyList<PeerRoute>, MeshTokens, int, LobbyMeshSample>? measureMesh = null)
     {
         int assignedPort = 0, playerCount = 0, delay = 0;
         SyncMode mode = SyncMode.Lockstep;
@@ -644,7 +644,7 @@ public static class Handshake
                     throw new HandshakeException("host asked for a mesh measurement before sending WELCOME");
                 RequireGeneration(ControlMessageType.MeshRtt, body, generation);
                 var mesh = measureMesh != null
-                    ? measureMesh(hostUdpPort, peerRoutes, tokens)
+                    ? measureMesh(hostUdpPort, peerRoutes, tokens, assignedPort)
                     : LobbyMeshSample.None;
                 channel.Send(ControlMessageType.MeshRtt, ControlMessageCodec.EncodeMeshRtt(
                     generation, mesh.Rtt.MedianMs, mesh.Rtt.HighMs, mesh.MeasuredEdges,

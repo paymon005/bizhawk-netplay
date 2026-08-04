@@ -237,6 +237,18 @@ public sealed partial class NetplayToolForm
         if (mesh.ReceiveFaults > 0)
             note += $" — NOTE: the UDP receive path threw {mesh.ReceiveFaults} time(s), most recently " +
                     $"'{mesh.LastReceiveFault}'. That is a fault in this tool, not in the network.";
+        // Both of these are silent input loss wearing a network fault's clothes, which is exactly
+        // the confusion the rest of this note exists to prevent. Named separately because they have
+        // opposite causes: one is a datagram we refused, the other is one we never sent.
+        if (mesh.InputUnauthenticated > 0)
+            note += $" — NOTE: {mesh.InputUnauthenticated} input datagram(s) were refused because the " +
+                    "author could not be proved. If the session is otherwise healthy this is someone " +
+                    "writing packets at us; if input is missing from one seat it is more likely that " +
+                    "peer's keys never arrived.";
+        if (mesh.InputUnkeyed > 0)
+            note += $" — NOTE: {mesh.InputUnkeyed} outgoing datagram(s) were NOT sent because this " +
+                    "machine holds no key for that peer. That is a fault in this tool: the session " +
+                    "handed out an incomplete key set.";
         return note;
     }
 

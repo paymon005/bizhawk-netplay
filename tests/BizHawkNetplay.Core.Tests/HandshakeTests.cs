@@ -676,15 +676,19 @@ public class HandshakeTests
 
             var c1 = Task.Run(() => Handshake.RunClientMulti(
                 clientCh1, Id(), new SessionPreferences(1, false), 51001,
-                measureMesh: (hostUdpPort, routes, _) =>
+                measureMesh: (hostUdpPort, routes, _, localPort) =>
                 {
                     Assert.Equal(47800, hostUdpPort);        // the joiner measures the host edge too
                     Assert.Equal(2, Assert.Single(routes).RemotePort);
+                    // The seat the WELCOME just assigned. The mesh signs input as this and verifies
+                    // as this, so a lobby that measured under the wrong one would authenticate
+                    // nothing once the session started.
+                    Assert.Equal(1, localPort);
                     return j1Mesh;
                 }));
             var c2 = Task.Run(() => Handshake.RunClientMulti(
                 clientCh2, Id(), new SessionPreferences(1, false), 51002,
-                measureMesh: (_, __, ___) => j2Mesh));
+                measureMesh: (_, __, ___, ____) => j2Mesh));
 
             var hostPrefs = new SessionPreferences(1, false);
             var g1 = Handshake.HostGreet(hostCh1, Id(), hostPrefs, 47800);
@@ -743,7 +747,7 @@ public class HandshakeTests
             var generation = Generation(0xC0DEUL, epoch: 1);
             var client = Task.Run(() => Handshake.RunClientMulti(
                 clientCh, Id(), new SessionPreferences(1, false), 51001,
-                measureMesh: (_, __, ___) => new LobbyMeshSample(default, measuredEdges: 0, totalEdges: 3)));
+                measureMesh: (_, __, ___, ____) => new LobbyMeshSample(default, measuredEdges: 0, totalEdges: 3)));
 
             Handshake.HostGreet(hostCh, Id(), new SessionPreferences(1, false), 47800);
             Handshake.HostSendStart(hostCh, 1, 2, 3, SyncMode.Lockstep, new byte[8], generation);

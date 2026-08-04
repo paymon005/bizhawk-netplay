@@ -476,7 +476,7 @@ public sealed partial class NetplayToolForm
         // Trust the negotiated endpoints before asking clients to prepare their drivers: their
         // pre-READY neutral windows can then queue instead of being rejected as foreign UDP.
         _mesh!.SetPeerRoutes(RoutesExcept(links, null));
-        _mesh!.ApplyTokens(TokensFor(0, players));
+        _mesh!.ApplyTokens(TokensFor(0, players), 0);
         // WELCOME + state, but NOT the READY request: the routes WELCOME carries are what every
         // joiner needs before it can punch and measure the edges this machine cannot see, and
         // READY is the point of no return for the delay each driver gets built with.
@@ -596,8 +596,18 @@ public sealed partial class NetplayToolForm
         var stableSeats = new HashSet<int>();
         for (int i = 0; i < links.Count; i++)
             if (links[i].RemotePort == i + 1) stableSeats.Add(i + 1);
+        bool renumbered = false;
         for (int port = 1; port <= need; port++)
-            if (!stableSeats.Contains(port)) _portTokens.Remove(port);
+            if (!stableSeats.Contains(port)) { _portTokens.Remove(port); renumbered = true; }
+
+        // The pair keys go with them, and for a sharper reason than the tokens. A key is what lets
+        // its holder author input as its seat, so anyone who held seat 2's keys and then left could
+        // still write seat 2's input for whoever inherits it. The whole table is reminted rather
+        // than the moved seats' rows, because a pair spans two seats and half a rotation would
+        // leave the survivor and the newcomer holding different bytes for the same pair — which
+        // reads on the wire as every datagram between them failing its tag. The next start attempt
+        // distributes the fresh table with its WELCOMEs, exactly as it does the tokens.
+        if (renumbered) _pairKeys = null;
 
         for (int i = 0; i < links.Count; i++)
         {
@@ -914,13 +924,15 @@ public sealed partial class NetplayToolForm
     /// leaves the confirmations and samples taken here intact.
     /// </summary>
     private LobbyMeshSample MeasureJoinerMesh(
-        IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes, MeshTokens tokens)
+        IPEndPoint hostEndpoint, IReadOnlyList<PeerRoute> peerRoutes, MeshTokens tokens, int localPort)
     {
         UiConnLog($"measuring my {peerRoutes.Count + 1} direct UDP path(s) ({MeshProbeWindowMs}ms)…",
             Color.DarkSlateBlue);
         // Tokens before probes: an edge whose far side only ever sees us at an address we were
         // never able to advertise is exactly the edge this measurement would otherwise write off.
-        _mesh?.ApplyTokens(tokens);
+        // The seat comes from the WELCOME being measured rather than from session state, which at
+        // this point does not exist yet — the lobby can still reassign it before GO.
+        _mesh?.ApplyTokens(tokens, localPort);
         var sample = TakeJoinerMeshSample(hostEndpoint, peerRoutes);
         UiConnLog(sample.HasMeasurement
             ? $"my worst direct path: ~{sample.Rtt.MedianMs:F0}ms (±{sample.Rtt.JitterMs:F0}ms), " +
@@ -1131,8 +1143,8 @@ public sealed partial class NetplayToolForm
                                   "Disconnect still cancels.", Color.DarkGreen);
                         UiLobbyPhase("Connected — waiting for the host to fill the lobby and start…",
                             Color.DarkGreen);
-                    }, measureMesh: (hostUdpPort, peerRoutes, tokens) =>
-                        MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes, tokens),
+                    }, measureMesh: (hostUdpPort, peerRoutes, tokens, localPort) =>
+                        MeasureJoinerMesh(new IPEndPoint(remoteIp, hostUdpPort), peerRoutes, tokens, localPort),
                        localReflexive: AwaitLocalReflexive());
                 }
                 catch (Exception ex) when (greetDeadline.Expired)

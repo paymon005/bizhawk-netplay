@@ -89,7 +89,14 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // seed also changed shape (it folds a range LIST and the mask identity, replacing v20's single
     // span), so a v20 peer computes different values for identical states: a mixed pair would
     // report a desync that is not there, which is what the version refusal pre-empts.
-    private const int Protocol = 21;
+    // 22: input datagrams name and prove their author. The host mints one key per unordered pair of
+    // seats and hands each peer only the pairs it belongs to (pk= lines in WELCOME), so the seat
+    // byte a peer writes is no longer a claim any member could make about any other — see
+    // MeshPairKeyring. The UDP envelope grew an author byte and an 8-byte tag, and the host re-tags
+    // what it relays, so a v21 peer's datagrams are unreadable to a v22 peer and vice versa. That is
+    // a silent total input loss rather than a desync, so the version refusal matters more here than
+    // usual.
+    private const int Protocol = 22;
     private const int DefaultPort = 47800;
 
     /// <summary>
