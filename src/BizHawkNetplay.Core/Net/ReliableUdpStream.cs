@@ -33,7 +33,10 @@ public sealed class ReliableUdpStream : Stream
 
     /// <summary>
     /// Floor for the loss-adapted window below. Matches <see cref="RtoBurst"/>: no point offering
-    /// the link fewer segments than a single timer burst re-drives anyway.
+    /// the link fewer segments than a single timer burst re-drives anyway. The equality is a
+    /// COUPLING, not a coincidence — lower the burst without lowering this floor and a timeout
+    /// stops being able to re-drive the whole window it just shrank to, so the two must move
+    /// together or the floor must stay the larger of them.
     /// </summary>
     private const int MinWindow = RtoBurst;
 
@@ -264,6 +267,14 @@ public sealed class ReliableUdpStream : Stream
     /// </summary>
     private const int DuplicateAcksBeforeFastRetransmit = 3;
 
+    // The zero DEFAULT is load-bearing, not an oversight: an ack of 0 arriving while data is
+    // unacked means the receiver is taking later segments and still missing seq 0 — a genuine
+    // loss signal that must count toward fast retransmit from the very first ack of a stream,
+    // which is exactly what losing the opening segment produces. The case where an ack of 0
+    // carries no information (nothing sent yet) is already excluded by the _unacked.Count == 0
+    // guard below. A "fix" that made the first ack establish-only was tried and reverted: it
+    // cost the lost-first-segment repair one of its three duplicates and pushed that repair
+    // onto the 500ms timer.
     private uint _lastAckValue;
     private int _duplicateAcks;
 
