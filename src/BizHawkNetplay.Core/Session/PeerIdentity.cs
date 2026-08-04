@@ -23,8 +23,10 @@ public sealed class PeerIdentity
         bool syncSettingsReadable = true,
         string? videoSettings = null,
         string? buildId = null,
-        string? firmwareHash = null)
+        string? firmwareHash = null,
+        IReadOnlyList<string>? discHashes = null)
     {
+        DiscHashes = discHashes ?? Array.Empty<string>();
         SyncSettingsReadable = syncSettingsReadable;
         VideoSettings = videoSettings ?? "";
         BuildId = buildId ?? "";
@@ -99,6 +101,16 @@ public sealed class PeerIdentity
     /// whole time and the handshake never asked for it. Empty on the many systems that need none.
     /// </summary>
     public string FirmwareHash { get; }
+
+    /// <summary>
+    /// A hash per mounted disc, in the order the core was given them.
+    ///
+    /// Empty for the many systems with no discs. See <see cref="DiscIdentity"/> for why the order
+    /// matters and why the per-disc list travels rather than only a digest: a multi-disc set was
+    /// identified from disc one, so two players holding the same disc 1 and different disc 2s
+    /// passed every check and diverged on the swap.
+    /// </summary>
+    public IReadOnlyList<string> DiscHashes { get; }
 
     public IReadOnlyList<string> PortLayoutDigests { get; }
 

@@ -98,6 +98,12 @@ public static class SessionNegotiator
             && BuildIdentity.Mismatch(local.BuildId, remote.BuildId) is { } buildProblem)
             return NegotiationResult.Reject(buildProblem);
 
+        // A multi-disc set was identified from disc one, so the same disc 1 with different disc 2s
+        // passed everything above and diverged on the swap. Checked after the ROM hash, which for a
+        // disc game is derived from disc one anyway — so this is the check that sees the rest.
+        if (DiscIdentity.Mismatch(local.DiscHashes, remote.DiscHashes) is { } discProblem)
+            return NegotiationResult.Reject(discProblem);
+
         // Different BIOS revisions run different code before the game does. BizHawk has always
         // carried this on GameInfo; the handshake simply never asked.
         if (!string.Equals(local.FirmwareHash, remote.FirmwareHash, StringComparison.OrdinalIgnoreCase))

@@ -183,7 +183,8 @@ public sealed partial class NetplayToolForm
             syncSettingsReadable: a.SyncSettingsReadable,
             videoSettings: a.VideoSettingsDiagnostic(),
             buildId: a.BuildId,
-            firmwareHash: a.FirmwareHash);
+            firmwareHash: a.FirmwareHash,
+            discHashes: a.DiscHashes);
     }
 
     /// <summary>Map the "My controls" dropdown to an input-source port: P1..P4 (0..3) or -1 (assigned port).</summary>

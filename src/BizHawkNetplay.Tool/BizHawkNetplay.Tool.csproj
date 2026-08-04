@@ -46,6 +46,12 @@
       <HintPath>$(BizHawkHome)\EmuHawk.exe</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- For per-disc identity (KI-17): DiscHasher is BizHawk's own, and a multi-disc set was
+         previously identified from disc one alone. Bind-only, never copied. -->
+    <Reference Include="BizHawk.Emulation.DiscSystem">
+      <HintPath>$(BizHawkHome)\dll\BizHawk.Emulation.DiscSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <!-- Ships with BizHawk (loaded already); used to serialize the core's sync-settings object for a
          real cross-peer digest. Bind-only, never copied. -->
     <Reference Include="Newtonsoft.Json">

@@ -49,18 +49,26 @@ open is recorded with what it would actually take.
   different programs. `BuildIdentity` assembles and compares them, and names which of the three
   kinds of mismatch it found. `CoreVersion` is still compared, and still could not have done this:
   it is `Assembly.GetName().Version`, which is one string for every build of a release.
-- **KI-17 — PARTLY CLOSED in v0.33.0.** Firmware is compared: `GameInfo.FirmwareHash` was there
+- **KI-17 — disc half CLOSED in v0.34.0; ROM-hash strength still open.**
+  **Discs (fixed):** every mounted disc is hashed individually and in order, using both of
+  BizHawk's own hashers per disc — `Calculate_PSX_BizIDHash` for the TOC and first 26 sectors
+  (which is what covers an audio-only disc with no data track) and `OldHash` for MD5 over up to 512
+  sectors of the first data track, which is far more discriminating than the CRC32 the first ends
+  in. The per-disc list travels, so a refusal names the disc rather than saying "your discs differ"
+  and leaving two people to compare three files by hand. Order is part of the identity on purpose:
+  it is the order the core was handed them, so it is what a disc-swap indexes into. `DiscIdentity`.
+  **Firmware (fixed in v0.33.0):** Firmware is compared: `GameInfo.FirmwareHash` was there
   the whole time and the handshake never asked, so two players on different PSX or Saturn BIOS
   revisions ran different code before the game started and diverged for reasons nothing in the game
   explained.
-  **Still open:** `RomHash` is `GameInfo.Hash`, which is whichever digest matched the gamedb —
-  read against 2.11.1's `Database.GetGameInfo`, the lookup tries SHA-1, then MD5, then CRC32, and a
-  miss falls back to SHA-1. So a DB-hit ROM can be identified by a 32-bit checksum. Both peers on
-  the same file still agree, which is why this has never misfired; what it cannot do is resist a
-  deliberately-crafted collision, and it is a short answer where a long one was available. The
-  disc half is untouched: the PSX quick identifier hashes the TOC and the first 26 sectors, and a
-  multi-disc set identifies from disc one, so two players on different disc 2s pass. Treat PSX
-  multi-disc as unverified.
+  **Still open — cartridge ROM hash strength.** `RomHash` is `GameInfo.Hash`, which is whichever
+  digest matched the gamedb: read against 2.11.1's `Database.GetGameInfo`, the lookup tries SHA-1,
+  then MD5, then CRC32, and a miss falls back to SHA-1. So a ROM that hits the database can be
+  identified by a 32-bit checksum. Two peers on the same file always agree, which is why this has
+  never misfired, and an accidental collision between two real ROMs is not a practical concern; what
+  it cannot do is resist a deliberately-crafted one. Closing it needs the ROM bytes, and nothing in
+  the ApiHawk surface hands them over — `IGameInfo` carries the digest, not the file. That is the
+  blocker, not the effort.
 - **KI-18 — CLOSED in v0.33.0.** Determinism is read from the core instead of hardcoded `true`,
   with Mupen64Plus the one named exception. The exception is by name rather than by tolerance for
   a false flag, and the reason is in `DeterminismPolicy`: reading the 2.11.1 cores shows nearly

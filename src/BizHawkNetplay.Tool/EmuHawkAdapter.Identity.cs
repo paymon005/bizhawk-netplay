@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using BizHawk.Common;
 using BizHawk.Emulation.Common;
+using BizHawk.Emulation.DiscSystem;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Session;
 
@@ -92,6 +93,105 @@ internal sealed partial class EmuHawkAdapter
 
     /// <summary>BizHawk system identifier (for conservative per-system netplay defaults).</summary>
     public string SystemId => _emulator.SystemId;
+
+    /// <summary>
+    /// A hash per mounted disc, in the order the core holds them. Empty on the many systems that
+    /// have none — which is not a failure, and compares equal between two such peers.
+    ///
+    /// <b>Both of BizHawk's own hashers, per disc.</b> <c>Calculate_PSX_BizIDHash</c> covers the TOC
+    /// and the first 26 sectors, which is what catches a mangled rip and an audio-only disc that has
+    /// no data track to read; <c>OldHash</c> is MD5 over up to 512 sectors of the first data track,
+    /// which is a great deal more discriminating than the CRC32 the first one ends in. Together they
+    /// read about 1.3 MB per disc, which is a file read and not worth optimising.
+    ///
+    /// The full redump hash reads every sector of every disc and is what BizHawk's own PSX menu
+    /// warns "would take too long". Not at session start.
+    ///
+    /// Cached: the discs do not change under a running core, and re-reading them on every handshake
+    /// would charge that cost to each joiner in turn.
+    /// </summary>
+    public IReadOnlyList<string> DiscHashes => _discHashes ??= ComputeDiscHashes();
+
+    private IReadOnlyList<string>? _discHashes;
+
+    private IReadOnlyList<string> ComputeDiscHashes()
+    {
+        var hashes = new List<string>();
+        try
+        {
+            foreach (var disc in MountedDiscs())
+            {
+                string quick = "", deep = "";
+                // Each guarded separately: a disc whose data track cannot be read should still
+                // contribute its TOC rather than dropping out of the identity entirely.
+                try { quick = new DiscHasher(disc).Calculate_PSX_BizIDHash() ?? ""; } catch { }
+                try { deep = new DiscHasher(disc).OldHash() ?? ""; } catch { }
+                hashes.Add(quick + "/" + deep);
+            }
+        }
+        catch { return Array.Empty<string>(); }
+        return hashes;
+    }
+
+    /// <summary>
+    /// The discs a core is holding, found by reflection because no interface exposes them.
+    ///
+    /// Every disc-based core keeps them in a field of its own naming — Octoshock has a public
+    /// <c>List&lt;Disc&gt; Discs</c>, Nymashock a private <c>IReadOnlyList&lt;Disc&gt; _discs</c>,
+    /// NymaCore a private <c>Disc[] _disks</c> — so this matches on the element TYPE rather than on
+    /// any name, and picks up a core nobody here has heard of for free.
+    ///
+    /// The first matching member wins, and members are taken in a fixed order, because the disc
+    /// ORDER is part of the identity: a core exposing two different views of its discs must not
+    /// yield a different order on two machines.
+    /// </summary>
+    private IEnumerable<Disc> MountedDiscs()
+    {
+        const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        var type = _emulator.GetType();
+
+        var fields = new List<FieldInfo>(type.GetFields(Any));
+        fields.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+        foreach (var f in fields)
+            if (HoldsDiscs(f.FieldType) && Materialize(SafeGet(() => f.GetValue(_emulator))) is { } fromField)
+                return fromField;
+
+        var props = new List<PropertyInfo>(type.GetProperties(Any));
+        props.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+        foreach (var p in props)
+            if (p.CanRead && p.GetIndexParameters().Length == 0 && HoldsDiscs(p.PropertyType)
+                && Materialize(SafeGet(() => p.GetValue(_emulator))) is { } fromProp)
+                return fromProp;
+
+        return Array.Empty<Disc>();
+    }
+
+    private static bool HoldsDiscs(Type type)
+    {
+        if (type.IsArray) return type.GetElementType() == typeof(Disc);
+        if (!type.IsGenericType) return false;
+        var args = type.GetGenericArguments();
+        return args.Length == 1 && args[0] == typeof(Disc) && typeof(IEnumerable<Disc>).IsAssignableFrom(type);
+    }
+
+    private static object? SafeGet(Func<object?> read)
+    {
+        try { return read(); } catch { return null; }
+    }
+
+    /// <summary>Null when the member held nothing usable, so the caller keeps looking rather than
+    /// settling for an empty list from the first field that merely had the right type.</summary>
+    private static List<Disc>? Materialize(object? value)
+    {
+        if (value is not IEnumerable<Disc> discs) return null;
+        var list = new List<Disc>();
+        try
+        {
+            foreach (var d in discs) if (d != null) list.Add(d);
+        }
+        catch { return null; }
+        return list.Count > 0 ? list : null;
+    }
 
     // Identity = core + version + system + the core's REAL sync-settings blob. The blob is what
     // makes two peers on the same core but different per-core settings (e.g. an N64 video plugin, a

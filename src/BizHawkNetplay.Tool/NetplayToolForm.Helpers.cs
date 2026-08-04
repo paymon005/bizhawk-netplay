@@ -471,6 +471,12 @@ public sealed partial class NetplayToolForm
         {
             string build = _adapter.BuildId;
             if (build.Length > 0) Log($"emulator build: {build}");
+            // Says which discs were identified, and by saying a number it says that more than the
+            // first one was looked at — which for a multi-disc set it previously was not.
+            int discs = _adapter.DiscHashes.Count;
+            if (discs > 0)
+                Log($"content: {discs} disc(s) identified individually" +
+                    (discs > 1 ? " — all of them are compared, in order" : ""));
         }
         catch { /* a log line is never worth failing a session over */ }
     }

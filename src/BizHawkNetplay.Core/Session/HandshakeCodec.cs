@@ -53,6 +53,10 @@ public static class HandshakeCodec
             sb.Append("video=").Append(Escape(id.VideoSettings)).Append('\n');
         if (id.BuildId.Length > 0) sb.Append("build=").Append(Escape(id.BuildId)).Append('\n');
         if (id.FirmwareHash.Length > 0) sb.Append("fw=").Append(Escape(id.FirmwareHash)).Append('\n');
+        // One line per disc, in order — the order is part of the identity (see DiscIdentity), so
+        // these are indexed rather than left to arrive in whatever order a parser happens to read.
+        for (int i = 0; i < id.DiscHashes.Count && i < DiscIdentity.MaxNamedDiscs; i++)
+            sb.Append("disc=").Append(i).Append(':').Append(Escape(id.DiscHashes[i] ?? "")).Append('\n');
         sb.Append("depth=").Append(id.MaxRollbackDepth).Append('\n');
         sb.Append("delay=").Append(prefs.InputDelay).Append('\n');
         sb.Append("rollback=").Append(prefs.WantRollback ? '1' : '0').Append('\n');
@@ -402,6 +406,36 @@ public static class HandshakeCodec
         return new MeshTokens(local, peers, new MeshPairKeyring(pairs));
     }
 
+    /// <summary>
+    /// Read the <c>disc=</c> lines back into an ordered list.
+    ///
+    /// Indexed rather than positional because this is untrusted input: a peer can send them in any
+    /// order, repeat an index, skip one, or send a hundred. A gap becomes an empty entry rather than
+    /// a shifted list, which would silently compare disc 2 against disc 3 and name the wrong one.
+    /// </summary>
+    private static IReadOnlyList<string> DecodeDiscHashes(byte[] body)
+    {
+        var byIndex = new Dictionary<int, string>();
+        int highest = -1;
+        foreach (var raw in Encoding.UTF8.GetString(body).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (!line.StartsWith("disc=", StringComparison.Ordinal)) continue;
+            int colon = line.IndexOf(':');
+            if (colon < 0) continue;
+            if (!int.TryParse(line.Substring(5, colon - 5), NumberStyles.Integer,
+                    CultureInfo.InvariantCulture, out int index)
+                || index < 0 || index >= DiscIdentity.MaxNamedDiscs)
+                continue;
+            byIndex[index] = Unescape(line.Substring(colon + 1));
+            if (index > highest) highest = index;
+        }
+        if (highest < 0) return Array.Empty<string>();
+        var list = new string[highest + 1];
+        for (int i = 0; i <= highest; i++) list[i] = byIndex.TryGetValue(i, out var h) ? h : "";
+        return list;
+    }
+
     private static byte[]? ValidToken(string hex)
     {
         var token = SessionAuth.FromHex(hex);
@@ -534,7 +568,8 @@ public static class HandshakeCodec
             Get(map, "sread") != "0",
             Unescape(Get(map, "video")),
             Unescape(Get(map, "build")),
-            Unescape(Get(map, "fw")));
+            Unescape(Get(map, "fw")),
+            DecodeDiscHashes(body));
 
         // The remote's password is never on the wire — prefs carries only delay/rollback here. Clamp
         // delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge value
