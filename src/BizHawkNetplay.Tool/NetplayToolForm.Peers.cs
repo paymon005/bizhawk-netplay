@@ -28,7 +28,9 @@ public sealed partial class NetplayToolForm
     {
         if (body == null) body = [];
         if (!link.WriterRunning) { completed?.Invoke(false); return false; }
-        long bytes = body.LongLength + 5;
+        // Header + body + the integrity tag an authenticated channel appends. Counting the tag
+        // keeps the cap exact rather than 16 bytes optimistic per queued frame.
+        long bytes = body.LongLength + 5 + (link.Control.IntegrityEnabled ? ControlChannel.MacBytes : 0);
         long queued = Interlocked.Add(ref link.QueuedBytes, bytes);
         if (queued > MaxQueuedControlBytes)
         {
@@ -36,7 +38,7 @@ public sealed partial class NetplayToolForm
             completed?.Invoke(false);
             return false;
         }
-        link.Outbound.Enqueue(new OutboundMessage(type, body, completed));
+        link.Outbound.Enqueue(new OutboundMessage(type, body, completed, bytes));
         link.OutboundSignal.Set();
         // Re-check AFTER the enqueue. If the writer exited between the check at the top and the
         // Enqueue — its finally-drain having already run — the message would sit in the queue
@@ -53,7 +55,7 @@ public sealed partial class NetplayToolForm
             while (link.Outbound.TryDequeue(out var orphan))
             {
                 abandoned = true;
-                Interlocked.Add(ref link.QueuedBytes, -(orphan.Body.LongLength + 5));
+                Interlocked.Add(ref link.QueuedBytes, -orphan.ChargedBytes);
                 try { orphan.Completed?.Invoke(false); } catch { }
             }
             if (abandoned) return false;
@@ -83,7 +85,7 @@ public sealed partial class NetplayToolForm
                     try { msg.Completed?.Invoke(false); } catch { }
                     throw;
                 }
-                finally { Interlocked.Add(ref link.QueuedBytes, -(msg.Body.LongLength + 5)); }
+                finally { Interlocked.Add(ref link.QueuedBytes, -msg.ChargedBytes); }
             }
         }
         catch (Exception ex) { failure = ex; }
@@ -92,7 +94,7 @@ public sealed partial class NetplayToolForm
             link.WriterRunning = false;
             while (link.Outbound.TryDequeue(out var pending))
             {
-                Interlocked.Add(ref link.QueuedBytes, -(pending.Body.LongLength + 5));
+                Interlocked.Add(ref link.QueuedBytes, -pending.ChargedBytes);
                 try { pending.Completed?.Invoke(false); } catch { }
             }
             int attempt = link.Attempt;

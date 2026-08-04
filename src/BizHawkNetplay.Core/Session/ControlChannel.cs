@@ -186,9 +186,13 @@ public sealed class ControlChannel
     /// in milliseconds. When set (and the stream supports timeouts), the wait for a frame's
     /// FIRST byte stays governed by the stream's own timeout — an idle channel may legitimately
     /// be silent for minutes (a joiner waiting out the host's lobby) — but once a header has
-    /// arrived, the body must keep flowing: its reads run under the mapped timeout, so a peer
-    /// that dies mid-transfer surfaces as an <see cref="IOException"/> instead of hanging the
-    /// receive forever. The stream's previous timeout is restored after every frame.
+    /// arrived, the rest of the frame must keep flowing: those reads run under the mapped
+    /// timeout, so a peer that dies mid-transfer surfaces as an <see cref="IOException"/> instead
+    /// of hanging the receive forever. The stream's previous timeout is restored after every frame.
+    ///
+    /// "The rest of the frame" includes the integrity tag, not merely the body — see
+    /// <see cref="Receive"/>. The length handed here is therefore body + tag, so the budget a
+    /// caller computes from it covers everything still to arrive.
     /// </summary>
     public Func<int, int>? BodyReadTimeoutMs { get; set; }
 
@@ -225,14 +229,28 @@ public sealed class ControlChannel
         if (len < 0 || len > max)
             throw new InvalidDataException(
                 $"Frame length {len} out of range for {type} (max {max})");
-        var body = len == 0 ? [] : ReadBody(len);
+        // Body AND tag under ONE deadline. Reading the tag after ReadBody restored the previous
+        // timeout left the tag read unbounded: a peer that sent a complete body and then stopped
+        // held the reader forever — the exact stall the per-frame progress bound (KI-2) exists to
+        // prevent, reintroduced by appending bytes after it. A zero-length authenticated frame is
+        // the same hazard with no body at all, which is why the timed read now covers the tag even
+        // when len is 0.
+        bool authenticated = _recvMac != null;
+        int trailing = authenticated ? MacBytes : 0;
+        var framed = len + trailing == 0 ? [] : ReadBody(len + trailing);
+        byte[] body;
+        if (trailing == 0) body = framed;
+        else
+        {
+            body = len == 0 ? [] : new byte[len];
+            if (len > 0) Buffer.BlockCopy(framed, 0, body, 0, len);
+        }
         if (_recvMac != null)
         {
-            var received = ReadFully(MacBytes);
             var expected = ComputeMac(_recvMac, _recvPreamble, _recvDirection, _recvSequence++,
                 header[0], len, body);
             int diff = 0;
-            for (int i = 0; i < MacBytes; i++) diff |= received[i] ^ expected[i];
+            for (int i = 0; i < MacBytes; i++) diff |= framed[len + i] ^ expected[i];
             if (diff != 0)
                 throw new InvalidDataException(
                     $"control frame {type} failed its integrity check — the stream was tampered " +

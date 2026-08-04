@@ -61,13 +61,21 @@ public sealed partial class NetplayToolForm
 
     private sealed class OutboundMessage
     {
-        public OutboundMessage(ControlMessageType type, byte[] body, Action<bool>? completed)
+        public OutboundMessage(ControlMessageType type, byte[] body, Action<bool>? completed,
+            long chargedBytes)
         {
-            Type = type; Body = body; Completed = completed;
+            Type = type; Body = body; Completed = completed; ChargedBytes = chargedBytes;
         }
         public ControlMessageType Type { get; }
         public byte[] Body { get; }
         public Action<bool>? Completed { get; }
+
+        /// <summary>What this message added to the link's queue budget. Carried rather than
+        /// recomputed on release: the charge includes the integrity tag when the channel is
+        /// authenticated, and a decrement that recomputed the figure would drift from the
+        /// increment the moment those two expressions stopped matching — which is exactly how a
+        /// queue cap leaks until it refuses everything.</summary>
+        public long ChargedBytes { get; }
     }
 
     /// <summary>

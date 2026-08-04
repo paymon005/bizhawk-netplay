@@ -1032,6 +1032,8 @@ public sealed partial class NetplayToolForm
         {
             try { stream.ReadTimeout = Timeout.Infinite; } catch { }
         }
+        // The length handed to this map is body + integrity tag (see ControlChannel.Receive), so
+        // the budget covers everything still to arrive rather than stopping short of the tag.
         link.Control.BodyReadTimeoutMs = len =>
             StateTransferBudget.SocketTimeoutMs(len, HandshakeReceiveTimeoutMs);
     }
