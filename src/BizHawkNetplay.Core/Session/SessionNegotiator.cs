@@ -90,6 +90,23 @@ public static class SessionNegotiator
             return NegotiationResult.Reject(
                 $"core version mismatch ({local.CoreVersion} vs {remote.CoreVersion}) — use the same BizHawk build");
 
+        // The check the one above could not make. An assembly version is the same string for every
+        // build of a release, so a fork, a developer build and the stock download all passed it.
+        // Skipped when either side reports nothing — a peer that cannot name its build is a weaker
+        // guarantee, not a mismatch, and refusing on absence would refuse every older peer.
+        if (local.BuildId.Length > 0 && remote.BuildId.Length > 0
+            && BuildIdentity.Mismatch(local.BuildId, remote.BuildId) is { } buildProblem)
+            return NegotiationResult.Reject(buildProblem);
+
+        // Different BIOS revisions run different code before the game does. BizHawk has always
+        // carried this on GameInfo; the handshake simply never asked.
+        if (!string.Equals(local.FirmwareHash, remote.FirmwareHash, StringComparison.OrdinalIgnoreCase))
+            return NegotiationResult.Reject(
+                "firmware mismatch — this system boots from a BIOS or bootrom file, and yours is not " +
+                $"the same as the other player's (yours {Describe(local.FirmwareHash)}, theirs " +
+                $"{Describe(remote.FirmwareHash)}). Different revisions run different code before " +
+                "the game starts. Both players need the same firmware file.");
+
         // Before comparing the digests, establish that they mean anything.
         //
         // A settings read that threw produced an empty blob, and an empty blob hashes to a constant.
@@ -175,6 +192,13 @@ public static class SessionNegotiator
     /// whether the game reads its own framebuffer, which is a property of the game rather than of
     /// the numbers, and plenty of sessions run fine mismatched. What was unacceptable was silence.
     /// </summary>
+    /// <summary>A hash for a human: the first few characters, or "none" when there isn't one — so
+    /// "you have firmware and they don't" reads as that rather than as two similar hex strings.</summary>
+    private static string Describe(string hash) =>
+        string.IsNullOrEmpty(hash) ? "none"
+            : hash.Length <= 12 ? hash
+            : hash.Substring(0, 12) + "…";
+
     private static string? DescribeVideoDifference(PeerIdentity local, PeerIdentity remote)
     {
         if (local.VideoSettings.Length == 0 || remote.VideoSettings.Length == 0) return null;

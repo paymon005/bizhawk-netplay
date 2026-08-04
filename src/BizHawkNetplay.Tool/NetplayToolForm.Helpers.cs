@@ -455,6 +455,28 @@ public sealed partial class NetplayToolForm
             _logFileLabel.Text = "saving to " + System.IO.Path.GetFileName(_logFile.Path!);
     }
 
+    /// <summary>
+    /// Put which BizHawk this is into the log, once per session.
+    ///
+    /// Not in <see cref="StartLogFile"/>, which runs before the adapter exists. "Which version are
+    /// you on?" is a question people answer wrongly, and until this line the best answer a log could
+    /// give was an assembly version identical across every build of a release — see
+    /// <c>BuildIdentity</c> for what that hid.
+    /// </summary>
+    private void LogEmulatorBuild()
+    {
+        if (_buildLogged || _adapter == null) return;
+        _buildLogged = true;
+        try
+        {
+            string build = _adapter.BuildId;
+            if (build.Length > 0) Log($"emulator build: {build}");
+        }
+        catch { /* a log line is never worth failing a session over */ }
+    }
+
+    private bool _buildLogged;
+
     private void Log(string message)
     {
         // Stamped like the connection box, and for the same reason: almost every question worth

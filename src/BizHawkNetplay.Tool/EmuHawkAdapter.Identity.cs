@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using BizHawk.Common;
 using BizHawk.Emulation.Common;
 using BizHawkNetplay.Core.Emu;
 using BizHawkNetplay.Core.Session;
@@ -43,6 +44,51 @@ internal sealed partial class EmuHawkAdapter
 
     public string CoreVersion =>
         _emulator.GetType().Assembly.GetName().Version?.ToString() ?? "0";
+
+    /// <summary>
+    /// Which BizHawk this is, from BizHawk's own <c>VersionInfo</c>: release, commit, branch, dev
+    /// flag, architecture, custom-build string. See <see cref="BuildIdentity"/> for what
+    /// <see cref="CoreVersion"/> was missing.
+    ///
+    /// The git fields are read by reflection rather than bound at compile time. They come from a
+    /// generated partial class, so they are the parts most likely to be absent or renamed in an
+    /// unusual build — and a tool that fails to load because a build had no commit hash would be a
+    /// worse outcome than one that reports "?" and says so.
+    /// </summary>
+    public string BuildId
+    {
+        get
+        {
+            try
+            {
+                return BuildIdentity.Format(
+                    VersionInfo.MainVersion,
+                    VersionInfoField("GIT_HASH"),
+                    VersionInfoField("GIT_BRANCH"),
+                    VersionInfo.DeveloperBuild,
+                    VersionInfo.CustomBuildString,
+                    IntPtr.Size == 8);
+            }
+            catch { return ""; }   // "" means "not known", which the negotiator skips rather than refuses
+        }
+    }
+
+    private static string? VersionInfoField(string name)
+    {
+        try
+        {
+            return typeof(VersionInfo)
+                .GetField(name, BindingFlags.Public | BindingFlags.Static)
+                ?.GetValue(null) as string;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// The firmware BizHawk matched alongside the ROM — a PSX or Saturn BIOS, an NDS bootrom. Empty
+    /// on the many systems that boot no firmware at all, which compares equal between two such peers.
+    /// </summary>
+    public string FirmwareHash => _apis.Emulation.GetGameInfo()?.FirmwareHash ?? "";
 
     /// <summary>BizHawk system identifier (for conservative per-system netplay defaults).</summary>
     public string SystemId => _emulator.SystemId;

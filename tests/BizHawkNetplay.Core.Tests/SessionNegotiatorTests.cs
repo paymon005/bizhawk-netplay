@@ -11,10 +11,12 @@ public class SessionNegotiatorTests
         int protocol = 1, string rom = "ROMHASH", string core = "GPGX",
         string coreVer = "2.11.1.0", string sync = "SYNC1",
         bool deterministic = true, int depth = 20, string layout = "L0",
-        bool syncReadable = true, string? video = null)
+        bool syncReadable = true, string? video = null,
+        string? build = null, string? firmware = null)
         => new(protocol, rom, core, coreVer, sync,
             new[] { layout, "L1" }, deterministic, depth,
-            syncSettingsReadable: syncReadable, videoSettings: video);
+            syncSettingsReadable: syncReadable, videoSettings: video,
+            buildId: build, firmwareHash: firmware);
 
     private static SessionPreferences Pref(int delay = 2, bool rollback = false, string password = "")
         => new(delay, rollback, password);
@@ -284,21 +286,79 @@ public class SessionNegotiatorTests
         Assert.Null(SessionNegotiator.Negotiate(Id(), Id(), Pref(), Pref()).Warning);
     }
 
+    // ---------------------------------------------------------------- KI-16 / KI-17
+
+    [Fact]
+    public void TwoBuildsOfTheSameReleaseFromDifferentCommitsAreRefused()
+    {
+        // Both report CoreVersion "2.11.1.0", so the check above them passes. This is the one that
+        // notices, and the message has to say why the version matching was not enough.
+        var stock = BuildIdentity.Format("2.11.1", "bdddf4a58aa1", "release", false, null, true);
+        var fork = BuildIdentity.Format("2.11.1", "0123456789ab", "fork", true, null, true);
+
+        var r = SessionNegotiator.Negotiate(Id(build: stock), Id(build: fork), Pref(), Pref());
+        Assert.False(r.Accepted);
+        Assert.Contains("different commits", r.RejectReason);
+    }
+
+    [Fact]
+    public void APeerThatCannotNameItsBuildIsNotRefusedForIt()
+    {
+        // Absence is a weaker guarantee, not a mismatch — otherwise every peer on an older build,
+        // and every unusual build with no commit hash, becomes unplayable.
+        var known = BuildIdentity.Format("2.11.1", "bdddf4a58aa1", "release", false, null, true);
+        Assert.True(SessionNegotiator.Negotiate(Id(build: known), Id(), Pref(), Pref()).Accepted);
+        Assert.True(SessionNegotiator.Negotiate(Id(), Id(build: known), Pref(), Pref()).Accepted);
+        Assert.True(SessionNegotiator.Negotiate(Id(), Id(), Pref(), Pref()).Accepted);
+    }
+
+    [Fact]
+    public void DifferentFirmwareIsRefusedAndNamed()
+    {
+        var r = SessionNegotiator.Negotiate(
+            Id(firmware: "AAAAAAAAAAAAAAAAAAAA"), Id(firmware: "BBBBBBBBBBBBBBBBBBBB"),
+            Pref(), Pref());
+
+        Assert.False(r.Accepted);
+        Assert.Contains("firmware mismatch", r.RejectReason);
+        Assert.Contains("AAAAAAAAAAAA", r.RejectReason);
+    }
+
+    [Fact]
+    public void OnePeerHavingFirmwareAndTheOtherNotReadsAsThat()
+    {
+        var r = SessionNegotiator.Negotiate(Id(firmware: "AAAAAAAAAAAAAAAAAAAA"), Id(), Pref(), Pref());
+        Assert.False(r.Accepted);
+        Assert.Contains("none", r.RejectReason);   // not two similar-looking hex strings
+    }
+
+    [Fact]
+    public void SystemsThatBootNoFirmwareStillMatch()
+    {
+        Assert.True(SessionNegotiator.Negotiate(Id(), Id(), Pref(), Pref()).Accepted);
+    }
+
     [Fact]
     public void TheIdentityFieldsSurviveTheHandshakeRoundTrip()
     {
         // Both new fields cross the wire, and absence decodes as "readable" so a peer predating
         // them is not refused for never having said so.
-        var id = Id(syncReadable: false, video: "800x600, plugin Rice (InN64Resolution=False)");
+        var id = Id(syncReadable: false, video: "800x600, plugin Rice (InN64Resolution=False)",
+            build: BuildIdentity.Format("2.11.1", "bdddf4a58aa1", "release", false, null, true),
+            firmware: "0123456789ABCDEF0123");
         var encoded = HandshakeCodec.Encode(id, Pref(), 47800, null);
         var (decoded, _, _, _, _) = HandshakeCodec.Decode(encoded);
 
         Assert.False(decoded.SyncSettingsReadable);
         Assert.Equal(id.VideoSettings, decoded.VideoSettings);
+        Assert.Equal(id.BuildId, decoded.BuildId);
+        Assert.Equal(id.FirmwareHash, decoded.FirmwareHash);
 
         var plain = HandshakeCodec.Encode(Id(), Pref(), 47800, null);
         var (decodedPlain, _, _, _, _) = HandshakeCodec.Decode(plain);
         Assert.True(decodedPlain.SyncSettingsReadable);
         Assert.Equal("", decodedPlain.VideoSettings);
+        Assert.Equal("", decodedPlain.BuildId);
+        Assert.Equal("", decodedPlain.FirmwareHash);
     }
 }

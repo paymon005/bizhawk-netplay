@@ -51,6 +51,8 @@ public static class HandshakeCodec
         sb.Append("sread=").Append(id.SyncSettingsReadable ? '1' : '0').Append('\n');
         if (id.VideoSettings.Length > 0)
             sb.Append("video=").Append(Escape(id.VideoSettings)).Append('\n');
+        if (id.BuildId.Length > 0) sb.Append("build=").Append(Escape(id.BuildId)).Append('\n');
+        if (id.FirmwareHash.Length > 0) sb.Append("fw=").Append(Escape(id.FirmwareHash)).Append('\n');
         sb.Append("depth=").Append(id.MaxRollbackDepth).Append('\n');
         sb.Append("delay=").Append(prefs.InputDelay).Append('\n');
         sb.Append("rollback=").Append(prefs.WantRollback ? '1' : '0').Append('\n');
@@ -530,7 +532,9 @@ public static class HandshakeCodec
             GetInt(map, "depth", 0),
             DecodeSyncFields(body),
             Get(map, "sread") != "0",
-            Unescape(Get(map, "video")));
+            Unescape(Get(map, "video")),
+            Unescape(Get(map, "build")),
+            Unescape(Get(map, "fw")));
 
         // The remote's password is never on the wire — prefs carries only delay/rollback here. Clamp
         // delay to a sane range so a malformed/hostile peer can't request delay < 1 or a huge value

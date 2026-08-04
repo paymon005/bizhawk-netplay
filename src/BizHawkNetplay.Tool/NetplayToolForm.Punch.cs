@@ -50,19 +50,39 @@ public sealed partial class NetplayToolForm
         {
             _adapter = new EmuHawkAdapter(APIs, _emulator, _statable, Config, MovieSession);
             _adapter.InputSourcePort = InputSourceFromCombo(); // read your normal pad, whatever port you're assigned
-            if (!_adapter.VerifyDeterministicMode())
-                Log("WARNING: core does not report deterministic emulation — desyncs are likely.");
+            LogEmulatorBuild();
             if (!_adapter.HasBindings)
                 Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
-            // Same refusal as the ordinary start path: a core the checksum cannot fully see is not
-            // one to netplay, whichever transport is carrying it.
+            // The same three refusals as the ordinary start path. Whichever transport is carrying a
+            // session, a core the checksum cannot fully see, a core whose clock came off the wall,
+            // and settings that cannot be compared are all equally unplayable.
             var coverageGap = _adapter.MainMemoryCoverageGap();
             if (coverageGap != null)
             {
                 _punchStatus.Text = "this core emulates several machines — see the log.";
                 _punchStatus.ForeColor = Color.Firebrick;
                 ConnLog(coverageGap, Color.Firebrick);
+                return;
+            }
+
+            var determinismGap = _adapter.DeterminismGap();
+            if (determinismGap != null)
+            {
+                _punchStatus.Text = "this core is not running deterministically — see the log.";
+                _punchStatus.ForeColor = Color.Firebrick;
+                ConnLog(determinismGap, Color.Firebrick);
+                return;
+            }
+
+            if (!_adapter.SyncSettingsReadable)
+            {
+                _punchStatus.Text = "this core's sync settings could not be read — see the log.";
+                _punchStatus.ForeColor = Color.Firebrick;
+                ConnLog("this core's sync settings could not be read, so they cannot be checked " +
+                        "against the other player's — and a difference there (video plugin, region, " +
+                        "CPU core) desyncs without warning. Reload the ROM and try again.",
+                    Color.Firebrick);
                 return;
             }
 

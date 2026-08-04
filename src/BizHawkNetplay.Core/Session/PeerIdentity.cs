@@ -21,10 +21,14 @@ public sealed class PeerIdentity
         int maxRollbackDepth,
         IReadOnlyList<KeyValuePair<string, string>>? syncSettingsFields = null,
         bool syncSettingsReadable = true,
-        string? videoSettings = null)
+        string? videoSettings = null,
+        string? buildId = null,
+        string? firmwareHash = null)
     {
         SyncSettingsReadable = syncSettingsReadable;
         VideoSettings = videoSettings ?? "";
+        BuildId = buildId ?? "";
+        FirmwareHash = firmwareHash ?? "";
         SyncSettingsFields = syncSettingsFields ?? Array.Empty<KeyValuePair<string, string>>();
         ProtocolVersion = protocolVersion;
         RomHash = romHash ?? "";
@@ -75,6 +79,26 @@ public sealed class PeerIdentity
     /// the core exposes nothing of the kind.
     /// </summary>
     public string VideoSettings { get; }
+
+    /// <summary>
+    /// Which BizHawk this is — release, commit, branch, dev flag, architecture. See
+    /// <see cref="BuildIdentity"/> for why <see cref="CoreVersion"/> could not do this: an assembly
+    /// version is the same string for every build of a release, so a fork, a dev build and the
+    /// stock download all looked identical to the handshake.
+    ///
+    /// Empty for a peer predating the field, which compares equal to another such peer and is why
+    /// the negotiator treats two empties as "not known" rather than "known to match".
+    /// </summary>
+    public string BuildId { get; }
+
+    /// <summary>
+    /// The firmware BizHawk identified alongside the ROM — a PSX or Saturn BIOS, an NDS bootrom.
+    ///
+    /// Two players with different BIOS revisions run different code before the game starts and
+    /// diverge for reasons nothing in the game explains. BizHawk had this on <c>GameInfo</c> the
+    /// whole time and the handshake never asked for it. Empty on the many systems that need none.
+    /// </summary>
+    public string FirmwareHash { get; }
 
     public IReadOnlyList<string> PortLayoutDigests { get; }
 
