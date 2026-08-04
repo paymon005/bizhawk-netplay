@@ -212,9 +212,11 @@ public static class Handshake
 
         string myRole = isHost ? SessionAuth.RoleHost : SessionAuth.RoleJoin;
         string peerRole = isHost ? SessionAuth.RoleJoin : SessionAuth.RoleHost;
-        // One key derivation for both proofs — they differ only in a role tag applied after it.
-        var (myProof, peerExpected) =
-            SessionAuth.ProofPair(password, myRole, peerRole, hostNonce, joinNonce);
+        // One key derivation for both proofs — they differ only in a role tag applied after it —
+        // and the key is KEPT this time: it becomes the control-frame MAC below, which is the
+        // whole of the KI-13 network fix.
+        var (myProof, peerExpected, sessionKey) =
+            SessionAuth.ProofPairWithKey(password, myRole, peerRole, hostNonce, joinNonce);
 
         if (isHost)
         {
@@ -242,6 +244,16 @@ public static class Handshake
         // legitimately be large — the initial state, a resync — comes after this point, so before it
         // a peer declaring 64 MiB is asking for an allocation it has no standing to ask for.
         channel.Authenticated = true;
+
+        // From here every frame in both directions carries a MAC. This is the end of the exchange
+        // on both sides — the host has read the joiner's AUTH and sent its own; the joiner has
+        // sent its AUTH and verified the host's — so each peer enables before sending any
+        // post-auth frame, and the first MACed frame either sends is the first the other expects.
+        // The AUTH frames themselves cannot be covered: the key they prove is the key this uses.
+        var macKey = SessionAuth.MacKey(sessionKey);
+        Array.Clear(sessionKey, 0, sessionKey.Length);
+        channel.EnableIntegrity(macKey, isHost);
+        Array.Clear(macKey, 0, macKey.Length); // the channel's HMAC holds its own copy
     }
 
     // ---- N-player (host-relay) handshake ---------------------------------------------

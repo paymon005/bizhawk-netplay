@@ -71,11 +71,16 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // and the span the video hardware is scanning out is skipped on every path, which is what lets
     // N64 run above native resolution without disagreeing at every checksum. Either alone would
     // make a mixed pair report a desync that is not there.
-    // 20: a session outlives its players. A graceful leave or an expired rejoin wait vacates the
-    // seat instead of ending the session: SeatVacated (type 23) travels ahead of the rebuild, the
-    // WELCOME grows a `vacated=` line for a rejoiner entering a session that already lost someone,
-    // and the host's checksum quorum shrinks to the active player count. A v19 peer neither sends
-    // nor understands any of it — it would end the session on the very leave this build survives.
+    // 20: a session outlives its players, a dead leg gets relayed live, and every post-auth
+    // control frame is authenticated. A graceful leave or an expired rejoin wait vacates the seat
+    // instead of ending the session (SeatVacated, type 23, travels ahead of the rebuild; WELCOME
+    // grows a `vacated=` line for rejoiners; the checksum quorum shrinks to the living). A
+    // joiner-to-joiner leg that dies mid-game is reported (InputOutage, type 24) and the host
+    // carries the pair instead of the watchdog ending the session. And the PBKDF2 key the password
+    // proofs already derived is kept: every frame after AUTH carries a truncated HMAC bound to its
+    // direction and position, so an on-path party without the password can no longer inject,
+    // replay, reorder or tamper — the KI-13 network fix. A v19 peer sends none of it and would
+    // fail every integrity check, which is precisely what the version refusal is for.
     private const int Protocol = 20;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)

@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Security.Cryptography;
 
 namespace BizHawkNetplay.Core.Session;
 
@@ -94,6 +95,78 @@ public sealed class ControlChannel
     private readonly Stream _stream;
     private readonly object _writeLock = new();
 
+    // --- per-frame integrity (KI-13) -----------------------------------------------------------
+    // After EnableIntegrity, every frame carries a truncated HMAC-SHA256 appended after its body:
+    //   mac = HMAC(macKey, direction || sequence:8 || type:1 || length:4 || body)[0..15]
+    // The direction byte keeps a frame sent one way from ever verifying the other way (a
+    // reflection), and the per-direction sequence — counted from the moment integrity enables,
+    // never carried on the wire — makes every frame position-bound: replaying, reordering or
+    // deleting a frame desynchronizes the receiver's count and the next verification fails loudly.
+    // TCP already refuses reordering; this is for the peer on the PATH, who can do all three.
+    //
+    // What this does and does not buy, stated honestly: with a session password set, a man in the
+    // middle who missed the handshake cannot forge or tamper with control frames — the Resync
+    // parser KI-13 worries about is no longer reachable from the wire without the password. With
+    // an EMPTY password the key derives from the public nonces, so an on-path observer of the
+    // handshake can compute it; integrity then defends only against off-path (blind) injection.
+    // Confidentiality is out of scope either way — frames are authenticated, not encrypted.
+
+    /// <summary>MAC bytes appended to every frame once integrity is enabled.</summary>
+    public const int MacBytes = 16;
+
+    private HMACSHA256? _sendMac;   // guarded by _writeLock, like every send
+    private HMACSHA256? _recvMac;   // single reader per channel, like every receive
+    private long _sendSequence;
+    private long _recvSequence;
+    private byte _sendDirection;
+    private byte _recvDirection;
+    private readonly byte[] _sendPreamble = new byte[14]; // dir(1) + seq(8) + type(1) + len(4)
+    private readonly byte[] _recvPreamble = new byte[14];
+
+    /// <summary>
+    /// Turn on per-frame authentication in both directions. Call at the END of the password
+    /// exchange, once both sides hold the key and after the last unauthenticated frame has been
+    /// read — the AUTH frames themselves cannot be MACed, because the key they prove is the key
+    /// this uses. Both peers reach that point before either sends a post-auth frame, so the first
+    /// MACed frame each sends is the first the other expects.
+    /// </summary>
+    public void EnableIntegrity(byte[] macKey, bool isHost)
+    {
+        if (macKey == null || macKey.Length < 16)
+            throw new ArgumentException("integrity needs a real key", nameof(macKey));
+        lock (_writeLock)
+        {
+            _sendMac = new HMACSHA256(macKey);
+            _recvMac = new HMACSHA256(macKey);
+            _sendDirection = isHost ? (byte)1 : (byte)2;
+            _recvDirection = isHost ? (byte)2 : (byte)1;
+            _sendSequence = 0;
+            _recvSequence = 0;
+        }
+    }
+
+    /// <summary>Whether frames are currently authenticated (for logs and tests).</summary>
+    public bool IntegrityEnabled => _sendMac != null;
+
+    private static byte[] ComputeMac(HMACSHA256 mac, byte[] preamble, byte direction, long sequence,
+        byte type, int length, byte[] body)
+    {
+        preamble[0] = direction;
+        for (int i = 0; i < 8; i++) preamble[1 + i] = (byte)(sequence >> (56 - 8 * i));
+        preamble[9] = type;
+        preamble[10] = (byte)(length >> 24);
+        preamble[11] = (byte)(length >> 16);
+        preamble[12] = (byte)(length >> 8);
+        preamble[13] = (byte)length;
+        mac.Initialize();
+        mac.TransformBlock(preamble, 0, preamble.Length, null, 0);
+        mac.TransformFinalBlock(body, 0, body.Length);
+        var full = mac.Hash!;
+        var truncated = new byte[MacBytes];
+        Buffer.BlockCopy(full, 0, truncated, 0, MacBytes);
+        return truncated;
+    }
+
     public ControlChannel(Stream stream)
     {
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
@@ -123,6 +196,12 @@ public sealed class ControlChannel
         {
             _stream.Write(header, 0, header.Length);
             if (body.Length > 0) _stream.Write(body, 0, body.Length);
+            if (_sendMac != null)
+            {
+                var mac = ComputeMac(_sendMac, _sendPreamble, _sendDirection, _sendSequence++,
+                    (byte)type, body.Length, body);
+                _stream.Write(mac, 0, mac.Length);
+            }
             _stream.Flush();
         }
     }
@@ -138,6 +217,18 @@ public sealed class ControlChannel
             throw new InvalidDataException(
                 $"Frame length {len} out of range for {type} (max {max})");
         var body = len == 0 ? [] : ReadBody(len);
+        if (_recvMac != null)
+        {
+            var received = ReadFully(MacBytes);
+            var expected = ComputeMac(_recvMac, _recvPreamble, _recvDirection, _recvSequence++,
+                header[0], len, body);
+            int diff = 0;
+            for (int i = 0; i < MacBytes; i++) diff |= received[i] ^ expected[i];
+            if (diff != 0)
+                throw new InvalidDataException(
+                    $"control frame {type} failed its integrity check — the stream was tampered " +
+                    "with, replayed, or reordered by something on the path");
+        }
         return (type, body);
     }
 

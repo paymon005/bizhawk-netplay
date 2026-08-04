@@ -75,9 +75,36 @@ public static class SessionAuth
     public static (string mine, string peers) ProofPair(
         string? password, string myRole, string peerRole, byte[] hostNonce, byte[] joinNonce)
     {
+        var (mine, peers, key) = ProofPairWithKey(password, myRole, peerRole, hostNonce, joinNonce);
+        Array.Clear(key, 0, key.Length);
+        return (mine, peers);
+    }
+
+    /// <summary>
+    /// As <see cref="ProofPair"/>, and hands the derived session key back instead of discarding
+    /// it. This is what KI-13 called "the fix is cheaper than it reads": the 32 bytes that
+    /// authenticate every control frame for the rest of the session were already being computed
+    /// here and thrown away. The caller feeds them to <see cref="MacKey"/> and then to
+    /// <see cref="ControlChannel.EnableIntegrity"/>, and should clear its copy afterwards.
+    /// </summary>
+    public static (string mine, string peers, byte[] key) ProofPairWithKey(
+        string? password, string myRole, string peerRole, byte[] hostNonce, byte[] joinNonce)
+    {
         var salt = Salt(hostNonce, joinNonce);
         var key = DeriveKey(password, salt);
-        return (ProofFromKey(key, myRole, salt), ProofFromKey(key, peerRole, salt));
+        return (ProofFromKey(key, myRole, salt), ProofFromKey(key, peerRole, salt), key);
+    }
+
+    /// <summary>
+    /// The control-frame MAC key, derived from — never equal to — the session key. The proofs are
+    /// SHA256 over the session key with a role tag; keeping the MAC in its own HMAC domain means
+    /// no value computed for one purpose is ever verified as another.
+    /// </summary>
+    public static byte[] MacKey(byte[] sessionKey)
+    {
+        if (sessionKey == null) throw new ArgumentNullException(nameof(sessionKey));
+        using var hmac = new HMACSHA256(sessionKey);
+        return hmac.ComputeHash(Encoding.UTF8.GetBytes("bizhawk-netplay control-frame mac v1"));
     }
 
     private static byte[] Salt(byte[] hostNonce, byte[] joinNonce)
