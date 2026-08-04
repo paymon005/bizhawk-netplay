@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.31.0 | **20** | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
+| v0.32.0 | **21** | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
+| v0.31.0 | 20 | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
 | v0.30.0 | 19 | The desync checksum changed which bytes it reads, twice over. A memory domain that wraps a raw pointer in per-byte delegates — N64's RDRAM, and the reason its checksum used to sample a quarter of RAM by word — is now copied and hashed whole, so a v18 peer hashes a quarter of what this one hashes all of. And the span the video hardware is scanning out is skipped on every path, which is what lets N64 run above native resolution without disagreeing at every checksum. Either alone would make a mixed pair report a desync that is not there. |
 | v0.29.0 | 18 | Three wire contracts moved at once. The mesh report names its silent edges, so the host relays exactly the broken joiner-to-joiner pairs instead of everything; port 0's input payload carries the console controls (Reset/Select/Pause/FDS, appended after the host pad's own); and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a different slice of the same RAM. Any one of the three would desync or misparse a mixed pair. |
 | v0.28.0 – v0.28.2 | 17 | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
@@ -26,6 +27,37 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.32.0 — protocol 21
+
+**Protocol 21 — everyone must update.** The N64/heavy-core release: the desync checksum now
+measures what it must not read, instead of guessing.
+
+**Divergence learning (closes KI-15, supersedes KI-14's guess).** Right after every authoritative
+rebuild all peers are byte-identical, so over the next three checksum boundaries each peer hashes
+main memory in 256 buckets and ships the vector beside its checksum. Any bucket that disagrees
+between peers standing on identical states can only hold machine-produced bytes — on N64 above
+native resolution, the framebuffer the video plugin resolves back into RDRAM from the GPU. The host
+takes the union across boundaries (which is what catches double-buffering — the two framebuffers
+alternate roles, so any single look sees one of them) and publishes it as an exclusion mask every
+checksum thereafter skips. Three properties keep it honest: it self-disables at native resolution
+(nothing diverges, nothing masked, nothing changes); a real desync spreads through memory, blows
+the 25% share cap and is refused rather than masked; and during the learn window a mismatch is
+treated as the measurement rather than the emergency — which also breaks the resync loop
+above-native N64 used to live in. Every desync report now names the disagreeing address ranges,
+because every resync starts a learn round. The VI-register span from v0.30 remains only as the
+pre-learn default.
+
+**The checksum runs 5× more often where it is cheap.** The 300-frame interval dated from when a
+hash was a 7-38ms hitch; the fast paths made it ~0.1-2ms and the interval never noticed. The host
+now measures one hash at session start and sizes the interval to an amortized half-percent of the
+frame period, clamped to [60, 600] — once a second on every fast-path core, so a desync is caught
+seconds earlier with seconds less divergence to recover. The interval is a session agreement
+(mismatched intervals would silently stop detection completing), so the host publishes one figure
+in WELCOME and every peer quantizes to it.
+
+*Still to validate on hardware:* a two-machine N64 session above native resolution, watching the
+learn round conclude and checksums agree thereafter — see KI-14 in KNOWN-ISSUES.
 
 ### v0.31.0 — protocol 20
 

@@ -39,30 +39,23 @@ above native those bytes are produced by your GPU rather than by the emulated co
 between machines and land inside the region the desync checksum reads. Resyncing cannot fix it,
 because the next frame reproduces it.
 
-**Protocol 19 skips some of those bytes, and it is not expected to be enough.** The checksum now
-reads the VI registers, works out the span the video hardware is scanning out, and excludes it —
-the machinery for excluding a span is in place and correct, and the session log names what it
-skipped beside the checksum path, as `-fb@2048KiB+150KiB`.
+**Since v0.32.0 (protocol 21) the excluded region is measured, not guessed.** Right after every
+session start or resync all machines hold byte-identical memory, so over the first three checksum
+boundaries the peers compare per-block hashes of RDRAM; blocks that disagree on identical states
+can only be machine-produced — the GPU write-back — and the host publishes them as a mask every
+later checksum skips. The learn round's verdict appears in the log (`measured which memory is
+machine-produced: N% …`), the checksum line names what is skipped (`-maskNr/NKiB`), and at native
+resolution the round concludes with nothing to mask and nothing changes. A real desync spreads far
+past any framebuffer's footprint, blows the mask's 25% cap, and is refused rather than hidden.
 
-The trouble is which span. `VI_ORIGIN` names the buffer being **scanned out**, while the plugin
-writes back to the buffer it just **rendered** — the other one, in any double-buffered game, which
-is nearly all of them. So the block still holding fresh GPU-produced bytes is usually the one still
-in the hash. Reading a different register does not fix it: the render target's address is set by an
-RDP display-list command and lives in the video plugin, not in any register BizHawk exposes.
-
-**So keep running native.** Above it, expect checksums to still disagree. If you try 800×600 anyway,
-the useful thing is to say whether they disagreed *every* time or only sometimes, and to keep the
-log.
-
-The real fix is to stop guessing at the region and measure it: after a joiner imports the host's
-state the two machines are byte-identical, so running a few frames and comparing per-block hashes
-says exactly which blocks are machine-dependent, whatever the game, plugin or resolution. That is
-KI-15 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md), and it is what would make this section say something
-different.
+**This has not yet been confirmed on two machines above native** — it is built and unit-tested,
+not yet watched at 800×600 on real hardware. KI-14 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md) lists
+exactly what to read off the first session that tries it. Until then, native remains the setting
+with fifteen thousand frames of evidence behind it.
 
 Note also what none of this buys: a higher resolution still costs frame time (see the sweep below),
-and on a heavy core that is the budget rollback depth comes out of. This is a correctness barrier,
-not a performance one.
+and on a heavy core that is the budget rollback depth comes out of. The mask removes a correctness
+barrier, not a performance one.
 
 ## What resolution costs
 
@@ -84,9 +77,9 @@ Savestate cost stays flat at ~5.9 ms throughout, as it should: state size does n
 render. An earlier independent sweep of the Rice column landed within 0.05 ms at three of the four
 points, so this is a replication rather than a single run.
 
-The desync boundary is native and the performance boundary is somewhere past 800×600, so native is
-still the setting that satisfies both. Protocol 19 is a first move at the first of those, not a
-removal of it — see above.
+The performance boundary is somewhere past 800×600. The desync boundary should be gone as of
+protocol 21's measured mask — pending the two-machine confirmation above — so once that lands, the
+resolution question becomes a frame-cost question alone.
 
 ## `render: false` saves nothing here
 

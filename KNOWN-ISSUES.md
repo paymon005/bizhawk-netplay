@@ -47,9 +47,10 @@ That settles resync: session generations, the authoritative state transfer, the 
 and the generation gating all work at four players over the internet.
 
 **Drop and rejoin is proven too (2026-07-30, same setup, logs kept).** The network was pulled from a
-joiner mid-session — an ungraceful break, which is the only thing that reaches this path: a
-*graceful* leave (Disconnect, or closing the tool) is handled at `Peers.cs` by ending the session
-outright, deliberately, because the peer meant to go. What the host logged, in order:
+joiner mid-session — an ungraceful break, which at the time was the only thing that reached this
+path: a *graceful* leave used to end the session outright. (Since v0.31.0 a graceful leave at 3+
+players vacates the seat and the survivors play on; the held-seat flow below remains the ungraceful
+path, and its timeout now also vacates instead of ending.) What the host logged, in order:
 
 ```
 P4 dropped (An existing connection was forcibly closed…) — holding the session; waiting up to 60s…
@@ -239,58 +240,32 @@ sounds. What remains open is the upstream half, which no wire change here can to
 still imports its host's savestate, and a savestate is a trusted-input format all the way down
 into the cores. Join people you know, or set a password.
 
-**KI-14 (open) — the framebuffer exclusion skips the wrong buffer, and is expected to be
-insufficient on its own.** Protocol 19 excludes the span `VI_ORIGIN` names, on the reasoning that
-this is where the GPU-produced bytes desyncing every checksum above native land. The exclusion
-machinery is right — the span threads through all five hash paths, is folded into the hash so peers
-cannot compare unlike byte sets, is word-aligned so it survives the core's `addr ^ 3` swizzle, and
-the arithmetic is unit-tested (`VideoFramebufferTests`).
+**KI-14 (validation) — divergence learning replaced the VI-register guess; two machines above
+native is what remains.** The v0.30 exclusion read `VI_ORIGIN` and skipped the buffer being
+scanned out — structurally insufficient, since the plugin writes back to the buffer it just
+*rendered* (the other one, in any double-buffered game), and the render target's address lives
+inside the plugin where no register exposes it. v0.32.0 measures instead of guessing: right after
+every rebuild the peers are byte-identical, so buckets of memory that disagree over the next three
+checksum boundaries can only be machine-produced, and the host publishes their union as the mask
+(see `DivergenceLearner`; the resync loop is broken by treating learn-window mismatches as the
+measurement). The VI span survives only as the pre-learn default.
 
-The span it is given is the part that is wrong. `VI_ORIGIN` names the buffer being **scanned out**;
-the plugin writes back to the buffer it just **rendered**, which in a double-buffered game — nearly
-all of them — is the other one. So the block holding fresh GPU bytes is typically still in the hash,
-and N64 above native should be expected to keep disagreeing. No register fixes this: the render
-target's address is set by an RDP display-list command and lives inside the video plugin, not in
-anything `N64_MEMORY` exposes (`RDRAM, PI_REG, SI_REG, VI_REG, RI_REG, AI_REG`, plus saves and ROM).
+None of that is yet a two-machine N64 session at 800×600. *What to read off the first one:*
+- **The learn round's verdict line** — `measured which memory is machine-produced: N% …` is the
+  mechanism firing; `all 256 buckets agreed` above native would mean the write-back never happened
+  (plugin setting); `refused a mask: N%` means something far beyond a framebuffer diverged.
+- **Whether checksums agree after the mask's switch-over frame.** They never did before, at any
+  point, above native.
+- **The checksum line's `-maskNr/NKiB` tag**, which names how much is being skipped — a framebuffer
+  should read as a few ranges totalling ~2-15% of RDRAM.
 
-Nor can it be found from one machine. The obvious local test — render a frame, roll back, render it
-again with video off, diff RAM — is dead because `render: false` saves nothing on Mupen64Plus/Rice:
-the plugin does its video work regardless of the flag, which `docs/n64-tuning.md` measured across
-all twelve probe runs. Two machines are the only instrument that can see this.
-
-So this stays open, and KI-15 is its fix rather than a follow-up. What is worth doing meanwhile:
-- **The checksum line names the exclusion**, as `-fb@2048KiB+150KiB` beside the path. Its absence on
-  N64 means the VI registers were not describing a picture and nothing was skipped at all.
-- **If anyone tries 800×600**, the useful report is whether checksums disagreed *every* time or only
-  sometimes, with the log kept. Every time is the predicted result; sometimes would be surprising and
-  informative.
-
-**KI-15 (open) — a desync says the hashes differ, never which bytes.** The checksum is one 32-bit
-number over all of main memory, so every disagreement looks identical: the same resync, the same
-log line, whether the cause is a determinism bug in the core, a stray write, or a video plugin
-resolving pixels into RAM. KI-14 exists because of that blindness — the framebuffer was reasoned to
-be the divergent region from what plugins are known to do, not measured to be.
-
-The fix is a **bucketed divergence map**: both peers hash main memory in ~256 blocks of ~32KiB and
-exchange the vector, and the host compares them. A few kilobytes, on a path that is about to carry a
-whole savestate anyway.
-
-Run **on a mismatch** it is a diagnostic — every desync report becomes an address range instead of
-"they differ". Run **at session start** it is the fix for KI-14, and a better one than reading
-registers: right after a joiner imports the host's state the two machines are byte-identical, so
-running a few frames on identical inputs and comparing blocks says exactly which ones are
-machine-dependent. That is measured rather than inferred, and it is core-, plugin- and
-game-agnostic — which matters, because where a game puts its framebuffers is game-specific and can
-move between scenes, so no fixed rule and no per-game table would hold.
-
-It should also be self-disabling: at native resolution the write-back bytes already agree (15,000+
-frames of evidence above), so the learned mask would come out empty and nothing changes for the
-sessions that work today.
-
-The hazard is that a learned mask could swallow a real determinism bug, so it needs bounding: log
-the excluded ranges and their total, refuse a mask above some fraction of RAM (a framebuffer is
-~2–15%; anything near half is a broken core, not a GPU), and re-learn rather than resync-loop if
-divergence later appears outside it.
+**KI-15 — CLOSED in v0.32.0.** The bucketed divergence map shipped exactly as designed here:
+256-bucket vectors exchanged over the first three boundaries of every generation, the learned mask
+capped at 25% of RAM (a real desync spreads through memory, blows the cap, and is refused rather
+than masked), self-disabling at native resolution, and re-learned from a fresh identical baseline
+on every rebuild — which also means every desync report now names the disagreeing address ranges,
+since every resync starts a learn round. See `DivergenceLearner` and its tests; validation on real
+hardware is KI-14 above.
 
 ## Fixed (2026-07-27, v0.11.3)
 
