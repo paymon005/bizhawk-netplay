@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.32.0 | **21** | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
+| v0.33.0 | **22** | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
+| v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
 | v0.31.0 | 20 | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
 | v0.30.0 | 19 | The desync checksum changed which bytes it reads, twice over. A memory domain that wraps a raw pointer in per-byte delegates — N64's RDRAM, and the reason its checksum used to sample a quarter of RAM by word — is now copied and hashed whole, so a v18 peer hashes a quarter of what this one hashes all of. And the span the video hardware is scanning out is skipped on every path, which is what lets N64 run above native resolution without disagreeing at every checksum. Either alone would make a mixed pair report a desync that is not there. |
 | v0.29.0 | 18 | Three wire contracts moved at once. The mesh report names its silent edges, so the host relays exactly the broken joiner-to-joiner pairs instead of everything; port 0's input payload carries the console controls (Reset/Select/Pause/FDS, appended after the host pad's own); and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a different slice of the same RAM. Any one of the three would desync or misparse a mixed pair. |
@@ -27,6 +28,38 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.33.0 — the session proves what it is running (protocol 22)
+
+The identity work the previous release named as the next one's business. Four of the five items in
+that plan; the fifth (majority-aware recovery) is deliberately still waiting on real logs.
+
+- **Input datagrams prove their author.** The author was byte [1] of the payload — a number the
+  sender wrote — so any admitted peer could put another player's seat there and have the input
+  attributed to them. Membership tokens could not close it: every peer holds every seat's token,
+  which is what makes a rejoin on a new address recognisable and what makes a token useless for
+  proving authorship. The host now mints one key per unordered pair of seats and hands each peer
+  only the pairs it belongs to, so the datagram a peer can forge is one it was entitled to send.
+  The host re-tags what it relays, which is the only reason it holds the whole table.
+- **"Same BizHawk build" is finally checked.** `CoreVersion` is an assembly version — "2.11.1.0"
+  for the stock download, a developer build, a fork with a patched core and a custom build alike.
+  BizHawk's `VersionInfo` has the release, git commit, branch and dev flag; the architecture is
+  added because an x86 and an x64 build of one commit are different programs. Same release from
+  different commits gets its own message, since both players believe they are on 2.11.1.
+- **Firmware is compared.** Different BIOS revisions run different code before the game starts.
+  `GameInfo.FirmwareHash` was there the whole time and the handshake never asked.
+- **Determinism is read from the core instead of assumed.** It was a hardcoded `true`, on
+  reasoning that is exactly right for N64 and wrong for most other cores: reading the 2.11.1
+  sources, nearly every core that computes the flag seeds its clock from `DateTime.Now` when it is
+  false, so two peers begin with different times. Mupen64Plus is the one named exception — it
+  declares the flag a constant and reads it back nowhere in the entire N64 tree.
+- **Unreadable sync settings refuse instead of matching.** Both peers failing to read theirs
+  produced the same empty blob, the same digest, and a pass — the check inverted itself exactly
+  when it was needed. N64 video settings now travel too, as a named warning rather than a refusal.
+- **The link cores are playable again.** The checksum folds in every emulated machine's main
+  memory, so a divergence confined to another player's Game Boy is visible. Not every registered
+  domain — that would pull in ROM, video registers, and a System Bus whose regions have side
+  effects — but the sibling machines, which are the same kind of domain as the one already hashed.
 
 ### v0.32.1 — corrections from an external review (protocol 21, mixes with v0.32.0)
 

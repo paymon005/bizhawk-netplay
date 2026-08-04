@@ -33,41 +33,57 @@ each domain TYPE lands on the right hash path is not the same question as whethe
 the whole machine — and on the link cores it is not. `MemoryDomainList.MainMemory` falls back to
 the first registered domain, and GBHawkLink/3x/4x/GGHawkLink register `Main RAM A/B/C/D` (or
 `L`/`R`) nominating none, so the checksum read one Game Boy of up to four and divergence on any
-other machine was invisible. Those cores are now refused (`MainMemoryCoverage`). The lesson worth
-keeping: an audit answers only the question it asked, and "the paths are right" was never the same
-claim as "the coverage is right".
+other machine was invisible. Those cores were refused in v0.32.1 and are played again in v0.33.0,
+which folds every emulated machine's main memory into the checksum (`MainMemoryCoverage`,
+`SiblingMachineDomains`). The lesson worth keeping: an audit answers only the question it asked,
+and "the paths are right" was never the same claim as "the coverage is right".
 
-## Open findings from the 2026-08-04 external review
+## Findings from the 2026-08-04 external review
 
-Confirmed against source, not yet fixed — each is a wire or identity change, and they are the
-substance of the next release rather than this one's hotfixes:
+Most of these are closed in v0.33.0, which is the release they were the substance of. What remains
+open is recorded with what it would actually take.
 
-- **KI-16 (open) — "same BizHawk build" is not actually verified.** `CoreVersion` is
-  `Assembly.GetName().Version`, not the release, Git hash, developer-build flag or the selected
-  native plugin's identity, all of which BizHawk exposes in `VersionInfo`. Two different builds can
-  pass the handshake. Needs a versioned build manifest.
-- **KI-17 (open) — content and firmware identity is incomplete.** `RomHash` is `GameInfo.Hash`,
-  which BizHawk permits to be CRC32/MD5/SHA-1; the PSX quick identifier hashes the TOC and the
-  first 26 sectors only, multi-disc sets identify from disc one, and firmware/BIOS is not compared
-  at all. PSX and other firmware/disc systems should be treated as experimental until a canonical
-  content manifest exists.
-- **KI-18 (open) — `deterministic` is hardcoded true.** `Probe.cs` passes a constant, so
-  `SessionNegotiator`'s determinism rejection is dead code. That is defensible for Mupen (which
-  always reports false and syncs fine in practice) and wrong to generalize: bsnes, Ares64 and MAME
-  answer conditionally, and BizHawk calls the flag a contract. Should request deterministic loading
-  and fail closed, with Mupen an explicit named exception.
-- **KI-19 (open) — sync settings fail open.** `SyncSettingsBlob()` returns `""` on any read or
-  serialization failure, so two peers that both fail to read theirs match. "No sync settings" and
-  "could not read them" must be different outcomes. N64's `VideoSizeX/Y` are ordinary settings and
-  not compared at all, which is why above-native is a per-session opt-in rather than a checked
-  configuration.
+- **KI-16 — CLOSED in v0.33.0.** "Same BizHawk build" is verified now. `VersionInfo` gives the
+  release, the git branch and commit, the developer-build flag and any `dll/custombuild.txt`
+  string; the process architecture is added because an x86 and an x64 build of one commit are
+  different programs. `BuildIdentity` assembles and compares them, and names which of the three
+  kinds of mismatch it found. `CoreVersion` is still compared, and still could not have done this:
+  it is `Assembly.GetName().Version`, which is one string for every build of a release.
+- **KI-17 — PARTLY CLOSED in v0.33.0.** Firmware is compared: `GameInfo.FirmwareHash` was there
+  the whole time and the handshake never asked, so two players on different PSX or Saturn BIOS
+  revisions ran different code before the game started and diverged for reasons nothing in the game
+  explained.
+  **Still open:** `RomHash` is `GameInfo.Hash`, which is whichever digest matched the gamedb —
+  read against 2.11.1's `Database.GetGameInfo`, the lookup tries SHA-1, then MD5, then CRC32, and a
+  miss falls back to SHA-1. So a DB-hit ROM can be identified by a 32-bit checksum. Both peers on
+  the same file still agree, which is why this has never misfired; what it cannot do is resist a
+  deliberately-crafted collision, and it is a short answer where a long one was available. The
+  disc half is untouched: the PSX quick identifier hashes the TOC and the first 26 sectors, and a
+  multi-disc set identifies from disc one, so two players on different disc 2s pass. Treat PSX
+  multi-disc as unverified.
+- **KI-18 — CLOSED in v0.33.0.** Determinism is read from the core instead of hardcoded `true`,
+  with Mupen64Plus the one named exception. The exception is by name rather than by tolerance for
+  a false flag, and the reason is in `DeterminismPolicy`: reading the 2.11.1 cores shows nearly
+  every one that computes the flag seeds its clock from `DateTime.Now` when it is false, while
+  Mupen declares it a constant and reads it back nowhere in the whole N64 tree. MAME goes further
+  and registers a different set of memory domains when false.
+- **KI-19 — CLOSED in v0.33.0.** "No sync settings" and "could not read them" are different
+  answers on the wire now, and the second refuses. The old behaviour inverted the check exactly
+  when it mattered: both peers failing produced the same empty blob, the same digest, and a pass.
+  N64's `VideoSizeX/Y` are carried too — as a named warning rather than a refusal, since whether a
+  resolution difference matters depends on whether the game reads its own framebuffer.
 - **KI-20 (open) — recovery always assumes the host is correct.** The host's state is distributed
   on every resync, so a lone-diverged host can overwrite three agreeing joiners. The partition is
-  now recorded and the case is named in the log (`DesyncPartition`), but the policy is unchanged;
-  choosing a different authority needs majority reconstruction and a wire change.
-- **KI-21 (open) — UDP input is not author-bound.** Input datagrams are unauthenticated and the
-  author is taken from a payload byte, so an admitted peer can submit another seat's input and
-  first-write-wins keeps it. The control channel is authenticated (v0.31.0); the input path is not.
+  recorded and the case is named in the log (`DesyncPartition`), but the policy is unchanged;
+  choosing a different authority needs majority reconstruction and a wire change. Deliberately
+  waiting on real logs — deciding the authority policy from a session that actually hit it beats
+  deciding it from reasoning.
+- **KI-21 — CLOSED in v0.33.0.** Input datagrams carry their author and a per-pair HMAC tag. The
+  host mints one key per unordered pair of seats and hands each peer only the pairs it belongs to,
+  so a peer holds nothing it could sign as another seat with; the payload's own port byte is
+  checked against the proven author. Membership tokens could not have done this — every peer holds
+  every seat's token, which is what makes a rejoin recognisable and what makes a token useless for
+  proving authorship. See `MeshPairKeyring`, including what it deliberately does not do (replay).
 - **KI-22 (open) — the product says 2-4 players, the runtime permits 8.** `MaxPlayers` is 8 and
   PSX/adapters can reach it, entering a topology nothing has tested.
 

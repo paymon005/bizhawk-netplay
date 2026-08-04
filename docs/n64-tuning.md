@@ -22,10 +22,15 @@ remains the worst case.
 Every player must use **identical** N64 settings. They are sync settings, so a mismatch is refused at
 the handshake — and since v0.24.0 the refusal names which setting differs and both sides' values.
 
-N64 reports itself as non-deterministic. That is **not** treated as a refusal: it usually means
-determinism was not requested rather than that the core will diverge. You will see a warning in the
-log, the session runs, and the periodic checksum is what actually guards you. In practice it stays in
-sync.
+N64 reports itself as non-deterministic, and that is **not** treated as a refusal — N64 is the one
+core it isn't. Mupen64Plus declares `DeterministicEmulation => false` as a constant and then reads it
+back nowhere in its entire source tree, so the flag drives nothing there.
+
+Since v0.33.0 that is a **named exception rather than a general tolerance**, because on nearly every
+other core a false flag means the core seeded its clock from the wall clock — two players start with
+different times and any game that reads the clock drifts apart. Those cores are refused with the
+setting to change ("Use Real Time"), so if you meet that message on some other system it is telling
+you something real.
 
 ## Resolution and desyncs
 
