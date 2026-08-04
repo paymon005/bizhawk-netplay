@@ -298,6 +298,7 @@ public sealed partial class NetplayToolForm
         _pendingReconnectGeneration = default;
         _lastResyncStamp = 0;
         lock (_hashLock) { _checksums.Clear(); }
+        ResetDivergenceLearning();
         _driver!.Start(); // idempotent; normally seeded before READY
         _driver.ResetRemoteInputLiveness();
         _sessionDriverPrepared = false;

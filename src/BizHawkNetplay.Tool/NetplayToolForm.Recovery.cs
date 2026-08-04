@@ -30,6 +30,21 @@ public sealed partial class NetplayToolForm
         if (outcome == ChecksumOutcome.Pending) return;
         if (outcome == ChecksumOutcome.Mismatch)
         {
+            // During the divergence-learning window a mismatch IS the measurement, not the
+            // emergency: right after a rebuild the peers are byte-identical, so a disagreeing
+            // boundary here means machine-produced bytes (GPU write-back) — exactly what the
+            // learner is collecting, and what the mask it produces will exclude. Resyncing now
+            // would just restart the same learning from another identical baseline, forever —
+            // the resync loop that above-native N64 used to be. A REAL desync in this window is
+            // caught by the learner's own share cap (TooBroadToMask ends the suppression with a
+            // verdict), and by the very next boundary past the window regardless.
+            if (DivergenceLearner.IsLearnFrame(frame, ChecksumInterval))
+            {
+                if (Verbose) BeginInvokeUi(() =>
+                    Log($"checksum frame {frame}: peers disagree during the learning window — " +
+                        "measuring which memory is machine-produced rather than resyncing"));
+                return;
+            }
             BeginInvokeUi(() =>
             {
                 if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
@@ -54,6 +69,114 @@ public sealed partial class NetplayToolForm
             }
             else if (Verbose) Log($"checksum frame {frame}: all {_playerCount} agree");
         });
+    }
+
+    // --- divergence learning (KI-14/KI-15): measure what is machine-produced, then mask it ----
+
+    /// <summary>Host only; rebuilt for every generation, since every rebuild stands the peers on
+    /// freshly identical memory — the perfect learning baseline. Guarded by _hashLock beside the
+    /// checksum ledger it works with. Null when fewer than two active players.</summary>
+    private DivergenceLearner? _divergenceLearner;
+    private bool _divergencePublished; // the learner's verdict is terminal; act on it once
+
+    /// <summary>Fresh learner for a fresh generation (host), and no stale mask anywhere: frame
+    /// numbers restart at zero on a rebuild, so every peer clears at the same boundary and the
+    /// learn round that every rebuild begins decides what replaces it.</summary>
+    private void ResetDivergenceLearning()
+    {
+        try { _adapter?.ClearLearnedExclusion(); } catch { }
+        lock (_hashLock)
+        {
+            int active = _playerCount - _vacatedCount;
+            _divergenceLearner = _isHost && active >= 2 ? new DivergenceLearner(active) : null;
+            _divergencePublished = false;
+        }
+    }
+
+    /// <summary>Host: fold one peer's (or our own) bucket vector into the learner, and act once
+    /// on its verdict. Runs from reader threads and the UI thread, like the checksum ledger.</summary>
+    private void RecordDivergence(int attempt, SessionGeneration generation, int port, int frame,
+        uint[] buckets)
+    {
+        DivergenceVerdict verdict;
+        DivergenceLearner? learner;
+        lock (_hashLock)
+        {
+            if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_isHost
+                || generation != CurrentGeneration) return;
+            learner = _divergenceLearner;
+            if (learner == null || _divergencePublished) return;
+            verdict = learner.Record(frame, port, buckets);
+            if (verdict == DivergenceVerdict.Learning) return;
+            _divergencePublished = true;
+        }
+        BeginInvokeUi(() =>
+        {
+            if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
+                && CurrentGeneration == generation)
+                OnDivergenceLearned(generation, learner!, verdict);
+        });
+    }
+
+    /// <summary>How many checksum intervals past the learn window the mask takes effect — margin
+    /// for control-channel lag plus rollback's anchors, which hash a boundary up to a ring's
+    /// depth before it is reported. Every peer switches at the same frame.</summary>
+    private const int MaskEffectiveMargin = 2;
+
+    private void OnDivergenceLearned(SessionGeneration generation, DivergenceLearner learner,
+        DivergenceVerdict verdict)
+    {
+        switch (verdict)
+        {
+            case DivergenceVerdict.NothingDiverges:
+                // The native-resolution case, and most cores always: nothing machine-dependent,
+                // nothing masked, nothing changes. One quiet line so a log can prove it ran.
+                Log($"divergence learning: all {ControlMessageCodec.DivergenceBuckets} buckets " +
+                    $"agreed across {learner.LearnedFrames.Count} boundaries — nothing here is " +
+                    "machine-produced, the checksum keeps reading everything.");
+                break;
+
+            case DivergenceVerdict.MaskLearned:
+            {
+                var mask = learner.MaskBuckets;
+                int effectiveFrom =
+                    (DivergenceLearner.LearnRounds + MaskEffectiveMargin) * ChecksumInterval;
+                try { _adapter?.SetLearnedExclusion(mask, effectiveFrom); } catch { }
+                var body = ControlMessageCodec.EncodeExclusionMask(generation, effectiveFrom, mask);
+                foreach (var link in _peers)
+                    QueueControl(link, ControlMessageType.ExclusionMask, body);
+                ConnLog($"measured which memory is machine-produced: {learner.MaskedShare:P0} of " +
+                        $"main RAM disagreed between peers on otherwise-identical states — video " +
+                        $"write-back, not a desync. Those ranges are excluded from checksum frame " +
+                        $"{effectiveFrom} on, so the rest of memory is compared honestly and " +
+                        "above-native rendering no longer reads as a desync.", Color.DarkGreen);
+                break;
+            }
+
+            case DivergenceVerdict.TooBroadToMask:
+                // Real divergence spreads through memory; a framebuffer does not. Refuse to learn
+                // a mask that would blind the checksum, and let the next boundary past the learn
+                // window fire the ordinary desync recovery.
+                ConnLog($"divergence learning refused a mask: {learner.MaskedShare:P0} of main " +
+                        "RAM disagreed between peers, which is far more than video write-back can " +
+                        "explain — that is a real desync. Normal desync recovery resumes from the " +
+                        "next checksum.", Color.Firebrick);
+                break;
+        }
+    }
+
+    /// <summary>Joiner: adopt the host's measured exclusion mask (or clear, when all-false).</summary>
+    private void OnExclusionMask(SessionGeneration generation, int effectiveFrom, bool[] mask)
+    {
+        if (!_phase.IsActive || _isHost || generation != CurrentGeneration) return;
+        try { _adapter?.SetLearnedExclusion(mask, effectiveFrom); } catch { return; }
+        int set = 0;
+        foreach (bool b in mask) if (b) set++;
+        if (set > 0)
+            ConnLog($"the host measured which memory is machine-produced (video write-back): " +
+                    $"{set} of {mask.Length} buckets are excluded from checksum frame " +
+                    $"{effectiveFrom} on. Above-native rendering no longer reads as a desync.",
+                Color.DarkGreen);
     }
 
     private void OnHostDesync(int frame)
@@ -463,6 +586,8 @@ public sealed partial class NetplayToolForm
         _driver = CreateDriver();
         _startEmuFrame = APIs.Emulation.FrameCount();
         lock (_hashLock) { _checksums.Clear(); }
+        // Every rebuild is a fresh identical baseline — the moment divergence learning restarts.
+        ResetDivergenceLearning();
         _driver.Start();
         _lastResyncStamp = MonotonicNow();
         RebaseFrameSchedule();
@@ -573,6 +698,9 @@ public sealed partial class NetplayToolForm
         _relayPairs.RemoveWhere(pair => pair.A == port || pair.B == port);
         _portTokens.Remove(port); // no rejoin path into a vacated seat; the token dies with it
         try { _driver?.VacatePort(port); } catch { /* a rebuild re-applies it regardless */ }
+        // The learner's quorum changed; a learner waiting on the departed seat's reports would
+        // never complete. The rebuild that follows every vacate resets it again harmlessly.
+        ResetDivergenceLearning();
     }
 
     /// <summary>Joiner: the host says a seat is permanently empty. Arrives ordered ahead of the

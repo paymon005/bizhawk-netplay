@@ -165,6 +165,10 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     /// <summary>The per-frame repair cost when <see cref="BudgetExceededByFloor"/> first latched,
     /// so the advice can name the measurement rather than assert the conclusion.</summary>
     public double FloorRepairPerFrameMs { get; private set; }
+    /// <summary>Highest interval boundary already checksummed, so a caller can tell whether the
+    /// NEXT checksum will land inside a window it cares about (divergence learning asks).</summary>
+    public int LastChecksumFrame => _lastChecksumFrame;
+
     /// <summary>Checksums answered from the anchor rather than by visiting the state again.</summary>
     public int ChecksumsFromAnchor { get; private set; }
     /// <summary>Checksums that had to save, load, hash and load back — the pre-anchor cost.</summary>
@@ -308,10 +312,31 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
                 "the core was left on the wrong frame by an earlier failed restore");
     }
 
-    public bool TryConfirmedChecksum(int interval, out int frame, out uint hash)
+    public bool TryConfirmedChecksum(int interval, out int frame, out uint hash) =>
+        TryConfirmedChecksumCore(interval, null, out frame, out hash, out _);
+
+    /// <summary>
+    /// As <see cref="TryConfirmedChecksum"/>, and additionally fill per-bucket hashes of the same
+    /// boundary state for divergence learning. This deliberately FORCES the save/load/hash/restore
+    /// visit — the cached anchor hash cannot help, since the buckets must come off the very state
+    /// the hash describes — so it costs the pre-anchor hitch (~18ms on N64) and is only worth
+    /// calling during the few learn boundaries of a generation, where a rebuild hitch just
+    /// happened anyway. <paramref name="bucketsFilled"/> is false on a core whose domain cannot
+    /// be read whole; the hash is valid regardless.
+    /// </summary>
+    public bool TryConfirmedChecksumWithBuckets(int interval, uint[] bucketSink,
+        out int frame, out uint hash, out bool bucketsFilled)
+    {
+        if (bucketSink == null) throw new ArgumentNullException(nameof(bucketSink));
+        return TryConfirmedChecksumCore(interval, bucketSink, out frame, out hash, out bucketsFilled);
+    }
+
+    private bool TryConfirmedChecksumCore(int interval, uint[]? bucketSink,
+        out int frame, out uint hash, out bool bucketsFilled)
     {
         frame = 0;
         hash = 0;
+        bucketsFilled = false;
         ThrowIfCoreStranded();
         if (interval < 1) return false;
 
@@ -322,7 +347,7 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         int boundary = (confirmed / interval) * interval;
         if (boundary <= _lastChecksumFrame) return false;   // already reported (cadence + dedupe)
 
-        if (_anchorHashFrame == boundary)
+        if (bucketSink == null && _anchorHashFrame == boundary)
         {
             hash = _anchorHash;
             _anchorHashFrame = -1;
@@ -339,7 +364,10 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         try
         {
             _adapter.LoadStateFromMemory(st);
-            hash = _adapter.HashMainMemory(boundary);
+            if (bucketSink != null)
+                bucketsFilled = _adapter.TryHashMainMemoryBuckets(boundary, bucketSink, out hash);
+            else
+                hash = _adapter.HashMainMemory(boundary);
         }
         finally
         {
@@ -348,6 +376,7 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
             // has to be told about. Release first so a failed restore does not also leak the pin.
             RestoreLivePosition(here);
         }
+        if (_anchorHashFrame == boundary) _anchorHashFrame = -1; // the visit consumed this boundary
         ChecksumsByVisit++;
         frame = boundary;
         _lastChecksumFrame = boundary;

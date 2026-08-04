@@ -127,4 +127,17 @@ public interface IEmuAdapter
     /// ignores it.
     /// </summary>
     uint HashMainMemory(int salt = 0);
+
+    /// <summary>
+    /// As <see cref="HashMainMemory"/>, and additionally fill
+    /// <see cref="Session.ControlMessageCodec.DivergenceBuckets"/> per-bucket hashes covering ALL
+    /// of main memory (buckets ignore any exclusion — they exist to find the bytes worth
+    /// excluding). The returned hash must equal what <see cref="HashMainMemory"/> would return for
+    /// the same state and salt, since peers compare it against values computed either way.
+    ///
+    /// False when this adapter cannot read the domain as a whole (a sampled or opaque domain), in
+    /// which case nothing was written and the caller simply reports no buckets — divergence
+    /// learning degrades to absent rather than wrong.
+    /// </summary>
+    bool TryHashMainMemoryBuckets(int salt, uint[] buckets, out uint hash);
 }

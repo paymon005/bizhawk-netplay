@@ -300,6 +300,91 @@ public static class ControlMessageCodec
         return port < HandshakeCodec.MaxPlayers;
     }
 
+    /// <summary>How many buckets main memory is divided into for divergence mapping. Part of the
+    /// wire contract: both peers must slice memory identically or the vectors describe different
+    /// things. 256 makes a report ~1KiB and a mask bitmap 32 bytes.</summary>
+    public const int DivergenceBuckets = 256;
+
+    /// <summary>One peer's per-bucket hashes of the state a checksum boundary describes.</summary>
+    public static byte[] EncodeDivergenceReport(SessionGeneration generation, int frame, uint[] buckets)
+    {
+        if (buckets == null || buckets.Length != DivergenceBuckets)
+            throw new ArgumentException($"A report carries exactly {DivergenceBuckets} buckets", nameof(buckets));
+        if (frame < 0) throw new ArgumentOutOfRangeException(nameof(frame));
+        var body = new byte[GenerationSize + 4 + 2 + DivergenceBuckets * 4];
+        WriteGeneration(body, 0, generation);
+        WriteInt32(body, 12, frame);
+        body[16] = (byte)(DivergenceBuckets >> 8);
+        body[17] = (byte)(DivergenceBuckets & 0xFF);
+        for (int i = 0; i < DivergenceBuckets; i++)
+        {
+            int at = 18 + i * 4;
+            uint v = buckets[i];
+            body[at] = (byte)(v >> 24); body[at + 1] = (byte)(v >> 16);
+            body[at + 2] = (byte)(v >> 8); body[at + 3] = (byte)v;
+        }
+        return body;
+    }
+
+    public static bool TryDecodeDivergenceReport(byte[] body, out SessionGeneration generation,
+        out int frame, out uint[] buckets)
+    {
+        generation = default;
+        frame = 0;
+        buckets = [];
+        if (body == null || body.Length != GenerationSize + 4 + 2 + DivergenceBuckets * 4
+            || !TryReadGeneration(body, 0, out generation)) return false;
+        frame = ReadInt32(body, 12);
+        if (frame < 0) return false;
+        if (((body[16] << 8) | body[17]) != DivergenceBuckets) return false;
+        var read = new uint[DivergenceBuckets];
+        for (int i = 0; i < DivergenceBuckets; i++)
+        {
+            int at = 18 + i * 4;
+            read[i] = ((uint)body[at] << 24) | ((uint)body[at + 1] << 16)
+                | ((uint)body[at + 2] << 8) | body[at + 3];
+        }
+        buckets = read;
+        return true;
+    }
+
+    /// <summary>The buckets the checksum must skip from <paramref name="effectiveFromFrame"/> on.
+    /// The frame gives every peer the same switch-over point, far enough ahead that nobody has
+    /// already hashed a boundary past it the old way. An all-false mask clears a previous one.</summary>
+    public static byte[] EncodeExclusionMask(SessionGeneration generation, int effectiveFromFrame,
+        bool[] maskBuckets)
+    {
+        if (maskBuckets == null || maskBuckets.Length != DivergenceBuckets)
+            throw new ArgumentException($"A mask covers exactly {DivergenceBuckets} buckets", nameof(maskBuckets));
+        if (effectiveFromFrame < 0) throw new ArgumentOutOfRangeException(nameof(effectiveFromFrame));
+        var body = new byte[GenerationSize + 4 + 2 + DivergenceBuckets / 8];
+        WriteGeneration(body, 0, generation);
+        WriteInt32(body, 12, effectiveFromFrame);
+        body[16] = (byte)(DivergenceBuckets >> 8);
+        body[17] = (byte)(DivergenceBuckets & 0xFF);
+        for (int i = 0; i < DivergenceBuckets; i++)
+            if (maskBuckets[i]) body[18 + (i >> 3)] |= (byte)(1 << (i & 7));
+        return body;
+    }
+
+    public static bool TryDecodeExclusionMask(byte[] body, out SessionGeneration generation,
+        out int effectiveFromFrame, out bool[] maskBuckets)
+    {
+        generation = default;
+        effectiveFromFrame = 0;
+        maskBuckets = [];
+        if (body == null || body.Length != GenerationSize + 4 + 2 + DivergenceBuckets / 8
+            || !TryReadGeneration(body, 0, out generation)) return false;
+        effectiveFromFrame = ReadInt32(body, 12);
+        if (effectiveFromFrame < 0) return false;
+        if (((body[16] << 8) | body[17]) != DivergenceBuckets) return false;
+        var mask = new bool[DivergenceBuckets];
+        for (int i = 0; i < DivergenceBuckets; i++)
+            mask[i] = (body[18 + (i >> 3)] & (1 << (i & 7))) != 0;
+        maskBuckets = mask;
+        return true;
+    }
+
     /// <summary>The host's authoritative delay, sent after the mesh round and before READY.</summary>
     public static byte[] EncodeInputDelay(SessionGeneration generation, int delay)
     {

@@ -215,10 +215,14 @@ public sealed partial class NetplayToolForm
         return note;
     }
 
+    /// <summary>Scratch for divergence-learning bucket vectors, allocated on first learn frame.</summary>
+    private uint[]? _divergenceBuckets;
+
     private void MaybeSendChecksum()
     {
         int frame;
         uint hash;
+        bool bucketsFilled = false;
         if (_driver!.Strategy is RollbackStrategy rb)
         {
             // Under rollback the current frame may be a prediction that legitimately differs
@@ -232,7 +236,16 @@ public sealed partial class NetplayToolForm
             // returns false on roughly 299 of every 300, so the allocation was paying for a
             // measurement that was usually of nothing. Stopwatch.GetTimestamp allocates nothing.
             long hashStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
+            // The first boundaries of a generation are the divergence-learning window (see
+            // DivergenceLearner): the bucket variant forces the state visit, which costs the
+            // pre-anchor hitch a few times right after a rebuild hitch already happened.
+            if (rb.LastChecksumFrame < DivergenceLearner.LearnRounds * ChecksumInterval)
+            {
+                _divergenceBuckets ??= new uint[ControlMessageCodec.DivergenceBuckets];
+                if (!rb.TryConfirmedChecksumWithBuckets(ChecksumInterval, _divergenceBuckets,
+                        out frame, out hash, out bucketsFilled)) return;
+            }
+            else if (!rb.TryConfirmedChecksum(ChecksumInterval, out frame, out hash)) return;
             _lastHashMs += ElapsedMs(hashStart);
         }
         else
@@ -240,7 +253,12 @@ public sealed partial class NetplayToolForm
             frame = _driver.CurrentFrame;
             if (frame % ChecksumInterval != 0) return;
             long hashStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            hash = _adapter!.HashMainMemory(frame);
+            if (DivergenceLearner.IsLearnFrame(frame, ChecksumInterval))
+            {
+                _divergenceBuckets ??= new uint[ControlMessageCodec.DivergenceBuckets];
+                bucketsFilled = _adapter!.TryHashMainMemoryBuckets(frame, _divergenceBuckets, out hash);
+            }
+            else hash = _adapter!.HashMainMemory(frame);
             _lastHashMs += ElapsedMs(hashStart);
         }
         // Which checksum path the core actually got, once per session. This is the only place the
@@ -268,6 +286,20 @@ public sealed partial class NetplayToolForm
         // The host aggregates all peers' checksums itself; joiners just report theirs to the host.
         var generation = _driver.Generation;
         if (generation != CurrentGeneration) return;
+
+        // The divergence vector travels beside the checksum it describes — same boundary, same
+        // state — so the host can see WHICH buckets disagree, not merely that some byte does.
+        // Sent only for learn frames; steady state carries nothing extra.
+        if (bucketsFilled && DivergenceLearner.IsLearnFrame(frame, ChecksumInterval))
+        {
+            if (_isHost)
+                RecordDivergence(CurrentConnectionAttempt, generation, _localPort, frame,
+                    (uint[])_divergenceBuckets!.Clone()); // the learner keeps it; the scratch is reused
+            else if (_peers.Count > 0)
+                QueueControl(_peers[0], ControlMessageType.DivergenceReport,
+                    ControlMessageCodec.EncodeDivergenceReport(generation, frame, _divergenceBuckets!));
+        }
+
         if (_isHost) RecordChecksum(CurrentConnectionAttempt, generation, _localPort, frame, hash);
         else if (_peers.Count > 0)
         {

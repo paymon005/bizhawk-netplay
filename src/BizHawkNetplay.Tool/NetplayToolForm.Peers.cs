@@ -251,6 +251,21 @@ public sealed partial class NetplayToolForm
                         && generation == CurrentGeneration)
                         BeginInvokePeer(link, () => ResumeResyncAsJoiner(generation));
                 }
+                else if (type == ControlMessageType.DivergenceReport)
+                {
+                    // Joiner -> host: a learn-window bucket vector. RecordDivergence does its own
+                    // locking and marshals only the terminal verdict, so no UI hop per report.
+                    if (_isHost && ControlMessageCodec.TryDecodeDivergenceReport(body,
+                            out var generation, out int frame, out var buckets))
+                        RecordDivergence(link.Attempt, generation, link.RemotePort, frame, buckets);
+                }
+                else if (type == ControlMessageType.ExclusionMask)
+                {
+                    // Host -> joiner: the measured machine-produced ranges to stop hashing.
+                    if (!_isHost && ControlMessageCodec.TryDecodeExclusionMask(body,
+                            out var generation, out int effectiveFrom, out var mask))
+                        BeginInvokePeer(link, () => OnExclusionMask(generation, effectiveFrom, mask));
+                }
                 else if (type == ControlMessageType.InputOutage)
                 {
                     // Joiner -> host only: a mesh leg died and its victim is asking for a relay.

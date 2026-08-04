@@ -47,6 +47,15 @@ public enum ControlMessageType : byte
     // and this is the only party that can. The host answers by carrying the named pair over its
     // own legs, exactly as it would have at session start had the leg never opened.
     InputOutage = 24,
+    // Joiner -> host, first checksum boundaries of a generation only:
+    // [generation:12][frame:4][count:2][count x uint32] — main memory hashed in buckets, so the
+    // host can see WHICH ranges disagree rather than only that some byte does. The evidence the
+    // learned exclusion mask is built from; see DivergenceLearner.
+    DivergenceReport = 25,
+    // Host -> joiner: [generation:12][effectiveFrom:4][count:2][bitmap:count/8] — the buckets the
+    // desync checksum must skip from the stated frame on, because their contents are produced per
+    // machine (a video plugin resolving GPU output back into console RAM) and can never agree.
+    ExclusionMask = 26,
 }
 
 /// <summary>

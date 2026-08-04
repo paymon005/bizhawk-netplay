@@ -81,7 +81,15 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // direction and position, so an on-path party without the password can no longer inject,
     // replay, reorder or tamper — the KI-13 network fix. A v19 peer sends none of it and would
     // fail every integrity check, which is precisely what the version refusal is for.
-    private const int Protocol = 20;
+    // 21: the checksum's exclusions are measured instead of guessed. During the first boundaries
+    // of every generation peers exchange per-bucket hashes (DivergenceReport, type 25) — possible
+    // because a rebuild makes everyone byte-identical, so a disagreeing bucket can only be
+    // machine-produced bytes — and the host publishes the union as an exclusion mask
+    // (ExclusionMask, type 26) that every checksum from a stated frame on must skip. The hash's
+    // seed also changed shape (it folds a range LIST and the mask identity, replacing v20's single
+    // span), so a v20 peer computes different values for identical states: a mixed pair would
+    // report a desync that is not there, which is what the version refusal pre-empts.
+    private const int Protocol = 21;
     private const int DefaultPort = 47800;
     private const int ChecksumInterval = 300; // full-memory hashes are intentionally infrequent (~5s at 60fps)
 

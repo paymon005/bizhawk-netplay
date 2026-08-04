@@ -211,4 +211,25 @@ public sealed class FakeEmuAdapter : IEmuAdapter
         foreach (var b in _memory) { h ^= b; h *= 16777619; }
         return h;
     }
+
+    /// <summary>Whether <see cref="TryHashMainMemoryBuckets"/> reports the domain as readable —
+    /// false models a core on the sampled/opaque path, where learning must degrade to absent.</summary>
+    public bool SupportsBuckets { get; set; } = true;
+
+    public bool TryHashMainMemoryBuckets(int salt, uint[] buckets, out uint hash)
+    {
+        hash = HashMainMemory(salt);
+        if (!SupportsBuckets) return false;
+        long span = BizHawkNetplay.Core.Session.DivergenceLearner.BucketSpan(_memory.Length, buckets.Length);
+        for (int i = 0; i < buckets.Length; i++)
+        {
+            long start = i * span;
+            if (start >= _memory.Length) { buckets[i] = 2166136261u; continue; }
+            long end = Math.Min(_memory.Length, start + span);
+            uint h = 2166136261;
+            for (long a = start; a < end; a++) { h ^= _memory[a]; h *= 16777619; }
+            buckets[i] = h;
+        }
+        return true;
+    }
 }
