@@ -13,7 +13,7 @@ where the core is fast enough to afford it.
 | | |
 |---|---|
 | **Download** | [Releases](../../releases) — two DLLs, no compiler needed |
-| **Players** | 2–4, up to the core's controller-port count |
+| **Players** | 2–4 tested; up to 8 permitted, bounded by the core's controller-port count |
 | **Requires** | BizHawk 2.11.x (.NET Framework 4.8 build), Windows |
 | **Licence** | [MIT](LICENSE) |
 
@@ -103,7 +103,7 @@ are the host's to set.
 
 | Setting | Who sets it | What it does |
 |---|---|---|
-| **Players** | Host | How many of the core's controller ports to fill. Unused ports read neutral, so you can play 2-player on a 4-port core. |
+| **Players** | Host | How many of the core's controller ports to fill. Unused ports read neutral, so you can play 2-player on a 4-port core. Above 4 (a PSX with two multitaps, say) the code supports it and nobody has run it — the host says so in the log and names what gets harder. |
 | **My controls** | Each player | Which of *your* controller-port bindings the tool reads (default *Use P1 pad*), independent of the port you are assigned in-game. |
 | **Password** | Host + joiners | Optional; must match. Empty means an open session. |
 | **Netcode** | Host | *Automatic*, *Rollback* (forced) or *Lockstep* (forced). |

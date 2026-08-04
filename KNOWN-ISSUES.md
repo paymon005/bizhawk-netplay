@@ -84,8 +84,13 @@ open is recorded with what it would actually take.
   checked against the proven author. Membership tokens could not have done this — every peer holds
   every seat's token, which is what makes a rejoin recognisable and what makes a token useless for
   proving authorship. See `MeshPairKeyring`, including what it deliberately does not do (replay).
-- **KI-22 (open) — the product says 2-4 players, the runtime permits 8.** `MaxPlayers` is 8 and
-  PSX/adapters can reach it, entering a topology nothing has tested.
+- **KI-22 — CLOSED in v0.34.0.** The product said 2-4 players and the runtime permitted 8, and a
+  host crossing between the two was told nothing. Capping was the wrong fix: every array, mesh
+  route, pair key and partition description in the code is written for N and holds at 8, so a cap
+  would have removed a capability on suspicion. Instead the documented range is what has been run,
+  the permitted range is what the code supports, and crossing between them says so once — naming
+  the mesh edge count, the per-frame send count and the host relay load rather than waving at
+  "untested". `PlayerCountPolicy`.
 
 The same review produced the v0.31.0/v0.32.0 work and the v0.32.1 hotfixes: vacated seats, live
 relay failover, the control-frame MAC, divergence learning, the measured checksum cadence, and then

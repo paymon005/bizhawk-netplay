@@ -103,6 +103,13 @@ public sealed partial class NetplayToolForm
                 RefreshPlayerLimit();
             }
 
+            // Past the size anything has actually been run at. Said once, by the host, because the
+            // host is the only one who chose it — and said rather than prevented: nothing about a
+            // fifth player is known to be broken, and capping on suspicion would remove a capability
+            // the code supports. See PlayerCountPolicy.
+            if (_hostRadio.Checked && PlayerCountPolicy.Advisory(players) is { } sizeAdvisory)
+                ConnLog(sizeAdvisory, Color.DarkOrange);
+
             // Validate the join address BEFORE pausing — otherwise a typo'd IP leaves the emulator
             // frozen on the early return with no session to un-freeze it. The box takes either a
             // bare IP or "ip:port" (what a host usually reads out), and a port typed there wins
