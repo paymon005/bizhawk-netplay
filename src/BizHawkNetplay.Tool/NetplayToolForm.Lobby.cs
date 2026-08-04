@@ -32,6 +32,16 @@ public sealed partial class NetplayToolForm
             if (!_adapter.HasBindings)
                 Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
+            // Refuse before anything is paused or bound: a core whose MainMemory covers only one
+            // of several emulated machines cannot be desync-checked at all (see
+            // MainMemoryCoverage). Both roles refuse — the blindness is symmetric.
+            var coverageGap = _adapter.MainMemoryCoverageGap();
+            if (coverageGap != null)
+            {
+                ConnLog(coverageGap, Color.Firebrick);
+                SetBusy(false); return;
+            }
+
             _isHost = _hostRadio.Checked;
             int portCount = _adapter.PortCount; // controller ports the core exposes (N64 = 4, Genesis = 2…)
             if (_hostRadio.Checked && portCount < 2)

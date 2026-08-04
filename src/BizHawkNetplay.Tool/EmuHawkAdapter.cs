@@ -664,6 +664,34 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         catch { return null; }
     }
 
+    /// <summary>
+    /// Why the desync checksum cannot see this core's whole machine, or null when it can.
+    ///
+    /// Non-null only on the link cores, where <c>MainMemory</c> is one emulated Game Boy's RAM and
+    /// the others are never hashed — see <see cref="MainMemoryCoverage"/> for what that costs a
+    /// 3-4 player session. The session refuses rather than running with detection blind to most of
+    /// the state it is meant to be guarding.
+    /// </summary>
+    public string? MainMemoryCoverageGap()
+    {
+        try
+        {
+            var domain = MainMemoryDomain();
+            var domains = _memoryDomains;
+            if (domain == null || domains == null) return null;
+            var names = new List<string>();
+            foreach (var d in domains) names.Add(d.Name);
+            if (!MainMemoryCoverage.IsSingleMachineSlice(domain.Name, names)) return null;
+            var siblings = MainMemoryCoverage.SiblingMachines(domain.Name, names);
+            return $"this core emulates more than one machine, and the desync checksum can only " +
+                   $"read '{domain.Name}' — {string.Join(", ", siblings)} would never be checked. " +
+                   "A divergence confined to another player's machine would be invisible: every " +
+                   "checksum would agree while the session was already broken. Netplay refuses " +
+                   "rather than run with detection blind to most of the state it is guarding.";
+        }
+        catch { return null; } // a probe that cannot answer must not be the thing that refuses
+    }
+
     /// <summary>Main memory as a raw domain, resolved once. Null if the service isn't offered.</summary>
     private MemoryDomain? MainMemoryDomain()
     {

@@ -55,6 +55,17 @@ public sealed partial class NetplayToolForm
             if (!_adapter.HasBindings)
                 Log($"WARNING: input may not register — {_adapter.BindingDiagnostic}");
 
+            // Same refusal as the ordinary start path: a core the checksum cannot fully see is not
+            // one to netplay, whichever transport is carrying it.
+            var coverageGap = _adapter.MainMemoryCoverageGap();
+            if (coverageGap != null)
+            {
+                _punchStatus.Text = "this core emulates several machines — see the log.";
+                _punchStatus.ForeColor = Color.Firebrick;
+                ConnLog(coverageGap, Color.Firebrick);
+                return;
+            }
+
             _isHost = false;
             int players = _adapter.PortCount;
             if (players < 2)
