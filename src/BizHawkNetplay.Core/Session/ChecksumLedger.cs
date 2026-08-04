@@ -83,6 +83,14 @@ public sealed class ChecksumLedger
                 if (!haveFirst) { first = report; haveFirst = true; }
                 else if (report != first) { outcome = ChecksumOutcome.Mismatch; break; }
             }
+            // Keep WHO reported WHAT on a mismatch. Reducing to a bare verdict threw away the one
+            // fact that says whether the host is the majority or the outlier — and the recovery
+            // that follows overwrites everyone with the host's state either way. Recording it
+            // does not change that policy; it makes the case where the policy is wrong visible
+            // instead of silent. See LastMismatch.
+            LastMismatch = outcome == ChecksumOutcome.Mismatch
+                ? DesyncPartition.FromReports(frame, reports)
+                : null;
             frames.Remove(frame);
         }
 
@@ -103,10 +111,18 @@ public sealed class ChecksumLedger
         return outcome;
     }
 
+    /// <summary>Who reported what at the most recent mismatch, or null. Read by the caller
+    /// immediately after a <see cref="ChecksumOutcome.Mismatch"/>, under the same lock.</summary>
+    public DesyncPartition? LastMismatch { get; private set; }
+
     /// <summary>Frames still awaiting reports for a generation (diagnostics/tests).</summary>
     public int OpenFrames(SessionGeneration generation) =>
         _byGeneration.TryGetValue(generation, out var frames) ? frames.Count : 0;
 
     /// <summary>Forget everything (session start, resync rebuild, teardown).</summary>
-    public void Clear() => _byGeneration.Clear();
+    public void Clear()
+    {
+        _byGeneration.Clear();
+        LastMismatch = null;
+    }
 }

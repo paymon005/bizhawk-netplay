@@ -18,6 +18,7 @@ public sealed partial class NetplayToolForm
     private void RecordChecksum(int attempt, SessionGeneration generation, int sourcePort, int frame, uint hash)
     {
         ChecksumOutcome outcome;
+        DesyncPartition? partition;
         lock (_hashLock)
         {
             if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive || !_isHost
@@ -26,6 +27,7 @@ public sealed partial class NetplayToolForm
             // pending forever the moment someone left for good.
             outcome = _checksums.Record(generation, sourcePort, frame, hash, _playerCount,
                 _playerCount - _vacatedCount);
+            partition = _checksums.LastMismatch; // read under the lock that produced it
         }
         if (outcome == ChecksumOutcome.Pending) return;
         if (outcome == ChecksumOutcome.Mismatch)
@@ -48,7 +50,7 @@ public sealed partial class NetplayToolForm
             BeginInvokeUi(() =>
             {
                 if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
-                    OnHostDesync(frame);
+                    OnHostDesync(frame, partition);
             });
             return;
         }
@@ -179,11 +181,28 @@ public sealed partial class NetplayToolForm
                 Color.DarkGreen);
     }
 
-    private void OnHostDesync(int frame)
+    private void OnHostDesync(int frame, DesyncPartition? partition = null)
     {
         if (_phase.IsRebuilding) return;
         if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // just resynced; give it time
-        Log($"DESYNC at frame {frame} — peers disagree");
+        Log(partition == null
+            ? $"DESYNC at frame {frame} — peers disagree"
+            : $"DESYNC at frame {frame} — {partition.Describe()}");
+
+        // Recovery is about to overwrite every peer with THIS machine's state. When this machine
+        // is the outlier that is the wrong state, and it is worth saying so out loud rather than
+        // letting a log show three agreeing players quietly adopting one disagreeing one. Choosing
+        // a different authority needs a majority-reconstruction protocol (a wire change); naming
+        // the case does not, and until then the player can act on it — the usual causes are local
+        // and theirs to clear.
+        if (partition is { HostIsOutvoted: true })
+            ConnLog($"this machine is the ONLY one reporting its checksum — " +
+                    $"{partition.HostGroupSize} of {partition.ReportCount} players agree with each " +
+                    "other and not with the host. The resync about to run makes everyone adopt " +
+                    "THIS machine's state, which on this evidence is the wrong one. Suspect " +
+                    "something local here: a Lua script, a cheat, a savestate load, or a core " +
+                    "setting that differs. If it repeats, host from another machine.",
+                Color.Firebrick);
         // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
         // the emulation drifting — a real drift would sync fine for a while first. It means the two
         // machines are comparing memory that was never going to match. On N64 the usual cause is
