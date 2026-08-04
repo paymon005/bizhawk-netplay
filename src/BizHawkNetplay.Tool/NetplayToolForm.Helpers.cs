@@ -15,6 +15,10 @@ public sealed partial class NetplayToolForm
     // --- State used only by this file (everything shared stays in NetplayToolForm.cs) ---
     private Config? _config;
     private bool _hostOwnershipHeld;
+
+    /// <summary>Why ownership could not be taken, or null. Set by a failed acquisition, which has
+    /// already undone its own partial work; the caller refuses the session and reports this.</summary>
+    private string? OwnershipRefusal { get; set; }
     private int _logLines;      // lines currently in _log, tracked so trimming needn't split its text
     private bool _prevAcceptBackgroundInput;
     private bool _prevAcceptBackgroundInputControllerOnly;
@@ -64,15 +68,41 @@ public sealed partial class NetplayToolForm
                 // times on the way in. Re-running would snapshot the values we ourselves just wrote,
                 // and teardown would then "restore" the user's settings to ours.
                 if (_hostOwnershipHeld) return;
-                _hostOwnershipHeld = true;
 
-                // Taken first, and independent of everything below, because this is the guard that
-                // actually stops EmuHawk stepping the core. Pause cannot: advancing a paused core is
-                // exactly what the Frame Advance hotkey is for. Failing to reach the config is no
-                // reason to skip it — which is what the earlier ordering did.
-                try { _prevBlockFrameAdvance = MainForm.BlockFrameAdvance; MainForm.BlockFrameAdvance = true; }
+                // Ownership is claimed only once the two guards that DEFINE it are proven, and the
+                // flag is set last. It used to be set first, with each guard logging and carrying
+                // on if it failed — so a session could run believing it owned a timeline whose
+                // frame advance was never actually blocked (EmuHawk's own loop free to step an
+                // unsynchronized frame through its ordinary controller chain) or whose state-load
+                // hooks were never installed (a Quick Load neither refused nor observed). Both are
+                // silent desyncs wearing the costume of a working session. Failing closed here
+                // costs a refused session; failing open cost a session that looked fine.
+                bool blockedFrameAdvance = false;
+                try
+                {
+                    _prevBlockFrameAdvance = MainForm.BlockFrameAdvance;
+                    MainForm.BlockFrameAdvance = true;
+                    blockedFrameAdvance = MainForm.BlockFrameAdvance;   // read back, never assumed
+                }
                 catch (Exception ex) { Log("(note) could not block EmuHawk's frame advance: " + ex.Message); }
-                SubscribeHostCommandEvents(); // Quick Load refused, any other load ends the session
+                if (!blockedFrameAdvance)
+                {
+                    try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
+                    OwnershipRefusal = "EmuHawk's own frame advance could not be blocked, so its run " +
+                        "loop could step a frame this session never sent to anyone — a silent desync. " +
+                        "Netplay refuses rather than run without that guard.";
+                    return;
+                }
+
+                if (!SubscribeHostCommandEvents()) // Quick Load refused, any other load ends the session
+                {
+                    try { MainForm.BlockFrameAdvance = _prevBlockFrameAdvance; } catch { }
+                    OwnershipRefusal = "the savestate hooks could not be installed, so a state load " +
+                        "would be neither refused nor noticed — every peer would carry on from a " +
+                        "state this machine no longer has. Netplay refuses rather than run blind to it.";
+                    return;
+                }
+                _hostOwnershipHeld = true;
 
                 // FormBase.Config is the supported route (ToolManager sets it before the form is
                 // shown); the forbidden reference stays as a fallback that should never be needed.
@@ -230,7 +260,9 @@ public sealed partial class NetplayToolForm
     /// reason it is: that would make every session end leave the emulator frozen. Idempotent for the
     /// same reason, since a session pauses more than once on the way in.
     /// </summary>
-    private void PauseForSession()
+    /// <returns>False when ownership could not be taken — see <see cref="OwnershipRefusal"/>. The
+    /// caller must abandon the session; nothing has been paused and nothing acquired.</returns>
+    private bool PauseForSession()
     {
         if (!_pausedByUs)
         {
@@ -243,9 +275,18 @@ public sealed partial class NetplayToolForm
             // the baseline the peers agreed on, and the post-GO drift check cannot see it because
             // _startEmuFrame is only sampled once the session begins. The host never re-imports what
             // it exported, so on its side that drift is a desync at frame 0.
+            OwnershipRefusal = null;
             ApplySessionHostOwnership(true);
+            if (OwnershipRefusal != null)
+            {
+                // Acquisition already undid its own partial work; give back the pause flag too, so
+                // the refused attempt leaves the emulator exactly as it found it.
+                _pausedByUs = false;
+                return false;
+            }
         }
         APIs.EmuClient.Pause();
+        return true;
     }
 
     /// <summary>Undo <see cref="PauseForSession"/>, leaving a deliberately-paused emulator paused.</summary>

@@ -150,7 +150,11 @@ public sealed partial class NetplayToolForm : IControlMainform
     ///
     /// The <c>-=</c> before each <c>+=</c> makes it idempotent regardless.
     /// </summary>
-    private void SubscribeHostCommandEvents()
+    /// <returns>False when the hooks could not be installed. The caller refuses the session: a
+    /// state load that is neither refused nor observed leaves every peer continuing from a state
+    /// this machine no longer has, and the frame-drift check cannot see a load that landed on the
+    /// frame we were already standing on.</returns>
+    private bool SubscribeHostCommandEvents()
     {
         try
         {
@@ -159,8 +163,13 @@ public sealed partial class NetplayToolForm : IControlMainform
             client.BeforeQuickLoad += OnBeforeQuickLoad;
             client.StateLoaded -= OnStateLoaded;
             client.StateLoaded += OnStateLoaded;
+            return true;
         }
-        catch (Exception ex) { Log("(note) could not hook savestate events: " + ex.Message); }
+        catch (Exception ex)
+        {
+            Log("(note) could not hook savestate events: " + ex.Message);
+            return false;
+        }
     }
 
     private void UnsubscribeHostCommandEvents()

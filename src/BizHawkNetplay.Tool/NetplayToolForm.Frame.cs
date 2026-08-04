@@ -397,6 +397,11 @@ public sealed partial class NetplayToolForm
                     _adapter?.PumpAudio();
                 }
 
+                // The pre-frame half of EmuHawk's own input bookkeeping — the two clears it
+                // performs before stepping (MainForm.cs:2945-2946). Before the capture, as
+                // upstream does it: a one-frame override cleared after the capture would be read
+                // by the very capture it was meant to have expired for.
+                _adapter!.AdvanceHostInputBookkeeping(beforeFrame: true);
                 driver.CaptureLocalInput(); // capture local pad (paused-safe, via IInputApi) + send
                 // Collection counts either side of the frame decision. Two field reads per
                 // generation, no allocation — see the gcGate/gcTick remarks in the slow-tick line
@@ -471,10 +476,13 @@ public sealed partial class NetplayToolForm
                     coreMs += frameCoreMs;
                     _pacing.AddFrame(frameCoreMs, rendered: !anotherFrameDue);
                     driver.CompleteFrame();
-                    // EmuHawk ticks these once per frame inside the block our BlockFrameAdvance
-                    // suppresses, so during a session nothing advances them: sticky autofire freezes
-                    // on one pattern value and a Virtual Pad click never clears. Upstream of what we
-                    // capture, so this restores two features without changing what the wire carries.
+                    // ...and the post-frame half: the two counters upstream advances after the step
+                    // (MainForm.cs:3038-3043), autofire phase gated on the lag frame exactly as it
+                    // gates it. EmuHawk ticks all four inside the block our BlockFrameAdvance
+                    // suppresses, so during a session nothing advances them — sticky autofire
+                    // freezes on one pattern value, a Virtual Pad click never clears, and a
+                    // one-frame override never expires. Upstream of what we capture, so this
+                    // restores features without changing what the wire carries.
                     _adapter!.AdvanceHostInputBookkeeping();
                     steppedThisTick = true;
                     framesThisTick++;

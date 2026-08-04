@@ -317,9 +317,11 @@ public sealed partial class NetplayToolForm
         // Ask once, so the answer is in the log rather than discovered as "my autofire stopped".
         _adapter.AdvanceHostInputBookkeeping();
         if (!_adapter.HostInputBookkeepingAvailable)
-            Log("(note) could not reach EmuHawk's per-frame input bookkeeping — sticky autofire and " +
-                "Virtual Pad clicks will not advance during this session. Ordinary controller input " +
-                "is unaffected.");
+            Log("(note) could not reach EmuHawk's per-frame input bookkeeping — sticky autofire, " +
+                "Virtual Pad clicks and one-frame button overrides will not advance during this " +
+                "session. Ordinary controller input is unaffected.");
+        else if (_adapter.HostInputBookkeepingNote != null)
+            Log("(note) " + _adapter.HostInputBookkeepingNote);
 
         // Render resolution isn't a sync setting, so nothing else in the session will ever mention
         // it — and on N64 it is the single most likely reason two peers disagree. Put it in the log

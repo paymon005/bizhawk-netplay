@@ -120,37 +120,73 @@ internal sealed partial class EmuHawkAdapter
     private object? _stickyAutofire;
     private MethodInfo? _clickyFrameTick;
     private object? _clickyVirtualPad;
+    // The two the first pass missed. BizHawk ticks four things per frame, not two — see
+    // AdvanceHostInputBookkeeping.
+    private MethodInfo? _overrideFrameTick;
+    private object? _buttonOverride;
+    private MethodInfo? _autoFireIncrementStarts;
+    private object? _autoFire;
     private bool _hostInputBookkeepingResolved;
 
     /// <summary>Whether EmuHawk's own per-frame input bookkeeping could be reached. False means
     /// <see cref="AdvanceHostInputBookkeeping"/> is doing nothing and the caller should say so.</summary>
     public bool HostInputBookkeepingAvailable { get; private set; }
 
+    /// <summary>Set when only PART of that bookkeeping resolved — the session still runs, but one
+    /// of the features silently will not, which is worth a line rather than a mystery.</summary>
+    public string? HostInputBookkeepingNote { get; private set; }
+
     /// <summary>
-    /// Advance the two pieces of host-side input state that MainForm normally ticks once per frame.
+    /// Advance the host-side input state MainForm normally ticks once per frame.
     ///
-    /// Both live inside the <c>BlockFrameAdvance</c> gate, so during a session neither runs — and
-    /// both are stateful. <c>StickyAutofireController.IncrementLoops</c> is the only thing that
-    /// advances an autofire pattern, and <c>IsPressed</c> merely peeks, so a sticky-autofire button
-    /// reads whatever value it held when the session began, forever. <c>ClickyVirtualPadController
-    /// .FrameTick</c> is a Clear(), so a Virtual Pad click sticks for the rest of the session —
-    /// which looks exactly like a desync from the chair.
+    /// All of it lives inside the <c>BlockFrameAdvance</c> gate, so during a session none of it
+    /// runs — and all of it is stateful. BizHawk ticks FOUR things, in two groups
+    /// (<c>MainForm.cs:2945-2946</c> before the core step, <c>3038-3043</c> after it):
     ///
-    /// Determinism is unaffected either way: both sit upstream of the controller we read, so their
-    /// resolved value is captured and shipped to peers like any other input. This restores two
-    /// features, it does not change what the wire carries.
+    /// <list type="bullet">
+    /// <item><c>ClickyVirtualPadController.FrameTick</c> — a Clear(), so a Virtual Pad click
+    /// sticks for the rest of the session, which looks exactly like a desync from the chair.</item>
+    /// <item><c>ButtonOverrideAdapter.FrameTick</c> — also a clear, of the one-frame button and
+    /// axis overrides. An override standing when the session took ownership persisted
+    /// indefinitely: a control held down by nobody, for the whole session.</item>
+    /// <item><c>AutoFireController.IncrementStarts</c> — advances ordinary autofire phase, and
+    /// only on a lag frame with <c>Config.AutofireLagFrames</c> set, which is the condition
+    /// upstream applies.</item>
+    /// <item><c>StickyAutofireController.IncrementLoops</c> — the only thing that advances a
+    /// sticky-autofire pattern; <c>IsPressed</c> merely peeks, so the button read whatever value
+    /// it held when the session began, forever.</item>
+    /// </list>
+    ///
+    /// The first pass restored only two of the four. The order and the lag-frame gate are copied
+    /// from upstream rather than invented: phase that advances on the wrong frames is its own
+    /// desync-shaped bug, and the two clears belong BEFORE the step while the two counters belong
+    /// after — hence <paramref name="beforeFrame"/>.
+    ///
+    /// Determinism is unaffected either way: all of it sits upstream of the controller we read, so
+    /// the resolved value is captured and shipped to peers like any other input. This restores
+    /// features; it does not change what the wire carries.
     /// </summary>
-    public void AdvanceHostInputBookkeeping()
+    public void AdvanceHostInputBookkeeping(bool beforeFrame = false)
     {
         if (!_hostInputBookkeepingResolved) ResolveHostInputBookkeeping();
         if (!HostInputBookkeepingAvailable) return;
         try
         {
+            if (beforeFrame)
+            {
+                _clickyFrameTick!.Invoke(_clickyVirtualPad, null);
+                _overrideFrameTick?.Invoke(_buttonOverride, null);
+                return;
+            }
+
             bool lagged = false;
             try { lagged = _emulator.CanPollInput() && _emulator.AsInputPollable().IsLagFrame; }
             catch { /* a core without lag polling simply never reports one */ }
+            // Upstream gates ordinary autofire on the lag frame AND the config flag; sticky
+            // autofire takes the lag frame as an argument and decides for itself.
+            if (lagged && (_hostConfig?.AutofireLagFrames ?? false))
+                _autoFireIncrementStarts?.Invoke(_autoFire, null);
             _stickyIncrementLoops!.Invoke(_stickyAutofire, new object[] { lagged });
-            _clickyFrameTick!.Invoke(_clickyVirtualPad, null);
         }
         catch
         {
@@ -170,12 +206,28 @@ internal sealed partial class EmuHawkAdapter
             var type = _inputManager.GetType();
             _stickyAutofire = type.GetProperty("StickyAutofireController")?.GetValue(_inputManager);
             _clickyVirtualPad = type.GetProperty("ClickyVirtualPadController")?.GetValue(_inputManager);
+            _buttonOverride = type.GetProperty("ButtonOverrideAdapter")?.GetValue(_inputManager);
+            _autoFire = type.GetProperty("AutoFireController")?.GetValue(_inputManager);
             _stickyIncrementLoops = _stickyAutofire?.GetType()
                 .GetMethod("IncrementLoops", new[] { typeof(bool) });
             _clickyFrameTick = _clickyVirtualPad?.GetType()
                 .GetMethod("FrameTick", Type.EmptyTypes);
+            _overrideFrameTick = _buttonOverride?.GetType()
+                .GetMethod("FrameTick", Type.EmptyTypes);
+            _autoFireIncrementStarts = _autoFire?.GetType()
+                .GetMethod("IncrementStarts", Type.EmptyTypes);
+            // The two original members gate availability; the two added ones are invoked when
+            // present and skipped when not, so a BizHawk that renamed one costs its feature rather
+            // than the other three.
             HostInputBookkeepingAvailable =
                 _stickyIncrementLoops != null && _clickyFrameTick != null;
+            if (_overrideFrameTick == null || _autoFireIncrementStarts == null)
+                HostInputBookkeepingNote =
+                    "some of EmuHawk's per-frame input bookkeeping could not be reached (" +
+                    (_overrideFrameTick == null ? "one-frame button overrides" : "") +
+                    (_overrideFrameTick == null && _autoFireIncrementStarts == null ? ", " : "") +
+                    (_autoFireIncrementStarts == null ? "autofire phase" : "") +
+                    ") — those may stick or freeze during a session.";
         }
         catch { HostInputBookkeepingAvailable = false; }
     }

@@ -74,7 +74,16 @@ public sealed partial class NetplayToolForm
                 return;
             }
 
-            PauseForSession(); // freeze now so the resume frame is fixed before the state arrives
+            // Freeze now so the resume frame is fixed before the state arrives — and refuse if the
+            // timeline guards could not be taken, on the same terms as the ordinary start path.
+            if (!PauseForSession())
+            {
+                _punchStatus.Text = "could not take ownership of the emulator — see the log.";
+                _punchStatus.ForeColor = Color.Firebrick;
+                ConnLog(OwnershipRefusal ?? "could not take ownership of the emulator timeline.",
+                    Color.Firebrick);
+                return;
+            }
 
             _netcodeChoice = (NetcodeChoice)_netcodeCombo.SelectedIndex;
             _punchPrefs = LocalPreferences(isHost: false); // punching is always the joining side
