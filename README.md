@@ -55,9 +55,9 @@ same files.
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
 friends must update to the same release.
 
-**v0.30.0 uses protocol 19**, a break from v0.29.0 — the desync checksum reads different bytes, so a
-mixed pair would report a desync that is not there. See [CHANGELOG.md](CHANGELOG.md) for the full
-table of which release changed what, and which ones mix freely.
+**v0.31.0 uses protocol 20**, a break from v0.30.0 — control frames are now authenticated and
+3-4 player sessions survive a player leaving, neither of which a v19 peer understands. See
+[CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what.
 
 A version mismatch is refused at the handshake with a clear message. That is the intended behaviour,
 not a fault — the alternative is a session that appears to work and silently loses input.

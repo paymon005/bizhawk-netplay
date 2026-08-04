@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.30.0 | **19** | The desync checksum changed which bytes it reads, twice over. A memory domain that wraps a raw pointer in per-byte delegates — N64's RDRAM, and the reason its checksum used to sample a quarter of RAM by word — is now copied and hashed whole, so a v18 peer hashes a quarter of what this one hashes all of. And the span the video hardware is scanning out is skipped on every path, which is what lets N64 run above native resolution without disagreeing at every checksum. Either alone would make a mixed pair report a desync that is not there. |
+| v0.31.0 | **20** | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
+| v0.30.0 | 19 | The desync checksum changed which bytes it reads, twice over. A memory domain that wraps a raw pointer in per-byte delegates — N64's RDRAM, and the reason its checksum used to sample a quarter of RAM by word — is now copied and hashed whole, so a v18 peer hashes a quarter of what this one hashes all of. And the span the video hardware is scanning out is skipped on every path, which is what lets N64 run above native resolution without disagreeing at every checksum. Either alone would make a mixed pair report a desync that is not there. |
 | v0.29.0 | 18 | Three wire contracts moved at once. The mesh report names its silent edges, so the host relays exactly the broken joiner-to-joiner pairs instead of everything; port 0's input payload carries the console controls (Reset/Select/Pause/FDS, appended after the host pad's own); and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a different slice of the same RAM. Any one of the three would desync or misparse a mixed pair. |
 | v0.28.0 – v0.28.2 | 17 | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
 | v0.27.0 | 16 | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
@@ -25,6 +26,38 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.31.0 — protocol 20
+
+**Protocol 20 — everyone must update.** The 3-4 player robustness release: the three ways a
+multiplayer session died that a 2-player session never would are gone.
+
+**A session outlives its players.** A graceful leave used to end a 4-player session for everyone,
+while an ungraceful drop politely held the seat for a minute — inverted severity. Now a joiner
+leaving cleanly vacates its seat: the survivors are rebuilt onto one baseline with the seat empty
+from frame 0 (the same authoritative-rebuild flow a settings change uses, spending no desync
+budget) and play continues. The expired rejoin wait takes the same exit instead of killing a
+session it held open for 60 seconds. A session now ends only when the host leaves, at 2 players,
+or when a leave lands mid-recovery. The rule everything hangs off: a vacate applies only to a
+fresh timeline — mid-frame it is a desync by construction, since peers hear about the leave at
+different frames and the one player who could reconcile the difference is gone.
+
+**A leg that dies mid-session gets relayed instead of ending the session.** The lobby has always
+relayed joiner-to-joiner legs that never opened; a leg dying mid-game still killed the session at
+the 8-second watchdog, with the rescue machinery sitting right there. Now the starving joiner
+reports the silent seat at 3 seconds (InputOutage), and the host — after checking it has a proven
+two-way path to both ends — carries the pair from then on. Installed once, never flapped: input is
+keyed by (port, frame), so a revived direct leg makes the relay redundant, never harmful. The
+watchdog stays armed for the one leg no relay can reach (the host's own). Decision rule in Core
+(`RelayFailover`), fully unit-tested.
+
+**Control frames are authenticated (KI-13's network half).** The password proofs already derived a
+32-byte key and threw it away; it is now kept, and every frame after AUTH carries a truncated
+HMAC-SHA256 bound to its direction and its position in the stream. An on-path party without the
+password can no longer inject a Resync, tamper, replay, reorder or reflect — each fails loudly
+into the ordinary link-loss path. With an empty password the key derives from public nonces, so
+integrity then holds only against off-path injection; frames are authenticated, not encrypted,
+either way. The local half of KI-13 (a savestate is a trusted format upstream) is unchanged.
 
 ### v0.30.0 — protocol 19
 

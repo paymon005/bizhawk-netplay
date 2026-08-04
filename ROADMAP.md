@@ -23,10 +23,11 @@ difference between "works for us" and "works".
 
 ## Planned
 
-- **Live relay failover.** The host's relay for a failed joiner↔joiner leg is decided once, at session
-  start. A leg that dies mid-game is not failed over to it. Start-of-session is deterministic, shows
-  up in the log and cannot oscillate under packet loss; live failover is a harder problem and was
-  deliberately left alone rather than half-done.
+- *(Live relay failover shipped in v0.31.0: a joiner starving on a dead leg reports it at 3s and
+  the host carries the pair, installed once and never flapped — the 8s watchdog stays as the
+  backstop for the host's own legs, which no relay can cover. The same release made sessions
+  outlive their players: a graceful leave or an expired rejoin wait vacates the seat instead of
+  ending the session.)*
 
 ## Considered and deferred
 

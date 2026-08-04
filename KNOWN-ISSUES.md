@@ -229,6 +229,16 @@ drops it. A MAC over control frames therefore needs no new exchange, no second K
 extra handshake round trip: it needs the key kept and the frames framed. The cost is a protocol
 bump, not a design.
 
+**The network half is FIXED in v0.31.0 (protocol 20).** The key is kept, and every control frame
+after AUTH carries a truncated HMAC-SHA256 bound to its direction and stream position — injection,
+tampering, replay, reordering and reflection each fail loudly into the ordinary link-loss path. So
+"someone on the path can send a `Resync`" is no longer true of any session with a password; with
+an EMPTY password the key derives from the public nonces, so integrity holds only against off-path
+(blind) injection, and joining strangers without a password remains exactly as trusting as it
+sounds. What remains open is the upstream half, which no wire change here can touch: a joiner
+still imports its host's savestate, and a savestate is a trusted-input format all the way down
+into the cores. Join people you know, or set a password.
+
 **KI-14 (open) — the framebuffer exclusion skips the wrong buffer, and is expected to be
 insufficient on its own.** Protocol 19 excludes the span `VI_ORIGIN` names, on the reasoning that
 this is where the GPU-produced bytes desyncing every checksum above native land. The exclusion
