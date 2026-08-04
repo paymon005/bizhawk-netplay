@@ -118,6 +118,49 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
+    /// Host: a joiner says a mesh leg went dead mid-session. If both of this host's own legs to
+    /// the pair are proven, carry the pair — the same rescue the lobby installs for a leg that
+    /// never opened, arriving live instead. The verdict is Core's (<see cref="RelayFailover"/>);
+    /// this supplies the transport measurements and executes it. A pair, once installed, stays
+    /// for the session (anti-oscillation — see the policy's remarks), and the 8-second watchdog
+    /// remains the backstop for the legs no relay can reach.
+    /// </summary>
+    private void OnInputOutage(PeerLink link, SessionGeneration generation, int silentPort)
+    {
+        var mesh = _mesh;
+        var silentPeer = _peers.Find(p => p.RemotePort == silentPort);
+        var verdict = RelayFailover.Judge(
+            _isHost, _phase.IsActive, generation == CurrentGeneration,
+            link.RemotePort, silentPort, _playerCount,
+            _vacatedPorts, _relayPairs,
+            reporterLegAlive: mesh != null && LinkHasLiveMeshPath(mesh, link),
+            silentLegAlive: mesh != null && silentPeer != null && LinkHasLiveMeshPath(mesh, silentPeer));
+
+        switch (verdict)
+        {
+            case RelayFailoverVerdict.Install:
+                _relayPairs.Add(Pair(link.RemotePort, silentPort));
+                RefreshRelayRoutes();
+                double routeMs = RelayedRouteRttMs(mesh);
+                ConnLog($"the direct path between {link.Label} and P{silentPort + 1} died " +
+                        $"mid-session — relaying that leg through this host from now on" +
+                        (routeMs > 0 ? $" (~{routeMs:F0}ms round trip)" : "") +
+                        ". If stalls appear, raise the input delay to cover the relayed route.",
+                    Color.DarkOrange);
+                break;
+            case RelayFailoverVerdict.NoHostLeg:
+                // Nothing to rescue with: a relay to that pair runs over the very leg that is
+                // down. Say so once; the watchdog owns the outcome.
+                ConnLog($"{link.Label} reports no input from P{silentPort + 1}, but this host has " +
+                        "no proven UDP path to carry a relay over — if the leg does not recover, " +
+                        "the session will end on the input watchdog.", Color.Firebrick);
+                break;
+            // AlreadyCarried is the other end of a leg failed over moments ago — expected, quiet.
+            // Refuse is a stale or malformed report — also quiet.
+        }
+    }
+
+    /// <summary>
     /// A peer's control link dropped unexpectedly (not a clean Bye). The host holds the session
     /// open and waits for it to rejoin into the same port; a joiner that lost the host just ends
     /// (the host is the hub — the user rejoins with the Join button). One drop at a time.

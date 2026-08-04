@@ -368,6 +368,7 @@ public sealed partial class NetplayToolForm
         _lastStallLogMs = double.NegativeInfinity;
         _lastUdpRepunchMs = double.NegativeInfinity;
         _udpWarningActive = false;
+        _outageReportedPorts.Clear();
         _pacingRebases = 0;
         _fpsClock.Restart(); _fpsCount = 0; _actualFps = -1;
         _pacing.Reset(); _lastPacing = default;

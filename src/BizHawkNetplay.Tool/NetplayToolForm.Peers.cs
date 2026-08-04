@@ -251,6 +251,13 @@ public sealed partial class NetplayToolForm
                         && generation == CurrentGeneration)
                         BeginInvokePeer(link, () => ResumeResyncAsJoiner(generation));
                 }
+                else if (type == ControlMessageType.InputOutage)
+                {
+                    // Joiner -> host only: a mesh leg died and its victim is asking for a relay.
+                    if (_isHost && ControlMessageCodec.TryDecodeInputOutage(body,
+                            out var generation, out int silentPort))
+                        BeginInvokePeer(link, () => OnInputOutage(link, generation, silentPort));
+                }
                 else if (type == ControlMessageType.SeatVacated)
                 {
                     // Host -> joiner only: a seat is permanently empty; the rebuild follows.

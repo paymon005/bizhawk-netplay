@@ -260,11 +260,27 @@ public static class ControlMessageCodec
     }
 
     public const int SeatVacatedSize = 13;
+    public const int InputOutageSize = 13;
 
     /// <summary>A seat that is now permanently empty: the generation the decision was made at
     /// (so a stale copy can be retired) and the controller port. See
     /// <see cref="ControlMessageType.SeatVacated"/>.</summary>
-    public static byte[] EncodeSeatVacated(SessionGeneration generation, int port)
+    public static byte[] EncodeSeatVacated(SessionGeneration generation, int port) =>
+        EncodeGenerationAndPort(generation, port);
+
+    public static bool TryDecodeSeatVacated(byte[] body, out SessionGeneration generation, out int port) =>
+        TryDecodeGenerationAndPort(body, out generation, out port);
+
+    /// <summary>A joiner telling the host no UDP input is reaching it from a seat — the trigger
+    /// for live relay failover. See <see cref="ControlMessageType.InputOutage"/> and
+    /// <see cref="RelayFailover"/>.</summary>
+    public static byte[] EncodeInputOutage(SessionGeneration generation, int port) =>
+        EncodeGenerationAndPort(generation, port);
+
+    public static bool TryDecodeInputOutage(byte[] body, out SessionGeneration generation, out int port) =>
+        TryDecodeGenerationAndPort(body, out generation, out port);
+
+    private static byte[] EncodeGenerationAndPort(SessionGeneration generation, int port)
     {
         if (port < 0 || port >= HandshakeCodec.MaxPlayers)
             throw new ArgumentOutOfRangeException(nameof(port));
@@ -274,7 +290,7 @@ public static class ControlMessageCodec
         return body;
     }
 
-    public static bool TryDecodeSeatVacated(byte[] body, out SessionGeneration generation, out int port)
+    private static bool TryDecodeGenerationAndPort(byte[] body, out SessionGeneration generation, out int port)
     {
         generation = default;
         port = 0;

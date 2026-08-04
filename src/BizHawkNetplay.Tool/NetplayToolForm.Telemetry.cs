@@ -102,6 +102,10 @@ public sealed partial class NetplayToolForm
             return _frameAdvantage.Consume(out known, out revision, out fresh);
     }
 
+    /// <summary>Silent legs already reported to the host this outage, so the reliable channel is
+    /// not asked to carry the same fact twice. Cleared when input recovers or a session begins.</summary>
+    private readonly HashSet<int> _outageReportedPorts = new();
+
     private void CheckUdpInputProgress()
     {
         if (_driver == null || _phase.AwaitingRejoin || _phase.IsRebuilding) return;
@@ -123,9 +127,23 @@ public sealed partial class NetplayToolForm
             if (_udpWarningActive)
             {
                 _udpWarningActive = false;
+                _outageReportedPorts.Clear(); // the leg came back; a future outage is a new report
                 Log("UDP input path recovered");
             }
             return;
+        }
+
+        // Live relay failover, joiner side: past the repunch threshold but before the kill, tell
+        // the host which leg is starving us — it is the only party that can carry the pair, and
+        // we are the only party that can see the leg is dead. Decision rule in Core: RelayFailover.
+        if (!_isHost && _peers.Count > 0
+            && RelayFailover.ShouldReport(seconds, port, _outageReportedPorts.Contains(port)))
+        {
+            _outageReportedPorts.Add(port); // the host installs permanently; once is enough
+            QueueControl(_peers[0], ControlMessageType.InputOutage,
+                ControlMessageCodec.EncodeInputOutage(CurrentGeneration, port));
+            Log($"reported the silent leg to the host: no UDP input from P{port + 1} for " +
+                $"{seconds:F1}s — asking for a relay");
         }
 
         double nowMs = _paceClock.Elapsed.TotalMilliseconds;

@@ -41,6 +41,11 @@ public enum ControlMessageType : byte
     // control channel is ordered), so every peer rebuilds with the seat already neutral; the
     // generation is the one current when the vacate was decided, purely to retire stale copies.
     SeatVacated = 23,
+    // Joiner -> host: [generation:12][port:1] — "no UDP input is reaching me from this seat".
+    // The evidence behind live relay failover: the host cannot see a joiner-to-joiner leg die,
+    // and this is the only party that can. The host answers by carrying the named pair over its
+    // own legs, exactly as it would have at session start had the leg never opened.
+    InputOutage = 24,
 }
 
 /// <summary>
