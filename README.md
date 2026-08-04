@@ -55,8 +55,9 @@ same files.
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
 friends must update to the same release.
 
-**v0.24.0 uses protocol 14**, a break from v0.23.0. Releases from v0.21.0 to v0.23.0 share protocol
-13 and mix freely with each other. See [CHANGELOG.md](CHANGELOG.md) for which release changed what.
+**v0.30.0 uses protocol 19**, a break from v0.29.0 — the desync checksum reads different bytes, so a
+mixed pair would report a desync that is not there. See [CHANGELOG.md](CHANGELOG.md) for the full
+table of which release changed what, and which ones mix freely.
 
 A version mismatch is refused at the handshake with a clear message. That is the intended behaviour,
 not a fault — the alternative is a session that appears to work and silently loses input.

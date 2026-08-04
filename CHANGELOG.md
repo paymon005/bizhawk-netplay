@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.29.0 | **18** | Three wire contracts moved at once. The mesh report names its silent edges, so the host relays exactly the broken joiner-to-joiner pairs instead of everything; port 0's input payload carries the console controls (Reset/Select/Pause/FDS, appended after the host pad's own); and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a different slice of the same RAM. Any one of the three would desync or misparse a mixed pair. |
+| v0.30.0 | **19** | The desync checksum changed which bytes it reads, twice over. A memory domain that wraps a raw pointer in per-byte delegates — N64's RDRAM, and the reason its checksum used to sample a quarter of RAM by word — is now copied and hashed whole, so a v18 peer hashes a quarter of what this one hashes all of. And the span the video hardware is scanning out is skipped on every path, which is what lets N64 run above native resolution without disagreeing at every checksum. Either alone would make a mixed pair report a desync that is not there. |
+| v0.29.0 | 18 | Three wire contracts moved at once. The mesh report names its silent edges, so the host relays exactly the broken joiner-to-joiner pairs instead of everything; port 0's input payload carries the console controls (Reset/Select/Pause/FDS, appended after the host pad's own); and the strided checksum's sampling offset is bit-mixed, so a v17 peer hashes a different slice of the same RAM. Any one of the three would desync or misparse a mixed pair. |
 | v0.28.0 – v0.28.2 | 17 | The joiner's opening HELLO is now the mirror of the host's challenge — protocol version, nonce, UDP port and public candidate, nothing else — with its identity following only once the host's password proof has verified. v0.27.0 closed this leak on the host side only, so both directions of the opening sequence have now changed and the two builds disagree about the message shape rather than about a value. |
 | v0.27.0 | 16 | The host's opening HELLO is now a challenge — protocol version and nonce, nothing else — and its identity follows only once the joiner's password proof has verified. A v0.26.0 peer sends its whole identity up front and expects the same back, so the two disagree about the message sequence rather than about a value, which is what the version check catches first. |
 | v0.26.0 | 15 | The desync checksum reads memory differently on some cores: waterbox domains moved from a 1/16 stride sample to the whole domain, and the Hawk cores' byte-array domains are hashed directly. The value crosses the wire, so a mixed pair would report a phantom desync every interval — same rule as v10. |
@@ -24,6 +25,49 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.30.0 — protocol 19
+
+**Protocol 19 — everyone must update.** A v0.29.0 peer and a v0.30.0 peer refuse each other at the
+handshake. Comes out of a review pass over the open findings, the N64 resolution problem and the
+heavy-core hot paths, with BizHawk 2.11.1's own source (commit `bdddf4a`) read alongside to check
+what was being assumed about it.
+
+**The desync checksum is ~3× faster on N64 and covers four times as much.** BizHawk's N64 builds
+every memory domain by asking mupen for a pointer and then wrapping it in per-byte peek/poke
+lambdas that apply the core's `addr ^ 3` swizzle. The pointer is right there in the closure, but
+invisible to a `Data`-property probe — so the checksum had been reading 8MiB of RDRAM one delegate
+call per word, which is why it had to *sample*: ~7ms for a quarter of RAM, once every five seconds,
+on the UI thread. Reaching that pointer puts the domain on the same memcpy the plain native cores
+use: ~2ms for all of it. A hitch removed every checksum interval, and a narrow divergence is now
+caught at the next checksum rather than whenever the sampling rotation happens to land on it.
+
+The pointer is found by shape — exactly one `IntPtr` field plus an integer equal to the domain's
+size — never by the compiler-generated closure name, which a recompile may renumber. Acceptance
+depends only on the domain's type and size, never on what memory contains, because two peers must
+take the same path or they would hash unlike byte sets. The copied block is spot-checked against
+the domain on every hash, and a disagreement drops back to the old path permanently.
+
+**A first move on N64 above native resolution — and an honest one.** The checksum now excludes the
+span the video interface is scanning out, which is where the GPU-produced bytes that desync every
+checksum above native were assumed to land. The machinery is right and tested. The span is not
+expected to be sufficient: `VI_ORIGIN` names the buffer being *scanned out*, while the plugin writes
+back to the one it just *rendered*, which in a double-buffered game is the other one. **Keep running
+native.** See KI-14, which now states this plainly, and KI-15 for the measurement that replaces the
+guess.
+
+**Also in this release.** The wire format lost a second, unused encoder: `EncodeInput` was
+production-dead and the tests were validating it instead of `BeginInputDatagram`, the one that
+actually ships — a header change in the live encoder alone would not have been caught. It is now a
+test helper built *on* the shipping encoder. `CapabilityProbe.SolveMaxDepth` collapsed from four
+overloads to one. The framebuffer arithmetic lives in `Core` (`VideoFramebuffer`) rather than in the
+adapter no test can reach, with eleven tests covering both directions it can be wrong in — a span
+too small leaves GPU bytes in the hash, one too large silently blanks desync detection.
+
+**KI-13 correction.** The finding still holds in full, but the fix is cheaper than it read:
+`SessionAuth.ProofPair` already derives a 32-byte key from the password and both nonces and then
+discards it, so a MAC over control frames needs the key kept and the frames framed — no new
+exchange, no second KDF pass, no extra round trip.
 
 ### v0.29.0 — protocol 18
 
