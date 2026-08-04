@@ -198,6 +198,37 @@ internal sealed partial class EmuHawkAdapter
     }
 
     /// <summary>
+    /// Whether the core is rendering above its native resolution, or null when it exposes no
+    /// resolution to read (every core but N64).
+    ///
+    /// This is the gate on the learned exclusion mask: at native the video write-back bytes
+    /// already agree between machines, so masking there could only ever hide something real. The
+    /// comparison is against the console's own framebuffer size rather than a fixed number,
+    /// because "native" is what the VIDEO PROVIDER says it is.
+    /// </summary>
+    public bool? IsAboveNativeResolution()
+    {
+        try
+        {
+            var adapter = ReadOnlySettings();
+            var settings = adapter.HasSettings ? adapter.GetSettings() : null;
+            if (settings == null) return null;
+            if (MemberValue(settings, "VideoSizeX") is not int x
+                || MemberValue(settings, "VideoSizeY") is not int y) return null;
+
+            var vp = _emulator.ServiceProvider.GetService<IVideoProvider>();
+            // BufferWidth/Height is what the core actually presents at native; N64's own default
+            // is 320x240. Falling back to that rather than to "unknown" keeps the gate closed
+            // (above-native reads as true) instead of failing open into masking.
+            int nativeX = vp?.BufferWidth ?? 320;
+            int nativeY = vp?.BufferHeight ?? 240;
+            if (nativeX <= 0 || nativeY <= 0) { nativeX = 320; nativeY = 240; }
+            return x > nativeX || y > nativeY;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>
     /// Read a public instance member by name, whether it is a property or a field.
     ///
     /// BizHawk's settings objects mix the two freely — N64Settings exposes UseMupenStyleLag as a

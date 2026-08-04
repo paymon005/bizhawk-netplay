@@ -3,6 +3,33 @@ using System.Collections.Generic;
 
 namespace BizHawkNetplay.Core.Session;
 
+/// <summary>
+/// Whether a session is allowed to act on a learned mask at all.
+///
+/// <b>Why this gate exists.</b> Excluding memory from the checksum is only safe while the excluded
+/// bytes are an OUTPUT — something a machine produced for itself that nothing downstream consumes.
+/// That is not guaranteed. Rice's <c>FBRead</c> fires when emulated CPU code reads framebuffer
+/// memory and copies rendered data back into RDRAM, so GPU-produced bytes can become genuinely
+/// game-readable causal state. A startup disagreement proves the bytes are machine-dependent; it
+/// does not prove the game never reads them.
+///
+/// So masking is not a correctness fix, it is a trade: on the many games that never read their
+/// framebuffer it turns an unplayable above-native session into a working one, and on the few that
+/// do it can hide real divergence. A trade like that is the player's to make knowingly, not the
+/// tool's to make silently — hence an explicit opt-in, and hence native resolution never masking
+/// anything no matter what is measured.
+/// </summary>
+public enum MaskPolicy
+{
+    /// <summary>Never exclude. Divergence vectors are still collected and their ranges logged —
+    /// the diagnostic is free and answers "which bytes" for every desync.</summary>
+    DiagnosticOnly,
+
+    /// <summary>Exclude what was measured, because the player opted into above-native play and
+    /// accepted that a game reading its own framebuffer may desync undetected.</summary>
+    ExperimentalExclude,
+}
+
 /// <summary>What the learner concluded once its rounds completed.</summary>
 public enum DivergenceVerdict
 {
@@ -151,4 +178,23 @@ public sealed class DivergenceLearner
     /// aligned word — every peer derives the identical slicing from the identical domain size.</summary>
     public static long BucketSpan(long domainSize, int buckets) =>
         ((domainSize + buckets - 1) / buckets + 3) & ~3L;
+
+    /// <summary>
+    /// Whether a learned mask may actually be applied, given what the session is doing.
+    ///
+    /// Two gates, and both must open. The session must be rendering ABOVE native — at native the
+    /// write-back bytes already agree, so a mask there would exclude memory for no benefit and
+    /// could only ever hide something. And the player must have opted in, because excluding memory
+    /// trades detection for playability on a game that might read its own framebuffer (see
+    /// <see cref="MaskPolicy"/>).
+    ///
+    /// <paramref name="aboveNativeResolution"/> is null when the core exposes no resolution to
+    /// read, which is every core but N64 — those get DiagnosticOnly, since the phenomenon the mask
+    /// exists for is a render-resolution artifact and a mask elsewhere would be masking something
+    /// this reasoning does not cover.
+    /// </summary>
+    public static MaskPolicy ChoosePolicy(bool optedIn, bool? aboveNativeResolution) =>
+        optedIn && aboveNativeResolution == true
+            ? MaskPolicy.ExperimentalExclude
+            : MaskPolicy.DiagnosticOnly;
 }

@@ -141,6 +141,27 @@ public sealed partial class NetplayToolForm
             case DivergenceVerdict.MaskLearned:
             {
                 var mask = learner.MaskBuckets;
+                var ranges = DivergenceLearner.MaskRanges(mask, _adapter?.MainMemorySize ?? 0);
+                string where = DescribeMaskRanges(ranges);
+
+                // Measuring is always free; EXCLUDING is a trade, and the gate decides whether
+                // this session may make it. See MaskPolicy — the short version is that a game
+                // reading its own framebuffer would have real divergence hidden, so masking is
+                // opt-in and never happens at native resolution.
+                var policy = DivergenceLearner.ChoosePolicy(
+                    _aboveNativeCheck.Checked, _adapter?.IsAboveNativeResolution());
+                if (policy == MaskPolicy.DiagnosticOnly)
+                {
+                    ConnLog($"divergence measured: {learner.MaskedShare:P0} of main RAM disagrees " +
+                            $"between peers on otherwise-identical states{where} — video write-back, " +
+                            "not emulation drift. Nothing is being excluded: the checksum still reads " +
+                            "everything, which is the strongest detection and the right default. " +
+                            "Above native this WILL keep reading as a desync — 'Allow above-native " +
+                            "N64' on the Diagnostics tab is the opt-in, and native resolution is the " +
+                            "setting that needs no trade at all.", Color.DarkOrange);
+                    break;
+                }
+
                 int effectiveFrom =
                     (DivergenceLearner.LearnRounds + MaskEffectiveMargin) * _checksumInterval;
                 try { _adapter?.SetLearnedExclusion(mask, effectiveFrom); } catch { }
@@ -148,10 +169,11 @@ public sealed partial class NetplayToolForm
                 foreach (var link in _peers)
                     QueueControl(link, ControlMessageType.ExclusionMask, body);
                 ConnLog($"measured which memory is machine-produced: {learner.MaskedShare:P0} of " +
-                        $"main RAM disagreed between peers on otherwise-identical states — video " +
-                        $"write-back, not a desync. Those ranges are excluded from checksum frame " +
-                        $"{effectiveFrom} on, so the rest of memory is compared honestly and " +
-                        "above-native rendering no longer reads as a desync.", Color.DarkGreen);
+                        $"main RAM{where} disagreed between peers on otherwise-identical states — " +
+                        $"video write-back, not a desync. Excluded from checksum frame " +
+                        $"{effectiveFrom} on (EXPERIMENTAL, you opted in): the rest of memory is " +
+                        "compared honestly, and a game that reads its own framebuffer could now " +
+                        "diverge there without being caught.", Color.DarkOrange);
                 break;
             }
 
@@ -167,18 +189,48 @@ public sealed partial class NetplayToolForm
         }
     }
 
+    /// <summary>The masked ranges as addresses, which is KI-15's whole point: a desync report that
+    /// names WHERE, not merely that two numbers differ. Empty when the size is unknown.</summary>
+    private static string DescribeMaskRanges(List<(long Start, long EndExclusive)> ranges)
+    {
+        if (ranges.Count == 0) return "";
+        var named = new List<string>();
+        for (int i = 0; i < ranges.Count && i < 4; i++)
+            named.Add($"0x{ranges[i].Start:X}-0x{ranges[i].EndExclusive:X}");
+        return " (" + string.Join(", ", named)
+            + (ranges.Count > 4 ? $", and {ranges.Count - 4} more" : "") + ")";
+    }
+
     /// <summary>Joiner: adopt the host's measured exclusion mask (or clear, when all-false).</summary>
     private void OnExclusionMask(SessionGeneration generation, int effectiveFrom, bool[] mask)
     {
         if (!_phase.IsActive || _isHost || generation != CurrentGeneration) return;
-        try { _adapter?.SetLearnedExclusion(mask, effectiveFrom); } catch { return; }
         int set = 0;
         foreach (bool b in mask) if (b) set++;
+
+        // The host only sends a mask when its own gate opened, but this peer applies the mask to
+        // ITS memory — so it checks its own gate too. A joiner at native resolution, or one that
+        // did not opt in, keeps hashing everything: the strongest detection is never taken away
+        // from a machine that did not ask to trade it. The hash folds the mask's identity, so a
+        // peer that declines is loudly incomparable rather than quietly wrong.
+        var policy = DivergenceLearner.ChoosePolicy(
+            _aboveNativeCheck.Checked, _adapter?.IsAboveNativeResolution());
+        if (set > 0 && policy == MaskPolicy.DiagnosticOnly)
+        {
+            ConnLog("the host measured machine-produced memory and is excluding it, but this " +
+                    "machine has not opted in (or is at native resolution), so it keeps checksumming " +
+                    "everything — which will read as a desync against the host. Match the setting " +
+                    "on both machines: either both allow above-native N64, or both run native.",
+                Color.Firebrick);
+            return;
+        }
+
+        try { _adapter?.SetLearnedExclusion(mask, effectiveFrom); } catch { return; }
         if (set > 0)
             ConnLog($"the host measured which memory is machine-produced (video write-back): " +
                     $"{set} of {mask.Length} buckets are excluded from checksum frame " +
-                    $"{effectiveFrom} on. Above-native rendering no longer reads as a desync.",
-                Color.DarkGreen);
+                    $"{effectiveFrom} on (EXPERIMENTAL). A game that reads its own framebuffer " +
+                    "could now diverge there without being caught.", Color.DarkOrange);
     }
 
     private void OnHostDesync(int frame, DesyncPartition? partition = null)

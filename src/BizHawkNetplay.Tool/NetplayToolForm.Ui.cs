@@ -17,6 +17,7 @@ public sealed partial class NetplayToolForm
     private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
     private readonly ToolTip _tips = new(); // owns a native window — disposed with the form
     private CheckBox _unpausedClockCheck = null!;
+    private CheckBox _aboveNativeCheck = null!;
     private CheckBox _verboseCheck = null!;
 
     // ------------------------------------------------------------------ persisted settings
@@ -377,6 +378,25 @@ public sealed partial class NetplayToolForm
             "EmuHawk's own phase-locked frame clock. Watch 'judder' and 'gap' in the pacing line.\r\n" +
             "Read at session start; toggling mid-session does nothing until the next session.");
 
+        // The N64 above-native opt-in. Deliberately a checkbox with a blunt tooltip rather than a
+        // default: excluding memory from the desync checksum trades detection for playability, and
+        // it is only sound while the excluded bytes are never read back by the game. Rice copies
+        // rendered data into RDRAM when emulated code reads framebuffer memory, so on a game that
+        // does read it, a real divergence there would go unseen. That is the player's trade to
+        // make knowingly. Does nothing at native resolution, whatever the box says.
+        _aboveNativeCheck = new CheckBox
+        {
+            Text = "Allow above-native N64 (experimental)", AutoSize = true, Location = new Point(200, 186),
+        };
+        _tips.SetToolTip(_aboveNativeCheck,
+            "Experimental, N64 only, and only above native resolution.\r\n\r\n" +
+            "Above native the video plugin resolves its framebuffer back into console RAM, and those\r\n" +
+            "bytes come from your GPU — so two players disagree even when both are perfectly in sync.\r\n" +
+            "With this on, the session measures which memory that is and stops checksumming it.\r\n\r\n" +
+            "The trade: a game that READS its own framebuffer can then diverge for real without being\r\n" +
+            "detected. Most games never do. Leave this off and play at native if you want the\r\n" +
+            "strongest desync detection; the measurement is logged either way.");
+
         var simLatencyLabel = new Label { Text = "Sim latency ms:", AutoSize = true, Location = new Point(12, 132) };
         _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(110, 130), Width = 60 };
         _simUnresponsiveCheck = new CheckBox { Text = "Simulate unresponsive (diag)", AutoSize = true, Location = new Point(12, 160) };
@@ -393,6 +413,7 @@ public sealed partial class NetplayToolForm
         [
             _probeButton, _testInputButton, _analogWatchButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
             simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _unpausedClockCheck,
+            _aboveNativeCheck,
         ]);
         return page;
     }

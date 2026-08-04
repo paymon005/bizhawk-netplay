@@ -116,6 +116,26 @@ public class DivergenceLearnerTests
         Assert.False(DivergenceLearner.IsLearnFrame(300, 0));    // no interval, no window
     }
 
+    [Theory]
+    // Excluding memory is only sound while the excluded bytes are never read back by the game,
+    // and that is not guaranteed (Rice copies rendered data into RDRAM on an emulated read). So
+    // both gates must open: the player opted in, AND the session is actually above native.
+    [InlineData(true, true, MaskPolicy.ExperimentalExclude)]
+    [InlineData(true, false, MaskPolicy.DiagnosticOnly)]   // native: masking could only ever hide
+    [InlineData(false, true, MaskPolicy.DiagnosticOnly)]   // no opt-in: the trade is the player's
+    [InlineData(false, false, MaskPolicy.DiagnosticOnly)]
+    public void MaskingRequiresBothTheOptInAndAboveNative(bool optedIn, bool aboveNative, MaskPolicy expected)
+        => Assert.Equal(expected, DivergenceLearner.ChoosePolicy(optedIn, aboveNative));
+
+    [Fact]
+    public void ACoreWithNoResolutionToReadNeverMasks()
+    {
+        // Every core but N64. The phenomenon the mask exists for is a render-resolution artifact,
+        // so masking elsewhere would be excluding something this reasoning does not cover.
+        Assert.Equal(MaskPolicy.DiagnosticOnly, DivergenceLearner.ChoosePolicy(true, null));
+        Assert.Equal(MaskPolicy.DiagnosticOnly, DivergenceLearner.ChoosePolicy(false, null));
+    }
+
     [Fact]
     public void MaskRangesAreWordAlignedContiguousRuns()
     {

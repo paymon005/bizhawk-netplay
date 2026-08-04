@@ -755,6 +755,13 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// <summary>Whether a learned mask is present (for the session log).</summary>
     public bool HasLearnedExclusion => _learnedMaskBuckets != null;
 
+    /// <summary>Size of the domain the checksum reads, so masked buckets can be named as
+    /// addresses. 0 when the domain is not reachable.</summary>
+    public long MainMemorySize
+    {
+        get { try { return MainMemoryDomain()?.Size ?? 0; } catch { return 0; } }
+    }
+
     /// <summary>
     /// The byte ranges this hash must skip, with the seed contribution and log tag that identify
     /// them. The learned mask outranks the VI-register span: measurement beats the guess, and the
