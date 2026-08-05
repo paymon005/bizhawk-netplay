@@ -101,11 +101,9 @@ public sealed class ControlChannel
     /// fault, and a joiner losing its host link ends its session: the one peer whose state was
     /// correct got dropped for having been asked for it.
     ///
-    /// It is also the first type that may be large in the joiner → host direction, so an admitted
-    /// peer can now make the host allocate up to <see cref="MaxFrameLength"/> for one frame. That is
-    /// inherent to a host adopting a peer's state rather than an oversight here, it needs the
-    /// password to reach, the outbound queue cap bounds how much can be in flight, and the host
-    /// discards any offer it did not solicit (see the recovery path).
+    /// It is also the first type that may be large in the joiner → host direction, which is what
+    /// prompted <see cref="RoleMayCarryLargeFrame"/>: the ceiling is now granted per direction as
+    /// well as per type, so neither end offers the other an allocation it has no business asking for.
     /// </summary>
     private static bool CarriesState(ControlMessageType type) =>
         type is ControlMessageType.State or ControlMessageType.Resync
@@ -122,8 +120,32 @@ public sealed class ControlChannel
     /// </summary>
     public bool Authenticated { get; set; }
 
-    private int MaxLengthFor(ControlMessageType type) =>
-        CarriesState(type) && Authenticated ? MaxFrameLength : MaxSmallFrameLength;
+    /// <summary>
+    /// Which end of the link this is, once the handshake has said. 0 = not yet declared.
+    ///
+    /// The savestate ceiling used to turn on for an authenticated peer and stay on in both
+    /// directions, which is a weaker rule than its own comment claims. A state travels host →
+    /// joiner and an offer travels joiner → host, so half of every large-frame permission was
+    /// granted to the side that has no business using it: a joiner could declare a 64 MiB State at
+    /// its host, which the reader allocates in full before discovering it is not even a message the
+    /// host handles. Repeatable at will by an admitted peer, and on the 32-bit BizHawk build that
+    /// is an out-of-memory rather than merely churn.
+    /// </summary>
+    private int _role; // 1 = host, 2 = joiner
+
+    private bool RoleMayCarryLargeFrame(ControlMessageType type, bool sending)
+    {
+        if (_role == 0) return true;   // undeclared: authentication alone governs, as before
+        bool weAreHost = _role == 1;
+        // StateOffer is the one that travels toward the host; State and Resync travel away from it.
+        bool towardHost = type == ControlMessageType.StateOffer;
+        return sending ? weAreHost != towardHost : weAreHost == towardHost;
+    }
+
+    private int MaxLengthFor(ControlMessageType type, bool sending) =>
+        CarriesState(type) && Authenticated && RoleMayCarryLargeFrame(type, sending)
+            ? MaxFrameLength
+            : MaxSmallFrameLength;
 
     private readonly Stream _stream;
     private readonly object _writeLock = new();
@@ -171,6 +193,7 @@ public sealed class ControlChannel
         {
             _sendMac = new HMACSHA256(macKey);
             _recvMac = new HMACSHA256(macKey);
+            _role = isHost ? 1 : 2;
             _sendDirection = isHost ? (byte)1 : (byte)2;
             _recvDirection = isHost ? (byte)2 : (byte)1;
             _sendSequence = 0;
@@ -223,9 +246,10 @@ public sealed class ControlChannel
     public void Send(ControlMessageType type, byte[] body)
     {
         if (body == null) body = [];
-        if (body.Length > MaxLengthFor(type))
+        int sendCap = MaxLengthFor(type, sending: true);
+        if (body.Length > sendCap)
             throw new ArgumentException(
-                $"Frame body {body.Length} exceeds the {MaxLengthFor(type)}-byte cap for {type}");
+                $"Frame body {body.Length} exceeds the {sendCap}-byte cap for {type}");
         var header = new byte[5];
         header[0] = (byte)type;
         WriteInt32BE(header, 1, body.Length);
@@ -249,7 +273,7 @@ public sealed class ControlChannel
         var header = ReadFully(5);
         var type = (ControlMessageType)header[0];
         int len = ReadInt32BE(header, 1);
-        int max = MaxLengthFor(type);
+        int max = MaxLengthFor(type, sending: false);
         if (len < 0 || len > max)
             throw new InvalidDataException(
                 $"Frame length {len} out of range for {type} (max {max})");

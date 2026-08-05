@@ -229,4 +229,47 @@ public class ControlChannelTests
         var channel = new ControlChannel(new MemoryStream(header));   // not authenticated
         Assert.Throws<InvalidDataException>(() => channel.Receive());
     }
+
+    /// <summary>
+    /// The savestate ceiling is granted per DIRECTION, not merely per type.
+    ///
+    /// A state travels host → joiner and an offer travels joiner → host, so half of every large-frame
+    /// permission used to be handed to the side with no business using it: a joiner could declare a
+    /// 64 MiB State at its host and the reader allocated it in full before discovering the host does
+    /// not even handle that message. Repeatable at will by an admitted peer, and on the 32-bit
+    /// BizHawk build that is an out-of-memory rather than churn.
+    /// </summary>
+    [Theory]
+    // (declared type, we are host, may it be that large inbound?)
+    [InlineData(ControlMessageType.State, true, false)]        // a joiner sending the host a state
+    [InlineData(ControlMessageType.State, false, true)]        // the host sending a joiner a state
+    [InlineData(ControlMessageType.Resync, true, false)]
+    [InlineData(ControlMessageType.Resync, false, true)]
+    [InlineData(ControlMessageType.StateOffer, true, true)]    // the donor answering its host
+    [InlineData(ControlMessageType.StateOffer, false, false)]  // a host pushing an offer at a joiner
+    public void TheLargeCapIsGrantedOnlyInTheDirectionTheTypeTravels(
+        ControlMessageType type, bool weAreHost, bool allowed)
+    {
+        var key = new byte[32];
+        var header = Header(type, 2 * 1024 * 1024);
+        var channel = new ControlChannel(new MemoryStream(header)) { Authenticated = true };
+        channel.EnableIntegrity(key, isHost: weAreHost);   // declares which end we are
+
+        // Allowed: the length passes and the read then fails for want of a body, which is a
+        // different exception and proves the cap was not what stopped it.
+        if (allowed) Assert.Throws<EndOfStreamException>(() => channel.Receive());
+        else Assert.Throws<InvalidDataException>(() => channel.Receive());
+    }
+
+    /// <summary>
+    /// A channel that never declared a role keeps the old behaviour, so the direction rule cannot
+    /// silently break a caller that authenticates without saying which end it is.
+    /// </summary>
+    [Fact]
+    public void AnUndeclaredRoleFallsBackToAuthenticationAlone()
+    {
+        var header = Header(ControlMessageType.State, 2 * 1024 * 1024);
+        var channel = new ControlChannel(new MemoryStream(header)) { Authenticated = true };
+        Assert.Throws<EndOfStreamException>(() => channel.Receive());   // length accepted
+    }
 }
