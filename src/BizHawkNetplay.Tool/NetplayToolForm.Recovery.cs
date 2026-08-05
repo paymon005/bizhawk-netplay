@@ -291,8 +291,7 @@ public sealed partial class NetplayToolForm
     /// <summary>The seat the host asked for a state, or -1 when it is not waiting for one. Also the
     /// gate on <see cref="OnStateOffer"/>: an offer from anyone else, or when nothing was asked, is
     /// a peer trying to hand the host bytes it never requested.</summary>
-    private int _awaitingDonorPort = -1;
-    private SessionGeneration _awaitingDonorGeneration;
+    private readonly DonorExchange _donor = new();
 
     /// <summary>
     /// Ask the majority's chosen machine for its state. True when the request went out, in which
@@ -302,7 +301,7 @@ public sealed partial class NetplayToolForm
     private bool RequestStateFromDonor(int donorPort)
     {
         if (!_isHost || _phase.IsRebuilding) return false;
-        if (_awaitingDonorPort >= 0) return false;   // one ask in flight at a time
+        if (_donor.IsWaiting) return false;   // one ask in flight at a time
         PeerLink? donor = null;
         foreach (var link in _peers) if (link.RemotePort == donorPort) { donor = link; break; }
         if (donor == null) return false;
@@ -312,8 +311,7 @@ public sealed partial class NetplayToolForm
                 ControlMessageCodec.EncodeStateRequest(generation)))
             return false;
 
-        _awaitingDonorPort = donorPort;
-        _awaitingDonorGeneration = generation;
+        _donor.Begin(donorPort, generation);
         // Bounded, because a donor that never answers must not leave the session desynced forever
         // waiting on it. On expiry the ordinary host-authoritative resync runs, which is exactly
         // what would have happened had this never been attempted.
@@ -331,9 +329,10 @@ public sealed partial class NetplayToolForm
         _donorTimer.Tick += (_, __) =>
         {
             StopDonorTimeout();
-            if (_awaitingDonorPort < 0) return;
-            int port = _awaitingDonorPort;
-            _awaitingDonorPort = -1;
+            // Expire() is false when something else already ended the wait — a resync by another
+            // route, or an answer that arrived. Recovering again on a timer that was merely left
+            // running is the fault DonorExchange exists to make unrepresentable.
+            if (!_donor.Expire(out int port)) return;
             ConnLog($"P{port + 1} did not send its state within " +
                     $"{DonorStateTimeoutMs / 1000}s — recovering from this machine's own state " +
                     "instead, which on the checksum evidence is the wrong one.", Color.Firebrick);
@@ -349,19 +348,15 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
-    /// Forget any outstanding majority ask.
+    /// Forget any outstanding majority ask, and the timer that would have chased it.
     ///
-    /// Called wherever a resync happens by some other route, because the ask belongs to the desync
-    /// that resync is replacing. Left armed, its timeout fires later, finds itself still waiting,
-    /// blames the donor for never answering, and runs a SECOND full-state resync for a divergence
-    /// already recovered from — a whole savestate to every peer, for nothing. The way in is
-    /// ordinary: a second desync arrives while the first ask is in flight, is refused (one ask at a
-    /// time), and falls through to the host-authoritative path.
+    /// The rule lives in <see cref="DonorExchange.Cancel"/>; this pairs it with the timer, which is
+    /// the one piece of the exchange that has to stay here.
     /// </summary>
     private void CancelDonorWait()
     {
         StopDonorTimeout();
-        _awaitingDonorPort = -1;
+        _donor.Cancel();
     }
 
     /// <summary>
@@ -430,15 +425,14 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private void OnStateOffer(PeerLink link, SessionGeneration generation, byte[] packed)
     {
-        if (!_isHost || _awaitingDonorPort < 0) return;
-        if (link.RemotePort != _awaitingDonorPort) return;   // not the seat we asked; never solicited
-        // The seat we asked HAS answered, so the wait is over either way — clear it before judging
-        // the generation. Returning on a stale one without clearing left the timeout armed to fire
-        // later and force a redundant resync, which is the same fault CancelDonorWait describes
-        // reached from the other side: the peer answered a question the session had moved past.
-        var expected = _awaitingDonorGeneration;
-        CancelDonorWait();
-        if (generation != expected)
+        if (!_isHost) return;
+        // Three outcomes, decided in Core so the "wrong seat leaves the wait alone, right seat ends
+        // it whichever generation it carries" rule cannot drift apart from the timeout that depends
+        // on it. See DonorExchange.
+        var verdict = _donor.Offer(link.RemotePort, generation);
+        if (verdict == OfferVerdict.Unsolicited) return;
+        StopDonorTimeout();   // the wait is over; the timer that would have chased it is not
+        if (verdict == OfferVerdict.Stale)
         {
             Log($"P{link.RemotePort + 1}'s state arrived for epoch {generation.Epoch}, but the " +
                 $"session has since moved to {CurrentGeneration.Epoch} — discarding it.");

@@ -403,8 +403,7 @@ public sealed partial class NetplayToolForm
         _presentHint.Reset();
         _hashDiagLogged = false;
         _stateTrustLogged = false;   // said once per SESSION: the next host may not be this one
-        StopDonorTimeout();          // a pending majority ask belongs to the session that made it
-        _awaitingDonorPort = -1;
+        CancelDonorWait();           // a pending majority ask belongs to the session that made it
         _lastTickClockMs = -1;
         _lastPresentClockMs = -1;
         // Per-session, not per-window: a spike from a previous session must not be reported as
