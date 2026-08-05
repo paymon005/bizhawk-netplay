@@ -376,20 +376,47 @@ public sealed partial class NetplayToolForm
     {
         if (_isHost || !_phase.IsActive || generation != CurrentGeneration) return;
         if (_peers.Count == 0) return;
-        try
-        {
-            var state = _adapter!.ExportState();
-            ConnLog($"the host asked for this machine's state ({state.Length / 1024}KiB) — the " +
-                    "other players agreed with us and not with it, so this becomes the session's " +
-                    "state.", Color.DarkSlateBlue);
-            QueueControl(_peers[0], ControlMessageType.StateOffer,
-                ControlMessageCodec.EncodeStateOffer(generation, StateCompression.Pack(state)));
-        }
+
+        byte[] state;
+        try { state = _adapter!.ExportState(); }
         catch (Exception ex)
         {
             // Nothing to send and nothing to do: the host's timeout falls back to its own state.
             Log("(warning) could not export a state for the host's majority request: " + ex.Message);
+            return;
         }
+
+        ConnLog($"the host asked for this machine's state ({state.Length / 1024}KiB) — the other " +
+                "players agreed with us and not with it, so this becomes the session's state.",
+            Color.DarkSlateBlue);
+
+        // Only the CAPTURE above needs this thread. Deflating does not, and on a heavy core it is a
+        // few hundred milliseconds during which this machine's emulator is frozen and its input
+        // stops reaching anyone — so the donor would answer the majority request by looking, to
+        // every other player, exactly like the peer that had just gone wrong.
+        //
+        // The host's own resync learned this and moves the pack off-thread; this path did not, which
+        // is the same mistake one release later. The host is waiting on a 15s timeout and every peer
+        // is still ponging normally, so the time costs the transfer nothing.
+        var link = _peers[0];
+        int attempt = link.Attempt;
+        new Thread(() =>
+        {
+            byte[] body;
+            try { body = ControlMessageCodec.EncodeStateOffer(generation, StateCompression.Pack(state)); }
+            catch (Exception ex)
+            {
+                BeginInvokeUi(() => Log("(warning) could not pack the state the host asked for: "
+                    + ex.Message));
+                return;
+            }
+            BeginInvokeUi(() =>
+            {
+                if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive) return;
+                QueueControl(link, ControlMessageType.StateOffer, body);
+            });
+        })
+        { IsBackground = true, Name = "BizHawkNetplay-offer-pack" }.Start();
     }
 
     /// <summary>
