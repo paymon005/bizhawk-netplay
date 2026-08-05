@@ -408,7 +408,9 @@ public sealed partial class NetplayToolForm
         foreach (var link in _peers)
         {
             var snapshot = new LinkHealth.LinkSnapshot(
-                link.AwaitingAppliedEpoch,
+                // The barrier is what says whether this peer is holding the session up: a peer can
+                // answer pings forever while never importing the state that gates the generation.
+                _applyBarrier.EpochOwedBy(link.RemotePort),
                 Interlocked.Read(ref link.AppliedDeadlineTicks),
                 link.ResyncReceiving,
                 Interlocked.Read(ref link.ResyncReceiveDeadlineTicks),

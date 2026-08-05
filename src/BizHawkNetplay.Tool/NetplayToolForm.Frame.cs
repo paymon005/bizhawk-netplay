@@ -604,12 +604,9 @@ public sealed partial class NetplayToolForm
             // such signal. Decay ours after running well past the last resync without another one —
             // otherwise a run of successful recoveries would eventually trip the "persistent desync"
             // give-up limit on a perfectly healthy joiner.
-            if (!_isHost && _resyncCount > 0 && !_phase.AwaitingRejoin
-                && MonotonicElapsedSeconds(_lastResyncStamp) > ResyncRecoverySeconds)
-            {
-                _resyncCount = 0;
+            if (!_isHost && !_phase.AwaitingRejoin
+                && _resyncBudget.RecordQuiet(MonotonicElapsedSeconds(_lastResyncStamp)))
                 Log("back in sync — recovery confirmed");
-            }
 
             // One-shot audio pipeline snapshot ~2s in, so a single test shows where sound breaks.
             if (!_audioStatsLogged && _driver.CurrentFrame >= 120)

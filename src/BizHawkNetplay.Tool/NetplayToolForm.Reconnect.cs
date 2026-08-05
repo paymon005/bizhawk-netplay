@@ -134,11 +134,11 @@ public sealed partial class NetplayToolForm
         int attempt = CurrentConnectionAttempt;
         var vacatedBody = ControlMessageCodec.EncodeSeatVacated(generation, port);
         var stateBody = ReconnectStateBody(packed, generation, state);
+        _applyBarrier.Expect(SeatsOf(_peers), generation.Epoch);
         foreach (var survivor in _peers)
         {
             QueueControl(survivor, ControlMessageType.SeatVacated, vacatedBody);
             GraceForStateTransfer(survivor, state.Length);
-            survivor.AwaitingAppliedEpoch = generation.Epoch;
             Interlocked.Exchange(ref survivor.AppliedDeadlineTicks, StateApplyDeadlineTicks(state.Length));
             if (!QueueControl(survivor, ControlMessageType.Resync, stateBody, ok =>
                 {
@@ -623,10 +623,10 @@ public sealed partial class NetplayToolForm
                 ReleaseReconnectedPeer(link, state.Length, generation);
                 return;
             }
+            _applyBarrier.Expect(SeatsOf(survivors), generation.Epoch);
             foreach (var survivor in survivors)
             {
                 GraceForStateTransfer(survivor, state.Length); // same leash: a big frame is inbound
-                survivor.AwaitingAppliedEpoch = generation.Epoch;
                 Interlocked.Exchange(ref survivor.AppliedDeadlineTicks, StateApplyDeadlineTicks(state.Length));
                 QueueControl(survivor, ControlMessageType.PeerList,
                     HandshakeCodec.EncodeRoutes(RoutesExcept(allPeers, survivor)));
@@ -692,7 +692,7 @@ public sealed partial class NetplayToolForm
                         _phase.EndAwaitingRejoin();
                         _phase.EndRebuild();
                         _reconnectPort = -1;
-                        _resyncCount = 0;
+                        _resyncBudget.Reset();
                         RebaseFrameSchedule();
                         RefreshLiveSettingsUi();
                         ConnLog($"{link.Label} reconnected — epoch {generation.Epoch}, " +

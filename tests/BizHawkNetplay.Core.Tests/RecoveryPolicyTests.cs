@@ -117,26 +117,6 @@ public class RecoveryPolicyTests
             RecoveryPolicy.OnPeerLost(isHost: true, resyncInProgress: false, awaitingReconnect: true));
     }
 
-    // ---- resync gate -----------------------------------------------------------
-
-    [Fact]
-    public void ResyncGate_InProgressWinsOverEverything()
-    {
-        Assert.Equal(ResyncGate.AlreadyInProgress,
-            RecoveryPolicy.GateResync(true, 0.0, 5.0, 99, 3));
-    }
-
-    [Fact]
-    public void ResyncGate_DebouncesRepeatTriggersForTheSameDesync()
-    {
-        Assert.Equal(ResyncGate.Debounced, RecoveryPolicy.GateResync(false, 4.9, 5.0, 1, 3));
-        Assert.Equal(ResyncGate.Start, RecoveryPolicy.GateResync(false, 5.0, 5.0, 1, 3));
-    }
-
-    [Fact]
-    public void ResyncGate_GivesUpBeyondTheCap_NotAtIt()
-    {
-        Assert.Equal(ResyncGate.Start, RecoveryPolicy.GateResync(false, 60.0, 5.0, 3, 3));
-        Assert.Equal(ResyncGate.GiveUp, RecoveryPolicy.GateResync(false, 60.0, 5.0, 4, 3));
-    }
+    // The resync gate moved to ResyncBudget, which owns the counter it decides against; its tests
+    // moved with it to ResyncBudgetTests.
 }

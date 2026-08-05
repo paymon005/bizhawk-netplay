@@ -53,7 +53,9 @@ public sealed partial class NetplayToolForm
         public bool AdvantageKnown;           // false until a peer on a build that reports has answered
         public int PacingSendSequence;         // our monotonically increasing wire sample id
         public int LastReceivedPacingSequence; // peer sample most recently incorporated
-        public int AwaitingAppliedEpoch;       // host barrier: non-zero until this peer applies that epoch
+        // Which epoch this peer still owes an acknowledgement for lives in the session's
+        // ApplyBarrier, not here — one owner for the whole barrier rather than a field per link
+        // that four sites had to keep consistent with each other.
         public long AppliedDeadlineTicks;      // bounds a peer that stays alive but never applies state
         public bool DirectLogged;         // one-time flag: logged that this peer's direct UDP path opened
         public string Label = "";

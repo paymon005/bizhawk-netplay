@@ -90,21 +90,14 @@ public enum PeerLossAction
     BeginReconnectWait,
 }
 
-/// <summary>Whether a requested resync may start.</summary>
-public enum ResyncGate
-{
-    /// <summary>One is already in flight — ignore the trigger.</summary>
-    AlreadyInProgress,
-    /// <summary>Too soon after the previous resync; the same desync is still settling.</summary>
-    Debounced,
-    /// <summary>Too many attempts — a persistent desync is a determinism bug, not transience.</summary>
-    GiveUp,
-    Start,
-}
-
 /// <summary>
 /// The recovery phase/transition decisions of the reconnect + resync machinery, extracted from
 /// the tool form. Pure functions: the form supplies its flags and executes the returned action.
+///
+/// The resync gate used to live here too, as a static taking the caller's attempt counter. It now
+/// belongs to <see cref="ResyncBudget"/>, which owns that counter — a gate that decides whether an
+/// attempt may start, and a counter someone else increments, are one rule split in two, and the two
+/// halves disagreed about whether a debounced trigger costs an attempt.
 /// </summary>
 public static class RecoveryPolicy
 {
@@ -114,16 +107,5 @@ public static class RecoveryPolicy
         if (resyncInProgress && !awaitingReconnect) return PeerLossAction.EndSessionDropDuringResync;
         if (awaitingReconnect) return PeerLossAction.EndSessionSecondDropDuringReconnect;
         return PeerLossAction.BeginReconnectWait;
-    }
-
-    /// <param name="attemptNumber">This attempt's 1-based ordinal (the caller's counter AFTER
-    /// incrementing for this attempt).</param>
-    public static ResyncGate GateResync(bool resyncInProgress, double secondsSinceLastResync,
-        double graceSeconds, int attemptNumber, int maxResyncs)
-    {
-        if (resyncInProgress) return ResyncGate.AlreadyInProgress;
-        if (secondsSinceLastResync < graceSeconds) return ResyncGate.Debounced;
-        if (attemptNumber > maxResyncs) return ResyncGate.GiveUp;
-        return ResyncGate.Start;
     }
 }

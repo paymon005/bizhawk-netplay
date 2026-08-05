@@ -309,7 +309,8 @@ public sealed partial class NetplayToolForm
         PauseForSession(); // we own the clock now
         _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
         _checksumDue = false;
-        _resyncCount = 0;
+        _resyncBudget.Reset();
+        _applyBarrier.Clear();
         _desyncTrend.Reset();
         _reconnectState = null;
         _reconnectGeneration = default;

@@ -296,14 +296,18 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private volatile bool _isHost;      // host is authoritative for desync detection + resync
     private volatile int _playerCount = 2;
     private int _localPort;    // our controller port, for rebuilding the driver on resync
-    private int _resyncCount;   // resyncs since the last confirmed re-sync (bounds infinite loops)
+    // How many recoveries this session has left, and every way that allowance comes back. The
+    // counter used to be an int here, spent under two different rules and cleared under four.
+    private readonly ResyncBudget _resyncBudget = new();
+    // Who still owes an "I applied that epoch" acknowledgement. Replaces a per-peer field written
+    // in three loops and read back by a fourth that walked every link looking for one still set.
+    private readonly ApplyBarrier _applyBarrier = new();
     // Tells "the emulation drifted once" apart from "these two machines were never comparing the
     // same thing": a real drift agrees for a while first, a systematic mismatch never agrees at all.
     private readonly DesyncTrend _desyncTrend = new();
     private string? _videoDiagnostic; // resolution/plugin line, quoted back if desyncs turn systematic
     private long _lastResyncStamp; // monotonic timestamp; debounces near-simultaneous resync triggers
     private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
-    private const int MaxResyncs = 6;
     private const double ResyncGraceSeconds = 2.0;
     // The size of the last state this machine exported, which is the only estimate it has of what a
     // donor is about to send: same core, same game, same frame. Refreshed by every export, so the
@@ -319,7 +323,6 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         _ownStateBytes = state.Length;
         return state;
     }
-    private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
     // Delay is selected before WELCOME and then remains fixed. In rollback it trades local response
     // time for shallower visual corrections; in lockstep it also prevents routine network stalls.
     private bool _audioStatsLogged; // one-shot audio pipeline diagnostic per session

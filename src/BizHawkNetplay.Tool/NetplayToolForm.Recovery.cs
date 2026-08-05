@@ -32,21 +32,6 @@ public sealed partial class NetplayToolForm
         if (outcome == ChecksumOutcome.Pending) return;
         if (outcome == ChecksumOutcome.Mismatch)
         {
-            // During the divergence-learning window a mismatch IS the measurement, not the
-            // emergency: right after a rebuild the peers are byte-identical, so a disagreeing
-            // boundary here means machine-produced bytes (GPU write-back) — exactly what the
-            // learner is collecting, and what the mask it produces will exclude. Resyncing now
-            // would just restart the same learning from another identical baseline, forever —
-            // the resync loop that above-native N64 used to be. A REAL desync in this window is
-            // caught by the learner's own share cap (TooBroadToMask ends the suppression with a
-            // verdict), and by the very next boundary past the window regardless.
-            if (DivergenceLearner.IsLearnFrame(frame, _checksumInterval))
-            {
-                if (Verbose) BeginInvokeUi(() =>
-                    Log($"checksum frame {frame}: peers disagree during the learning window — " +
-                        "measuring which memory is machine-produced rather than resyncing"));
-                return;
-            }
             BeginInvokeUi(() =>
             {
                 if (IsConnectionAttemptCurrent(attempt) && CurrentGeneration == generation)
@@ -64,11 +49,7 @@ public sealed partial class NetplayToolForm
         {
             if (!IsConnectionAttemptCurrent(attempt) || CurrentGeneration != generation) return;
             _desyncTrend.RecordAgreement();
-            if (_resyncCount != 0)
-            {
-                _resyncCount = 0;
-                Log("back in sync — recovery confirmed");
-            }
+            if (_resyncBudget.RecordAgreement()) Log("back in sync — recovery confirmed");
             else if (Verbose) Log($"checksum frame {frame}: all {_playerCount} agree");
         });
     }
@@ -233,28 +214,37 @@ public sealed partial class NetplayToolForm
                     "could now diverge there without being caught.", Color.DarkOrange);
     }
 
+    /// <summary>
+    /// Act on a checksum disagreement. The decision — measuring, ignore, ask a donor, or recover
+    /// from our own state — is <see cref="DesyncPolicy"/>'s; this narrates it and does the I/O.
+    /// </summary>
     private void OnHostDesync(int frame, DesyncPartition? partition = null)
     {
-        if (_phase.IsRebuilding) return;
-        if (MonotonicElapsedSeconds(_lastResyncStamp) < ResyncGraceSeconds) return; // just resynced; give it time
+        var decision = DesyncPolicy.Decide(frame, _checksumInterval, _phase.IsRebuilding,
+            MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds, partition,
+            _deferToMajorityCheck.Checked);
+
+        if (decision.Action == DesyncAction.Ignore) return;
+        if (decision.Action == DesyncAction.Measuring)
+        {
+            if (Verbose)
+                Log($"checksum frame {frame}: peers disagree during the learning window — " +
+                    "measuring which memory is machine-produced rather than resyncing");
+            return;
+        }
+
         Log(partition == null
             ? $"DESYNC at frame {frame} — peers disagree"
             : $"DESYNC at frame {frame} — {partition.Describe()}");
 
-        // Recorded BEFORE the recovery branch below, because that branch can return.
-        //
-        // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
-        // the emulation drifting — a real drift would sync fine for a while first. It means the two
-        // machines are comparing memory that was never going to match. On N64 the usual cause is
-        // above-native video resolution: the plugin resolves its framebuffer back into RDRAM, and
-        // those bytes come from the GPU rather than the emulated core, so they differ per machine
-        // and land inside the region the checksum reads. Resyncing cannot fix that, and will keep
-        // shipping a 16MiB state every interval until it gives up.
-        //
-        // This used to sit after the deferral branch, where the successful path's `return` skipped
-        // it: a session that deferred every time never recorded a single desync, so the one warning
-        // that names an unresyncable mismatch could never fire — on exactly the N64 sessions it
-        // exists for.
+        // Recorded before anything that can return, which is why the policy decides first and the
+        // narration follows. A divergence that recurs at EVERY interval, with no agreeing checksum
+        // in between, is not the emulation drifting — a real drift would sync fine for a while
+        // first. It means the two machines are comparing memory that was never going to match. On
+        // N64 the usual cause is above-native video resolution: the plugin resolves its framebuffer
+        // back into RDRAM, and those bytes come from the GPU rather than the emulated core, so they
+        // differ per machine and land inside the region the checksum reads. Resyncing cannot fix
+        // that, and will keep shipping a 16MiB state every interval until it gives up.
         if (_desyncTrend.RecordDesync())
             ConnLog("every checksum since this session began has disagreed, with none agreeing in " +
                 "between — that is a systematic mismatch, not emulation drift, and resyncing will " +
@@ -269,19 +259,19 @@ public sealed partial class NetplayToolForm
         // the outlier that is the wrong state — so either defer to the majority that outvoted us
         // (opt-in; see MajorityRecovery for why it is not the default) or say plainly that we are
         // about to distribute the minority's.
-        int donor = MajorityRecovery.SelectDonor(partition, _deferToMajorityCheck.Checked);
-        if (donor >= 0)
+        if (decision.Action == DesyncAction.AskDonor)
         {
-            ConnLog(MajorityRecovery.Describe(partition!, donor), Color.DarkOrange);
-            if (RequestStateFromDonor(donor)) return;   // resync resumes when the state arrives
+            ConnLog(MajorityRecovery.Describe(partition!, decision.DonorPort), Color.DarkOrange);
+            if (RequestStateFromDonor(decision.DonorPort)) return;  // resumes when the state arrives
             // Falling through is deliberate: the donor is unreachable or already busy, and the
             // session still has to converge on something. Today's behaviour is the fallback.
-            ConnLog($"could not ask P{donor + 1} for its state — recovering from this machine's " +
-                    "own state instead, which on this evidence is the wrong one.", Color.Firebrick);
+            ConnLog($"could not ask P{decision.DonorPort + 1} for its state — recovering from this " +
+                    "machine's own state instead, which on this evidence is the wrong one.",
+                Color.Firebrick);
         }
-        else if (partition is { HostIsOutvoted: true })
+        else if (decision.HostIsOutvoted)
         {
-            ConnLog(MajorityRecovery.DescribeDeclined(partition), Color.Firebrick);
+            ConnLog(MajorityRecovery.DescribeDeclined(partition!), Color.Firebrick);
         }
         PerformResyncAsHost();
     }
@@ -481,20 +471,21 @@ public sealed partial class NetplayToolForm
     private void PerformResyncAsHost()
     {
         if (!_phase.IsActive || !_isHost) return;
-        var gate = RecoveryPolicy.GateResync(_phase.IsRebuilding,
-            MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds, _resyncCount + 1, MaxResyncs);
+        // One call answers all three questions and charges the attempt only when one really starts.
+        var gate = _resyncBudget.Gate(_phase.IsRebuilding,
+            MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds);
         if (gate == ResyncGate.AlreadyInProgress || gate == ResyncGate.Debounced) return;
         // This resync supersedes whatever the majority ask was going to recover from — including
         // when THIS call is the donor path's own continuation, where the wait is already cleared
         // and cancelling again is a no-op. See CancelDonorWait.
         CancelDonorWait();
-        _resyncCount++;
         if (gate == ResyncGate.GiveUp)
         {
-            EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
+            EndSession($"persistent desync — gave up after {_resyncBudget.MaxAttempts} resync " +
+                       "attempts (likely a determinism bug)");
             return;
         }
-        ShipAuthoritativeState($"resync #{_resyncCount}", isSettingsChange: false);
+        ShipAuthoritativeState($"resync #{_resyncBudget.Used}", isSettingsChange: false);
     }
 
     /// <summary>
@@ -609,10 +600,12 @@ public sealed partial class NetplayToolForm
             RefreshLiveSettingsUi();
             return;
         }
+        // Everyone owes an acknowledgement for this epoch before anyone resumes. The barrier
+        // replaces whatever it was waiting on, so a superseded rebuild cannot hold this one up.
+        _applyBarrier.Expect(SeatsOf(_peers), generation.Epoch);
         foreach (var link in _peers)
         {
             GraceForStateTransfer(link, stateLength); // it can't pong while its reader consumes the frame
-            link.AwaitingAppliedEpoch = generation.Epoch;
             Interlocked.Exchange(ref link.AppliedDeadlineTicks, StateApplyDeadlineTicks(stateLength));
             if (!QueueControl(link, ControlMessageType.ResyncBegin, generationBody)
                 || !QueueControl(link, ControlMessageType.Resync, stateBody, ok =>
@@ -721,9 +714,11 @@ public sealed partial class NetplayToolForm
         int attempt = CurrentConnectionAttempt;
         // A deliberate change is not evidence of a determinism bug, so it must not spend the budget
         // that exists to catch one — otherwise six delay tweaks would end the session.
-        if (!isSettingsChange && ++_resyncCount > MaxResyncs)
+        if (isSettingsChange) _resyncBudget.Excuse();
+        else if (!_resyncBudget.TrySpend())
         {
-            EndSession($"persistent desync — gave up after {MaxResyncs} resync attempts (likely a determinism bug)");
+            EndSession($"persistent desync — gave up after {_resyncBudget.MaxAttempts} resync " +
+                       "attempts (likely a determinism bug)");
             return;
         }
         try
@@ -765,7 +760,7 @@ public sealed partial class NetplayToolForm
                 EndSession("could not queue the applied-state acknowledgement");
                 return;
             }
-            Log($"resync #{_resyncCount}: imported epoch {generation.Epoch} " +
+            Log($"resync #{_resyncBudget.Used}: imported epoch {generation.Epoch} " +
                 $"({state.Length / 1024}KiB); waiting for the host to release all peers");
         }
         catch (Exception ex) { EndSession("resync apply failed: " + ex.Message); }
@@ -774,20 +769,28 @@ public sealed partial class NetplayToolForm
     private void OnPeerResyncApplied(PeerLink link, SessionGeneration generation)
     {
         if (!_phase.IsActive || !_isHost || generation != CurrentGeneration || !_peers.Contains(link)) return;
-        if (link.AwaitingAppliedEpoch != generation.Epoch) return; // stale or duplicate acknowledgement
 
-        link.AwaitingAppliedEpoch = 0;
+        // Stale and duplicate acknowledgements are the barrier's to recognise: an ack for an epoch
+        // nobody is waiting on, or a second one from a seat that has already paid, must not release
+        // a rebuild still in flight.
+        var ack = _applyBarrier.Applied(link.RemotePort, generation.Epoch);
+        if (ack == ApplyAck.Ignored) return;
+
         Interlocked.Exchange(ref link.AppliedDeadlineTicks, 0);
         Interlocked.Exchange(ref link.TimeoutGraceUntilTicks, 0);
         if (Verbose) Log($"{link.Label} applied resync epoch {generation.Epoch}");
-
-        foreach (var peer in _peers)
-            if (peer.AwaitingAppliedEpoch == generation.Epoch) return;
+        if (ack != ApplyAck.Complete) return;
 
         if (_pendingReconnectLink != null && _pendingReconnectGeneration == generation)
             ReleaseReconnectedPeer(_pendingReconnectLink, _pendingReconnectStateLength, generation);
         else
             ReleaseResyncAsHost(generation);
+    }
+
+    /// <summary>The seats behind a set of links — what the apply barrier waits on.</summary>
+    private static IEnumerable<int> SeatsOf(IEnumerable<PeerLink> links)
+    {
+        foreach (var link in links) yield return link.RemotePort;
     }
 
     private void ReleaseResyncAsHost(SessionGeneration generation)
@@ -917,9 +920,11 @@ public sealed partial class NetplayToolForm
                     link.AdvantageKnown = false;
                     link.PacingSendSequence = 0;
                     link.LastReceivedPacingSequence = 0;
-                    link.AwaitingAppliedEpoch = 0;
                     Interlocked.Exchange(ref link.AppliedDeadlineTicks, 0);
                 }
+                // A new generation retires whatever the previous one was waiting on. The caller
+                // arms the next barrier once it knows who is receiving the new baseline.
+                _applyBarrier.Clear();
             }
         }
     }
