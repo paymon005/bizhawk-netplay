@@ -92,9 +92,24 @@ public sealed class ControlChannel
     /// </summary>
     private const int MaxSmallFrameLength = 256 * 1024;
 
-    /// <summary>Whether this message type may legitimately carry a whole-core savestate.</summary>
+    /// <summary>
+    /// Whether this message type may legitimately carry a whole-core savestate.
+    ///
+    /// <see cref="ControlMessageType.StateOffer"/> belongs here and was missed when it was added,
+    /// which made majority recovery unusable on any core with a state over 256 KiB — that is, all
+    /// of them. The donor's <c>Send</c> threw on the cap, its writer thread treated that as a link
+    /// fault, and a joiner losing its host link ends its session: the one peer whose state was
+    /// correct got dropped for having been asked for it.
+    ///
+    /// It is also the first type that may be large in the joiner → host direction, so an admitted
+    /// peer can now make the host allocate up to <see cref="MaxFrameLength"/> for one frame. That is
+    /// inherent to a host adopting a peer's state rather than an oversight here, it needs the
+    /// password to reach, the outbound queue cap bounds how much can be in flight, and the host
+    /// discards any offer it did not solicit (see the recovery path).
+    /// </summary>
     private static bool CarriesState(ControlMessageType type) =>
-        type is ControlMessageType.State or ControlMessageType.Resync;
+        type is ControlMessageType.State or ControlMessageType.Resync
+            or ControlMessageType.StateOffer;
 
     /// <summary>
     /// Set once the peer on the other end has proved the session password.

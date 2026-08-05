@@ -183,4 +183,50 @@ public class ControlChannelTests
         var channel = new ControlChannel(new MemoryStream(header)) { Authenticated = true };
         Assert.Throws<InvalidDataException>(() => channel.Receive());
     }
+
+    /// <summary>
+    /// Every type that can carry a whole savestate must be able to SEND one.
+    ///
+    /// StateOffer was added without being added to the large-frame list, so a donor answering the
+    /// host's majority request threw on the 256 KiB cap. Its writer thread treats a send failure as
+    /// a link fault, and a joiner that loses its host link ends its session — so the one peer whose
+    /// state the session had just decided was correct got dropped for having been asked for it.
+    /// Majority recovery could not work on any core with a state over 256 KiB, which is all of them.
+    ///
+    /// The v0.34.0 tests covered the CODEC and never put an offer through a channel, which is
+    /// exactly the seam the fault lived in. This drives the send path with a state-sized body.
+    /// </summary>
+    [Theory]
+    [InlineData(ControlMessageType.State)]
+    [InlineData(ControlMessageType.Resync)]
+    [InlineData(ControlMessageType.StateOffer)]
+    public void EveryStateBearingTypeCanCarryOne(ControlMessageType type)
+    {
+        var sink = new MemoryStream();
+        var channel = new ControlChannel(sink) { Authenticated = true };
+        var body = new byte[2 * 1024 * 1024];   // ~a deflated N64 state; far over the small cap
+
+        channel.Send(type, body);   // threw ArgumentException for StateOffer
+
+        Assert.Equal(5 + body.Length, sink.Length);
+
+        // And the receiver must accept the length it just wrote, or the fault simply moves.
+        sink.Position = 0;
+        var reader = new ControlChannel(sink) { Authenticated = true };
+        var (readType, readBody) = reader.Receive();
+        Assert.Equal(type, readType);
+        Assert.Equal(body.Length, readBody.Length);
+    }
+
+    /// <summary>
+    /// The large cap is still earned rather than assumed: an unauthenticated peer declaring a
+    /// state-sized StateOffer is refused at the header, like the other two.
+    /// </summary>
+    [Fact]
+    public void AnUnauthenticatedStateOfferIsStillCappedSmall()
+    {
+        var header = Header(ControlMessageType.StateOffer, 2 * 1024 * 1024);
+        var channel = new ControlChannel(new MemoryStream(header));   // not authenticated
+        Assert.Throws<InvalidDataException>(() => channel.Receive());
+    }
 }
