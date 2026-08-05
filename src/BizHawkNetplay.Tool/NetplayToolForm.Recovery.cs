@@ -241,12 +241,34 @@ public sealed partial class NetplayToolForm
             ? $"DESYNC at frame {frame} — peers disagree"
             : $"DESYNC at frame {frame} — {partition.Describe()}");
 
-        // Recovery is about to overwrite every peer with THIS machine's state. When this machine
-        // is the outlier that is the wrong state, and it is worth saying so out loud rather than
-        // letting a log show three agreeing players quietly adopting one disagreeing one. Choosing
-        // a different authority needs a majority-reconstruction protocol (a wire change); naming
-        // the case does not, and until then the player can act on it — the usual causes are local
-        // and theirs to clear.
+        // Recorded BEFORE the recovery branch below, because that branch can return.
+        //
+        // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
+        // the emulation drifting — a real drift would sync fine for a while first. It means the two
+        // machines are comparing memory that was never going to match. On N64 the usual cause is
+        // above-native video resolution: the plugin resolves its framebuffer back into RDRAM, and
+        // those bytes come from the GPU rather than the emulated core, so they differ per machine
+        // and land inside the region the checksum reads. Resyncing cannot fix that, and will keep
+        // shipping a 16MiB state every interval until it gives up.
+        //
+        // This used to sit after the deferral branch, where the successful path's `return` skipped
+        // it: a session that deferred every time never recorded a single desync, so the one warning
+        // that names an unresyncable mismatch could never fire — on exactly the N64 sessions it
+        // exists for.
+        if (_desyncTrend.RecordDesync())
+            ConnLog("every checksum since this session began has disagreed, with none agreeing in " +
+                "between — that is a systematic mismatch, not emulation drift, and resyncing will " +
+                "not clear it. On N64 the usual cause is running the video plugin above native " +
+                "resolution: it resolves the framebuffer back into RDRAM, and those bytes come from " +
+                "your GPU rather than the emulated core, so they cannot match your opponent's. Drop " +
+                "to native resolution on BOTH machines." +
+                (_videoDiagnostic != null ? $" This session is running {_videoDiagnostic}." : ""),
+                Color.Firebrick);
+
+        // Recovery is about to overwrite every peer with THIS machine's state. When this machine is
+        // the outlier that is the wrong state — so either defer to the majority that outvoted us
+        // (opt-in; see MajorityRecovery for why it is not the default) or say plainly that we are
+        // about to distribute the minority's.
         int donor = MajorityRecovery.SelectDonor(partition, _deferToMajorityCheck.Checked);
         if (donor >= 0)
         {
@@ -261,22 +283,6 @@ public sealed partial class NetplayToolForm
         {
             ConnLog(MajorityRecovery.DescribeDeclined(partition), Color.Firebrick);
         }
-        // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
-        // the emulation drifting — a real drift would sync fine for a while first. It means the two
-        // machines are comparing memory that was never going to match. On N64 the usual cause is
-        // above-native video resolution: the plugin resolves its framebuffer back into RDRAM, and
-        // those bytes come from the GPU rather than the emulated core, so they differ per machine
-        // and land inside the region the checksum reads. Resyncing cannot fix that, and will keep
-        // shipping a 16MiB state every interval until it gives up.
-        if (_desyncTrend.RecordDesync())
-            ConnLog("every checksum since this session began has disagreed, with none agreeing in " +
-                "between — that is a systematic mismatch, not emulation drift, and resyncing will " +
-                "not clear it. On N64 the usual cause is running the video plugin above native " +
-                "resolution: it resolves the framebuffer back into RDRAM, and those bytes come from " +
-                "your GPU rather than the emulated core, so they cannot match your opponent's. Drop " +
-                "to native resolution on BOTH machines." +
-                (_videoDiagnostic != null ? $" This session is running {_videoDiagnostic}." : ""),
-                Color.Firebrick);
         PerformResyncAsHost();
     }
 
@@ -343,6 +349,22 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
+    /// Forget any outstanding majority ask.
+    ///
+    /// Called wherever a resync happens by some other route, because the ask belongs to the desync
+    /// that resync is replacing. Left armed, its timeout fires later, finds itself still waiting,
+    /// blames the donor for never answering, and runs a SECOND full-state resync for a divergence
+    /// already recovered from — a whole savestate to every peer, for nothing. The way in is
+    /// ordinary: a second desync arrives while the first ask is in flight, is refused (one ask at a
+    /// time), and falls through to the host-authoritative path.
+    /// </summary>
+    private void CancelDonorWait()
+    {
+        StopDonorTimeout();
+        _awaitingDonorPort = -1;
+    }
+
+    /// <summary>
     /// Joiner: the host has asked for our state because our group outvoted it. Export and send.
     ///
     /// Exporting is the same capture the host does for its own resync, on the same thread, so it
@@ -382,9 +404,19 @@ public sealed partial class NetplayToolForm
     private void OnStateOffer(PeerLink link, SessionGeneration generation, byte[] packed)
     {
         if (!_isHost || _awaitingDonorPort < 0) return;
-        if (link.RemotePort != _awaitingDonorPort || generation != _awaitingDonorGeneration) return;
-        StopDonorTimeout();
-        _awaitingDonorPort = -1;
+        if (link.RemotePort != _awaitingDonorPort) return;   // not the seat we asked; never solicited
+        // The seat we asked HAS answered, so the wait is over either way — clear it before judging
+        // the generation. Returning on a stale one without clearing left the timeout armed to fire
+        // later and force a redundant resync, which is the same fault CancelDonorWait describes
+        // reached from the other side: the peer answered a question the session had moved past.
+        var expected = _awaitingDonorGeneration;
+        CancelDonorWait();
+        if (generation != expected)
+        {
+            Log($"P{link.RemotePort + 1}'s state arrived for epoch {generation.Epoch}, but the " +
+                $"session has since moved to {CurrentGeneration.Epoch} — discarding it.");
+            return;
+        }
 
         if (!StateCompression.TryUnpack(packed, ControlMessageCodec.MaxStateBytes, out var state))
         {
@@ -425,6 +457,10 @@ public sealed partial class NetplayToolForm
         var gate = RecoveryPolicy.GateResync(_phase.IsRebuilding,
             MonotonicElapsedSeconds(_lastResyncStamp), ResyncGraceSeconds, _resyncCount + 1, MaxResyncs);
         if (gate == ResyncGate.AlreadyInProgress || gate == ResyncGate.Debounced) return;
+        // This resync supersedes whatever the majority ask was going to recover from — including
+        // when THIS call is the donor path's own continuation, where the wait is already cleared
+        // and cancelling again is a no-op. See CancelDonorWait.
+        CancelDonorWait();
         _resyncCount++;
         if (gate == ResyncGate.GiveUp)
         {
