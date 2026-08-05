@@ -59,6 +59,43 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
+    /// The reconnect baseline already deflated, and the generation it belongs to.
+    ///
+    /// Both consumers of <see cref="_reconnectState"/> — the rejoin and the timeout that vacates the
+    /// seat — used to call <c>EncodeStatePayload</c> themselves, on the UI thread, on a state that
+    /// was captured once and then sat unchanged for up to a minute. On a heavy core that is a few
+    /// hundred milliseconds of frozen WinForms, paid at the least convenient moment and paid twice
+    /// over the life of one drop.
+    ///
+    /// Packing it during the wait costs nothing: the session is held either way, and the thread has
+    /// the whole reconnect timeout to finish in. One immutable holder rather than two fields, so a
+    /// reader can never see a body from one generation tagged with another.
+    /// </summary>
+    private sealed class PackedReconnectState
+    {
+        public PackedReconnectState(SessionGeneration generation, byte[] body)
+        {
+            Generation = generation;
+            Body = body;
+        }
+        public SessionGeneration Generation { get; }
+        public byte[] Body { get; }
+    }
+
+    private volatile PackedReconnectState? _reconnectPacked;
+
+    /// <summary>
+    /// The deflated baseline for this generation — the pre-packed one when the background pack won
+    /// the race, otherwise packed here exactly as it always was. A rejoin that lands within the
+    /// first few hundred milliseconds simply gets the old behaviour rather than a wait.
+    /// </summary>
+    private static byte[] ReconnectStateBody(
+        PackedReconnectState? packed, SessionGeneration generation, byte[] state) =>
+        packed != null && packed.Generation == generation
+            ? packed.Body
+            : ControlMessageCodec.EncodeStatePayload(generation, state);
+
+    /// <summary>
     /// The rejoin wait expired with survivors still standing: vacate the seat and resume them,
     /// instead of ending a session that two or three people are still in. The survivors have been
     /// frozen since the drop, holding this generation's BEGIN and waiting for its state — so the
@@ -75,6 +112,7 @@ public sealed partial class NetplayToolForm
         }
         var state = _reconnectState;
         var generation = _reconnectGeneration;
+        var packed = _reconnectPacked;   // read before the clears below retire it
         if (state == null || !generation.IsValid || generation != CurrentGeneration)
         {
             EndSession("no rejoin within the timeout");
@@ -85,6 +123,7 @@ public sealed partial class NetplayToolForm
         _phase.EndAwaitingRejoin(); // the accept loop exits on this; IsRebuilding keeps frames held
         _reconnectPort = -1;
         _reconnectState = null;
+        _reconnectPacked = null;   // megabytes; nothing may hold it past the drop it belonged to
         _reconnectGeneration = default;
         _reconnectThread = null;
         RedistributeMesh();
@@ -94,7 +133,7 @@ public sealed partial class NetplayToolForm
 
         int attempt = CurrentConnectionAttempt;
         var vacatedBody = ControlMessageCodec.EncodeSeatVacated(generation, port);
-        var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
+        var stateBody = ReconnectStateBody(packed, generation, state);
         foreach (var survivor in _peers)
         {
             QueueControl(survivor, ControlMessageType.SeatVacated, vacatedBody);
@@ -229,6 +268,18 @@ public sealed partial class NetplayToolForm
             var generation = AdvanceGeneration();
             _reconnectState = state;
             _reconnectGeneration = generation;
+            // Deflate it now, while nothing is waiting on the answer. Whichever way this drop
+            // resolves — the player returns, or the timeout vacates their seat — the body is the
+            // same bytes for the same generation, and both paths used to compute it on the UI
+            // thread at the moment they needed it. See PackedReconnectState.
+            _reconnectPacked = null;
+            new Thread(() =>
+            {
+                try { _reconnectPacked = new PackedReconnectState(generation,
+                        ControlMessageCodec.EncodeStatePayload(generation, state)); }
+                catch { /* the consumers pack inline, exactly as they did before */ }
+            })
+            { IsBackground = true, Name = "BizHawkNetplay-reconnect-pack" }.Start();
             _phase.BeginRebuild(RebuildReason.PeerLoss);
             RebuildDriver();
             RedistributeMesh(); // remove the dead endpoint from host and survivor route tables
@@ -566,7 +617,7 @@ public sealed partial class NetplayToolForm
             _pendingReconnectLink = link;
             _pendingReconnectStateLength = state.Length;
             _pendingReconnectGeneration = generation;
-            var stateBody = ControlMessageCodec.EncodeStatePayload(generation, state);
+            var stateBody = ReconnectStateBody(_reconnectPacked, generation, state);
             if (survivors.Count == 0)
             {
                 ReleaseReconnectedPeer(link, state.Length, generation);
@@ -630,6 +681,7 @@ public sealed partial class NetplayToolForm
                         UntrackHandshakeClient(link.Tcp);
                         _greetingTcp = null;
                         _reconnectState = null;
+        _reconnectPacked = null;   // megabytes; nothing may hold it past the drop it belonged to
                         _reconnectGeneration = default;
                         _pendingReconnectLink = null;
                         _pendingReconnectStateLength = 0;
@@ -798,6 +850,7 @@ public sealed partial class NetplayToolForm
         // Stop any in-flight reconnect wait first; its loop exits once these flags clear.
         _phase.EndAwaitingRejoin();
         _reconnectState = null;
+        _reconnectPacked = null;   // megabytes; nothing may hold it past the drop it belonged to
         _reconnectGeneration = default;
         _pendingReconnectLink = null;
         _pendingReconnectStateLength = 0;
