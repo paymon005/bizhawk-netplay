@@ -752,6 +752,8 @@ public sealed partial class NetplayToolForm
         RestorePauseState();
         lock (_hashLock) { _checksums.Clear(); }
 
+        StopDonorTimeout();  // no majority ask outlives the session that sent it
+        _awaitingDonorPort = -1;
         _relayPairs.Clear(); // a fresh session re-measures; nothing from the last one should carry
         _portTokens.Clear(); // tokens must not outlive the control channel that authenticated them
         _pairKeys = null;    // and neither may the keys that made input provable

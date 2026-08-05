@@ -96,7 +96,14 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // what it relays, so a v21 peer's datagrams are unreadable to a v22 peer and vice versa. That is
     // a silent total input loss rather than a desync, so the version refusal matters more here than
     // usual.
-    private const int Protocol = 22;
+    // 23: identity grew a per-disc list (disc= lines — a multi-disc set was identified from disc one
+    // alone), and recovery grew a way to defer to the majority. StateRequest (27) and StateOffer
+    // (28) let an outvoted host adopt the majority's state instead of overwriting three correct
+    // machines with its own; a v22 peer has no handler for either, so an outvoted v23 host would
+    // wait out its donor timeout and fall back — degraded rather than broken, but the disc lines a
+    // v22 peer never sends would let a genuinely different disc 2 through, which is the reason to
+    // refuse rather than tolerate the mix.
+    private const int Protocol = 23;
     private const int DefaultPort = 47800;
 
     /// <summary>
@@ -298,6 +305,11 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
     private const int MaxResyncs = 6;
     private const double ResyncGraceSeconds = 2.0;
+    // How long the host waits for the majority's state before falling back to its own (KI-20).
+    // Generous because the donor has to capture and deflate a whole savestate — 6ms of capture on
+    // N64 plus the deflate plus the transfer — and the fallback costs the session a resync from the
+    // state the evidence says is wrong, which is worse than waiting a moment longer.
+    private const int DonorStateTimeoutMs = 15_000;
     private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
     // Delay is selected before WELCOME and then remains fixed. In rollback it trades local response
     // time for shallower visual corrections; in lockstep it also prevents routine network stalls.

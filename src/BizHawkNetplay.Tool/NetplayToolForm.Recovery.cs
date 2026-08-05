@@ -247,14 +247,20 @@ public sealed partial class NetplayToolForm
         // a different authority needs a majority-reconstruction protocol (a wire change); naming
         // the case does not, and until then the player can act on it — the usual causes are local
         // and theirs to clear.
-        if (partition is { HostIsOutvoted: true })
-            ConnLog($"this machine is the ONLY one reporting its checksum — " +
-                    $"{partition.HostGroupSize} of {partition.ReportCount} players agree with each " +
-                    "other and not with the host. The resync about to run makes everyone adopt " +
-                    "THIS machine's state, which on this evidence is the wrong one. Suspect " +
-                    "something local here: a Lua script, a cheat, a savestate load, or a core " +
-                    "setting that differs. If it repeats, host from another machine.",
-                Color.Firebrick);
+        int donor = MajorityRecovery.SelectDonor(partition, _deferToMajorityCheck.Checked);
+        if (donor >= 0)
+        {
+            ConnLog(MajorityRecovery.Describe(partition!, donor), Color.DarkOrange);
+            if (RequestStateFromDonor(donor)) return;   // resync resumes when the state arrives
+            // Falling through is deliberate: the donor is unreachable or already busy, and the
+            // session still has to converge on something. Today's behaviour is the fallback.
+            ConnLog($"could not ask P{donor + 1} for its state — recovering from this machine's " +
+                    "own state instead, which on this evidence is the wrong one.", Color.Firebrick);
+        }
+        else if (partition is { HostIsOutvoted: true })
+        {
+            ConnLog(MajorityRecovery.DescribeDeclined(partition), Color.Firebrick);
+        }
         // A divergence that recurs at EVERY interval, with no agreeing checksum in between, is not
         // the emulation drifting — a real drift would sync fine for a while first. It means the two
         // machines are comparing memory that was never going to match. On N64 the usual cause is
@@ -271,6 +277,138 @@ public sealed partial class NetplayToolForm
                 "to native resolution on BOTH machines." +
                 (_videoDiagnostic != null ? $" This session is running {_videoDiagnostic}." : ""),
                 Color.Firebrick);
+        PerformResyncAsHost();
+    }
+
+    // --- majority-aware recovery (KI-20, opt-in) -------------------------------------------------
+
+    /// <summary>The seat the host asked for a state, or -1 when it is not waiting for one. Also the
+    /// gate on <see cref="OnStateOffer"/>: an offer from anyone else, or when nothing was asked, is
+    /// a peer trying to hand the host bytes it never requested.</summary>
+    private int _awaitingDonorPort = -1;
+    private SessionGeneration _awaitingDonorGeneration;
+
+    /// <summary>
+    /// Ask the majority's chosen machine for its state. True when the request went out, in which
+    /// case recovery continues in <see cref="OnStateOffer"/>; false means the caller should fall
+    /// back to recovering from the host's own state, because the session still has to converge.
+    /// </summary>
+    private bool RequestStateFromDonor(int donorPort)
+    {
+        if (!_isHost || _phase.IsRebuilding) return false;
+        if (_awaitingDonorPort >= 0) return false;   // one ask in flight at a time
+        PeerLink? donor = null;
+        foreach (var link in _peers) if (link.RemotePort == donorPort) { donor = link; break; }
+        if (donor == null) return false;
+
+        var generation = CurrentGeneration;
+        if (!QueueControl(donor, ControlMessageType.StateRequest,
+                ControlMessageCodec.EncodeStateRequest(generation)))
+            return false;
+
+        _awaitingDonorPort = donorPort;
+        _awaitingDonorGeneration = generation;
+        // Bounded, because a donor that never answers must not leave the session desynced forever
+        // waiting on it. On expiry the ordinary host-authoritative resync runs, which is exactly
+        // what would have happened had this never been attempted.
+        StartDonorTimeout();
+        Status($"asking P{donorPort + 1} for the majority's state…", Color.DarkOrange);
+        return true;
+    }
+
+    private System.Windows.Forms.Timer? _donorTimer;
+
+    private void StartDonorTimeout()
+    {
+        StopDonorTimeout();
+        _donorTimer = new System.Windows.Forms.Timer { Interval = DonorStateTimeoutMs };
+        _donorTimer.Tick += (_, __) =>
+        {
+            StopDonorTimeout();
+            if (_awaitingDonorPort < 0) return;
+            int port = _awaitingDonorPort;
+            _awaitingDonorPort = -1;
+            ConnLog($"P{port + 1} did not send its state within " +
+                    $"{DonorStateTimeoutMs / 1000}s — recovering from this machine's own state " +
+                    "instead, which on the checksum evidence is the wrong one.", Color.Firebrick);
+            PerformResyncAsHost();
+        };
+        _donorTimer.Start();
+    }
+
+    private void StopDonorTimeout()
+    {
+        try { _donorTimer?.Stop(); _donorTimer?.Dispose(); } catch { }
+        _donorTimer = null;
+    }
+
+    /// <summary>
+    /// Joiner: the host has asked for our state because our group outvoted it. Export and send.
+    ///
+    /// Exporting is the same capture the host does for its own resync, on the same thread, so it
+    /// carries the same cost and the same guarantees. No frame is named — see
+    /// <c>ControlMessageCodec.EncodeStateRequest</c> for why asking for a specific one would be
+    /// worse than useless.
+    /// </summary>
+    private void OnStateRequested(SessionGeneration generation)
+    {
+        if (_isHost || !_phase.IsActive || generation != CurrentGeneration) return;
+        if (_peers.Count == 0) return;
+        try
+        {
+            var state = _adapter!.ExportState();
+            ConnLog($"the host asked for this machine's state ({state.Length / 1024}KiB) — the " +
+                    "other players agreed with us and not with it, so this becomes the session's " +
+                    "state.", Color.DarkSlateBlue);
+            QueueControl(_peers[0], ControlMessageType.StateOffer,
+                ControlMessageCodec.EncodeStateOffer(generation, StateCompression.Pack(state)));
+        }
+        catch (Exception ex)
+        {
+            // Nothing to send and nothing to do: the host's timeout falls back to its own state.
+            Log("(warning) could not export a state for the host's majority request: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Host: the donor's state arrived. Adopt it, then run the ordinary resync so every peer —
+    /// including the donor and including this machine — converges on it.
+    ///
+    /// This is the only place a host loads a peer's savestate, and every guard here is about that.
+    /// It must be the seat we asked, in the generation we asked it in, while we are still waiting;
+    /// anything else is discarded unread. See <see cref="MajorityRecovery"/> for why the whole
+    /// feature is opt-in, and <see cref="StateImportTrust"/> for what loading one means.
+    /// </summary>
+    private void OnStateOffer(PeerLink link, SessionGeneration generation, byte[] packed)
+    {
+        if (!_isHost || _awaitingDonorPort < 0) return;
+        if (link.RemotePort != _awaitingDonorPort || generation != _awaitingDonorGeneration) return;
+        StopDonorTimeout();
+        _awaitingDonorPort = -1;
+
+        if (!StateCompression.TryUnpack(packed, ControlMessageCodec.MaxStateBytes, out var state))
+        {
+            ConnLog($"P{link.RemotePort + 1} sent a malformed or oversized state — recovering from " +
+                    "this machine's own instead.", Color.Firebrick);
+            PerformResyncAsHost();
+            return;
+        }
+
+        try
+        {
+            LogStateImportTrust();   // the host is importing now too, which it never used to
+            _adapter!.ImportState(state);
+            ConnLog($"adopted P{link.RemotePort + 1}'s state ({state.Length / 1024}KiB) — " +
+                    "distributing it to everyone as the session's.", Color.DarkOrange);
+        }
+        catch (Exception ex)
+        {
+            // A failed import can leave this machine anywhere, so the resync below is not optional:
+            // it re-captures whatever state we are now in and makes it authoritative, which is the
+            // same convergence the session would have had without any of this.
+            ConnLog("could not load the majority's state (" + ex.Message +
+                    ") — recovering from this machine's own instead.", Color.Firebrick);
+        }
         PerformResyncAsHost();
     }
 

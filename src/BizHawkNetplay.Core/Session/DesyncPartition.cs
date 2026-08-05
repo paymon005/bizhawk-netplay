@@ -77,6 +77,32 @@ public sealed class DesyncPartition
         }
     }
 
+    /// <summary>
+    /// The peer whose state should become the session's, when the host's own is the minority
+    /// report — or -1 when there is no such peer and the host stays authoritative.
+    ///
+    /// The lowest port in the largest group, which is a choice about DETERMINISM rather than about
+    /// merit: every machine in that group reported the same hash, so any of them would do, and
+    /// picking by a rule both ends can compute means the host and the donor never disagree about
+    /// who was asked. Sorting is already done by <see cref="FromReports"/>.
+    ///
+    /// Returns -1 unless the host is genuinely outvoted. A tie is not a majority — with two groups
+    /// of two there is nothing to defer to — and handing authority to one half of a tie would be
+    /// inventing a verdict the evidence does not support, which is the same reasoning
+    /// <see cref="HostIsOutvoted"/> already applies.
+    /// </summary>
+    public int ChooseDonor()
+    {
+        if (!HostIsOutvoted) return -1;
+        foreach (var group in Groups)
+        {
+            if (group.Value.Contains(HostPort)) continue;
+            if (group.Value.Count <= HostGroupSize) continue;
+            return group.Value[0];   // sorted ascending by FromReports
+        }
+        return -1;
+    }
+
     /// <summary>One line naming the split, for the session log.</summary>
     public string Describe()
     {

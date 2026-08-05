@@ -268,6 +268,27 @@ public sealed partial class NetplayToolForm
                             out var generation, out int effectiveFrom, out var mask))
                         BeginInvokePeer(link, () => OnExclusionMask(generation, effectiveFrom, mask));
                 }
+                else if (type == ControlMessageType.StateRequest)
+                {
+                    // Host -> joiner: "your group outvoted me; send me your state." Only ever
+                    // arrives at the donor DesyncPartition.ChooseDonor named, and only when the host
+                    // opted into deferring — a joiner that receives one when it did not expect it
+                    // still answers, because the host is the only party that can send it and the
+                    // generation check below is what makes a stale one harmless.
+                    if (!_isHost && ControlMessageCodec.TryDecodeStateRequest(body, out var generation)
+                        && generation == CurrentGeneration)
+                        BeginInvokePeer(link, () => OnStateRequested(generation));
+                }
+                else if (type == ControlMessageType.StateOffer)
+                {
+                    // Joiner -> host: the donor's state. The ONE message that carries a peer's
+                    // savestate toward the host, which is why the host refuses it unless it asked
+                    // (see OnStateOffer) — an unsolicited one is a peer trying to hand the host
+                    // bytes it never requested.
+                    if (_isHost && ControlMessageCodec.TryDecodeStateOffer(body,
+                            out var generation, out var packed))
+                        BeginInvokePeer(link, () => OnStateOffer(link, generation, packed));
+                }
                 else if (type == ControlMessageType.InputOutage)
                 {
                     // Joiner -> host only: a mesh leg died and its victim is asking for a relay.

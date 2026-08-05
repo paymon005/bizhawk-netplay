@@ -300,6 +300,54 @@ public static class ControlMessageCodec
         return port < HandshakeCodec.MaxPlayers;
     }
 
+    /// <summary>
+    /// The host asking one peer for its state, because that peer's group outvoted the host.
+    ///
+    /// Carries the generation and nothing else: the donor sends whatever it holds NOW, and the
+    /// resync that follows makes that the new baseline for everyone. Naming a frame would be worse
+    /// than useless — the donor is running, so any frame the host could name is already behind it,
+    /// and pretending otherwise would invite a rewind the donor cannot perform.
+    /// </summary>
+    public static byte[] EncodeStateRequest(SessionGeneration generation)
+    {
+        var body = new byte[GenerationSize];
+        WriteGeneration(body, 0, generation);
+        return body;
+    }
+
+    public static bool TryDecodeStateRequest(byte[] body, out SessionGeneration generation)
+    {
+        generation = default;
+        return body != null && body.Length == GenerationSize && TryReadGeneration(body, 0, out generation);
+    }
+
+    /// <summary>
+    /// The donor's answer: its generation, then its state, already deflated by the caller.
+    ///
+    /// The state is NOT unpacked here. Callers hand the tail to <c>StateCompression.TryUnpack</c>
+    /// with its own bound, exactly as the joiner side does for a host's state, so there is one place
+    /// that decides how large a state may be rather than two that could disagree.
+    /// </summary>
+    public static byte[] EncodeStateOffer(SessionGeneration generation, byte[] packedState)
+    {
+        if (packedState == null) throw new ArgumentNullException(nameof(packedState));
+        var body = new byte[GenerationSize + packedState.Length];
+        WriteGeneration(body, 0, generation);
+        Buffer.BlockCopy(packedState, 0, body, GenerationSize, packedState.Length);
+        return body;
+    }
+
+    public static bool TryDecodeStateOffer(byte[] body, out SessionGeneration generation, out byte[] packedState)
+    {
+        generation = default;
+        packedState = [];
+        if (body == null || body.Length < GenerationSize || !TryReadGeneration(body, 0, out generation))
+            return false;
+        packedState = new byte[body.Length - GenerationSize];
+        Buffer.BlockCopy(body, GenerationSize, packedState, 0, packedState.Length);
+        return true;
+    }
+
     /// <summary>How many buckets main memory is divided into for divergence mapping. Part of the
     /// wire contract: both peers must slice memory identically or the vectors describe different
     /// things. 256 makes a report ~1KiB and a mask bitmap 32 bytes.</summary>

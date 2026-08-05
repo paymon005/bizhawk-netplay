@@ -18,6 +18,7 @@ public sealed partial class NetplayToolForm
     private readonly ToolTip _tips = new(); // owns a native window — disposed with the form
     private CheckBox _unpausedClockCheck = null!;
     private CheckBox _aboveNativeCheck = null!;
+    private CheckBox _deferToMajorityCheck = null!;
     private CheckBox _verboseCheck = null!;
 
     // ------------------------------------------------------------------ persisted settings
@@ -396,6 +397,27 @@ public sealed partial class NetplayToolForm
             "The trade: a game that READS its own framebuffer can then diverge for real without being\r\n" +
             "detected. Most games never do. Leave this off and play at native if you want the\r\n" +
             "strongest desync detection; the measurement is logged either way.");
+
+        // Host-side, and off by default because it is a trust decision rather than a setting.
+        // Recovery distributes the host's state, so a lone-diverged host overwrites everyone who was
+        // right. Fixing that means the host adopts a peer's savestate — and a savestate is a
+        // trusted-input format all the way into the core, an exposure that until now was the
+        // joiners' alone (KI-13). Needs a colluding MAJORITY to abuse, not one bad peer, but the
+        // trade belongs to whoever is running the session. See MajorityRecovery.
+        _deferToMajorityCheck = new CheckBox
+        {
+            Text = "Defer to the majority on a desync", AutoSize = true, Location = new Point(200, 210),
+        };
+        _tips.SetToolTip(_deferToMajorityCheck,
+            "Host only. Off by default.\r\n\r\n" +
+            "A resync makes everyone adopt the HOST's state. If the host is the machine that\r\n" +
+            "diverged — a Lua script, a cheat, a stray savestate load — that overwrites the players\r\n" +
+            "who were right. With this on, the host asks a machine from the majority for its state\r\n" +
+            "and everyone adopts that instead.\r\n\r\n" +
+            "The trade: the host then loads a peer's savestate, and a savestate can set memory, page\r\n" +
+            "permissions and the stack pointer of the emulated machine. It takes a colluding\r\n" +
+            "majority to abuse — two of three players, or three of four — not one bad peer. Turn it\r\n" +
+            "on for people you trust; leave it off and the log still names the case when it happens.");
 
         var simLatencyLabel = new Label { Text = "Sim latency ms:", AutoSize = true, Location = new Point(12, 132) };
         _simLatencyBox = new NumericUpDown { Minimum = 0, Maximum = 500, Increment = 10, Value = 0, Location = new Point(110, 130), Width = 60 };

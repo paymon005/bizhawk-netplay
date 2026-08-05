@@ -80,12 +80,20 @@ open is recorded with what it would actually take.
   when it mattered: both peers failing produced the same empty blob, the same digest, and a pass.
   N64's `VideoSizeX/Y` are carried too — as a named warning rather than a refusal, since whether a
   resolution difference matters depends on whether the game reads its own framebuffer.
-- **KI-20 (open) — recovery always assumes the host is correct.** The host's state is distributed
-  on every resync, so a lone-diverged host can overwrite three agreeing joiners. The partition is
-  recorded and the case is named in the log (`DesyncPartition`), but the policy is unchanged;
-  choosing a different authority needs majority reconstruction and a wire change. Deliberately
-  waiting on real logs — deciding the authority policy from a session that actually hit it beats
-  deciding it from reasoning.
+- **KI-20 — CLOSED in v0.34.0, opt-in.** An outvoted host can now ask the majority for its state
+  and adopt it, rather than overwriting three correct machines with its own. The donor is the
+  lowest port in the largest group — a rule both ends compute, so the host and the donor never
+  disagree about who was asked — and a tie is still not a majority.
+
+  **It is off by default, and the reason is the interesting part.** Correctness requires the wrong
+  machine to adopt the right state, so if the host is wrong, the host imports — and a savestate is
+  a trusted-input format all the way into the core (KI-13). Until now no path existed by which a
+  host ran a peer's bytes; every state-bearing handler was joiner-side, and that was a real
+  property. Deferring gives it up. Abusing it needs a colluding MAJORITY rather than one bad peer —
+  two of three players, or three of four — which is a far higher bar than the joiner-side case, but
+  it is a trade rather than an improvement, and a trade belongs to whoever is running the session.
+  A host that leaves it off keeps the old behaviour, which is loud about being wrong rather than
+  quiet about it, and the log names the setting. `MajorityRecovery`, `DesyncPartition.ChooseDonor`.
 - **KI-21 — CLOSED in v0.33.0.** Input datagrams carry their author and a per-pair HMAC tag. The
   host mints one key per unordered pair of seats and hands each peer only the pairs it belongs to,
   so a peer holds nothing it could sign as another seat with; the payload's own port byte is
@@ -310,9 +318,10 @@ in that code is correct for a file off your own disk. What this tool does is tur
 input. Worth reporting upstream; nothing here can make it safe.
 
 **What follows from it:**
-- A host is not exposed. A host never imports a peer's state — every state-bearing handler is gated
-  on `!_isHost`, and all three `ImportState` call sites are joiner-side or restore our own
-  pre-join state. No path was found by which a host runs a peer's bytes.
+- A host is not exposed BY DEFAULT. Every state-bearing handler is gated on `!_isHost`, and three
+  of the four `ImportState` call sites are joiner-side or restore our own pre-join state. The
+  fourth arrived in v0.34.0 with majority-aware recovery and is off unless the host turns it on;
+  see the note below the block.
 - A joiner is exposed to its host, and to anyone who can inject into the control stream. There is
   no encryption and no per-frame integrity after the handshake (the PBKDF2 output is compared and
   discarded rather than kept as a key), so on a hostile network — public wifi, a compromised router
@@ -339,9 +348,14 @@ sounds. What remains open is the upstream half, which no wire change here can to
 still imports its host's savestate, and a savestate is a trusted-input format all the way down
 into the cores. Join people you know, or set a password.
 
-*Re-verified 2026-08-04 against v0.34.0: the exposure is unchanged.* The three `ImportState` call
-sites are still the two joiner-side ones and the restore of this machine's own pre-join state, so
-nothing added since has given a host a peer's bytes to run. What v0.34.0 adds is not a fix but an
+*Re-verified 2026-08-04 against v0.34.0, and one thing HAS changed.* Three of the four `ImportState`
+call sites are still the two joiner-side ones and the restore of this machine's own pre-join state.
+The fourth is new: majority-aware recovery (KI-20) has an outvoted host adopt a peer's state, which
+is the first path by which a host runs a peer's bytes. That is exactly why it ships off by default
+and why the checkbox says so — correctness there requires the wrong machine to adopt the right
+state, so the exposure is inherent to the fix rather than an oversight in it. A host that leaves the
+setting alone still has no such path. Abusing the one it opts into needs a colluding majority, not a
+single bad peer. What v0.34.0 adds is not a fix but an
 end to the silence — a joiner says once, before the first host state loads, what a savestate can
 set (memory, page permissions, the stack pointer of the emulated machine), and distinguishes the
 two cases the MAC created: with a password only the host can reach that parser; without one the key

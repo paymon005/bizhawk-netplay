@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.33.0 | **22** | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
+| v0.34.0 | **23** | Content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
+| v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
 | v0.31.0 | 20 | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
 | v0.30.0 | 19 | The desync checksum changed which bytes it reads, twice over. A memory domain that wraps a raw pointer in per-byte delegates — N64's RDRAM, and the reason its checksum used to sample a quarter of RAM by word — is now copied and hashed whole, so a v18 peer hashes a quarter of what this one hashes all of. And the span the video hardware is scanning out is skipped on every path, which is what lets N64 run above native resolution without disagreeing at every checksum. Either alone would make a mixed pair report a desync that is not there. |
@@ -28,6 +29,27 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.34.0 — the last four findings (protocol 23)
+
+Everything left on the 2026-08-04 review's list, plus the one item that predates it.
+
+- **Every disc is identified, not just the first.** A multi-disc set was identified by
+  `GameInfo.Hash`, which BizHawk derives from disc one — so the same disc 1 with different disc 2s
+  passed every check and diverged on the swap. Each mounted disc is now hashed on its own with both
+  of BizHawk's own hashers, and the refusal names the disc rather than the set.
+- **An outvoted host can defer to the majority** (opt-in, Diagnostics tab). Recovery distributes the
+  host's state, so a lone-diverged host overwrote the players who were right. The host can now ask
+  the majority's lowest-numbered machine for its state and adopt it. Off by default because
+  correctness there requires the host to load a peer's savestate, which is the first path by which a
+  host runs a peer's bytes — a trade rather than an improvement, and one that belongs to whoever is
+  running the session. Left off, the log still names the case and the setting.
+- **A joiner is told what loading the host's state means.** KI-13 cannot be fixed here — a savestate
+  is a trusted-input format all the way into the core — but it was also never said. It is now, once
+  per session, distinguishing the two cases the control-frame MAC created.
+- **The player count says what has been run and what is merely supported.** `MaxPlayers` was 8 and
+  the README said 2-4. Capping was the wrong fix — every array and route holds at 8 — so the docs
+  now match the code, and a host asking for more than four is told which three things get harder.
 
 ### v0.33.0 — the session proves what it is running (protocol 22)
 
