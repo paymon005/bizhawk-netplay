@@ -93,23 +93,6 @@ public sealed class ControlChannel
     private const int MaxSmallFrameLength = 256 * 1024;
 
     /// <summary>
-    /// Whether this message type may legitimately carry a whole-core savestate.
-    ///
-    /// <see cref="ControlMessageType.StateOffer"/> belongs here and was missed when it was added,
-    /// which made majority recovery unusable on any core with a state over 256 KiB — that is, all
-    /// of them. The donor's <c>Send</c> threw on the cap, its writer thread treated that as a link
-    /// fault, and a joiner losing its host link ends its session: the one peer whose state was
-    /// correct got dropped for having been asked for it.
-    ///
-    /// It is also the first type that may be large in the joiner → host direction, which is what
-    /// prompted <see cref="RoleMayCarryLargeFrame"/>: the ceiling is now granted per direction as
-    /// well as per type, so neither end offers the other an allocation it has no business asking for.
-    /// </summary>
-    private static bool CarriesState(ControlMessageType type) =>
-        type is ControlMessageType.State or ControlMessageType.Resync
-            or ControlMessageType.StateOffer;
-
-    /// <summary>
     /// Set once the peer on the other end has proved the session password.
     ///
     /// Until then the savestate ceiling does not apply, whatever a frame declares itself to be. A
@@ -124,7 +107,7 @@ public sealed class ControlChannel
     /// Which end of the link this is, once the handshake has said. 0 = not yet declared.
     ///
     /// The savestate ceiling used to turn on for an authenticated peer and stay on in both
-    /// directions, which is a weaker rule than its own comment claims. A state travels host →
+    /// directions, which is a weaker rule than its own comment claimed. A state travels host →
     /// joiner and an offer travels joiner → host, so half of every large-frame permission was
     /// granted to the side that has no business using it: a joiner could declare a 64 MiB State at
     /// its host, which the reader allocates in full before discovering it is not even a message the
@@ -133,19 +116,30 @@ public sealed class ControlChannel
     /// </summary>
     private int _role; // 1 = host, 2 = joiner
 
-    private bool RoleMayCarryLargeFrame(ControlMessageType type, bool sending)
+    /// <summary>
+    /// The size ceiling for one frame, in the direction it is travelling.
+    ///
+    /// Three conditions, and each is load-bearing. The type must be one that may carry a state at
+    /// all; the peer must have proved the password, because a state is the one enormous thing on
+    /// this channel and nobody may send one before the handshake reaches that point; and this end
+    /// must be the end that legitimately sends or receives it.
+    ///
+    /// All three now read <see cref="ControlMessageRouting"/> rather than predicates kept here by
+    /// hand — see that table for what went wrong when they were separate. A role that has not been
+    /// declared stays permissive, exactly as before, so a caller that authenticates without saying
+    /// which end it is cannot be broken by this.
+    /// </summary>
+    private int MaxLengthFor(ControlMessageType type, bool sending)
     {
-        if (_role == 0) return true;   // undeclared: authentication alone governs, as before
+        if (ControlMessageRouting.Size(type) != MessageSize.State || !Authenticated)
+            return MaxSmallFrameLength;
+        if (_role == 0) return MaxFrameLength;   // undeclared: authentication alone governs
         bool weAreHost = _role == 1;
-        // StateOffer is the one that travels toward the host; State and Resync travel away from it.
-        bool towardHost = type == ControlMessageType.StateOffer;
-        return sending ? weAreHost != towardHost : weAreHost == towardHost;
+        bool permitted = sending
+            ? ControlMessageRouting.MaySend(type, weAreHost)
+            : ControlMessageRouting.Accepts(type, weAreHost);
+        return permitted ? MaxFrameLength : MaxSmallFrameLength;
     }
-
-    private int MaxLengthFor(ControlMessageType type, bool sending) =>
-        CarriesState(type) && Authenticated && RoleMayCarryLargeFrame(type, sending)
-            ? MaxFrameLength
-            : MaxSmallFrameLength;
 
     private readonly Stream _stream;
     private readonly object _writeLock = new();

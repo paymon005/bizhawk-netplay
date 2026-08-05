@@ -116,11 +116,22 @@ public sealed partial class NetplayToolForm
             {
                 var (type, body) = link.Control.Receive();
                 Interlocked.Exchange(ref link.LastRecvTicks, MonotonicNow()); // liveness heartbeat
+
+                // One direction check for every message, read from ControlMessageRouting rather
+                // than repeated as an `_isHost &&` in each arm below. A resync arriving at the host,
+                // or a checksum at a joiner, is dropped here — it is a message travelling the wrong
+                // way, which no handler should have to think about individually.
+                //
+                // Types the table does not know are accepted and then fall off the end of the chain
+                // unhandled, which is what an older peer's unfamiliar message should do. Their SIZE
+                // is where they are actually constrained (ControlChannel.MaxLengthFor).
+                if (!ControlMessageRouting.Accepts(type, _isHost)) continue;
+
                 if (type == ControlMessageType.Checksum)
                 {
                     // Only the host aggregates; a joiner never receives checksums.
                     var generation = CurrentGeneration;
-                    if (_isHost && ControlMessageCodec.TryDecodeChecksum(body, generation, out int frame, out uint hash))
+                    if (ControlMessageCodec.TryDecodeChecksum(body, generation, out int frame, out uint hash))
                         RecordChecksum(link.Attempt, generation, link.RemotePort, frame, hash);
                 }
                 else if (type == ControlMessageType.Ping && body.Length == 8)
@@ -173,31 +184,25 @@ public sealed partial class NetplayToolForm
                 else if (type == ControlMessageType.PeerList)
                 {
                     // Host reshuffled the mesh (e.g. someone rejoined) — update who we send to.
-                    if (!_isHost)
+                    var routes = HandshakeCodec.DecodeRoutes(body);
+                    BeginInvokePeer(link, () =>
                     {
-                        var routes = HandshakeCodec.DecodeRoutes(body);
-                        BeginInvokePeer(link, () =>
-                        {
-                            _meshOthers = routes;
-                            ApplyJoinerMesh();
-                            if (Verbose) Log($"mesh updated: {routes.Count} other peer(s)");
-                        });
-                    }
+                        _meshOthers = routes;
+                        ApplyJoinerMesh();
+                        if (Verbose) Log($"mesh updated: {routes.Count} other peer(s)");
+                    });
                 }
                 else if (type == ControlMessageType.Candidate)
                 {
                     // A joiner reported its public (reflexive) endpoint; record it and re-share the
                     // candidate lists so everyone can reach it across NAT.
-                    if (_isHost)
-                    {
-                        var eps = HandshakeCodec.DecodeEndpoints(body);
-                        if (eps.Count > 0)
-                            BeginInvokePeer(link, () => OnJoinerCandidate(link, eps[0]));
-                    }
+                    var eps = HandshakeCodec.DecodeEndpoints(body);
+                    if (eps.Count > 0)
+                        BeginInvokePeer(link, () => OnJoinerCandidate(link, eps[0]));
                 }
                 else if (type == ControlMessageType.ResyncBegin)
                 {
-                    if (!_isHost && ControlMessageCodec.TryDecodeResyncBegin(body, out var generation, out int stateBytes,
+                    if (ControlMessageCodec.TryDecodeResyncBegin(body, out var generation, out int stateBytes,
                         out int waitSeconds, out int resyncDelay, out var resyncMode, out bool settingsChange)
                         && generation == CurrentGeneration.Next())
                     {
@@ -221,7 +226,7 @@ public sealed partial class NetplayToolForm
                 }
                 else if (type == ControlMessageType.Resync)
                 {
-                    if (!_isHost && link.ResyncReceiving)
+                    if (link.ResyncReceiving)
                     {
                         int expectedEpoch = link.ReceivingResyncEpoch;
                         int expectedBytes = link.ReceivingResyncBytes;
@@ -243,13 +248,13 @@ public sealed partial class NetplayToolForm
                 }
                 else if (type == ControlMessageType.ResyncApplied)
                 {
-                    if (_isHost && ControlMessageCodec.TryDecodeGeneration(body, out var generation)
+                    if (ControlMessageCodec.TryDecodeGeneration(body, out var generation)
                         && generation == CurrentGeneration)
                         BeginInvokePeer(link, () => OnPeerResyncApplied(link, generation));
                 }
                 else if (type == ControlMessageType.ResyncResume)
                 {
-                    if (!_isHost && ControlMessageCodec.TryDecodeGeneration(body, out var generation)
+                    if (ControlMessageCodec.TryDecodeGeneration(body, out var generation)
                         && generation == CurrentGeneration)
                         BeginInvokePeer(link, () => ResumeResyncAsJoiner(generation));
                 }
@@ -257,14 +262,14 @@ public sealed partial class NetplayToolForm
                 {
                     // Joiner -> host: a learn-window bucket vector. RecordDivergence does its own
                     // locking and marshals only the terminal verdict, so no UI hop per report.
-                    if (_isHost && ControlMessageCodec.TryDecodeDivergenceReport(body,
+                    if (ControlMessageCodec.TryDecodeDivergenceReport(body,
                             out var generation, out int frame, out var buckets))
                         RecordDivergence(link.Attempt, generation, link.RemotePort, frame, buckets);
                 }
                 else if (type == ControlMessageType.ExclusionMask)
                 {
                     // Host -> joiner: the measured machine-produced ranges to stop hashing.
-                    if (!_isHost && ControlMessageCodec.TryDecodeExclusionMask(body,
+                    if (ControlMessageCodec.TryDecodeExclusionMask(body,
                             out var generation, out int effectiveFrom, out var mask))
                         BeginInvokePeer(link, () => OnExclusionMask(generation, effectiveFrom, mask));
                 }
@@ -275,7 +280,7 @@ public sealed partial class NetplayToolForm
                     // opted into deferring — a joiner that receives one when it did not expect it
                     // still answers, because the host is the only party that can send it and the
                     // generation check below is what makes a stale one harmless.
-                    if (!_isHost && ControlMessageCodec.TryDecodeStateRequest(body, out var generation)
+                    if (ControlMessageCodec.TryDecodeStateRequest(body, out var generation)
                         && generation == CurrentGeneration)
                         BeginInvokePeer(link, () => OnStateRequested(generation));
                 }
@@ -285,21 +290,21 @@ public sealed partial class NetplayToolForm
                     // savestate toward the host, which is why the host refuses it unless it asked
                     // (see OnStateOffer) — an unsolicited one is a peer trying to hand the host
                     // bytes it never requested.
-                    if (_isHost && ControlMessageCodec.TryDecodeStateOffer(body,
+                    if (ControlMessageCodec.TryDecodeStateOffer(body,
                             out var generation, out var packed))
                         BeginInvokePeer(link, () => OnStateOffer(link, generation, packed));
                 }
                 else if (type == ControlMessageType.InputOutage)
                 {
                     // Joiner -> host only: a mesh leg died and its victim is asking for a relay.
-                    if (_isHost && ControlMessageCodec.TryDecodeInputOutage(body,
+                    if (ControlMessageCodec.TryDecodeInputOutage(body,
                             out var generation, out int silentPort))
                         BeginInvokePeer(link, () => OnInputOutage(link, generation, silentPort));
                 }
                 else if (type == ControlMessageType.SeatVacated)
                 {
                     // Host -> joiner only: a seat is permanently empty; the rebuild follows.
-                    if (!_isHost && ControlMessageCodec.TryDecodeSeatVacated(body,
+                    if (ControlMessageCodec.TryDecodeSeatVacated(body,
                             out var generation, out int vacatedPort))
                         BeginInvokePeer(link, () => OnSeatVacated(generation, vacatedPort));
                 }
