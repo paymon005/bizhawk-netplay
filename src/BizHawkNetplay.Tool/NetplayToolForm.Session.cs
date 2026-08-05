@@ -310,7 +310,9 @@ public sealed partial class NetplayToolForm
         _startEmuFrame = APIs.Emulation.FrameCount(); // baseline for frame-advance drift checks
         _checksumDue = false;
         _resyncBudget.Reset();
-        _applyBarrier.Clear();
+        // A rebuild left in flight by a previous attempt must not outlive it — it would refuse
+        // every recovery this session ever tries, with nothing on screen to say why.
+        _rebuild.Abort();
         _desyncTrend.Reset();
         _reconnectState = null;
         _reconnectGeneration = default;

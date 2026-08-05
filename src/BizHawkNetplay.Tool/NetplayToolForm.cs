@@ -531,6 +531,9 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     public NetplayToolForm()
     {
+        // Composed rather than field-initialised: it drives the phase, the barrier and the budget,
+        // and a C# field initialiser cannot reach its siblings.
+        _rebuild = new HostRebuild(_phase, _applyBarrier, _resyncBudget);
         _logFile = SessionLog.Prepare(
             $"BizHawk Netplay v{ToolVersion} — protocol {Protocol}{Environment.NewLine}" +
             $"log opened {DateTime.Now:yyyy-MM-dd HH:mm:ss} (local time, UTC{DateTimeOffset.Now.Offset.Hours:+00;-00}:00)" +

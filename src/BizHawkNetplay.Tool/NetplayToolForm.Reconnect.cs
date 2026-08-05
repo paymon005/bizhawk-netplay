@@ -134,7 +134,11 @@ public sealed partial class NetplayToolForm
         int attempt = CurrentConnectionAttempt;
         var vacatedBody = ControlMessageCodec.EncodeSeatVacated(generation, port);
         var stateBody = ReconnectStateBody(packed, generation, state);
-        _applyBarrier.Expect(SeatsOf(_peers), generation.Epoch);
+        // Nothing left to capture or pack — the baseline was taken when the peer dropped — but the
+        // wait for every survivor and the single release afterwards are the ordinary ones, so this
+        // joins that sequence rather than reimplementing its tail. See HostRebuild.TryAdopt.
+        _rebuild.TryAdopt(generation, state.Length, attempt);
+        _rebuild.TryDistribute(SeatsOf(_peers));
         foreach (var survivor in _peers)
         {
             QueueControl(survivor, ControlMessageType.SeatVacated, vacatedBody);

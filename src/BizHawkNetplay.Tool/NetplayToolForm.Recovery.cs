@@ -513,26 +513,28 @@ public sealed partial class NetplayToolForm
             : $"{wireBytes / 1024}KiB on the wire ({pct}% of it)";
     }
 
+    /// <summary>
+    /// The sequence — claim, capture, pack, distribute, await, release — is
+    /// <see cref="HostRebuild"/>'s; this supplies the emulator, the sockets and the words.
+    /// </summary>
+    private readonly HostRebuild _rebuild;
+
     private void ShipAuthoritativeState(string label, bool isSettingsChange)
     {
         int attempt = CurrentConnectionAttempt;
+        // Claim BEFORE anything irreversible, and hold the claim across the off-thread pack below.
+        // A second trigger arriving in that window is refused rather than racing; two authoritative
+        // baselines on one generation is the worst failure this file has.
+        if (!_rebuild.TryBegin(isSettingsChange, attempt))
+        {
+            Log($"{label}: a rebuild is already in flight — refused");
+            return;
+        }
         try
         {
-            // Claim the rebuild BEFORE anything irreversible. BeginRebuild refusing a second
-            // rebuild while one is in flight is the point of the phase flag — but the refusal was
-            // being discarded, after the generation had already advanced. Every current caller
-            // checks IsRebuilding first on the UI thread, so this is unreachable today; the pack
-            // thread now holds the rebuild open for hundreds of milliseconds longer than it used
-            // to, and the failure a careless fourth caller would produce — two authoritative
-            // baselines racing on a generation peers were never told about — is the worst one in
-            // this file. Cheap insurance, honestly labelled.
-            if (!_phase.BeginRebuild(isSettingsChange ? RebuildReason.SettingsChange : RebuildReason.Desync))
-            {
-                Log($"{label}: a rebuild is already in flight — refused");
-                return;
-            }
             var state = ExportOwnState();
             var generation = AdvanceGeneration();
+            _rebuild.Captured(generation, state.Length);
             RebuildDriver();
             RefreshLiveSettingsUi();
             int peerCount = _peers.Count;
@@ -543,9 +545,7 @@ public sealed partial class NetplayToolForm
 
             if (peerCount == 0)
             {
-                _phase.EndRebuild();
-                RebaseFrameSchedule();
-                RefreshLiveSettingsUi();
+                FinishRebuild();
                 return;
             }
 
@@ -562,8 +562,7 @@ public sealed partial class NetplayToolForm
                 {
                     BeginInvokeUi(() =>
                     {
-                        if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
-                            && CurrentGeneration == generation)
+                        if (_rebuild.IsCurrent(attempt, generation))
                             EndSession("resync failed: " + ex.Message);
                     });
                     return;
@@ -573,7 +572,21 @@ public sealed partial class NetplayToolForm
             })
             { IsBackground = true, Name = "BizHawkNetplay-state-pack" }.Start();
         }
-        catch (Exception ex) { EndSession("resync failed: " + ex.Message); }
+        catch (Exception ex)
+        {
+            // The claim must not outlive the sequence: a rebuild left standing refuses every future
+            // recovery while showing no reason for it.
+            _rebuild.Abort();
+            EndSession("resync failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>End a rebuild that has nothing left to wait for, and start the clock again.</summary>
+    private void FinishRebuild()
+    {
+        _rebuild.Complete();
+        RebaseFrameSchedule();
+        RefreshLiveSettingsUi();
     }
 
     /// <summary>
@@ -586,23 +599,21 @@ public sealed partial class NetplayToolForm
     private void QueueAuthoritativeState(string label, int attempt, SessionGeneration generation,
         int stateLength, byte[] generationBody, byte[] stateBody)
     {
-        if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive
-            || CurrentGeneration != generation) return;
+        // The pack ran on another thread; this is the one place that asks whether its result is
+        // still for the world we are in. See HostRebuild.IsCurrent for the three ways it might not be.
+        if (!_rebuild.TryPacked(attempt, generation)) return;
 
         Log($"{label}: captured {stateLength / 1024}KiB for epoch {generation.Epoch}, " +
             $"{DescribeStateTransfer(stateLength, stateBody.Length)}; " +
             "waiting for every peer to import it");
 
-        if (_peers.Count == 0)
+        // Everyone owes an acknowledgement for this epoch before anyone resumes; false means there
+        // is nobody to wait for, which a solo host reaches when its last peer left during the pack.
+        if (!_rebuild.TryDistribute(SeatsOf(_peers)))
         {
-            _phase.EndRebuild();
-            RebaseFrameSchedule();
-            RefreshLiveSettingsUi();
+            FinishRebuild();
             return;
         }
-        // Everyone owes an acknowledgement for this epoch before anyone resumes. The barrier
-        // replaces whatever it was waiting on, so a superseded rebuild cannot hold this one up.
-        _applyBarrier.Expect(SeatsOf(_peers), generation.Epoch);
         foreach (var link in _peers)
         {
             GraceForStateTransfer(link, stateLength); // it can't pong while its reader consumes the frame
@@ -612,8 +623,7 @@ public sealed partial class NetplayToolForm
                 {
                     if (!ok) BeginInvokeUi(() =>
                     {
-                        if (IsConnectionAttemptCurrent(attempt) && _phase.IsActive
-                            && CurrentGeneration == generation)
+                        if (_rebuild.IsCurrent(attempt, generation))
                             EndSession("resync state transfer failed");
                     });
                 }))
@@ -772,8 +782,11 @@ public sealed partial class NetplayToolForm
 
         // Stale and duplicate acknowledgements are the barrier's to recognise: an ack for an epoch
         // nobody is waiting on, or a second one from a seat that has already paid, must not release
-        // a rebuild still in flight.
-        var ack = _applyBarrier.Applied(link.RemotePort, generation.Epoch);
+        // a rebuild still in flight. A reconnect drives the barrier directly — its sequence is not
+        // this one — so an ack for that flow is judged by the barrier rather than by the rebuild.
+        var ack = _rebuild.Step == RebuildStep.AwaitingApply
+            ? _rebuild.Applied(link.RemotePort, generation.Epoch)
+            : _applyBarrier.Applied(link.RemotePort, generation.Epoch);
         if (ack == ApplyAck.Ignored) return;
 
         Interlocked.Exchange(ref link.AppliedDeadlineTicks, 0);
@@ -795,17 +808,16 @@ public sealed partial class NetplayToolForm
 
     private void ReleaseResyncAsHost(SessionGeneration generation)
     {
-        if (generation != CurrentGeneration || !_phase.TryQueueResume()) return;
+        // Once, however many peers report last. TryBeginResume refuses a second RESUME for a
+        // session that has already resumed.
+        if (generation != CurrentGeneration || !_rebuild.TryBeginResume()) return;
         int attempt = CurrentConnectionAttempt;
         QueueResyncResumeToPeers(generation, ok => BeginInvokeUi(() =>
         {
-            if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive
-                || CurrentGeneration != generation) return;
+            if (!_rebuild.IsCurrent(attempt, generation)) return;
             if (!ok) { EndSession("resync resume transfer failed"); return; }
             _driver?.ResetRemoteInputLiveness();
-            _phase.EndRebuild();
-            RebaseFrameSchedule();
-            RefreshLiveSettingsUi();
+            FinishRebuild();
             Status($"in session — {DescribeMode(_mode)}, you are P{_localPort + 1}/{_playerCount}, " +
                    $"delay {_sessionDelay}", Color.Green);
             Log($"every peer applied epoch {generation.Epoch}; resuming");
