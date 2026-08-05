@@ -52,7 +52,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     // "I am the peer holding this token, and this is the address you actually see me at." The one
     // frame accepted from an endpoint we were never told about — see LearnFromHello.
     private const byte THello = 0x40;
-    private const int TokenBytes = 16;
+    private const int TokenBytes = MeshLearnedEndpoints.TokenBytes;
 
     private const int PunchTickMs = 250;     // probe cadence while a candidate is unconfirmed
     private const int KeepaliveMs = 1000;    // re-probe cadence once a candidate is alive (holds the NAT mapping)
@@ -61,13 +61,8 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     // is too few to separate a link's settled cost from its jitter. A short burst before GO buys a
     // proper sample set on the path input will actually ride.
     private const int BurstTickMs = 60;
-    private const int RttWindowSamples = 24; // ~1.4s of burst per candidate
-    private const int AliveWindowMs = 8000;  // no traffic for this long => the path is considered down again
-    // Send-path selection is stricter than plain liveness: with keepalive acks arriving at least
-    // every ~1.25s on a healthy path (and input at frame rate on the active one), a candidate not
-    // heard from in this long has very likely died — fail input over to a sibling that is still
-    // answering instead of waiting out the full alive window on a black hole.
-    private const int FreshWindowMs = 2500;
+    // How long a path stays "alive" without traffic, and the stricter window send-path selection
+    // uses, both live with the tables that answer those questions: see MeshLinkQuality.
 
     private readonly Socket _socket;
     private readonly ConcurrentQueue<byte[]> _inbound = new();
@@ -102,23 +97,11 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     private long _inputUnauthenticated;   // arrived, failed the tag or the author check
     private long _inputUnkeyed;           // could not be sent: no key for that pair
 
-    // --- endpoint learning (the symmetric-NAT fix) ---------------------------------------------
-    // Our own token, announced in THello, and the tokens we will accept from others. Both are
-    // distributed over the authenticated control channel, so possessing one is proof of membership.
-    private volatile byte[]? _localToken;
-    private readonly ConcurrentDictionary<int, byte[]> _peerTokens = new();       // remotePort -> token
-    // Where each peer ACTUALLY reaches us from, once it has proved who it is. A symmetric NAT gives
-    // a different public port per destination, so this is frequently not any address it advertised.
-    private readonly ConcurrentDictionary<int, IPEndPoint> _learnedByPort = new();
-    private readonly ConcurrentDictionary<IPEndPoint, int> _learnedByEndpoint = new();
-    // When each learned endpoint was first recorded, so one that never answers a probe can be
-    // dropped instead of being probed for the rest of the session.
-    private readonly ConcurrentDictionary<IPEndPoint, long> _learnedAt = new();
-
-    /// <summary>How long a learned endpoint may go without answering a probe before it is forgotten.
-    /// A real peer acks within a round trip of the next 250ms punch; this only has to be longer than
-    /// that, and short enough that an address which was never a peer stops being probed quickly.</summary>
-    private const int UnprovenLearnExpiryMs = 10_000;
+    // --- what the mesh knows about each path, and where peers really are -----------------------
+    // Liveness, round trips and the per-frame send-path choice; then the symmetric-NAT fix, which
+    // needs liveness to tell a binding that has proved itself from a claim that has not.
+    private readonly MeshLinkQuality _quality = new();
+    private readonly MeshLearnedEndpoints _learned;
 
     /// <summary>
     /// Blinds the timestamp carried in a punch probe.
@@ -158,65 +141,6 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             _knownEndpoints.TryGetValue(endpoint, out known!);
     }
 
-    /// <summary>
-    /// A bounded ring of raw round-trip samples for one candidate, summarized the same way the
-    /// control-channel lobby probe summarizes its own: median for the settled cost, nearest-rank
-    /// 85th percentile for the high-water mark. Using the same statistic on both transports is what
-    /// makes a UDP reading and a TCP reading comparable enough to take the worst of.
-    /// </summary>
-    private sealed class RttWindow
-    {
-        private readonly double[] _samples = new double[RttWindowSamples];
-        private int _count;
-        private int _next;
-
-        public void Add(double sample)
-        {
-            lock (_samples)
-            {
-                _samples[_next] = sample;
-                _next = (_next + 1) % RttWindowSamples;
-                if (_count < RttWindowSamples) _count++;
-            }
-        }
-
-        public bool TryDescribe(out double medianMs, out double highMs)
-        {
-            double[] sorted;
-            lock (_samples)
-            {
-                if (_count == 0) { medianMs = 0; highMs = 0; return false; }
-                sorted = new double[_count];
-                Array.Copy(_samples, sorted, _count);
-            }
-            Array.Sort(sorted);
-            int middle = sorted.Length / 2;
-            medianMs = sorted.Length % 2 == 0
-                ? (sorted[middle - 1] + sorted[middle]) / 2.0
-                : sorted[middle];
-            int rank = (int)Math.Ceiling(0.85 * sorted.Length);
-            if (rank < 1) rank = 1;
-            if (rank > sorted.Length) rank = sorted.Length;
-            highMs = sorted[rank - 1];
-            if (highMs < medianMs) highMs = medianMs;
-            return true;
-        }
-    }
-
-    // Per-candidate liveness: endpoint -> last time we heard anything back from it (stopwatch ms).
-    private readonly ConcurrentDictionary<IPEndPoint, long> _alive = new();
-    private readonly ConcurrentDictionary<IPEndPoint, long> _lastPunch = new();
-    private readonly ConcurrentDictionary<IPEndPoint, double> _rtt = new();
-    // Raw sample window per candidate, kept alongside the EMA above. The EMA is what send-path
-    // selection wants (one smooth number); a delay decision wants the distribution, because what
-    // stalls a session is the worst packet rather than the typical one.
-    private readonly ConcurrentDictionary<IPEndPoint, RttWindow> _rttWindows =
-        new();
-    private long _burstUntilMs = long.MinValue;
-    // Last candidate input was actually sent through, per logical peer — the failover anchor
-    // while a repunch has the liveness table cleared.
-    private readonly ConcurrentDictionary<int, IPEndPoint> _lastSelected = new();
-
     // Reliable control streams carried on this same socket, keyed by peer endpoint — what lets a
     // hole-punched joiner run the ordinary handshake into a normal hosted lobby with no TCP.
     private readonly ConcurrentDictionary<IPEndPoint, ReliableUdpStream> _controlStreams =
@@ -248,6 +172,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     private MeshUdpTransport(int localPort)
     {
+        _learned = new MeshLearnedEndpoints(_quality);
         var saltBytes = new byte[8];
         using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
             rng.GetBytes(saltBytes);
@@ -443,17 +368,16 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         // un-learn the symmetric-NAT peers, which is the one thing they cannot recover from on
         // their own. It does not survive its port leaving the session.
         var routedPorts = new HashSet<int>(portOrder);
-        foreach (var kv in _learnedByPort.ToArray())
+        foreach (int seat in _learned.Seats.ToArray())
         {
-            if (routedPorts.Contains(kv.Key)) { keep.Add(kv.Value); continue; }
-            _learnedByPort.TryRemove(kv.Key, out _);
-            _learnedByEndpoint.TryRemove(kv.Value, out _);
+            if (routedPorts.Contains(seat))
+            {
+                if (_learned.TryGet(seat, out var kept)) keep.Add(kept);
+                continue;
+            }
+            _learned.ForgetSeat(seat);
         }
-        foreach (var k in _alive.Keys.ToArray()) if (!keep.Contains(k)) _alive.TryRemove(k, out _);
-        foreach (var k in _lastPunch.Keys.ToArray()) if (!keep.Contains(k)) _lastPunch.TryRemove(k, out _);
-        foreach (var k in _rtt.Keys.ToArray()) if (!keep.Contains(k)) _rtt.TryRemove(k, out _);
-        foreach (var k in _rttWindows.Keys.ToArray()) if (!keep.Contains(k)) _rttWindows.TryRemove(k, out _);
-        foreach (var kv in _lastSelected.ToArray()) if (!keep.Contains(kv.Value)) _lastSelected.TryRemove(kv.Key, out _);
+        _quality.RetainOnly(keep);
     }
 
     // Scratch for framing the per-frame input datagram. Send() runs only on the frame thread
@@ -535,25 +459,16 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     /// <summary>True if this candidate endpoint has answered a probe or sent input recently — i.e. a
     /// direct UDP path to it is currently open.</summary>
-    public bool IsEndpointAlive(IPEndPoint endpoint)
-        => endpoint != null && IsEndpointAlive(endpoint, Clock.ElapsedMilliseconds);
-
-    private bool IsEndpointAlive(IPEndPoint endpoint, long now) =>
-        _alive.TryGetValue(endpoint, out var t) && now - t < AliveWindowMs;
+    public bool IsEndpointAlive(IPEndPoint endpoint) =>
+        _quality.IsAlive(endpoint, Clock.ElapsedMilliseconds);
 
     /// <summary>
     /// Smoothed round-trip time to a candidate, measured by the timestamped punch/ack exchange — i.e.
     /// on the path input actually travels, rather than the TCP control link. False when nothing has
     /// answered yet, or when the peer runs a build whose acks carry no timestamp.
     /// </summary>
-    public bool TryGetRttMs(IPEndPoint endpoint, out double rttMs)
-    {
-        rttMs = 0;
-        if (endpoint == null) return false;
-        if (!_rtt.TryGetValue(endpoint, out double v)) return false;
-        rttMs = v;
-        return true;
-    }
+    public bool TryGetRttMs(IPEndPoint endpoint, out double rttMs) =>
+        _quality.TryGetRtt(endpoint, out rttMs);
 
     /// <summary>
     /// Select each logical peer's lowest-RTT live candidate, then return the worst of those per-peer
@@ -582,12 +497,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         return rttMs >= 0;
     }
 
-    internal void RecordRtt(IPEndPoint endpoint, double sample)
-    {
-        // Same EMA shape as the control-channel ping, so the two readings are comparable.
-        _rtt.AddOrUpdate(endpoint, sample, (_, prev) => 0.8 * prev + 0.2 * sample);
-        _rttWindows.GetOrAdd(endpoint, _ => new RttWindow()).Add(sample);
-    }
+    internal void RecordRtt(IPEndPoint endpoint, double sample) => _quality.RecordRtt(endpoint, sample);
 
     /// <summary>
     /// Probe every candidate at <see cref="BurstTickMs"/> for the next <paramref name="durationMs"/>
@@ -595,26 +505,15 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// the resulting figures are the only measurement of the joiner-to-joiner edges that exists, and
     /// they are taken on the UDP path rather than on the control link.
     /// </summary>
-    public void BeginRttBurst(int durationMs)
-    {
-        if (durationMs < 0) throw new ArgumentOutOfRangeException(nameof(durationMs));
-        _rttWindows.Clear();
-        _lastPunch.Clear();   // probe on the very next tick rather than waiting out the keepalive
-        Interlocked.Exchange(ref _burstUntilMs, Clock.ElapsedMilliseconds + durationMs);
-    }
+    public void BeginRttBurst(int durationMs) =>
+        _quality.BeginBurst(Clock.ElapsedMilliseconds, durationMs);
 
     /// <summary>
     /// Per-candidate view of the burst window: the settled round-trip and its high-water mark on
     /// this exact path. False until at least one probe has been answered.
     /// </summary>
-    public bool TryGetRttStats(IPEndPoint endpoint, out double medianMs, out double highMs)
-    {
-        medianMs = 0;
-        highMs = 0;
-        return endpoint != null
-            && _rttWindows.TryGetValue(endpoint, out var window)
-            && window.TryDescribe(out medianMs, out highMs);
-    }
+    public bool TryGetRttStats(IPEndPoint endpoint, out double medianMs, out double highMs) =>
+        _quality.TryGetStats(endpoint, out medianMs, out highMs);
 
     /// <summary>
     /// Aggregate the sample windows the way a session-wide input delay has to be chosen: per logical
@@ -669,7 +568,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         for (int i = 0; i < routes.Length; i++)
         {
             var route = routes[i];
-            bool learned = _learnedByPort.TryGetValue(route.RemotePort, out var learnedEndpoint);
+            bool learned = _learned.TryGet(route.RemotePort, out var learnedEndpoint);
             double bestMedian = 0, bestHigh = 0;
             bool measured = false, viaLearned = false;
             foreach (var endpoint in CandidatesIncludingLearned(route))
@@ -690,71 +589,14 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     /// <summary>Membership test over the advertised candidates, indexed rather than LINQ — this
     /// sits on the per-frame send path.</summary>
-    private static bool IsRoutedCandidate(PeerRoute route, IPEndPoint endpoint)
-    {
-        var candidates = route.Candidates;
-        for (int i = 0; i < candidates.Count; i++)
-            if (candidates[i].Equals(endpoint)) return true;
-        return false;
-    }
+    private static bool IsRoutedCandidate(PeerRoute route, IPEndPoint endpoint) =>
+        MeshLinkQuality.Contains(route.Candidates, endpoint);
 
-    private IPEndPoint? SelectSendCandidate(PeerRoute route, long now)
-    {
-        // A learned endpoint outranks every advertised candidate, because it is the only one we have
-        // OBSERVED this peer arriving from. For a symmetric-NAT peer none of the advertised
-        // candidates can ever work, so without this the learning would be recorded and never used.
-        if (_learnedByPort.TryGetValue(route.RemotePort, out var learned)
-            && _alive.TryGetValue(learned, out var learnedHeard) && now - learnedHeard < AliveWindowMs)
-        {
-            _lastSelected[route.RemotePort] = learned;
-            return learned;
-        }
-
-        IPEndPoint? firstFresh = null, bestFresh = null;
-        IPEndPoint? firstLive = null, bestLive = null;
-        double bestFreshRtt = double.MaxValue, bestLiveRtt = double.MaxValue;
-        var routeCandidates = route.Candidates;
-        for (int i = 0; i < routeCandidates.Count; i++) // indexed: per-frame path, no enumerator box
-        {
-            var endpoint = routeCandidates[i];
-            if (!_alive.TryGetValue(endpoint, out var heard) || now - heard >= AliveWindowMs) continue;
-            bool fresh = now - heard < FreshWindowMs;
-            if (firstLive == null) firstLive = endpoint;
-            if (fresh && firstFresh == null) firstFresh = endpoint;
-            if (_rtt.TryGetValue(endpoint, out double rtt) && rtt >= 0)
-            {
-                if (rtt < bestLiveRtt) { bestLiveRtt = rtt; bestLive = endpoint; }
-                if (fresh && rtt < bestFreshRtt) { bestFreshRtt = rtt; bestFresh = endpoint; }
-            }
-        }
-
-        // Prefer candidates heard from RECENTLY. A path that dies mid-session keeps its (stale,
-        // low) RTT and stays inside the alive window for a while; if a sibling candidate is still
-        // answering keepalives, input must move there rather than stay pinned to a black hole
-        // until the alive window finally expires — which races the UDP-lost session watchdog.
-        var chosen = bestFresh ?? firstFresh ?? bestLive ?? firstLive;
-        if (chosen != null)
-        {
-            _lastSelected[route.RemotePort] = chosen;
-            return chosen;
-        }
-
-        // Nothing is confirmed right now (start-up, or a repunch just cleared the liveness table).
-        // Keep sending along the last path that actually worked: for an internet peer the first
-        // advertised candidate is typically the pre-NAT address, which is exactly the one that
-        // does NOT work when the reflexive path was carrying the session. The learned endpoint
-        // counts as valid here even though it is never in Candidates — for a symmetric-NAT peer
-        // it is the ONLY address that works, and rejecting it stopped input to that peer entirely
-        // the moment its liveness lapsed.
-        if (_lastSelected.TryGetValue(route.RemotePort, out var last)
-            && (IsRoutedCandidate(route, last)
-                || (_learnedByPort.TryGetValue(route.RemotePort, out var learnedLast) && learnedLast.Equals(last))))
-            return last;
-
-        // Nothing has ever worked for this peer — no single candidate is a safe guess. Return
-        // null so the caller broadcasts to every candidate until the punch confirms one.
-        return null;
-    }
+    /// <summary>Which address this peer's input goes to right now. The ranking, and why each step
+    /// of it is there, is <see cref="MeshLinkQuality.Select"/>.</summary>
+    private IPEndPoint? SelectSendCandidate(PeerRoute route, long now) =>
+        _quality.Select(route.RemotePort, route.Candidates,
+            _learned.TryGet(route.RemotePort, out var learned) ? learned : null, now);
 
     /// <summary>
     /// Every address that might reach this peer: the ones it advertised, plus the one we LEARNED
@@ -777,8 +619,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     {
         var candidates = route.Candidates;
         for (int i = 0; i < candidates.Count; i++) yield return candidates[i];
-        if (_learnedByPort.TryGetValue(route.RemotePort, out var learned)
-            && !IsRoutedCandidate(route, learned))
+        if (_learned.TryGet(route.RemotePort, out var learned) && !IsRoutedCandidate(route, learned))
             yield return learned;
     }
 
@@ -788,8 +629,8 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         bool found = false;
         foreach (var endpoint in CandidatesIncludingLearned(route))
         {
-            if (!IsEndpointAlive(endpoint, now)) continue;
-            if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
+            if (!_quality.IsAlive(endpoint, now)) continue;
+            if (!_quality.TryGetRtt(endpoint, out double rtt) || rtt < 0) continue;
             if (rtt < bestRtt) bestRtt = rtt;
             found = true;
         }
@@ -805,7 +646,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         bool found = false;
         foreach (var endpoint in CandidatesIncludingLearned(route))
         {
-            if (!_rtt.TryGetValue(endpoint, out double rtt) || rtt < 0) continue;
+            if (!_quality.TryGetRtt(endpoint, out double rtt) || rtt < 0) continue;
             if (rtt < bestRtt) bestRtt = rtt;
             found = true;
         }
@@ -847,11 +688,7 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     /// <summary>Forget the current path confirmations and make the punch loop probe every candidate
     /// immediately. Used when control traffic is healthy but input progress has gone quiet.</summary>
-    public void RequestRepunch()
-    {
-        _alive.Clear();
-        _lastPunch.Clear();
-    }
+    public void RequestRepunch() => _quality.ForgetAllLiveness();
 
     /// <summary>Forget confirmations only for one logical peer. Healthy routes keep their chosen
     /// failover candidate while the silent peer is re-probed. The learned endpoint is cleared
@@ -863,17 +700,9 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         foreach (var route in _routeTable.Routes)
         {
             if (route.RemotePort != remotePort) continue;
-            foreach (var endpoint in route.Candidates)
-            {
-                _alive.TryRemove(endpoint, out _);
-                _lastPunch.TryRemove(endpoint, out _);
-            }
+            foreach (var endpoint in route.Candidates) _quality.Forget(endpoint);
         }
-        if (_learnedByPort.TryGetValue(remotePort, out var learned))
-        {
-            _alive.TryRemove(learned, out _);
-            _lastPunch.TryRemove(learned, out _);
-        }
+        if (_learned.TryGet(remotePort, out var learned)) _quality.Forget(learned);
     }
 
     /// <summary>
@@ -915,19 +744,19 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
             try
             {
                 long now = Clock.ElapsedMilliseconds;
-                bursting = now < Interlocked.Read(ref _burstUntilMs);
-                PruneUnprovenLearned(now);
+                bursting = _quality.InBurst(now);
+                _learned.PruneUnproven(now);
                 // Learned endpoints are probed alongside the advertised ones. Without this a
                 // symmetric-NAT peer is a one-way street: we accept its input and reply to it, but
                 // never probe it, so nothing ever measures that edge and the lobby reports it silent
                 // while it is plainly carrying traffic. It also has to be kept warm like any other.
-                foreach (var p in _routeTable.Endpoints.Concat(_learnedByPort.Values).Distinct())
+                foreach (var p in _routeTable.Endpoints.Concat(_learned.Endpoints).Distinct())
                 {
-                    bool alive = IsEndpointAlive(p);
+                    bool alive = _quality.IsAlive(p, now);
                     // Probe aggressively until confirmed, then just often enough to hold the mapping —
                     // unless a lobby measurement is in flight, which wants samples, not mappings.
                     int due = bursting ? BurstTickMs : alive ? KeepaliveMs : PunchTickMs;
-                    bool neverSent = !_lastPunch.TryGetValue(p, out var lastSent);
+                    bool neverSent = !_quality.TryGetLastPunch(p, out var lastSent);
                     if (neverSent || now - lastSent >= due)
                     {
                         // Stamp the probe so its ack measures the round trip on THIS path — the one
@@ -939,9 +768,9 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
                         // destination, the token lets the far side recognise the packet as ours and
                         // record where we really came from. Only while the path is unconfirmed —
                         // once it answers, the advertised address evidently works and this is noise.
-                        var token = _localToken;
+                        var token = _learned.LocalToken;
                         if (token != null && !alive) SendFramed(Frame(THello, token), p);
-                        _lastPunch[p] = now;
+                        _quality.MarkPunched(p, now);
                     }
                 }
             }
@@ -1021,12 +850,14 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         if (!_routeTable.TryResolve(source, out var known))
         {
             // Already learned: everything from here on is ordinary traffic from a known peer.
-            if (_learnedByEndpoint.ContainsKey(source)) { known = source; learned = true; }
+            if (_learned.IsLearned(source)) { known = source; learned = true; }
             // Otherwise, not an address anyone advertised — and exactly one thing may still be
             // true of it: a peer holding a valid token is telling us this is where it really
             // comes from. That is the symmetric-NAT case, where the address it advertised was
             // only ever valid for the STUN server it asked. Anything else is dropped here, unread.
-            else if (type == THello && LearnFromHello(buffer, n, source)) { known = source; learned = true; }
+            else if (type == THello
+                     && _learned.TryLearn(buffer, HeaderSize, n, source, Clock.ElapsedMilliseconds))
+            { known = source; learned = true; }
             else return;
         }
 
@@ -1041,9 +872,9 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         // Only a punch ack can settle it: it echoes eight bytes we chose and blinded (see
         // _punchSalt), so producing one means actually receiving our probe at that address. Until
         // then the address is carried as a claim — probed, never sent to, and dropped if it stays
-        // silent (PruneUnprovenLearned).
+        // silent (MeshLearnedEndpoints.PruneUnproven).
         if (!learned || type == TPunchAck)
-            _alive[known] = Clock.ElapsedMilliseconds;
+            _quality.MarkHeard(known, Clock.ElapsedMilliseconds);
 
         if (type == TPunch)
         {
@@ -1268,43 +1099,15 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
     /// whatever address their side of the network actually sees. Distributed over the authenticated
     /// control channel, so holding one is proof of belonging to this session.
     /// </summary>
-    public void SetLocalToken(byte[]? token) =>
-        _localToken = token is { Length: TokenBytes } ? (byte[])token.Clone() : null;
+    public void SetLocalToken(byte[]? token) => _learned.SetLocalToken(token);
 
     /// <summary>The tokens we will accept, by the controller port that owns each. A peer presenting
-    /// one of these is telling us where it really is; anything else stays unroutable.</summary>
-    public void SetPeerTokens(IEnumerable<KeyValuePair<int, byte[]>>? tokens)
-    {
-        var previous = _peerTokens.ToArray();
-        _peerTokens.Clear();
-        if (tokens != null)
-            foreach (var kv in tokens)
-                if (kv.Value is { Length: TokenBytes }) _peerTokens[kv.Key] = (byte[])kv.Value.Clone();
-
-        // A learned binding was earned by presenting the token its seat carried at the time. If the
-        // seat's token has since changed — the host rotates them when a lobby casualty renumbers
-        // seats — the claim behind the binding no longer stands. Keeping it is not conservative, it
-        // is the failure: the old occupant is usually still in the session on another seat, still
-        // answering from that endpoint, so the stale binding stays "alive" indefinitely and
-        // LearnFromHello refuses the seat's next genuine occupant forever.
-        foreach (var old in previous)
-        {
-            if (_peerTokens.TryGetValue(old.Key, out var current) && TokensEqual(old.Value, current))
-                continue;
-            if (!_learnedByPort.TryRemove(old.Key, out var endpoint)) continue;
-            _learnedByEndpoint.TryRemove(endpoint, out _);
-            _learnedAt.TryRemove(endpoint, out _);
-            _alive.TryRemove(endpoint, out _);
-        }
-    }
-
-    private static bool TokensEqual(byte[] a, byte[] b)
-    {
-        if (a.Length != b.Length) return false;
-        for (int i = 0; i < a.Length; i++)
-            if (a[i] != b[i]) return false;
-        return true;
-    }
+    /// one of these is telling us where it really is; anything else stays unroutable. Replacing a
+    /// seat's token retires anything learned under the old one — see
+    /// <see cref="MeshLearnedEndpoints.SetPeerTokens"/> for why keeping it is the failure rather
+    /// than the safe choice.</summary>
+    public void SetPeerTokens(IEnumerable<KeyValuePair<int, byte[]>>? tokens) =>
+        _learned.SetPeerTokens(tokens);
 
     /// <summary>Adopt a whole mesh identity at once — who we announce ourselves as and who we will
     /// accept. The two always arrive together from the control channel, so they are applied together.</summary>
@@ -1339,90 +1142,11 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
 
     /// <summary>Endpoints learned from a token that no advertised candidate matched — i.e. peers
     /// whose real address only became knowable by being told. Zero on a well-behaved network.</summary>
-    public int LearnedEndpointCount => _learnedByPort.Count;
+    public int LearnedEndpointCount => _learned.Count;
 
     /// <summary>The address a peer was learned at, for the session log.</summary>
     public bool TryGetLearnedEndpoint(int remotePort, out IPEndPoint endpoint) =>
-        _learnedByPort.TryGetValue(remotePort, out endpoint!);
-
-    /// <summary>
-    /// Accept an endpoint nobody advertised, on the strength of a token.
-    ///
-    /// This is the whole symmetric-NAT fix. Such a router assigns a fresh public port per
-    /// DESTINATION, so the address a peer discovered by asking a STUN server is not the address it
-    /// reaches us from — and pinning on advertised endpoints alone meant we dropped its packets
-    /// unread, forever, on a path that was physically working. The peer cannot know its own
-    /// destination-specific port either; only we can see it, which is why it has to be learned here
-    /// rather than announced.
-    ///
-    /// The token is what makes that safe: it is 16 random bytes handed out over the authenticated
-    /// control channel, so an off-path attacker guessing one is the same problem as guessing the
-    /// session password. Compared in constant time, and a peer may migrate — a NAT rebinding
-    /// mid-session is the same event as the first arrival.
-    /// </summary>
-    private bool LearnFromHello(byte[] buffer, int n, IPEndPoint source)
-    {
-        if (n < HeaderSize + TokenBytes) return false;
-        foreach (var kv in _peerTokens)
-        {
-            if (!ConstantTimeEquals(kv.Value, buffer, HeaderSize)) continue;
-
-            int port = kv.Key;
-            long now = Clock.ElapsedMilliseconds;
-            if (_learnedByPort.TryGetValue(port, out var previous))
-            {
-                if (previous.Equals(source)) return true; // already known, nothing to record
-                // A binding that is currently answering is not replaced. Every peer holds every
-                // seat's token — that is what makes a rejoin on a new address recognisable — so
-                // without this any session member could point another member's seat at an address
-                // of its choosing and take them off the mesh. A NAT rebinding, the case this whole
-                // path exists for, arrives at a seat that has just gone quiet, which still rebinds.
-                if (_alive.TryGetValue(previous, out var heard) && now - heard < FreshWindowMs)
-                    return false;
-                _learnedByEndpoint.TryRemove(previous, out _);
-                _learnedAt.TryRemove(previous, out _);
-                _alive.TryRemove(previous, out _);
-            }
-            _learnedByPort[port] = source;
-            _learnedByEndpoint[source] = port;
-            _learnedAt[source] = now;
-            return true;
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Forget learned endpoints that have never answered a probe.
-    ///
-    /// Learning is now a claim rather than a conclusion, so something has to retire the claims that
-    /// were never true. Without this, one spoofed THello would have this node probing the named
-    /// address for the rest of the session — a slow trickle rather than the input stream it used to
-    /// turn on, but still traffic aimed at a stranger by a stranger. A genuine peer answers within a
-    /// round trip of the next 250ms punch, and one dropped here is re-learned by its next THello.
-    /// </summary>
-    private void PruneUnprovenLearned(long now)
-    {
-        if (_learnedByPort.IsEmpty) return;
-        foreach (var kv in _learnedByPort)
-        {
-            var endpoint = kv.Value;
-            if (_alive.ContainsKey(endpoint)) continue;               // it proved itself
-            if (!_learnedAt.TryGetValue(endpoint, out long at)) continue;
-            if (now - at < UnprovenLearnExpiryMs) continue;
-            // Racing a fresh learn for the same seat costs at most one re-learn on the next THello,
-            // which is 250ms away, so this stays a plain remove rather than a compare-and-swap.
-            _learnedByPort.TryRemove(kv.Key, out _);
-            _learnedByEndpoint.TryRemove(endpoint, out _);
-            _learnedAt.TryRemove(endpoint, out _);
-        }
-    }
-
-    private static bool ConstantTimeEquals(byte[] expected, byte[] buffer, int offset)
-    {
-        int diff = 0;
-        for (int i = 0; i < expected.Length; i++) diff |= expected[i] ^ buffer[offset + i];
-        return diff == 0;
-    }
+        _learned.TryGet(remotePort, out endpoint);
 
     private void SendFramed(byte[] framed, IPEndPoint to) => SendFramed(framed, 0, framed.Length, to);
 
