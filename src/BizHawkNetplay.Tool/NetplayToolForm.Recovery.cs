@@ -325,7 +325,13 @@ public sealed partial class NetplayToolForm
     private void StartDonorTimeout()
     {
         StopDonorTimeout();
-        _donorTimer = new System.Windows.Forms.Timer { Interval = DonorStateTimeoutMs };
+        // Sized from the same transfer model every other state deadline uses, against this
+        // machine's own state size — the best estimate it has of the donor's. A flat figure was
+        // shorter than the model's own allowance for the bytes, so on the slow uplink that model
+        // exists for, the host gave up on a donor that was behaving and recovered from the state
+        // the evidence says is wrong. See DonorExchange.StateTimeoutSeconds.
+        int timeoutMs = DonorExchange.StateTimeoutMs(_ownStateBytes);
+        _donorTimer = new System.Windows.Forms.Timer { Interval = timeoutMs };
         _donorTimer.Tick += (_, __) =>
         {
             StopDonorTimeout();
@@ -334,7 +340,7 @@ public sealed partial class NetplayToolForm
             // running is the fault DonorExchange exists to make unrepresentable.
             if (!_donor.Expire(out int port)) return;
             ConnLog($"P{port + 1} did not send its state within " +
-                    $"{DonorStateTimeoutMs / 1000}s — recovering from this machine's own state " +
+                    $"{timeoutMs / 1000}s — recovering from this machine's own state " +
                     "instead, which on the checksum evidence is the wrong one.", Color.Firebrick);
             PerformResyncAsHost();
         };
@@ -373,7 +379,7 @@ public sealed partial class NetplayToolForm
         if (_peers.Count == 0) return;
 
         byte[] state;
-        try { state = _adapter!.ExportState(); }
+        try { state = ExportOwnState(); }
         catch (Exception ex)
         {
             // Nothing to send and nothing to do: the host's timeout falls back to its own state.
@@ -534,7 +540,7 @@ public sealed partial class NetplayToolForm
                 Log($"{label}: a rebuild is already in flight — refused");
                 return;
             }
-            var state = _adapter!.ExportState();
+            var state = ExportOwnState();
             var generation = AdvanceGeneration();
             RebuildDriver();
             RefreshLiveSettingsUi();

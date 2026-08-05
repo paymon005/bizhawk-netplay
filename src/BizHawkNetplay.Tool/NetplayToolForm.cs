@@ -305,11 +305,20 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private bool _forceDesyncOnce; // diagnostic: corrupt the next checksum to exercise resync
     private const int MaxResyncs = 6;
     private const double ResyncGraceSeconds = 2.0;
-    // How long the host waits for the majority's state before falling back to its own (KI-20).
-    // Generous because the donor has to capture and deflate a whole savestate — 6ms of capture on
-    // N64 plus the deflate plus the transfer — and the fallback costs the session a resync from the
-    // state the evidence says is wrong, which is worse than waiting a moment longer.
-    private const int DonorStateTimeoutMs = 15_000;
+    // The size of the last state this machine exported, which is the only estimate it has of what a
+    // donor is about to send: same core, same game, same frame. Refreshed by every export, so the
+    // donor wait is sized from a real figure rather than a guess. 0 until the first export, which
+    // OnePhaseSeconds reads as "just the fixed grace".
+    private int _ownStateBytes;
+
+    /// <summary>Export a state and remember how big it was. Every export in the form goes through
+    /// here, so the size is never stale for want of one call site remembering.</summary>
+    private byte[] ExportOwnState()
+    {
+        var state = _adapter!.ExportState();
+        _ownStateBytes = state.Length;
+        return state;
+    }
     private const double ResyncRecoverySeconds = 8.0; // joiner clears its resync counter after this long without another
     // Delay is selected before WELCOME and then remains fixed. In rollback it trades local response
     // time for shallower visual corrections; in lockstep it also prevents routine network stalls.

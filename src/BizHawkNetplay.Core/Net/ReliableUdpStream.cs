@@ -25,11 +25,11 @@ public sealed class ReliableUdpStream : Stream
     private const byte SegAck = 0x02;
     private const byte SegFin = 0x03;
 
-    private const int Mss = 1024;         // payload bytes per DATA segment (outer framing kept < MTU)
-    private const int Window = 128;       // segments in flight, ceiling (flow control): 128 KiB
-    private const int RtoStartMs = 500;   // initial retransmit timeout
-    private const int RtoMaxMs = 1500;    // backoff ceiling
-    private const int DeadRetries = 40;   // consecutive fruitless retransmits of the base -> fault
+    internal const int Mss = 1024;         // payload bytes per DATA segment (outer framing kept < MTU)
+    internal const int Window = 128;       // segments in flight, ceiling (flow control): 128 KiB
+    internal const int RtoStartMs = 500;   // initial retransmit timeout
+    internal const int RtoMaxMs = 1500;    // backoff ceiling
+    internal const int DeadRetries = 40;   // consecutive fruitless retransmits of the base -> fault
 
     /// <summary>
     /// Floor for the loss-adapted window below. Matches <see cref="RtoBurst"/>: no point offering
@@ -38,7 +38,7 @@ public sealed class ReliableUdpStream : Stream
     /// stops being able to re-drive the whole window it just shrank to, so the two must move
     /// together or the floor must stay the larger of them.
     /// </summary>
-    private const int MinWindow = RtoBurst;
+    internal const int MinWindow = RtoBurst;
 
     /// <summary>
     /// How much reassembled data may wait for a reader before the sender is made to wait instead.
@@ -368,7 +368,7 @@ public sealed class ReliableUdpStream : Stream
         return a;
     }
 
-    private const int RtoBurst = 16; // segments resent from the base per timeout (covers a run of losses)
+    internal const int RtoBurst = 16; // segments resent from the base per timeout (covers a run of losses)
 
     /// <summary>
     /// How long the retransmit thread keeps re-driving unacked tail data and the FIN after Dispose.
@@ -386,11 +386,17 @@ public sealed class ReliableUdpStream : Stream
     /// room for the tail repair to finish first, gives ten attempts. Dispose still never blocks —
     /// the thread is a background one and the linger runs out behind it.
     /// </summary>
-    private const int CloseLingerMs = 4000;
+    internal const int CloseLingerMs = 4000;
     /// <summary>Cadence for re-driving the FIN, on its OWN clock. Independent of the data RTO
     /// because they are different questions: the data backoff is a congestion response, while a
     /// lost 5-byte FIN says nothing about the path and its repair should not be rationed by one.</summary>
-    private const int FinRedriveMs = 400;
+    internal const int FinRedriveMs = 400;
+
+    /// <summary>
+    /// How often the retransmit thread wakes. It is the resolution of every deadline above: nothing
+    /// here can fire more often than this, so a cadence set below it silently becomes this instead.
+    /// </summary>
+    internal const int RetransmitTickMs = 50;
     private long _lingerDeadline;         // guarded by _gate; 0 until Close arms it
     private long _finSentTicks;           // guarded by _gate; when the FIN last went out
 
@@ -411,7 +417,7 @@ public sealed class ReliableUdpStream : Stream
                     if (!lingering) break;
                 }
             }
-            Thread.Sleep(50);
+            Thread.Sleep(RetransmitTickMs);
             batch.Clear();
             byte[]? refin = null;
             lock (_gate)

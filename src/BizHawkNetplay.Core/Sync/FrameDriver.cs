@@ -66,10 +66,10 @@ public sealed class FrameDriver : IDisposable
     // Longer local-input history for answering gap requests: a frame that has aged out of the
     // redundant send window can still be re-sent from here. A few payload-bytes per frame — memory
     // is negligible.
-    private const int RetransmitKeepFrames = 240;   // ~4 s at 60 fps
-    private const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
-    private const long GapServeWindowMs = 50;       // serve-side budget window (see ServeGapRequest)
-    private const int GapServesPerWindow = 8;
+    internal const int RetransmitKeepFrames = 240;   // ~4 s at 60 fps
+    internal const long GapRequestIntervalMs = 50;   // per-port request cadence while a gap persists
+    internal const long GapServeWindowMs = 50;       // serve-side budget window (see ServeGapRequest)
+    internal const int GapServesPerWindow = 8;
     // Same overflow-safe sentinel as _lastSendMs, and here it was load-bearing: with long.MinValue
     // the window-reset test `now - _serveWindowStartMs >= GapServeWindowMs` overflowed negative and
     // never fired, so _servesThisWindow climbed to GapServesPerWindow and STAYED there — after the

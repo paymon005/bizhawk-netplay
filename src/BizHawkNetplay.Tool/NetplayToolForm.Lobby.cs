@@ -186,7 +186,7 @@ public sealed partial class NetplayToolForm
                 catch { _checksumInterval = ChecksumCadence.DefaultIntervalFrames; }
 
                 _mesh = MeshUdpTransport.Bind(port); _transport = WrapSimLatency(_mesh);
-                var state = _adapter.ExportState();
+                var state = ExportOwnState();
                 // Not reporting the compressed size here: it would mean deflating the whole state a
                 // second time on the UI thread just to print a percentage. The resync line reports
                 // the ratio, and it is the same state.

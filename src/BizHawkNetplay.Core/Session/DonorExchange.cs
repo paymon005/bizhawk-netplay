@@ -35,6 +35,32 @@ public enum OfferVerdict
 /// </summary>
 public sealed class DonorExchange
 {
+    /// <summary>
+    /// How long the host waits for the donor's state before falling back to its own.
+    ///
+    /// This was a flat 15 seconds, chosen as "generous" against a donor that has to capture and
+    /// deflate a whole savestate. It was generous against a fast link and nothing else: the same
+    /// codebase budgets a state transfer at <see cref="StateTransferBudget.MinBytesPerSecond"/>,
+    /// deliberately pessimistic, and one N64 state at that floor is a minute and a half. On the
+    /// slow uplink that floor exists to model, the host gave up on a donor that was behaving
+    /// perfectly and resynced everyone from its OWN state — which on the checksum evidence is the
+    /// wrong one, and is the exact outcome majority recovery exists to prevent. It would then
+    /// spend the same minute and a half distributing it.
+    ///
+    /// So it is the transfer model's own allowance for those bytes, like every other state
+    /// deadline in the session. The wait is long, and that is the honest figure: the alternative
+    /// to waiting is not a quick recovery, it is a slow wrong one.
+    ///
+    /// <paramref name="stateBytes"/> is the host's own state size, which is the best estimate it
+    /// has of the donor's — same core, same game, same frame.
+    /// </summary>
+    public static double StateTimeoutSeconds(int stateBytes) =>
+        StateTransferBudget.OnePhaseSeconds(stateBytes);
+
+    /// <summary>The same figure in milliseconds, for a timer interval.</summary>
+    public static int StateTimeoutMs(int stateBytes) =>
+        (int)System.Math.Min(int.MaxValue, StateTimeoutSeconds(stateBytes) * 1000.0);
+
     /// <summary>The seat we are waiting on, or -1.</summary>
     public int AwaitingPort { get; private set; } = -1;
 

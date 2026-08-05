@@ -264,7 +264,7 @@ public sealed partial class NetplayToolForm
             // Capture the boundary immediately and advance exactly once. Survivors receive BEGIN
             // now, so they freeze instead of timing out their UDP input while the host waits up to
             // a minute for the missing player to return.
-            var state = _adapter!.ExportState();
+            var state = ExportOwnState();
             var generation = AdvanceGeneration();
             _reconnectState = state;
             _reconnectGeneration = generation;

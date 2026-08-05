@@ -68,7 +68,7 @@ public sealed partial class NetplayToolForm
 
     private void PrepareSessionJoiner(SessionParams sp, PeerLink hostLink)
     {
-        if (_preJoinRestoreState == null) _preJoinRestoreState = _adapter!.ExportState();
+        if (_preJoinRestoreState == null) _preJoinRestoreState = ExportOwnState();
         ApplyInitialState(sp);
         _peers.Clear(); _peers.Add(hostLink);
         _isHost = false; _playerCount = sp.PlayerCount; _sessionDelay = sp.InputDelay; _localPort = sp.LocalPort;
