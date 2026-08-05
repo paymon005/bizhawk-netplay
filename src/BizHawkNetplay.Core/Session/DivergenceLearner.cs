@@ -153,8 +153,19 @@ public sealed class DivergenceLearner
         return Verdict;
     }
 
-    /// <summary>Name the masked buckets as byte ranges of a domain, for the log — the answer
-    /// KI-15 wanted every desync report to carry: WHICH bytes, not just "some byte".</summary>
+    /// <summary>
+    /// Name the masked buckets as byte ranges of a domain, for the log — the answer KI-15 wanted
+    /// every desync report to carry: WHICH bytes, not just "some byte". The ranges are also what
+    /// the checksum skips, so every one must be a real span of the domain.
+    ///
+    /// Both ends are clamped and empty runs dropped, because <see cref="BucketSpan"/> rounds UP to
+    /// a word: whenever <c>buckets * span</c> overshoots the domain — any size that is not a whole
+    /// number of word-aligned buckets — the trailing buckets START past the end. Clamping only the
+    /// end (as this did) turns such a bucket into an inverted range whose length is negative.
+    /// The bucket vectors never set those buckets, so no session has produced one; the mask
+    /// arrives over the wire, and a range that runs backwards is not something to hand a hasher on
+    /// the strength of the sender having behaved.
+    /// </summary>
     public static List<(long Start, long EndExclusive)> MaskRanges(bool[] maskBuckets, long domainSize)
     {
         var ranges = new List<(long, long)>();
@@ -164,10 +175,11 @@ public sealed class DivergenceLearner
         for (int i = 0; i <= maskBuckets.Length; i++)
         {
             bool set = i < maskBuckets.Length && maskBuckets[i];
-            if (set && runStart < 0) runStart = i * span;
+            if (set && runStart < 0) runStart = Math.Min(domainSize, i * span);
             else if (!set && runStart >= 0)
             {
-                ranges.Add((runStart, Math.Min(domainSize, (long)i * span)));
+                long end = Math.Min(domainSize, (long)i * span);
+                if (end > runStart) ranges.Add((runStart, end));
                 runStart = -1;
             }
         }
