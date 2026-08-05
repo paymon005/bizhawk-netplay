@@ -53,9 +53,15 @@ public sealed class MeshPairKeyring
     }
 
     /// <summary>
-    /// Stable identity for the unordered pair {a, b}. Deliberately the same packing
-    /// <c>MeshUdpTransport</c> uses for relay pairs, so the two tables are keyed alike and a pair
-    /// means the same thing on both sides of the transport.
+    /// Stable identity for the unordered pair {a, b}, packed a byte a side.
+    ///
+    /// Eight bits is provably enough HERE and only here: every way into this ring validates its
+    /// ports against <c>HandshakeCodec.MaxPlayers</c>, and the packed value is decoded back into
+    /// (a, b) in two places that assume the same width. <c>MeshUdpTransport</c> keys relay pairs by
+    /// the same arithmetic at sixteen bits a side, because it also hands out synthetic punch-target
+    /// ports in the thousands and an eight-bit packing collides there. The two are not required to
+    /// agree — neither table is ever keyed from the other, and this value never reaches the wire
+    /// (the handshake sends a and b as separate fields).
     /// </summary>
     public static int PairKey(int a, int b) => a < b ? (a << 8) | b : (b << 8) | a;
 

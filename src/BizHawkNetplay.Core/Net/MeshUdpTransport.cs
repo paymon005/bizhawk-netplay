@@ -299,7 +299,12 @@ public sealed class MeshUdpTransport : ITransport, IDisposable
         _relayPairs = set;
     }
 
-    private static int PairKey(int a, int b) => a < b ? (a << 8) | b : (b << 8) | a;
+    // 16 bits a side, not 8. A port of 1000 — which PunchTargetPortBase hands out fifteen lines
+    // below — overflows an 8-bit packing into its neighbour: PairKey(5, 1000) and PairKey(7, 232)
+    // both come out 0x7E8, so two unrelated pairs would share one relay decision. Nothing reaches
+    // it today (relay pairs are real seats, and the payload port is a byte), which is exactly what
+    // makes it the kind of trap worth closing rather than documenting.
+    private static int PairKey(int a, int b) => a < b ? (a << 16) | b : (b << 16) | a;
 
     /// <summary>How many peers are being relayed to — for the session log, and zero when the mesh
     /// is fully connected.</summary>
