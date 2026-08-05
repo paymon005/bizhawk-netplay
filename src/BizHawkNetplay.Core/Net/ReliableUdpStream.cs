@@ -371,14 +371,28 @@ public sealed class ReliableUdpStream : Stream
     private const int RtoBurst = 16; // segments resent from the base per timeout (covers a run of losses)
 
     /// <summary>
-    /// How long the retransmit thread keeps re-driving unacked tail data and the FIN after
-    /// Dispose. Room for the tail to be repaired (a burst per RTO) plus a few FIN re-drives;
-    /// against a peer that is simply gone, the sends land nowhere and the thread exits at the
-    /// deadline. Bounded so a hard teardown never holds a thread for long — and Dispose itself
-    /// never blocks; the linger runs out here in the background.
+    /// How long the retransmit thread keeps re-driving unacked tail data and the FIN after Dispose.
+    ///
+    /// This was 2000ms, with a comment claiming room for "a burst per RTO plus a few FIN re-drives".
+    /// The arithmetic never supported it. The FIN re-drive shared <see cref="_baseSentTicks"/> with
+    /// data retransmission and waited out the same <see cref="_rtoMs"/>, which backs off to
+    /// <see cref="RtoMaxMs"/> — so a tail needing two RTO rounds spent 1500ms of the linger and then
+    /// wanted 1500ms more for the FIN, out of 2000. The FIN went out exactly once, and if that copy
+    /// was lost the peer never got its EOF: it blocked until its own read timeout and reported a
+    /// network fault for a stream that had closed cleanly. On a lossy link that is a session ending
+    /// with the wrong reason.
+    ///
+    /// Sized against the schedule now rather than rounded: <see cref="FinRedriveMs"/> apart, with
+    /// room for the tail repair to finish first, gives ten attempts. Dispose still never blocks —
+    /// the thread is a background one and the linger runs out behind it.
     /// </summary>
-    private const int CloseLingerMs = 2000;
+    private const int CloseLingerMs = 4000;
+    /// <summary>Cadence for re-driving the FIN, on its OWN clock. Independent of the data RTO
+    /// because they are different questions: the data backoff is a congestion response, while a
+    /// lost 5-byte FIN says nothing about the path and its repair should not be rationed by one.</summary>
+    private const int FinRedriveMs = 400;
     private long _lingerDeadline;         // guarded by _gate; 0 until Close arms it
+    private long _finSentTicks;           // guarded by _gate; when the FIN last went out
 
     private void RetransmitLoop()
     {
@@ -417,11 +431,17 @@ public sealed class ReliableUdpStream : Stream
                     _effectiveWindow = Math.Max(MinWindow, _effectiveWindow / 2); // sustained loss: back off
                     if (++_baseRetries >= DeadRetries) { _faulted = true; Monitor.PulseAll(_gate); }
                 }
-                // Re-drive a pending FIN whose ACK may have been lost (only once data is all acked).
-                if (_finSent && _unacked.Count == 0 && now - _baseSentTicks >= _rtoMs)
+                // Re-drive a pending FIN, on its own clock and regardless of unacked data.
+                //
+                // The "only once data is all acked" gate this used to carry was unnecessary
+                // conservatism that cost the FIN most of its attempts: an early FIN is already
+                // harmless, because the receiver records _rcvFinSeq and reports EOF only once
+                // _rcvBase reaches it (see AcceptData/Read). So a FIN arriving mid-repair simply
+                // waits there for the data — and arriving is the whole difficulty.
+                if (_finSent && now - _finSentTicks >= FinRedriveMs)
                 {
                     refin = MakeFin();
-                    _baseSentTicks = now;
+                    _finSentTicks = now;
                 }
             }
             foreach (var s in batch) _send(s);
@@ -454,6 +474,7 @@ public sealed class ReliableUdpStream : Stream
             {
                 _finSent = true;
                 _finSeq = _nextSeq; // ends after all data queued so far
+                _finSentTicks = NowMs();
                 fin = MakeFin();
             }
             // Arm the retransmit thread's linger BEFORE _closed is set (base.Close() below runs

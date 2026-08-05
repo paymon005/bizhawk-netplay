@@ -413,4 +413,38 @@ public class ReliableUdpStreamTests
         }
         return buf;
     }
+
+    /// <summary>
+    /// A FIN keeps being re-driven while data is still unacknowledged.
+    ///
+    /// The re-drive used to be gated on <c>_unacked.Count == 0</c> AND to share the data path's
+    /// retransmit clock, so a tail that took two RTO rounds spent 1500ms of a 2000ms linger and left
+    /// the FIN no room for a second attempt. One copy of a 5-byte segment on a lossy link, and if it
+    /// was lost the peer never learned the stream had ended: it blocked to its own read timeout and
+    /// reported a network fault for a clean close.
+    ///
+    /// Deterministic on purpose — nothing is delivered at all, so the data can never drain and the
+    /// old gate can never open. Counting FINs is the whole assertion: one means the gate, several
+    /// mean the FIN has its own clock.
+    /// </summary>
+    [Fact]
+    public void AFinIsRedrivenWhileDataIsStillUnacked()
+    {
+        const byte SegFin = 0x03;   // mirrors the private constant; asserted by shape below
+        int fins = 0;
+        var counter = new object();
+        // A sink, not a link: nothing is ever acked, which is exactly the state the old gate
+        // treated as "not yet time to worry about the FIN".
+        var stream = new ReliableUdpStream(seg => { if (seg.Length > 0 && seg[0] == SegFin) lock (counter) fins++; });
+
+        stream.Write(new byte[2048], 0, 2048);   // two segments that will never be acknowledged
+        stream.Dispose();                        // FIN #1, and the linger starts here
+
+        Thread.Sleep(1500);
+        int seen;
+        lock (counter) seen = fins;
+        Assert.True(seen >= 3,
+            $"the FIN was sent {seen} time(s) in 1.5s of linger — it must keep being re-driven " +
+            "while data is outstanding, or a lossy close strands the peer without an EOF");
+    }
 }
