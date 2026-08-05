@@ -123,8 +123,19 @@ public sealed class FakeEmuAdapter : IEmuAdapter
         return handle;
     }
 
+    /// <summary>
+    /// Set to model a core that REFUSES a savestate — the only failure the rollback paths cannot
+    /// recover from, because they save the live position, jump away, and put it back, and a refusal
+    /// on the way back leaves the core standing somewhere the session does not think it is.
+    ///
+    /// Return null to load normally, or the exception the core would raise. It is called before the
+    /// counters move, so a refused load is not a load.
+    /// </summary>
+    public Func<StateHandle, Exception?>? LoadFault { get; set; }
+
     public void LoadStateFromMemory(StateHandle handle)
     {
+        if (LoadFault?.Invoke(handle) is { } fault) throw fault;
         LoadCount++;
         LoadJumps.Add((_frame, handle.Frame));
         _memory = (byte[])((byte[])handle.Token).Clone();

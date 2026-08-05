@@ -134,8 +134,13 @@ public static class UpnpPortMapper
         return locations;
     }
 
-    private static string? ExtractHeader(string httpText, string headerName)
+    /// <summary>
+    /// One header out of an SSDP reply. Internal because the input is a broadcast answer from
+    /// anything on the LAN, which makes it worth driving with the shapes a router would not send.
+    /// </summary>
+    internal static string? ExtractHeader(string httpText, string headerName)
     {
+        if (httpText == null) return null;
         foreach (var line in httpText.Split('\n'))
         {
             int colon = line.IndexOf(':');
@@ -146,9 +151,37 @@ public static class UpnpPortMapper
         return null;
     }
 
-    private static (string? controlUrl, string? serviceType) FindControlUrl(string location, TimeSpan timeout)
+    private static (string? controlUrl, string? serviceType) FindControlUrl(string location, TimeSpan timeout) =>
+        ParseControlUrl(HttpGet(location, timeout), location);
+
+    /// <summary>
+    /// The WAN connection service's control URL out of a device description, or (null, null).
+    ///
+    /// Split from the fetch so it can be driven with what a hostile or merely broken device sends.
+    /// The XML is read with DTD processing off and no resolver: the responder is whatever answered
+    /// a broadcast, and the default reader would happily expand an entity bomb or fetch a URL an
+    /// unknown device chose, on the thread the host's lobby runs on. Anything unparseable returns
+    /// (null, null) rather than throwing — the caller's next device is a better answer than an
+    /// exception, and returning it here means every caller gets that behaviour rather than the one
+    /// that remembered to wrap the call.
+    /// </summary>
+    internal static (string? controlUrl, string? serviceType) ParseControlUrl(string? xml, string location)
     {
-        var doc = XDocument.Parse(HttpGet(location, timeout));
+        if (string.IsNullOrEmpty(xml)) return (null, null);
+        XDocument doc;
+        try
+        {
+            var settings = new System.Xml.XmlReaderSettings
+            {
+                DtdProcessing = System.Xml.DtdProcessing.Prohibit,
+                XmlResolver = null,
+                MaxCharactersFromEntities = 1024,
+            };
+            using var reader = System.Xml.XmlReader.Create(new StringReader(xml!), settings);
+            doc = XDocument.Load(reader);
+        }
+        catch { return (null, null); }
+
         string urlBase = location;
         foreach (var el in doc.Descendants())
             if (el.Name.LocalName == "URLBase" && !string.IsNullOrWhiteSpace(el.Value)) { urlBase = el.Value.Trim(); break; }
@@ -162,8 +195,16 @@ public static class UpnpPortMapper
                 if (child.Name.LocalName == "serviceType") serviceType = child.Value.Trim();
                 else if (child.Name.LocalName == "controlURL") controlUrl = child.Value.Trim();
             }
-            if (serviceType != null && controlUrl != null && ContainsWan(serviceType))
-                return (ResolveUrl(urlBase, controlUrl), serviceType);
+            // An EMPTY controlURL is not a relative one. Resolved against the base it comes back as
+            // the description URL, and the mapper would then POST AddPortMapping to the address it
+            // had just fetched the description from and report the forward as installed. The player
+            // is told UPnP worked and nobody can reach them.
+            if (serviceType == null || string.IsNullOrEmpty(controlUrl) || !ContainsWan(serviceType))
+                continue;
+            // Keep looking rather than giving up: a description can list several WAN services, and
+            // one with an unusable control URL must not hide the one after it.
+            var resolved = ResolveUrl(urlBase, controlUrl);
+            if (resolved != null) return (resolved, serviceType);
         }
         return (null, null);
     }
@@ -238,12 +279,27 @@ public static class UpnpPortMapper
         return false;
     }
 
-    private static string ResolveUrl(string baseUrl, string rel)
+    /// <summary>
+    /// Resolve a device's control URL against the description's base, and refuse anything that is
+    /// not HTTP.
+    ///
+    /// Both halves are the device's text. A relative <c>controlURL</c> against an <c>http://</c>
+    /// location is what every real router sends; the scheme check is for the ones that do not,
+    /// because the result is handed straight to <see cref="WebRequest.Create"/> and posted to —
+    /// and <c>file://</c> is a scheme WebRequest will happily accept from something that answered
+    /// a broadcast. A base URL that will not parse leaves the relative text alone rather than
+    /// throwing out of the caller's loop.
+    /// </summary>
+    internal static string? ResolveUrl(string baseUrl, string rel)
     {
-        if (Uri.TryCreate(rel, UriKind.Absolute, out var abs)) return abs.ToString();
-        if (Uri.TryCreate(new Uri(baseUrl), rel, out var combined)) return combined.ToString();
-        return rel;
+        if (Uri.TryCreate(rel, UriKind.Absolute, out var abs)) return Http(abs);
+        if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var base_)
+            && Uri.TryCreate(base_, rel, out var combined)) return Http(combined);
+        return null;
     }
+
+    private static string? Http(Uri uri) =>
+        uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps ? uri.ToString() : null;
 
     private static string Escape(string s) => s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 }

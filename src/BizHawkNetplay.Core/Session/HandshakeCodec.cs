@@ -274,6 +274,13 @@ public static class HandshakeCodec
 
     private static void RefuseOversizedText(byte[] body)
     {
+        // The null guard lives here rather than only at the four decoders that happened to have
+        // one, so every text entry point refuses the same way. DecodeRoutes and its neighbours
+        // check first and name their own parameter; the ParseLines-based decoders — Decode,
+        // DecodeWelcome, DecodeChallenge, DecodeJoinerIntro, DecodeChecksumInterval — reached
+        // body.Length with nothing in front of it and raised NullReferenceException, which is the
+        // one exception no caller catches by name.
+        if (body == null) throw new ArgumentNullException(nameof(body));
         if (body.Length > MaxTextBodyBytes)
             throw new FormatException(
                 $"control body of {body.Length} bytes exceeds the {MaxTextBodyBytes}-byte limit for " +

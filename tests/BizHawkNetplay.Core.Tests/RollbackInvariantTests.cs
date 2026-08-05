@@ -23,19 +23,6 @@ public class RollbackInvariantTests
     private const int Delay = 2;
     private const int Redundancy = 8;
 
-    private sealed class QueueTransport : ITransport
-    {
-        private readonly Queue<byte[]> _inbound = new();
-        public void Enqueue(byte[] datagram) => _inbound.Enqueue(datagram);
-        public void Send(byte[] datagram) { }
-        public bool TryReceive(out byte[] datagram)
-        {
-            if (_inbound.Count == 0) { datagram = null!; return false; }
-            datagram = _inbound.Dequeue();
-            return true;
-        }
-    }
-
     private static FrameDriver Build(QueueTransport transport, int maxRollback,
         int keyframeInterval, bool elide, out FakeEmuAdapter emu)
     {
@@ -57,14 +44,8 @@ public class RollbackInvariantTests
     }
 
     /// <summary>One frame of remote input, as a real datagram for the driver's own codec.</summary>
-    private static byte[] RemoteFrame(FrameDriver driver, int frame, byte value)
-    {
-        int size = driver.Codec.PayloadSizeFor(1);
-        var payload = new byte[size];
-        if (size > 0) payload[0] = value;
-        return driver.Codec.EncodeInput(1,
-            new List<KeyValuePair<int, byte[]>> { new(frame, payload) });
-    }
+    private static byte[] RemoteFrame(FrameDriver driver, int frame, byte value) =>
+        QueueTransport.Frame(driver, port: 1, frame, value);
 
     /// <summary>
     /// Run with the remote port's input arriving late, out of order, and contradicting predictions
