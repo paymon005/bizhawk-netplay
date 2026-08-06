@@ -5,25 +5,40 @@ What is planned, what is deliberately not, and what is blocked on measurement ra
 For issues in what already ships, see [KNOWN-ISSUES.md](KNOWN-ISSUES.md). For what each release
 changed, see [CHANGELOG.md](CHANGELOG.md).
 
-## Identity and verification — shipped in v0.33.0
+## Identity and verification — shipped in v0.33.0 and v0.34.0
 
 An external review (2026-08-04) reframed the priorities, and the reframing was right: the netcode
 was strong, and what was weak was knowing that two peers are running the same thing and that the
-checksum sees the whole machine. That release did four of its five items.
+checksum sees the whole machine. v0.33.0 did four of its five items; v0.34.0 did the fifth and the
+per-disc identity below.
 
 - **Build identity.** BizHawk's release, git commit, branch, dev flag, custom-build string and the
-  process architecture, compared exactly. Firmware compared too. What is still missing is content:
-  `GameInfo.Hash` can be a CRC32, and a multi-disc PSX set identifies from disc one (KI-17).
+  process architecture, compared exactly. Firmware compared too.
 - **Determinism qualified**, Mupen a named exception, sync-settings reads that fail closed.
 - **Every emulated machine hashed**, which is what let the link cores be played again.
 - **Author-bound UDP input**, per-pair keys, tags on every datagram.
-
-**Majority-aware recovery is the item left** (KI-20), and it is deliberately waiting: the partition
-is recorded and named in the log now, and deciding the authority policy from a session that
-actually hit the case beats deciding it from reasoning.
+- **Per-disc identity** (v0.34.0). A multi-disc set used to identify from disc one, so the same
+  disc 1 with different disc 2s passed every check and diverged on the swap. What is still missing
+  is cartridge ROM-hash strength: `GameInfo.Hash` can be a CRC32, and closing it needs the ROM
+  bytes, which nothing in the ApiHawk surface hands over (KI-17).
+- **Majority-aware recovery** (v0.34.0, opt-in; *actually working* in v0.35.0 — see KI-20 for why
+  the version distinction matters). This was the item held back for real logs, on the argument that
+  deciding an authority policy from a session that hit the case beats deciding it from reasoning.
+  What settled it instead was the review that found the host had no way to be wrong *visibly*: the
+  partition naming shipped first, and the policy followed once the case was legible.
 
 Faster checksums and deeper rollback come after. A faster checksum over the wrong bytes is worse
 than a slow one, because it is confidently green.
+
+## Owed at the next protocol bump
+
+Nothing here is worth a wire break on its own; they are queued so the next break carries them.
+
+- **The password KDF moves from SHA-1 to SHA-256.** Faster on both targets *and* retires a legacy
+  primitive: on .NET Framework 4.8, 100k iterations cost 1092ms with SHA-1 against 478ms with
+  SHA-256, because the framework takes a slow legacy path for SHA-1. The measurements and what they
+  rule out (hand-rolling, and cutting iterations) are in `SessionAuth` beside the constant, and in
+  KNOWN-ISSUES.md. Held only because it changes the derived key.
 
 ## Needs people, not code
 

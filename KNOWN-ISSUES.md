@@ -80,10 +80,20 @@ open is recorded with what it would actually take.
   when it mattered: both peers failing produced the same empty blob, the same digest, and a pass.
   N64's `VideoSizeX/Y` are carried too — as a named warning rather than a refusal, since whether a
   resolution difference matters depends on whether the game reads its own framebuffer.
-- **KI-20 — CLOSED in v0.34.0, opt-in.** An outvoted host can now ask the majority for its state
-  and adopt it, rather than overwriting three correct machines with its own. The donor is the
-  lowest port in the largest group — a rule both ends compute, so the host and the donor never
-  disagree about who was asked — and a tie is still not a majority.
+- **KI-20 — CLOSED in v0.35.0, opt-in. It did NOT work in v0.34.0, where this entry first claimed
+  it did.** An outvoted host can ask the majority for its state and adopt it, rather than
+  overwriting three correct machines with its own. The donor is the lowest port in the largest
+  group — a rule both ends compute, so the host and the donor never disagree about who was asked —
+  and a tie is still not a majority.
+
+  **What shipped in v0.34.0 could not send a state at all.** `StateOffer` was missing from the
+  predicate that decides which control messages may carry a savestate, so the donor's reply was
+  capped at the small-frame limit and refused *by the sender's own channel* before it left the
+  machine. The host then waited out its donor timeout and recovered from its own state — the exact
+  outcome the feature exists to prevent — and the refusal was counted against the donor, so a peer
+  that had answered correctly was named in the log as the one that failed. Fixed in v0.35.0.
+  The codec had round-trip tests for the message and the channel had tests of its own; nothing had
+  ever sent one *through* the other, which is the seam and the lesson.
 
   **It is off by default, and the reason is the interesting part.** Correctness requires the wrong
   machine to adopt the right state, so if the host is wrong, the host imports — and a savestate is
@@ -111,6 +121,54 @@ open is recorded with what it would actually take.
 The same review produced the v0.31.0/v0.32.0 work and the v0.32.1 hotfixes: vacated seats, live
 relay failover, the control-frame MAC, divergence learning, the measured checksum cadence, and then
 the corrections above.
+
+## 2026-08-05 non-advocate review, and the test work that followed
+
+A read of every line with comments treated as claims to verify rather than as evidence. **Eleven
+defects, all fixed in v0.35.0** — five of them in code added by the two releases immediately before
+it, which is the number worth keeping rather than the list.
+
+**They clustered at one seam.** Three were a pure function with round-trip tests whose *integration*
+had never been driven once: the codec could encode a `StateOffer`, the channel could carry a large
+frame, and nobody had ever sent one through the other (KI-20 above). Two more were comments
+asserting arithmetic the code did not perform — the FIN linger's "a burst per RTO plus a few
+re-drives" out of a budget that allowed one, and a donor timeout of fifteen seconds against a
+transfer the same codebase budgets at ninety-two.
+
+Structural response rather than eleven patches:
+
+- `ControlMessageRouting` — one table every message type must be registered in, giving direction and
+  size class. A new type added without deciding both now fails the suite instead of shipping.
+- Decision-carrying state moved out of the tool form into Core where it can be driven: the majority
+  ask, the apply barrier, the resync budget, the desync decision, the whole host rebuild sequence,
+  the mesh's link quality and endpoint learning, and the lobby's mesh verdict.
+- A harness that runs a host and up to eight joiners through a real desync recovery — the end-to-end
+  test the previous plan wanted and could not have while the sequence lived in the form.
+- Seeded fuzzing over every decoder, and contract tests holding timing constants against each other
+  rather than against a comment.
+
+**The verdict that was too strong, again.** The plan this review replaced closed with "no incorrect
+assumption found anywhere". Two passes later that had produced eleven. Same lesson as the memory
+domains above, and worth stating twice because it was learned twice: a confident review verdict is
+not evidence.
+
+**Owed at the next protocol bump — move the password KDF from SHA-1 to SHA-256.** Measured
+2026-08-06, 100,000 iterations, eight cores: on .NET Framework 4.8 (what the tool ships on) SHA-1
+costs 1092ms against SHA-256's 478ms, and on .NET 10 it is 105ms against 46ms. SHA-1 is 2.3x
+*slower* despite doing less work per block, because .NET Framework takes a slow legacy path for it.
+So the swap is faster on both targets and retires a legacy primitive, for nothing but a changed
+derived key — which is a wire break, hence the wait. Two things the measurement settles so nobody
+re-derives them: hand-rolling loses to the platform (518ms against 478), because the built-in
+already sits on the raw-HMAC floor; and nothing below ~478ms is reachable without cutting iterations
+at a count already under the 600,000 current guidance suggests. The figures live beside the constant
+in `SessionAuth`.
+
+**What the same measurement fixed without a wire change (v0.35.0+).** Verifying a joiner's proof
+costs the host one derivation, and the accept loop is serial — so a stranger who cannot pass the
+password could hold the lobby door shut against players who can. Attempts are metered per address
+before the greet, where a refusal costs microseconds (`PasswordAttemptLimiter`). It bounds what an
+unauthenticated party can make the host spend; it does not protect the password, which is what the
+stretch is for, and a per-address limiter cannot help against a distributed flood.
 
 ## Status
 
@@ -351,7 +409,14 @@ into the cores. Join people you know, or set a password.
 *Re-verified 2026-08-04 against v0.34.0, and one thing HAS changed.* Three of the four `ImportState`
 call sites are still the two joiner-side ones and the restore of this machine's own pre-join state.
 The fourth is new: majority-aware recovery (KI-20) has an outvoted host adopt a peer's state, which
-is the first path by which a host runs a peer's bytes. That is exactly why it ships off by default
+is the first path by which a host runs a peer's bytes.
+
+*One correction, 2026-08-06, and it cuts in the reassuring direction.* That fourth path did not
+actually function in v0.34.0 — the donor's state was refused by the channel before it was ever sent
+(see KI-20). So a v0.34.0 host, opted in or not, never ran a peer's bytes: the exposure described
+here begins with v0.35.0, where the path works. Recorded because "the feature was broken" and "the
+host was not exposed" are the same fact here, and a reader auditing which versions can load a peer's
+savestate should not have to derive that from a bug report. That is exactly why it ships off by default
 and why the checkbox says so — correctness there requires the wrong machine to adopt the right
 state, so the exposure is inherent to the fix rather than an oversight in it. A host that leaves the
 setting alone still has no such path. Abusing the one it opts into needs a colluding majority, not a

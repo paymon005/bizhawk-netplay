@@ -53,11 +53,13 @@ same files.
 ## Everyone must run the same version
 
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
-friends must update to the same release.
+friends usually have to update too — but not always, and the release notes always say which.
 
-**v0.32.0 uses protocol 21**, a break from v0.31.0 — the desync checksum measures what to exclude
-and how often to run, so a v20 peer computes different values for identical states. See
-[CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what.
+**v0.34.0 and v0.35.0 both use protocol 23, so they mix freely** — v0.35.0 is a correctness release
+that changes no wire format, and you can take it without waiting for anyone else. The last break was
+at v0.34.0, which added per-disc identity and majority-aware recovery; a v22 peer sends neither. See
+[CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what and who can play with
+whom.
 
 A version mismatch is refused at the handshake with a clear message. That is the intended behaviour,
 not a fault — the alternative is a session that appears to work and silently loses input.
