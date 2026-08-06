@@ -178,86 +178,54 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// and it is the same pair <see cref="ExportState"/> already round-trips for session start and
     /// resync, so the format is proven rather than newly trusted.
     /// </summary>
-    private readonly Stack<PooledState> _statePool = new();
+    /// The pool itself lives in Core (<see cref="StateBufferPool"/>) because none of it needs
+    /// BizHawk — it is a stack of MemoryStreams and the rule that a buffer is handed out once. That
+    /// rule is why it moved: releasing one twice used to push it into the pool twice, and two later
+    /// saves would then pop what they believed were two buffers and get one, so two savestates
+    /// aliased the same bytes. Nothing reached it, but the test double had always refused a double
+    /// release while the shipping pool did not — so the suite was exercising something strictly
+    /// more forgiving than production.
+    /// </summary>
+    private readonly StateBufferPool _statePool = new();
 
     /// <summary>
-    /// One pooled savestate buffer and the reader/writer bound to it.
-    ///
-    /// The writer is part of the pooling for the same reason the buffer is: a new BinaryWriter
-    /// (and its UTF8 encoder) per savestate is ~60 small objects a second under continuous
-    /// prediction on N64 — trivial against the 5.9ms save itself, but pure churn inside the most
-    /// timing-critical span in the program, and avoidable for free once something owns the pair.
-    /// </summary>
-    private sealed class PooledState
-    {
-        public PooledState(int capacity)
-        {
-            Stream = new MemoryStream(capacity);
-            Writer = new BinaryWriter(Stream, Encoding.UTF8, leaveOpen: true);
-            Reader = new BinaryReader(Stream, Encoding.UTF8, leaveOpen: true);
-        }
-        public MemoryStream Stream { get; }
-        public BinaryWriter Writer { get; }
-        public BinaryReader Reader { get; }
-    }
-
-    /// <summary>Largest state seen, so a fresh buffer starts big enough to avoid growth copies.</summary>
-    private int _stateSizeHint = 1 << 16;
-
-    /// <summary>
-    /// Cap on retained buffers. The ring keeps roughly maxRollback + margin states, so this is far
-    /// above steady state and exists only so a pathological release burst cannot pin memory.
-    /// </summary>
-    private const int StatePoolCap = 64;
-
     public StateHandle SaveStateToMemory()
     {
-        PooledState pooled;
-        if (_statePool.Count > 0) pooled = _statePool.Pop();
-        else { pooled = new PooledState(_stateSizeHint); StateBuffersAllocated++; }
-        var ms = pooled.Stream;
-        ms.SetLength(0);
-        ms.Position = 0;
-        _statable.SaveStateBinary(pooled.Writer);
-        pooled.Writer.Flush();
-        if (ms.Length > _stateSizeHint) _stateSizeHint = (int)ms.Length;
-        return new StateHandle(_emulator.Frame, pooled);
+        var buffer = _statePool.Take();
+        _statable.SaveStateBinary(buffer.Writer);
+        buffer.Writer.Flush();
+        _statePool.NoteSize(buffer.Stream.Length);
+        return new StateHandle(_emulator.Frame, buffer);
     }
 
     public void LoadStateFromMemory(StateHandle handle)
     {
-        var pooled = (PooledState)handle.Token;
-        pooled.Stream.Position = 0;
-        _statable.LoadStateBinary(pooled.Reader);
+        var buffer = (StateBuffer)handle.Token;
+        buffer.Stream.Position = 0;
+        _statable.LoadStateBinary(buffer.Reader);
     }
 
-    public void ReleaseState(StateHandle handle)
-    {
-        // Retire the buffer for reuse rather than dropping it for the collector. Over the cap it
-        // is simply let go, which is the old behaviour for that one buffer.
-        if (!(handle.Token is PooledState pooled)) return;
-        if (_statePool.Count >= StatePoolCap) return;
-        pooled.Stream.SetLength(0);
-        _statePool.Push(pooled);
-    }
+    /// <summary>Retire the buffer for reuse. Releasing the same one twice is a no-op — see
+    /// <see cref="StateBufferPool.Return"/> for what a second entry in the pool would cost.</summary>
+    public void ReleaseState(StateHandle handle) => _statePool.Return(handle.Token as StateBuffer);
 
     /// <summary>Drop every retired buffer. Called when a session ends so a long idle between
     /// sessions does not hold the ring's worth of memory for nothing. Must run AFTER the driver is
     /// disposed — disposing the rollback ring is what pushes its buffers back in here.</summary>
     public void ClearStatePool()
     {
-        while (_statePool.Count > 0) _statePool.Pop().Stream.Dispose();
+        _statePool.Clear();
         _hashScratch = [];   // sized to the main-memory domain — 8MiB on N64, same argument
     }
 
     /// <summary>Buffers currently retired and reusable. Reported so a session can show the pool
     /// reaching steady state — once it stops growing, the save path has stopped allocating.</summary>
-    public int StatePoolSize => _statePool.Count;
+    public int StatePoolSize => _statePool.Size;
 
     /// <summary>Buffers created since the session began. This is the number that matters: it should
     /// climb to the ring's size in the first second or two and then stop. If it keeps climbing, the
     /// pool is being outrun and the allocation this exists to remove is still happening.</summary>
-    public int StateBuffersAllocated { get; private set; }
+    public int StateBuffersAllocated => _statePool.Allocated;
 
     public byte[] ExportState()
     {
@@ -267,22 +235,15 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         // object heap per whole-state transfer on N64 rather than ~16MiB, and every resync is a
         // moment the session is already struggling: net48 neither compacts the LOH nor reclaims it
         // outside a blocking gen2, which is the same 52.5ms-pause bill the pool was built to stop.
-        var pooled = _statePool.Count > 0 ? _statePool.Pop() : new PooledState(_stateSizeHint);
+        var buffer = _statePool.Take();
         try
         {
-            var ms = pooled.Stream;
-            ms.SetLength(0);
-            ms.Position = 0;
-            _statable.SaveStateBinary(pooled.Writer);
-            pooled.Writer.Flush();
-            if (ms.Length > _stateSizeHint) _stateSizeHint = (int)ms.Length;
-            return ms.ToArray();
+            _statable.SaveStateBinary(buffer.Writer);
+            buffer.Writer.Flush();
+            _statePool.NoteSize(buffer.Stream.Length);
+            return buffer.Stream.ToArray();
         }
-        finally
-        {
-            pooled.Stream.SetLength(0);
-            if (_statePool.Count < StatePoolCap) _statePool.Push(pooled);
-        }
+        finally { _statePool.Return(buffer); }
     }
 
     public void ImportState(byte[] state)

@@ -783,8 +783,11 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
             if (key < keepFrom && !IsUnconsumedChecksumAnchor(key)) _pruneScratch.Add(key);
         foreach (var key in _pruneScratch)
         {
-            _adapter.ReleaseState(_states[key]);
+            // Dropped before released, as everywhere else here: an entry must never outlive the
+            // state it names, and the release is what ends that state's life.
+            var st = _states[key];
             _states.Remove(key);
+            _adapter.ReleaseState(st);
         }
 
         // _applied is pruned on its own keys, not as a passenger of _states. It used to be dropped
