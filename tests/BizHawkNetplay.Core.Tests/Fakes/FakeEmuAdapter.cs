@@ -110,6 +110,10 @@ public sealed class FakeEmuAdapter : IEmuAdapter
     /// vacuous, since a pool that never hands a buffer back tests nothing.</summary>
     public int StateBuffersAllocated { get; private set; }
 
+    /// <summary>Buffers currently retired and reusable — the mirror of the adapter's own pool size,
+    /// so a test can ask whether a failure path gave its buffer back.</summary>
+    public int StatePoolSize => _statePool.Count;
+
     /// <summary>
     /// Set to model a core whose SAVE fails — out of memory on a big state, a core-level error.
     /// Return null to save normally, or the exception the core would raise.
@@ -132,12 +136,20 @@ public sealed class FakeEmuAdapter : IEmuAdapter
 
     public StateHandle SaveStateToMemory()
     {
-        if (SaveFault?.Invoke() is { } saveFault) throw saveFault;
-        SaveCount++;
-        SavedAtFrames.Add(_frame);
         byte[] buffer;
         if (_statePool.Count > 0 && _statePool.Peek().Length == _memory.Length) buffer = _statePool.Pop();
         else { buffer = new byte[_memory.Length]; StateBuffersAllocated++; }
+        // Faulted AFTER the buffer is taken, because that is where the real adapter faults: it takes
+        // from its pool and then asks the core to write into it. Throwing first — which this used to
+        // do — models a save path that cannot lose its buffer, so no test could ever have caught the
+        // one that did. Returning it here mirrors the adapter's catch.
+        if (SaveFault?.Invoke() is { } saveFault)
+        {
+            _statePool.Push(buffer);
+            throw saveFault;
+        }
+        SaveCount++;
+        SavedAtFrames.Add(_frame);
         Buffer.BlockCopy(_memory, 0, buffer, 0, _memory.Length);
         var handle = new StateHandle(_frame, buffer);
         LiveStates.Add(handle);

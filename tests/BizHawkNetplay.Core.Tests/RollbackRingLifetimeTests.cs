@@ -113,6 +113,42 @@ public class RollbackRingLifetimeTests
     }
 
     /// <summary>
+    /// A save that fails does not cost a pooled buffer.
+    ///
+    /// The buffer is taken before the core is asked to write into it, so a throw in between leaves
+    /// it owned by nobody unless the save path hands it back. On N64 that is sixteen megabytes per
+    /// failure, re-allocated on the next save — the large-object-heap churn the pool exists to
+    /// remove, arriving during a failure rather than in the steady state.
+    ///
+    /// <b>What this does and does not prove.</b> It pins the contract against the test double. The
+    /// shipping adapter is a separate implementation that no test can reach, so its matching fix
+    /// rests on reading rather than on this. Worth having anyway: the double faulted BEFORE taking
+    /// its buffer until now, which modelled a save path that could not lose one — so nothing here
+    /// could ever have expressed the question, let alone answered it.
+    /// </summary>
+    [Fact]
+    public void ASaveThatThrowsDoesNotCostAPooledBuffer()
+    {
+        var transport = new QueueTransport();
+        var driver = Build(transport, out var emu, out _);
+        RunConfirmed(driver, emu, transport, 40, value: 1);
+
+        int allocatedBefore = emu.StateBuffersAllocated;
+        int poolBefore = emu.StatePoolSize;
+        Assert.True(poolBefore > 0, "nothing had been released yet, so there was no pool to lose from");
+
+        for (int i = 0; i < 20; i++)
+        {
+            emu.SaveFault = () => new InvalidOperationException("the core could not save");
+            Assert.Throws<InvalidOperationException>(() => emu.SaveStateToMemory());
+        }
+        emu.SaveFault = null;
+
+        Assert.Equal(poolBefore, emu.StatePoolSize);
+        Assert.Equal(allocatedBefore, emu.StateBuffersAllocated);
+    }
+
+    /// <summary>
     /// The ordinary run never loads a state it has released either.
     ///
     /// The detector above is only worth having if it reads zero when nothing is wrong, so this

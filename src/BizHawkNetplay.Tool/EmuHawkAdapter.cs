@@ -192,8 +192,26 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     public StateHandle SaveStateToMemory()
     {
         var buffer = _statePool.Take();
-        _statable.SaveStateBinary(buffer.Writer);
-        buffer.Writer.Flush();
+        try
+        {
+            _statable.SaveStateBinary(buffer.Writer);
+            buffer.Writer.Flush();
+        }
+        catch
+        {
+            // The buffer belongs to this method until a StateHandle names it. A core that throws
+            // mid-save would otherwise drop a whole state's worth of pool on the floor — 16 MiB on
+            // N64 — and the next save allocates a replacement. That is not a leak in the sense that
+            // it grows without bound, but it is exactly the large-object-heap churn the pool exists
+            // to remove, arriving during a failure rather than in the steady state, and net48
+            // neither compacts the LOH nor reclaims it outside a blocking gen2.
+            //
+            // ExportState has always had this as a `finally` because it returns the buffer
+            // unconditionally. This path keeps the buffer on success, so it needs the failure half
+            // spelled out separately — which is how the two drifted apart.
+            _statePool.Return(buffer);
+            throw;
+        }
         _statePool.NoteSize(buffer.Stream.Length);
         return new StateHandle(_emulator.Frame, buffer);
     }
