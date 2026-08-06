@@ -180,6 +180,39 @@ before the greet, where a refusal costs microseconds (`PasswordAttemptLimiter`).
 unauthenticated party can make the host spend; it does not protect the password, which is what the
 stretch is for, and a per-address limiter cannot help against a distributed flood.
 
+## 2026-08-06: the measurement that decides rollback was itself pessimistic (v0.37.0)
+
+Two review passes over this codebase have now recorded N64's rollback depth as the tight case, and
+the To Do list was pessimistic about it "on the arithmetic that N64 sustains only ~3 frames of
+depth" (KI-8 below). **That arithmetic came from a probe measuring the wrong operation.**
+
+The timed savestate pass held every sample until the whole probe had finished, which left the
+adapter's buffer pool empty — so each timed save allocated a fresh 16.7 MiB whole-core buffer off
+the large object heap, while the session it models reuses one the rollback ring just released. The
+probe was timing allocate-plus-save and charging it to a model that only ever pays save. It was
+therefore most wrong exactly where the verdict is closest, and it under-reported the depth a heavy
+core can afford. Fixed in v0.37.0.
+
+**What this does not settle.** The direction of the error is certain and the mechanism is tested,
+but the size of it is not measured here — no figure in this file should be adjusted on the strength
+of the fix. KI-8's real-play record stands as written: at three players over the internet, Pokémon
+Stadium on Rice ran rollback at delay ~5 and was reported as working well, with no telemetry. What
+the fix means is that the *arithmetic* the pessimism rested on was measuring a cost the session does
+not pay, so the next N64 probe on real hardware is worth reading fresh rather than against the old
+number.
+
+Two smaller things from the same pass. The probe held ~400 MiB of states live across three
+measurement passes, felt hardest with several EmuHawk instances on one machine — the four-player
+case this tool exists for. And it had no cleanup boundary, so a core that threw mid-measurement left
+whole-core buffers checked out for the rest of the process while the tool's own save/restore made
+the game look recovered.
+
+Separately, a diagnostic that pointed at the wrong culprit: the frame loop reported cost-cap stalls
+as time-sync yields, so a machine too slow to repair inside its budget presented as a clock-skew
+problem — the opposite fix. And stalls waiting at the hard prediction cap, the most common kind on a
+lossy link, had no counter at all. Both corrected in v0.37.0; the scheduling was already right and
+did not change.
+
 ## Status
 
 Entries below are a mix: some are open work (KI-11), some are validation records kept because the

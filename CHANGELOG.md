@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.34.0 – v0.36.0 | **23** | *v0.35.0 and v0.36.0 change no wire format and mix freely with v0.34.0 — the first releases in this table to share a protocol with their predecessor, so nobody has to update in step. One caveat if your group is mixed: a v0.36.0 host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back. See the v0.36.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
+| v0.34.0 – v0.37.0 | **23** | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
 | v0.31.0 | 20 | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
@@ -29,6 +29,49 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.37.0 — the probe was measuring the wrong thing, and the stall was blaming the wrong thing (protocol 23, unchanged)
+
+Two measurements that were quietly lying. Neither breaks anything, and that is what made them worth
+finding: one made a heavy core look less capable than it is, and the other pointed a stuttering
+session at the wrong culprit.
+
+**The capability probe was timing an allocation the session never pays.** It held every timed
+savestate sample until all four measurement passes had finished — 24 of them on a heavy core, which
+is around 400 MiB of N64 states live at once, and worse with three or four EmuHawk instances sharing
+a machine. Holding them also left the buffer pool empty, so *every* timed save had to allocate a
+fresh 16.7 MiB buffer off the large object heap, while a session in steady state reuses one the
+rollback ring just released. The probe was therefore timing allocate-plus-save and charging it to a
+model that only ever pays save.
+
+That is pessimistic in exactly the place the verdict is closest. **On a heavy core the same machine
+may now qualify for rollback where it previously fell back to lockstep, or be granted more depth
+than before.** Nothing about what the number *means* changed, so no protocol move: peers negotiate
+the minimum of the two advertised depths, which is what makes a mixed group safe. It also means a
+group is held to its least optimistic member — if you want the depth, update together.
+
+The probe is also exception-safe now. Every state it acquires happens inside a pass that steps the
+core, and any of them can throw; without one cleanup boundary that exception skipped both the
+release and the position restore, and because the tool wraps the probe in its own save/restore the
+game *looked* recovered while whole-core buffers stayed checked out for the rest of the process. A
+failed save no longer costs the pool its buffer either.
+
+The pool gained a byte ceiling to go with its count cap. Sixty-four buffers is about 32 MiB of SNES
+states and better than a gigabyte of N64 ones, so a count alone bounds nothing on the core where
+bounding it matters.
+
+**A stall now says which of four things is wrong.** The frame loop read a single
+`LastStallWasTimeSync` flag, and the cost cap set it. That was right about the scheduling — both are
+frames given up on purpose, so both should cost a whole frame period rather than a retry — and wrong
+about the cause. A machine too slow to repair inside its frame budget reported itself in the log as
+a clock-skew problem, which points you at the opposite fix. And the most common stall of all,
+waiting at the hard prediction cap for a peer's input, had neither a name nor a counter: a session
+stalling on packet loss showed a time-sync count of zero and nothing else.
+
+The four are now distinct — waiting on the link, clock skew from the soft cap, clock skew from the
+measured frame advantage, and this machine's repair budget — and the status line shows `tsync`,
+`cost` and `wait` separately, each only once it has happened. The scheduling is unchanged; only the
+names are new.
 
 ### v0.36.0 — deferring to the majority is the default, and two silent corruptions closed (protocol 23, unchanged)
 
