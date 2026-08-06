@@ -287,9 +287,25 @@ public sealed partial class NetplayToolForm
 
                     try { tcp.NoDelay = true; } catch { } // control latency matters for ping + resync
                     try { tcp.ReceiveTimeout = HandshakeReceiveTimeoutMs; } catch { } // bound a silent joiner's HELLO
+                    var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
+
+                    // Metered BEFORE the greet, because the greet is what costs: verifying a proof
+                    // is one PBKDF2 derivation, about a second on this build, and this loop is
+                    // serial — so a stranger who cannot pass the password can still hold the door
+                    // shut against players who can. A refusal here costs microseconds.
+                    if (!_joinAttempts.TryBeginAttempt(remoteIp.ToString(), MonotonicSeconds()))
+                    {
+                        try { tcp.Close(); } catch { }
+                        UiConnLog($"ignoring a burst of join attempts from {remoteIp} — more than " +
+                                  $"{PasswordAttemptLimiter.BurstAllowance} in quick succession. Each " +
+                                  "one costs this machine a password check, and answering them all " +
+                                  "would keep real players out. If this is you, wait a few seconds " +
+                                  "and try again.", Color.DarkOrange);
+                        continue;
+                    }
+
                     if (!TrackHandshakeClient(tcp, attempt)) { try { tcp.Close(); } catch { } return; }
                     _greetingTcp = tcp; // so Disconnect/teardown can abort a joiner stuck mid-handshake
-                    var remoteIp = ((IPEndPoint)tcp.Client.RemoteEndPoint).Address;
                     var channel = new ControlChannel(tcp.GetStream());
 
                     Handshake.JoinerGreeting greet;
@@ -320,6 +336,9 @@ public sealed partial class NetplayToolForm
 
                     if (ReferenceEquals(_greetingTcp, tcp)) _greetingTcp = null;
                     try { tcp.ReceiveTimeout = 0; } catch { } // handshake done: restore blocking reads for the session
+                    // They passed, so forgive whatever they spent getting here: someone who
+                    // mistyped their password four times is a player, not a threat.
+                    _joinAttempts.RecordSuccess(remoteIp.ToString());
                     int assignedPort = links.Count + 1;
                     bool reflexiveCredible = ReflexiveCandidate.IsCredible(greet.Reflexive, remoteIp);
                     if (greet.Reflexive != null && !reflexiveCredible)

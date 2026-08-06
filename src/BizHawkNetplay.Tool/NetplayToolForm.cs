@@ -302,6 +302,10 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // Who still owes an "I applied that epoch" acknowledgement. Replaces a per-peer field written
     // in three loops and read back by a fourth that walked every link looking for one still set.
     private readonly ApplyBarrier _applyBarrier = new();
+    // How often one address may make this host check a password. Verifying a proof is a PBKDF2
+    // derivation — about a second on this build — and the accept loop is serial, so a stranger
+    // who cannot pass can otherwise hold the door shut against players who can.
+    private readonly PasswordAttemptLimiter _joinAttempts = new();
     // Tells "the emulation drifted once" apart from "these two machines were never comparing the
     // same thing": a real drift agrees for a while first, a systematic mismatch never agrees at all.
     private readonly DesyncTrend _desyncTrend = new();

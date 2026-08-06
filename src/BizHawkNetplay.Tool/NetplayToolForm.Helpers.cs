@@ -335,6 +335,11 @@ public sealed partial class NetplayToolForm
         ? double.PositiveInfinity
         : (MonotonicNow() - startedAt) / (double)System.Diagnostics.Stopwatch.Frequency;
 
+    /// <summary>A plain monotonic reading in seconds, for the rate limiter — distinct from
+    /// <see cref="MonotonicElapsedSeconds"/>, whose 0 means "never started" and answers infinity.</summary>
+    private static double MonotonicSeconds() =>
+        MonotonicNow() / (double)System.Diagnostics.Stopwatch.Frequency;
+
     private static int StateTransferTimeoutMs(int stateBytes) =>
         StateTransferBudget.SocketTimeoutMs(stateBytes, HandshakeReceiveTimeoutMs);
 

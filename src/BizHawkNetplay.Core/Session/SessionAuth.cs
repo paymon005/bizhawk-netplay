@@ -22,10 +22,31 @@ public static class SessionAuth
     /// PBKDF2 stretch: slows an offline password guess to a crawl.
     ///
     /// It is not free at the honest end either, and the figure is worth knowing: one derivation
-    /// measures ~108ms on .NET 10 and ~1043ms on .NET Framework 4.8, which is what the tool ships
-    /// on. So a join costs about a second of CPU on each side, once — and a HOST pays that for
-    /// every connection attempt that reaches the password step, including the ones that were never
-    /// going to pass it.
+    /// measures ~105ms on .NET 10 and ~1092ms on .NET Framework 4.8, which is what the tool ships
+    /// on. So a join costs about a second on each side, once — on a background thread, so it is
+    /// join latency rather than a frozen emulator — and a HOST pays it for every connection
+    /// attempt that reaches the password step, including the ones that were never going to pass.
+    /// The second of those is metered by <see cref="PasswordAttemptLimiter"/>; the first is the
+    /// price of the stretch.
+    ///
+    /// <b>Owed at the next protocol bump: move this KDF from SHA-1 to SHA-256.</b> Measured on
+    /// 2026-08-06, 100,000 iterations, eight cores:
+    /// <code>
+    ///                                          net48     net10.0
+    ///   Rfc2898 SHA-1 (what ships)            1092 ms      105 ms
+    ///   Rfc2898 SHA-256                        478 ms       46 ms
+    ///   hand-rolled PBKDF2 + reused HMACSHA256 518 ms       95 ms
+    ///   raw HMACSHA256 x100k (the floor)       512 ms       66 ms
+    /// </code>
+    /// SHA-1 is 2.3x SLOWER than SHA-256 here, which is backwards from the work each does per
+    /// block: .NET Framework's SHA-1 takes a slow legacy path and its SHA-256 does not. So the swap
+    /// is faster on both targets AND retires a legacy primitive, for nothing but a changed derived
+    /// key — which is a wire break, hence the wait.
+    ///
+    /// Two things the measurement settles, so nobody re-derives them: hand-rolling loses to the
+    /// platform (518 against 478), because the built-in already sits on the raw-HMAC floor; and
+    /// nothing below ~478ms on net48 is reachable without cutting iterations, which is a security
+    /// trade at a count already below the 600,000 current guidance suggests for PBKDF2-SHA256.
     /// </summary>
     public const int DefaultIterations = 100_000;
 
