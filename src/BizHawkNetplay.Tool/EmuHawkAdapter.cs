@@ -429,16 +429,16 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                 // domain never changes size mid-session, so this allocates once.
                 if (_hashScratch.Length != length) _hashScratch = new byte[length];
                 Marshal.Copy(data, _hashScratch, 0, length);
-                result = Fnv1a64(_hashScratch, length, PathPtr, exclusions, exclusionSeed);
-                bucketsFilled = FillBuckets(_hashScratch, length, buckets);
+                result = MemoryHash.Fnv1a64(_hashScratch, length, MemoryHash.PathPtr, exclusions, exclusionSeed);
+                bucketsFilled = MemoryHash.FillBuckets(_hashScratch, length, buckets);
                 how = "ptr";
             }
             else if (array != null && array.Length >= length)
             {
                 // Array-backed domain (the Hawk cores' RAM): the bytes are already
                 // managed, so hash them where they sit. No copy at all.
-                result = Fnv1a64(array, length, PathArray, exclusions, exclusionSeed);
-                bucketsFilled = FillBuckets(array, length, buckets);
+                result = MemoryHash.Fnv1a64(array, length, MemoryHash.PathArray, exclusions, exclusionSeed);
+                bucketsFilled = MemoryHash.FillBuckets(array, length, buckets);
                 how = "arr";
             }
             else if (closure != IntPtr.Zero)
@@ -460,8 +460,8 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                 }
                 else
                 {
-                    result = Fnv1a64(_hashScratch, length, PathClosure, exclusions, exclusionSeed);
-                    bucketsFilled = FillBuckets(_hashScratch, length, buckets);
+                    result = MemoryHash.Fnv1a64(_hashScratch, length, MemoryHash.PathClosure, exclusions, exclusionSeed);
+                    bucketsFilled = MemoryHash.FillBuckets(_hashScratch, length, buckets);
                     how = "ptr*";
                 }
             }
@@ -475,8 +475,8 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
                 // at the next checksum instead of up to stride intervals late.
                 if (_hashScratch.Length != length) _hashScratch = new byte[length];
                 domain.BulkPeekByte(0L.RangeToExclusive(size), _hashScratch);
-                result = Fnv1a64(_hashScratch, length, PathBulk, exclusions, exclusionSeed);
-                bucketsFilled = FillBuckets(_hashScratch, length, buckets);
+                result = MemoryHash.Fnv1a64(_hashScratch, length, MemoryHash.PathBulk, exclusions, exclusionSeed);
+                bucketsFilled = MemoryHash.FillBuckets(_hashScratch, length, buckets);
                 how = "bulk";
             }
             else
@@ -1023,7 +1023,7 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         // a slice it didn't. A peer reading a different slice produces an obviously different hash
         // rather than a plausible one.
         h = (h ^ (((ulong)(uint)stride << 32) | (uint)offset)) * prime;
-        h = SeedWithExclusions(h, PathWord, exRanges, 0);
+        h = MemoryHash.SeedWithExclusions(h, MemoryHash.PathWord, exRanges, 0);
 
         // Every exclusion bound is word-aligned, so a whole word is either in an excluded range or
         // out of it — the sample never has to split one. Addresses only ever increase, so the
@@ -1065,84 +1065,4 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         return x;
     }
 
-    /// <summary>
-    /// FNV-1a folded to 32 bits, consuming eight bytes per step. Both peers run the same arithmetic
-    /// on the same bytes, so the result is identical wherever it's computed — that, not collision
-    /// resistance, is the property desync detection needs.
-    /// </summary>
-    private static uint Fnv1a64(byte[] data, int length, int pathTag, long[] exRanges, ulong extraSeed)
-    {
-        ulong h = SeedWithExclusions(14695981039346656037UL, pathTag, exRanges, extraSeed);
-        long cursor = 0;
-        for (int r = 0; r < exRanges.Length; r += 2)
-        {
-            long start = Math.Min(exRanges[r], length);
-            long end = Math.Min(exRanges[r + 1], length);
-            if (start > cursor) h = FoldRange(h, data, (int)cursor, (int)start);
-            if (end > cursor) cursor = end;
-        }
-        if (cursor < length) h = FoldRange(h, data, (int)cursor, length);
-        // Fold the high half down so a divergence up there can't vanish in the truncation.
-        return (uint)(h ^ (h >> 32));
-    }
-
-    private static ulong FoldRange(ulong h, byte[] data, int from, int to)
-    {
-        const ulong prime = 1099511628211UL;
-        int i = from;
-        for (int limit = to - 7; i < limit; i += 8)
-            h = (h ^ BitConverter.ToUInt64(data, i)) * prime;
-        for (; i < to; i++)
-            h = (h ^ data[i]) * prime;
-        return h;
-    }
-
-    /// <summary>
-    /// Per-bucket hashes over ALL of the buffer — buckets deliberately ignore every exclusion,
-    /// because their whole purpose is to find the bytes worth excluding. Bucket slicing is a pure
-    /// function of the domain size (see <see cref="DivergenceLearner.BucketSpan"/>), so every
-    /// peer produces vectors that line up index for index.
-    /// </summary>
-    private static bool FillBuckets(byte[] data, int length, uint[]? buckets)
-    {
-        if (buckets == null) return false;
-        long span = DivergenceLearner.BucketSpan(length, buckets.Length);
-        for (int i = 0; i < buckets.Length; i++)
-        {
-            long start = i * span;
-            if (start >= length) { buckets[i] = 2166136261u; continue; } // past the end: constant
-            long end = Math.Min(length, start + span);
-            ulong h = FoldRange(14695981039346656037UL, data, (int)start, (int)end);
-            buckets[i] = (uint)(h ^ (h >> 32));
-        }
-        return true;
-    }
-
-    /// <summary>
-    /// Which hash path ran, and which bytes it skipped, folded into the seed.
-    ///
-    /// Same argument as the stride and offset in <see cref="HashByWord"/>, extended to cover the
-    /// things that now also decide what a checksum describes: the path (chosen from the domain's
-    /// type and size), every excluded range, and the learned mask's own identity when one is
-    /// active. Two peers are expected to agree on all of them — and if they ever did not, the
-    /// point is that the resulting values must not be comparable. A visible disagreement resyncs
-    /// and names the paths in the log; a plausible one would compare unlike byte sets forever.
-    /// </summary>
-    private static ulong SeedWithExclusions(ulong h, int pathTag, long[] exRanges, ulong extraSeed)
-    {
-        const ulong prime = 1099511628211UL;
-        h = (h ^ (uint)pathTag) * prime;
-        h = (h ^ (ulong)exRanges.Length) * prime;
-        foreach (long bound in exRanges) h = (h ^ (ulong)bound) * prime;
-        h = (h ^ extraSeed) * prime;
-        return h;
-    }
-
-    /// <summary>Identifies the route a hash took, so two peers on different ones cannot compare
-    /// their results as though they described the same bytes. See <see cref="SeedWithPath"/>.</summary>
-    private const int PathPtr = 1;
-    private const int PathArray = 2;
-    private const int PathBulk = 3;
-    private const int PathWord = 4;
-    private const int PathClosure = 5;
 }

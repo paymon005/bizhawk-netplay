@@ -5,6 +5,12 @@
     <RootNamespace>BizHawkNetplay.Core</RootNamespace>
     <AssemblyName>BizHawkNetplay.Core</AssemblyName>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- For MemoryHash.FoldRange only: reading the eight bytes through a fixed pointer instead of
+         BitConverter is 2.41x on .NET Framework, which is what the tool ships on, for a bit-for-bit
+         identical hash. That loop walks 8MiB of N64 RDRAM at every checksum, so it is worth the
+         keyword. Nothing else in Core is unsafe and nothing else should become so without a
+         measurement of its own. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- Kept in step with the Tool's version. The two DLLs ship together and must be installed
          together, so a pair that disagrees about which release it is would defeat the point of
          stamping either. Bump both when cutting a release. -->
