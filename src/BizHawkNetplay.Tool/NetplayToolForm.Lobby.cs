@@ -740,70 +740,45 @@ public sealed partial class NetplayToolForm
         RunStartPhase(links, casualties, attempt, "we asked it to measure its UDP paths",
             link => Handshake.HostRequestMeshRtt(link.Control, generation));
 
-        int measuredEdges = 0, totalEdges = 0;
-        var incomplete = new List<PeerLink>();   // joiners that could not open every direct leg
-        // The joiner-to-joiner edges that never opened, as unordered port pairs. Each report now
-        // NAMES its silent edges, so the relay can carry exactly these instead of everything
-        // addressed to an affected joiner — a joiner short one leg used to get all input relayed
-        // and the session's delay inflated by a hop its working legs were not taking.
-        var relayPairs = new HashSet<(int A, int B)>();
-        double rtt = worstRttMs, jitter = worstJitterMs; // ref params cannot be captured below
+        // Which edges to carry, who cannot play, and the worst figures a delay must cover are all
+        // decided in Core — see LobbyMeshAssessment for the three rules and what each has cost.
+        var seats = new List<int>();
+        foreach (var link in links) seats.Add(link.RemotePort);
+        var assessment = new LobbyMeshAssessment(seats);
+        assessment.AddHostEdges(0, 0, new LobbyRttSample(worstRttMs, worstRttMs + worstJitterMs));
+
         RunStartPhase(links, casualties, attempt, "we waited for its mesh measurement", link =>
         {
             var report = Handshake.HostWaitMeshRtt(link.Control, generation);
-            totalEdges += report.TotalEdges;
-            measuredEdges += report.MeasuredEdges;
-            if (report.MeasuredEdges < report.TotalEdges)
-            {
-                incomplete.Add(link);
-                bool namedAny = false;
-                foreach (int silentPort in report.SilentPorts)
-                {
-                    // The host leg is not a relayable pair: a relay to this joiner RUNS over that
-                    // leg, and a dead one makes the joiner a casualty below, not a relay customer.
-                    if (silentPort == 0 || silentPort == link.RemotePort) continue;
-                    relayPairs.Add(Pair(link.RemotePort, silentPort));
-                    namedAny = true;
-                }
-                // Backstop for a report that says edges are missing without naming them — that
-                // should not happen on this protocol, but an unnamed hole must fail toward the old
-                // over-delivery, not toward a leg silently carried by nobody.
-                if (!namedAny && report.SilentPorts.Count == 0)
-                    foreach (var other in links)
-                        if (!ReferenceEquals(other, link))
-                            relayPairs.Add(Pair(link.RemotePort, other.RemotePort));
-            }
+            assessment.AddJoinerReport(link.RemotePort, report);
             if (!report.HasMeasurement)
-            {
                 UiConnLog($"{link.Label} could not measure any of its {report.TotalEdges} UDP edge(s) — " +
                           "its direct paths have not opened yet, so only the edges that did answer " +
                           "are measured.", Color.DarkOrange);
-                return;
-            }
-            Fold(report.Rtt, ref rtt, ref jitter);
         });
-        worstRttMs = rtt;
-        worstJitterMs = jitter;
-        if (casualties.Count > 0 || !IsConnectionAttemptCurrent(attempt)) return;
+        if (casualties.Count > 0 || !IsConnectionAttemptCurrent(attempt))
+        {
+            worstRttMs = assessment.WorstRttMs;
+            worstJitterMs = assessment.WorstJitterMs;
+            return;
+        }
 
         // The host's own edges, on UDP this time. Its burst ran while it was blocked above.
         if (mesh.TryGetWorstRttStats(out double hostMedianMs, out double hostHighMs,
                 out int hostMeasured, out int hostTotal))
-        {
-            measuredEdges += hostMeasured;
-            totalEdges += hostTotal;
-            Fold(new LobbyRttSample(hostMedianMs, hostHighMs), ref worstRttMs, ref worstJitterMs);
-        }
-        else totalEdges += links.Count;
+            assessment.AddHostEdges(hostMeasured, hostTotal, new LobbyRttSample(hostMedianMs, hostHighMs));
+        else
+            assessment.AddHostEdges(0, links.Count, null);
 
         // Each edge is measured from both ends, so the mesh's 6 logical edges arrive as 12 reports.
         // Say what was covered rather than implying the whole mesh was.
-        if (measuredEdges >= totalEdges && totalEdges > 0)
-            UiConnLog($"mesh measured: all {totalEdges} direct path(s) answered.", Color.DarkGreen);
+        if (assessment.FullyCovered)
+            UiConnLog($"mesh measured: all {assessment.TotalEdges} direct path(s) answered.",
+                Color.DarkGreen);
         else
-            UiConnLog($"mesh measured: {measuredEdges} of {totalEdges} direct path(s) answered — the " +
-                      "delay below is a lower bound, and a path that opens later may need more.",
-                Color.DarkOrange);
+            UiConnLog($"mesh measured: {assessment.MeasuredEdges} of {assessment.TotalEdges} direct " +
+                      "path(s) answered — the delay below is a lower bound, and a path that opens " +
+                      "later may need more.", Color.DarkOrange);
 
         // A player this host cannot exchange UDP with cannot play, and until now the lobby said so
         // and started anyway: the warning was written, READY was requested, GO was sent, and the
@@ -813,9 +788,15 @@ public sealed partial class NetplayToolForm
         // that can actually work.
         var noHostLeg = new List<PeerLink>();
         foreach (var link in links)
-            if (!LinkHasLiveMeshPath(mesh, link)) noHostLeg.Add(link);
+            if (!LinkHasLiveMeshPath(mesh, link))
+            {
+                assessment.MarkNoHostLeg(link.RemotePort);
+                noHostLeg.Add(link);
+            }
         if (noHostLeg.Count > 0)
         {
+            worstRttMs = assessment.WorstRttMs;
+            worstJitterMs = assessment.WorstJitterMs;
             foreach (var link in noHostLeg)
             {
                 casualties.Add(link);
@@ -831,45 +812,32 @@ public sealed partial class NetplayToolForm
             return; // the caller drops them and reopens the lobby
         }
 
-        InstallMeshRelay(links, incomplete, relayPairs);
+        var incomplete = new List<PeerLink>();
+        foreach (var link in links)
+            if (System.Linq.Enumerable.Contains(assessment.IncompleteSeats, link.RemotePort))
+                incomplete.Add(link);
+        InstallMeshRelay(links, incomplete, new HashSet<(int A, int B)>(assessment.RelayPairs));
 
         // The relay adds a hop, so the legs riding it are NOT covered by the worst direct edge the
-        // delay was about to be sized from — and an edge that never opened contributed nothing to
-        // that figure in the first place. Fold in what the relayed legs actually cost, from the
-        // host's own legs, which are the two hops each is made of.
-        if (relayPairs.Count > 0)
-        {
-            var hostLegs = new Dictionary<int, LobbyRttSample>();
-            foreach (var edge in mesh.DescribeEdges())
-                if (edge.Measured) hostLegs[edge.RemotePort] = new LobbyRttSample(edge.MedianMs, edge.HighMs);
-            var relayed = LobbyDelayPolicy.RelayRouteStats(hostLegs, relayPairs);
-            double relayRttMs = relayed.MedianMs;
-            // The route swings when either hop swings, so its combined jitter competes for the
-            // session-wide worst independently of whether its round trip does.
-            if (relayed.JitterMs > worstJitterMs) worstJitterMs = relayed.JitterMs;
-            if (relayRttMs > worstRttMs)
-            {
-                UiConnLog(autoDelay
-                        ? $"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
-                          $"direct path's ~{worstRttMs:F0}ms — sizing the delay from the relayed " +
-                          "figure, since that is the one those players are actually using."
-                        : $"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
-                          $"direct path's ~{worstRttMs:F0}ms. Automatic delay is off, so nothing " +
-                          "sizes to that figure — check the manual delay covers it.",
-                    Color.DarkOrange);
-                worstRttMs = relayRttMs;
-            }
-        }
+        // delay was about to be sized from. Fold in what they actually cost, from the host's own
+        // legs, which are the two hops each relayed route is made of.
+        double directWorstMs = assessment.WorstRttMs;
+        var hostLegs = new Dictionary<int, LobbyRttSample>();
+        foreach (var edge in mesh.DescribeEdges())
+            if (edge.Measured) hostLegs[edge.RemotePort] = new LobbyRttSample(edge.MedianMs, edge.HighMs);
+        if (assessment.FoldRelayedRoutes(hostLegs, out double relayRttMs))
+            UiConnLog(autoDelay
+                    ? $"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
+                      $"direct path's ~{directWorstMs:F0}ms — sizing the delay from the relayed " +
+                      "figure, since that is the one those players are actually using."
+                    : $"the relayed route costs ~{relayRttMs:F0}ms round trip against the worst " +
+                      $"direct path's ~{directWorstMs:F0}ms. Automatic delay is off, so nothing " +
+                      "sizes to that figure — check the manual delay covers it.",
+                Color.DarkOrange);
 
-        static void Fold(LobbyRttSample sample, ref double rtt, ref double jitter)
-        {
-            if (sample.MedianMs > rtt) rtt = sample.MedianMs;
-            if (sample.JitterMs > jitter) jitter = sample.JitterMs;
-        }
+        worstRttMs = assessment.WorstRttMs;
+        worstJitterMs = assessment.WorstJitterMs;
     }
-
-    /// <summary>An unordered port pair, normalised so (2,4) and (4,2) are the same edge.</summary>
-    private static (int A, int B) Pair(int a, int b) => a < b ? (a, b) : (b, a);
 
     /// <summary>Whether ANY endpoint of this peer has completed a round trip on UDP — i.e. whether
     /// the host has a real mesh path to it, as distinct from the TCP control link it arrived on.

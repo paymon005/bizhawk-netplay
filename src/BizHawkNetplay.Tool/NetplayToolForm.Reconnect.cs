@@ -182,7 +182,7 @@ public sealed partial class NetplayToolForm
         switch (verdict)
         {
             case RelayFailoverVerdict.Install:
-                _relayPairs.Add(Pair(link.RemotePort, silentPort));
+                _relayPairs.Add(LobbyMeshAssessment.Pair(link.RemotePort, silentPort));
                 RefreshRelayRoutes();
                 double routeMs = RelayedRouteRttMs(mesh);
                 ConnLog($"the direct path between {link.Label} and P{silentPort + 1} died " +
