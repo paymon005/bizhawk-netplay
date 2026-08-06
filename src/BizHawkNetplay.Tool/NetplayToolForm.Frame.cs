@@ -418,20 +418,20 @@ public sealed partial class NetplayToolForm
                     _pacing.AddGate(stallGateMs);
                     stalledThisTick = true;
                     driver.ResendLocalInputIfDue();
-                    bool timeSync = driver.Strategy is RollbackStrategy stalledRollback
-                        && stalledRollback.LastStallWasTimeSync;
-                    timeSyncThisTick = timeSync;
-                    if (timeSync)
+                    var stallReason = driver.Strategy.LastStallReason;
+                    bool yielded = stallReason.IsDeliberateYield();
+                    timeSyncThisTick = yielded;
+                    if (yielded)
                     {
                         // Advantage debt is denominated in emulated frames, not timer callbacks.
+                        // The cost-cap yield is paid the same way for the same reason — the frame
+                        // is being given up on purpose, so there is nothing to retry for.
                         _schedule.SkipFrame();
                     }
                     if (Verbose && nowMs - _lastStallLogMs >= 1000)
                     {
                         _lastStallLogMs = nowMs;
-                        Log(timeSync
-                            ? $"time-sync yield at frame {driver.CurrentFrame}"
-                            : $"stalling at frame {driver.CurrentFrame} — waiting for remote input");
+                        Log($"frame {driver.CurrentFrame}: {stallReason.Describe()}");
                     }
                     break;
                 }
@@ -710,7 +710,14 @@ public sealed partial class NetplayToolForm
             // replayed to get to a keyframe. Their sum is what the repair actually re-simulated.
             ? $" — rollback ×{rbs.RollbackCount} (last d{rbs.LastRollbackDepth}" +
               $"{(rbs.LastRollbackWalkback > 0 ? $"+{rbs.LastRollbackWalkback}wb" : "")}" +
-              $", max d{rbs.MaxRollbackDepthSeen}, tsync {rbs.TimeSyncStalls})"
+            // The three stall counts are shown separately, and only once each has happened, because
+            // they point at three different culprits: tsync at the clock, cost at this machine, and
+            // wait at the link. Reporting only tsync meant a session stalling on packet loss showed
+            // a zero and nothing else.
+              $", max d{rbs.MaxRollbackDepthSeen}" +
+              $"{(rbs.TimeSyncStalls > 0 ? $", tsync {rbs.TimeSyncStalls}" : "")}" +
+              $"{(rbs.CostStalls > 0 ? $", cost {rbs.CostStalls}" : "")}" +
+              $"{(rbs.PredictionLimitStalls > 0 ? $", wait {rbs.PredictionLimitStalls}" : "")})"
             : "";
 
         if (_fpsClock.ElapsedMilliseconds >= 500)

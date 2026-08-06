@@ -149,7 +149,7 @@ public class FrameAdvantagePacingTests
 
         // With no remote frontier, frame 4 is beyond the soft cap. That stall must pay debt too.
         Assert.True(s.BeginFrame(4).Stall);
-        Assert.True(s.LastStallWasTimeSync);
+        Assert.Equal(StallReason.TimeSyncSoftCap, s.LastStallReason);
 
         pipe.Add(1, 0, neutral); // horizon is now exactly the soft cap
         Assert.True(s.BeginFrame(4).Stall);  // only one debt frame remains

@@ -13,6 +13,16 @@ public interface ISyncStrategy
     /// <summary>Decide inputs for <paramref name="frame"/>, or stall.</summary>
     FrameDecision BeginFrame(int frame);
 
+    /// <summary>
+    /// Why the latest <see cref="BeginFrame"/> refused, or <see cref="StallReason.None"/> if it
+    /// did not.
+    ///
+    /// On the interface rather than on the rollback strategy because the caller was reaching for it
+    /// through a type test — which meant lockstep, whose every stall has a perfectly good name,
+    /// silently fell through to the rollback wording.
+    /// </summary>
+    StallReason LastStallReason { get; }
+
     /// <summary>Called after the core has advanced <paramref name="frame"/>.</summary>
     void EndFrame(int frame);
 

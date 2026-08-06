@@ -19,14 +19,21 @@ public sealed class LockstepStrategy : ISyncStrategy
     /// <summary>True while the most recent BeginFrame could not proceed (for UI/status).</summary>
     public bool IsStalled { get; private set; }
 
+    /// <summary>Lockstep has exactly one reason to refuse, and it is never a deliberate yield —
+    /// the frame becomes runnable the instant the missing datagram lands, so the scheduler must
+    /// keep retrying rather than pay a frame period for it.</summary>
+    public StallReason LastStallReason { get; private set; }
+
     public FrameDecision BeginFrame(int frame)
     {
         if (_pipeline.AllConfirmed(frame))
         {
             IsStalled = false;
+            LastStallReason = StallReason.None;
             return FrameDecision.Run(_pipeline.Merge(frame));
         }
         IsStalled = true;
+        LastStallReason = StallReason.MissingRemoteInput;
         return FrameDecision.StallDecision;
     }
 

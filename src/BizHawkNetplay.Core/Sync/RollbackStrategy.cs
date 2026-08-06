@@ -143,9 +143,19 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
 
     public int MaxRollbackDepthSeen { get; private set; }
     public long FramesResimulated { get; private set; }
+    /// <summary>Frames yielded for clock skew — the soft cap and the measured-advantage debt.</summary>
     public int TimeSyncStalls { get; private set; }
     /// <summary>Frames yielded because the measured repair cost, not the clock skew, said to.</summary>
     public int CostStalls { get; private set; }
+    /// <summary>
+    /// Frames refused at the hard prediction cap, because a port's input has been missing long
+    /// enough that another frame would put the correction target outside the ring.
+    ///
+    /// The most common stall on a real link and the only one that had no counter, so the
+    /// diagnostics line could report time-sync yields against a session whose actual problem was
+    /// packet loss and show nothing at all for it.
+    /// </summary>
+    public int PredictionLimitStalls { get; private set; }
     public int SavesTaken { get; private set; }
     /// <summary>Snapshots skipped because the frame was already fully confirmed (see RollbackTuning).</summary>
     public int SavesElided { get; private set; }
@@ -193,10 +203,16 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
     /// <summary>Whether the next otherwise-runnable frame will be yielded for measured clock skew.</summary>
     public bool HasPendingTimeSyncDebt => _advantageStallFrames > 0;
 
-    /// <summary>True when the latest rejected frame was deliberate time synchronization rather
-    /// than the hard prediction-safety gate. A real-time scheduler should pay one frame period for
-    /// this stall instead of retrying it a couple of milliseconds later.</summary>
-    public bool LastStallWasTimeSync { get; private set; }
+    /// <summary>
+    /// Why the latest <see cref="BeginFrame"/> refused. A real-time scheduler should pay one frame
+    /// period for the deliberate yields (see <see cref="StallReasonExtensions.IsDeliberateYield"/>)
+    /// rather than retrying a couple of milliseconds later.
+    ///
+    /// This was a <c>LastStallWasTimeSync</c> bool, which was true for the cost cap as well —
+    /// correct about the scheduling and wrong about the cause, so a machine too slow to repair
+    /// reported itself as a clock skew problem.
+    /// </summary>
+    public StallReason LastStallReason { get; private set; }
 
     public FrameDecision BeginFrame(int frame)
     {
@@ -205,13 +221,15 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         ExecutePendingRollback(frame);
 
         int horizon = RemoteHorizon(frame);
-        LastStallWasTimeSync = false;
+        LastStallReason = StallReason.None;
 
         // 2a) Hard cap. Never run so far past the slowest remote port that a late correction could
         //     target a frame already evicted from the ring — that would be an unrecoverable desync.
         if (horizon > _maxRollback)
         {
+            PredictionLimitStalls++;
             IsStalled = true;
+            LastStallReason = StallReason.PredictionLimit;
             return FrameDecision.StallDecision;
         }
 
@@ -230,9 +248,10 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
             // debt is outstanding, pay it here too so the two time-sync mechanisms do not charge
             // twice for the same skew.
             if (_advantageStallFrames > 0) _advantageStallFrames--;
-            if (horizon > _softCap) TimeSyncStalls++; else CostStalls++;
+            bool skew = horizon > _softCap;
+            if (skew) TimeSyncStalls++; else CostStalls++;
             IsStalled = true;
-            LastStallWasTimeSync = true;
+            LastStallReason = skew ? StallReason.TimeSyncSoftCap : StallReason.RepairBudget;
             return FrameDecision.StallDecision;
         }
 
@@ -244,7 +263,7 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
             _advantageStallFrames--;
             TimeSyncStalls++;
             IsStalled = true;
-            LastStallWasTimeSync = true;
+            LastStallReason = StallReason.FrameAdvantage;
             return FrameDecision.StallDecision;
         }
         IsStalled = false;
