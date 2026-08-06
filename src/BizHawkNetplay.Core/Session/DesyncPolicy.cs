@@ -13,8 +13,8 @@ public enum DesyncAction
     Measuring,
 
     /// <summary>Ask <see cref="DesyncOutcome.DonorPort"/> for its state: its group outvoted the
-    /// host, and the host opted in to deferring. If the ask cannot be sent, fall back to
-    /// <see cref="ResyncFromHost"/> — the session still has to converge on something.</summary>
+    /// host, and deferring is enabled (which it is by default). If the ask cannot be sent, fall back
+    /// to <see cref="ResyncFromHost"/> — the session still has to converge on something.</summary>
     AskDonor,
 
     /// <summary>Recover from the host's own state, the way this has always worked.</summary>
@@ -40,7 +40,7 @@ public readonly struct DesyncOutcome
     /// The host is about to distribute a state a majority disagreed with.
     ///
     /// True for <see cref="DesyncAction.ResyncFromHost"/> when the host lost the vote but is
-    /// recovering from its own state anyway — because the player did not opt in to deferring. The
+    /// recovering from its own state anyway — because deferring is switched off on this host. The
     /// caller owes them a plain sentence saying so; it is the difference between a log they can act
     /// on and one they cannot.
     /// </summary>

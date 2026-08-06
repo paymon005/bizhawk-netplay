@@ -30,17 +30,38 @@ fault — the alternative is a session that appears to work and silently loses i
 
 ## Notable releases
 
+### Unreleased — deferring to the majority is now the default (protocol 23, unchanged)
+
+**A host that gets outvoted on a desync now adopts the majority's state by default**, where it
+previously kept its own unless a checkbox was ticked. The Diagnostics tab still has the switch;
+unticking it restores the old host-always-wins behaviour.
+
+The mechanism is unchanged, and so is the trade — what changed is which way it is weighed. Deferring
+means the host loads a peer's savestate, which is a trusted-input format all the way into the core
+(KI-13). Abusing that needs a colluding **majority** — two of three players, or three of four, all
+reporting a matching false checksum. The failure it prevents needs nobody at all: a host with a Lua
+script running, or one that brushed a savestate hotkey, overwrites every player who was right, and
+that is an ordinary accident rather than an attack. Hosting for strangers is the case to untick it
+for.
+
+**One thing to know if you play with someone still on v0.34.0.** Majority recovery is broken there
+(see below), so a v0.36.0 host that asks a v0.34.0 donor for its state gets no reply and waits out
+the donor timeout before falling back to its own — up to about 90 seconds on N64, playing diverged.
+Everyone on v0.35.0 or later is unaffected. If your group is mixed, either update together or untick
+the box until you have.
+
 ### v0.35.0 — the feature that could not run, and six behind it (protocol 23, unchanged)
 
 Mostly a correctness release, and the first one that does not force everybody to update together.
 
-- **Majority recovery could not send a state.** v0.34.0's headline feature did not work. The donor's
-  reply was refused by the control channel before it left the machine — `StateOffer` was missing
-  from the predicate deciding which messages may carry a savestate, so it was capped at the small
-  frame limit and rejected. The host then waited out its timeout and recovered from its own state,
-  the exact outcome the feature exists to prevent, and the refusal was counted against the donor so
-  a peer that answered correctly was blamed in the log. The codec had round-trip tests; nothing had
-  ever sent one through a real channel.
+- **Majority recovery could not send a state** *(host-side, and in v0.35.0 still opt-in — see
+  v0.36.0 below, which turns it on by default)*. v0.34.0's headline feature did not work. The
+  donor's reply was refused by the control channel before it left the machine — `StateOffer` was
+  missing from the predicate deciding which messages may carry a savestate, so it was capped at the
+  small frame limit and rejected. The host then waited out its timeout and recovered from its own
+  state, the exact outcome the feature exists to prevent, and the refusal was counted against the
+  donor so a peer that answered correctly was blamed in the log. The codec had round-trip tests;
+  nothing had ever sent one through a real channel.
 - **A lossy close stranded the peer without an EOF.** The FIN shared its clock with data
   retransmission, so a tail needing two RTO rounds left nothing for it and the FIN went out once. If
   that copy was lost, the peer blocked until its own read timeout and reported a network fault for a

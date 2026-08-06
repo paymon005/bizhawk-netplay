@@ -8,20 +8,23 @@ namespace BizHawkNetplay.Core.Session;
 /// overwrites three correct machines with the one wrong one. v0.32.1 made the case visible;
 /// <see cref="DesyncPartition.ChooseDonor"/> names who should have been asked instead.
 ///
-/// <b>Why it is off by default, and this is the interesting part.</b> Fixing it is not free, and
-/// the cost is not performance. Correctness requires the wrong machine to adopt the right state, so
-/// if the host is wrong, the host imports — and a savestate is a trusted-input format all the way
-/// into the core (see <see cref="StateImportTrust"/>). Until now no path existed by which a host
-/// ran a peer's bytes; every state-bearing handler was joiner-side, and that was a real property
-/// worth naming. Deferring to a majority gives it up.
+/// <b>What it costs, which is not performance.</b> Correctness requires the wrong machine to adopt
+/// the right state, so if the host is wrong, the host imports — and a savestate is a trusted-input
+/// format all the way into the core (see <see cref="StateImportTrust"/>). Before this existed no
+/// path let a host run a peer's bytes; every state-bearing handler was joiner-side, and that was a
+/// real property. Deferring to a majority gives it up.
 ///
-/// The exposure needs a colluding majority rather than one bad peer — two of three players, or
-/// three of four, all reporting a matching false checksum — which is a much higher bar than the
-/// joiner-side case, where the single host suffices. But it is a trade rather than an improvement,
-/// and a trade belongs to whoever is running the session.
+/// <b>On by default since v0.36.0, and the reasoning changed rather than the code.</b> It shipped
+/// opt-in, on the argument that a trade belongs to whoever is running the session. Weigh the two
+/// sides by what each requires and that reads differently: the exposure needs a colluding MAJORITY —
+/// two of three players, or three of four, all reporting a matching false checksum — while the
+/// failure it prevents needs nobody at all. A host with a Lua script running, or one that touched a
+/// savestate hotkey, overwrites every player who was right, and that is a Tuesday rather than an
+/// attack.
 ///
-/// So: off, and when it is on the host says what it is about to do and why. A host that leaves it
-/// off keeps today's behaviour, which is loud about being wrong rather than quiet about it.
+/// So: on, with the host saying what it is about to do and why, and a checkbox for a host that is
+/// playing with strangers. Unticked, the behaviour is the old one — loud about being wrong rather
+/// than quiet about it.
 /// </summary>
 public static class MajorityRecovery
 {
@@ -48,14 +51,19 @@ public static class MajorityRecovery
         "machine's. Everyone including the host adopts it. If this repeats, the cause is local to " +
         "the host — a Lua script, a cheat, a savestate load, or a differing core setting.";
 
-    /// <summary>What the host logs when it is outvoted and has NOT opted in — the same evidence,
-    /// the opposite action, and the setting that would change it.</summary>
+    /// <summary>
+    /// What the host logs when it is outvoted and deferring is switched OFF — the same evidence, the
+    /// opposite action, and the setting that would change it.
+    ///
+    /// Since deferring is on by default, reaching this means someone deliberately turned it off, so
+    /// the message points at the setting they changed rather than selling them a feature.
+    /// </summary>
     public static string DescribeDeclined(DesyncPartition partition) =>
         $"this machine is the ONLY one reporting its checksum — {partition.HostGroupSize} of " +
         $"{partition.ReportCount} players agree with each other and not with the host. The resync " +
         "about to run makes everyone adopt THIS machine's state, which on this evidence is the " +
         "wrong one. Suspect something local here: a Lua script, a cheat, a savestate load, or a " +
-        "core setting that differs. If it repeats, host from another machine — or tick \"Defer to " +
-        "the majority on a desync\" on the Diagnostics tab, which makes the host adopt their state " +
-        "instead (it is off by default because accepting a peer's savestate is a trust decision).";
+        "core setting that differs. \"Defer to the majority on a desync\" on the Diagnostics tab " +
+        "would have made the host adopt their state instead; it is on by default and is currently " +
+        "unticked on this machine. Re-tick it, or host from another machine.";
 }

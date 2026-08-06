@@ -80,8 +80,8 @@ open is recorded with what it would actually take.
   when it mattered: both peers failing produced the same empty blob, the same digest, and a pass.
   N64's `VideoSizeX/Y` are carried too — as a named warning rather than a refusal, since whether a
   resolution difference matters depends on whether the game reads its own framebuffer.
-- **KI-20 — CLOSED in v0.35.0, opt-in. It did NOT work in v0.34.0, where this entry first claimed
-  it did.** An outvoted host can ask the majority for its state and adopt it, rather than
+- **KI-20 — CLOSED in v0.35.0; ON by default since v0.36.0. It did NOT work in v0.34.0, where
+  this entry first claimed it did.** An outvoted host can ask the majority for its state and adopt it, rather than
   overwriting three correct machines with its own. The donor is the lowest port in the largest
   group — a rule both ends compute, so the host and the donor never disagree about who was asked —
   and a tie is still not a majority.
@@ -95,15 +95,25 @@ open is recorded with what it would actually take.
   The codec had round-trip tests for the message and the channel had tests of its own; nothing had
   ever sent one *through* the other, which is the seam and the lesson.
 
-  **It is off by default, and the reason is the interesting part.** Correctness requires the wrong
-  machine to adopt the right state, so if the host is wrong, the host imports — and a savestate is
-  a trusted-input format all the way into the core (KI-13). Until now no path existed by which a
-  host ran a peer's bytes; every state-bearing handler was joiner-side, and that was a real
-  property. Deferring gives it up. Abusing it needs a colluding MAJORITY rather than one bad peer —
-  two of three players, or three of four — which is a far higher bar than the joiner-side case, but
-  it is a trade rather than an improvement, and a trade belongs to whoever is running the session.
-  A host that leaves it off keeps the old behaviour, which is loud about being wrong rather than
-  quiet about it, and the log names the setting. `MajorityRecovery`, `DesyncPartition.ChooseDonor`.
+  **It was off by default until v0.36.0, and what flipped it was the weighing, not the code.**
+  Correctness requires the wrong machine to adopt the right state, so if the host is wrong, the host
+  imports — and a savestate is a trusted-input format all the way into the core (KI-13). Before this
+  existed, no path let a host run a peer's bytes; every state-bearing handler was joiner-side, and
+  that was a real property. Deferring gives it up. It shipped opt-in on the argument that a trade
+  belongs to whoever is running the session.
+
+  Compare what each side actually requires and that reads differently. The exposure needs a
+  colluding **majority** — two of three players, or three of four, all reporting a matching false
+  checksum. The failure it prevents needs **nobody**: a host with a Lua script running, or one that
+  brushed a savestate hotkey, overwrites every player who was right, and that is an ordinary
+  Tuesday. So it is on by default from v0.36.0, with the checkbox kept for a host playing with
+  strangers. Unticked, the behaviour is the old one, and the log still names the case and the
+  setting. `MajorityRecovery`, `DesyncPartition.ChooseDonor`.
+
+  *Mixed-version caveat.* Because v0.34.0 cannot send a state, a v0.36.0 host that asks a v0.34.0
+  donor waits out the donor timeout before falling back — up to ~90 seconds on N64, running
+  diverged, where the old default resynced immediately. Sessions where everyone is on v0.35.0 or
+  later are unaffected.
 - **KI-21 — CLOSED in v0.33.0.** Input datagrams carry their author and a per-pair HMAC tag. The
   host mints one key per unordered pair of seats and hands each peer only the pairs it belongs to,
   so a peer holds nothing it could sign as another seat with; the payload's own port byte is
@@ -416,10 +426,15 @@ actually function in v0.34.0 — the donor's state was refused by the channel be
 (see KI-20). So a v0.34.0 host, opted in or not, never ran a peer's bytes: the exposure described
 here begins with v0.35.0, where the path works. Recorded because "the feature was broken" and "the
 host was not exposed" are the same fact here, and a reader auditing which versions can load a peer's
-savestate should not have to derive that from a bug report. That is exactly why it ships off by default
-and why the checkbox says so — correctness there requires the wrong machine to adopt the right
-state, so the exposure is inherent to the fix rather than an oversight in it. A host that leaves the
-setting alone still has no such path. Abusing the one it opts into needs a colluding majority, not a
+savestate should not have to derive that from a bug report.
+
+*And a second change, v0.36.0, cutting the other way: deferring is now ON by default,* so a host
+that never touches the Diagnostics tab does have this path. The reasoning is under KI-20 — briefly,
+the exposure needs a colluding majority while the accident it prevents needs nobody — but the
+version summary a reader wants is: **v0.34.0 and earlier, no host is exposed; v0.35.0, only a host
+that ticked the box; v0.36.0 and later, any host that has not unticked it.** The exposure is
+inherent to the fix rather than an oversight in it — correctness there requires the wrong machine to
+adopt the right state. Abusing it needs a colluding majority, not a
 single bad peer. What v0.34.0 adds is not a fix but an
 end to the silence — a joiner says once, before the first host state loads, what a savestate can
 set (memory, page permissions, the stack pointer of the emulated machine), and distinguishes the

@@ -83,8 +83,12 @@ public class MajorityRecoveryTests
         var declined = MajorityRecovery.DescribeDeclined(partition);
         Assert.Contains("ONLY one reporting", declined);
         Assert.Contains("Defer to the majority", declined);
-        // And it says why the setting is not simply on, so turning it on is an informed choice.
-        Assert.Contains("trust decision", declined);
+        // Since v0.36.0 the setting is ON by default, so reaching this message means somebody
+        // deliberately turned it off. The message therefore points at the setting they changed —
+        // it used to sell the feature and explain why it was not simply on, which would now be
+        // telling a host something it already decided.
+        Assert.Contains("on by default", declined);
+        Assert.Contains("unticked", declined);
     }
 
     [Fact]

@@ -21,11 +21,13 @@ per-disc identity below.
   disc 1 with different disc 2s passed every check and diverged on the swap. What is still missing
   is cartridge ROM-hash strength: `GameInfo.Hash` can be a CRC32, and closing it needs the ROM
   bytes, which nothing in the ApiHawk surface hands over (KI-17).
-- **Majority-aware recovery** (v0.34.0, opt-in; *actually working* in v0.35.0 — see KI-20 for why
-  the version distinction matters). This was the item held back for real logs, on the argument that
-  deciding an authority policy from a session that hit the case beats deciding it from reasoning.
-  What settled it instead was the review that found the host had no way to be wrong *visibly*: the
-  partition naming shipped first, and the policy followed once the case was legible.
+- **Majority-aware recovery** (v0.34.0; *actually working* in v0.35.0; **on by default from
+  v0.36.0** — see KI-20 for why the version distinctions matter). This was the item held back for
+  real logs, on the argument that deciding an authority policy from a session that hit the case
+  beats deciding it from reasoning. What settled it instead was the review that found the host had
+  no way to be wrong *visibly*: the partition naming shipped first, and the policy followed once the
+  case was legible. The default flipped once the two sides were weighed by what each requires — a
+  colluding majority to abuse, nobody at all to trigger the accident it prevents.
 
 Faster checksums and deeper rollback come after. A faster checksum over the wrong bytes is worse
 than a slow one, because it is confidently green.

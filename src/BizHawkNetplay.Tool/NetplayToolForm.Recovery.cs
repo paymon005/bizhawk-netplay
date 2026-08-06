@@ -257,7 +257,7 @@ public sealed partial class NetplayToolForm
 
         // Recovery is about to overwrite every peer with THIS machine's state. When this machine is
         // the outlier that is the wrong state — so either defer to the majority that outvoted us
-        // (opt-in; see MajorityRecovery for why it is not the default) or say plainly that we are
+        // (on by default; see MajorityRecovery for the trade) or say plainly that we are
         // about to distribute the minority's.
         if (decision.Action == DesyncAction.AskDonor)
         {
@@ -276,7 +276,7 @@ public sealed partial class NetplayToolForm
         PerformResyncAsHost();
     }
 
-    // --- majority-aware recovery (KI-20, opt-in) -------------------------------------------------
+    // --- majority-aware recovery (KI-20, on by default) -------------------------------------------------
 
     /// <summary>The seat the host asked for a state, or -1 when it is not waiting for one. Also the
     /// gate on <see cref="OnStateOffer"/>: an offer from anyone else, or when nothing was asked, is
@@ -417,7 +417,7 @@ public sealed partial class NetplayToolForm
     /// This is the only place a host loads a peer's savestate, and every guard here is about that.
     /// It must be the seat we asked, in the generation we asked it in, while we are still waiting;
     /// anything else is discarded unread. See <see cref="MajorityRecovery"/> for why the whole
-    /// feature is opt-in, and <see cref="StateImportTrust"/> for what loading one means.
+    /// feature has a switch, and <see cref="StateImportTrust"/> for what loading one means.
     /// </summary>
     private void OnStateOffer(PeerLink link, SessionGeneration generation, byte[] packed)
     {

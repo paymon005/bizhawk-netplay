@@ -58,12 +58,12 @@ public enum ControlMessageType : byte
     ExclusionMask = 26,
     // Host -> joiner: [generation:12] — "your group outvoted me; send me your state, it is going to
     // become the session's." Only ever sent to the donor DesyncPartition.ChooseDonor named, and only
-    // when the host has been opted in to deferring. See MajorityRecovery.
+    // when deferring is enabled (on by default since v0.36.0). See MajorityRecovery.
     StateRequest = 27,
     // Joiner -> host: [generation:12][deflated state] — the answer. This is the ONLY message in the
-    // protocol that carries a peer's savestate toward the host, and it is why deferring is opt-in:
-    // a savestate is a trusted-input format all the way into the core (KI-13), so accepting one
-    // extends to the host an exposure that until now was the joiners' alone.
+    // protocol that carries a peer's savestate toward the host, and it is why deferring has a
+    // switch at all: a savestate is a trusted-input format all the way into the core (KI-13), so
+    // accepting one extends to the host an exposure that was once the joiners' alone.
     StateOffer = 28,
 }
 
