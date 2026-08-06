@@ -137,7 +137,40 @@ public class SaveWritePathTests
         for (int i = 0; i < 16; i++) h.Note(1024 * 1024);
 
         string verdict = SaveWritePathVerdict.Describe(h, actualMs: 6.1, replayMs: 2.3, floorMs: 1.6);
-        Assert.Contains("nothing here to win", verdict);
+        Assert.Contains("no change to the write path can touch it", verdict);
+        Assert.DoesNotContain("worth building", verdict);
+    }
+
+    /// <summary>
+    /// When the replay is not cheaper than the real save, the decomposition has failed and must say
+    /// so rather than subtracting to zero.
+    ///
+    /// This is not hypothetical: the first run of this diagnostic on real N64 measured actual 4.68ms
+    /// against a replay of 5.11ms — impossible for the same bytes through strictly less work — and
+    /// duly reported "core work ~0.00ms", which reads as a finding and is not one. The cause was the
+    /// comparison figures paying first-touch page faults the warm pooled save does not, but the
+    /// deeper point is that <c>Math.Max(0, ...)</c> turned a broken measurement into a confident
+    /// number. A floor of zero is how a measurement lies quietly.
+    /// </summary>
+    [Fact]
+    public void AFailedDecompositionSaysSoInsteadOfReportingZeroCoreWork()
+    {
+        var h = new WriteSizeHistogram();
+        h.Note(16 * 1024 * 1024);
+
+        string verdict = SaveWritePathVerdict.Describe(h, actualMs: 4.68, replayMs: 5.11, floorMs: 4.62);
+        Assert.Contains("cannot be separated", verdict);
+        Assert.DoesNotContain("core work ~0.00ms", verdict);
+    }
+
+    /// <summary>A replay only marginally under the real save is noise, not a decomposition.</summary>
+    [Fact]
+    public void AMarginalDifferenceIsNotTreatedAsASplit()
+    {
+        var h = new WriteSizeHistogram();
+        h.Note(16 * 1024 * 1024);
+        Assert.Contains("cannot be separated",
+            SaveWritePathVerdict.Describe(h, actualMs: 4.70, replayMs: 4.62, floorMs: 4.60));
     }
 
     /// <summary>And the opposite, on the same numbers except the shape.</summary>

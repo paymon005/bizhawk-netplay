@@ -260,17 +260,76 @@ Two things worth keeping from doing this:
   change there is a silent permanent desync between versions that no protocol check catches, since
   the protocol number would not have moved on its own. It is in Core now with its values pinned.
 
-## Open question — where the N64 savestate's 6.1ms actually goes (v0.38.1 measures it)
+## ANSWERED 2026-08-06 — the N64 savestate write path has nothing left in it
 
-**The savestate is the binding constraint on a heavy core, and it is not obvious why.** With
-confirmed saves elided and keyframes auto-solved, the model gives N64 a steady budget of 12.48ms
-(16.639 minus 25% headroom) and a repair budget of two frame periods. At depth 2 with no keyframe
-spacing, the repair sum is ~7.1ms of frames against ~12.2ms of saves: **the snapshot is roughly two
-thirds of the cost and the emulation a third.** Every lever this tool owns — elision, keyframe
-spacing, the cost cap — is already pulled.
+Measured on real hardware (laptop, Mupen64Plus + Rice, 16.3MiB state). **The core hands the whole
+state over in six writes, one of which carries 98% of the bytes.** It is essentially one `memcpy`,
+so the `BinaryWriter`/`MemoryStream` per-call overhead this was hunting does not exist on this core.
+Nothing in the write path can be won back. The section below is kept for the reasoning and the
+numbers; the question it opened is closed.
 
-~6.1ms for ~16.7MiB is about 2.7GB/s, well under what moving those bytes costs. Measured on this
-machine, 16.7MiB through a `BinaryWriter` over a `MemoryStream`:
+**Two lessons from getting there, both about measurement rather than about N64.**
+
+The supporting figures were wrong on the first run: the replay came out ABOVE the real save, which
+is impossible for the same bytes through less work, and the verdict duly printed "core work
+~0.00ms". The comparison paths allocated fresh 16MiB buffers and paid first-touch page faults inside
+the timed region while the real save reuses a warm pooled buffer — **the same error the capability
+probe was making until v0.37.0, and the third appearance of that class here.** If a figure is being
+compared against the shipping path, it has to be warm, because the shipping path is.
+
+And `Math.Max(0, a - b)` turned a broken measurement into a confident number. Clamping a
+decomposition at zero is how a measurement lies quietly; it now reports that it could not separate
+the terms, and says why.
+
+## ANSWERED 2026-08-06 — the probe is stable now, and the binding term is the LOAD
+
+**Ten consecutive probes returned maxDepth=2 every time**, five at 320x240 and five at 800x600. That
+settles the instability this file recorded before v0.37.0, where three consecutive probes of one
+configuration gave 2, 3 and 3: removing the 16.7MiB allocation from the timed save path took the
+variance with it. N64 on this machine therefore sits stably *below* the qualifying threshold of 3
+and runs lockstep — and that verdict is now trustworthy rather than a coin flip, which is the more
+useful half of the result.
+
+**The largest term is the load, not the save.** Repair-derived figures, which are the ones the
+solver uses:
+
+| term | 320x240 | 800x600 |
+|---|---|---|
+| live frame | 4.0–4.3ms | 5.7–7.9ms |
+| per-frame (repair) | 4.1–5.4ms | 5.9–6.4ms |
+| save | 3.2–4.0ms | 2.1–3.3ms |
+| **load** | **6.0–8.3ms** | **6.6–7.8ms** |
+
+The load is roughly double what an isolated load measures (3.3–4.0ms) — exactly the deferred cost
+the repair-derived intercept exists to catch, and the reason the isolated figure was never trusted.
+
+Working the model at 320x240: repair budget 33.37ms, minus live frame 4.13 and load 6.90, leaves
+22.34ms. Depth 3 at keyframe spacing 1 needs 3 × (4.33 + 4.02) = 25.06ms. **Short by 2.7ms.** Wider
+spacing does not rescue it: frame and save are now comparable (~1.1:1) rather than the ~3:1 that
+made sparse snapshots pay on the hardware the original note came from, so the walk-back costs more
+than the skipped snapshot saves — which is why the solver reports spacing 1.
+
+**This corrects an assumption these notes carried from the beginning: that the SAVE dominates on
+N64.** Here save is 3.2–4.0ms against a 4.1–5.4ms frame and a 6.9ms load. The three are comparable
+and all near their floors; there is no single dominant cost left to attack, and the write-path
+measurement above shows the save in particular is already one `memcpy`.
+
+Steady state is not the problem: 4.1ms used of a 12.5ms allowance at 320x240, 6.5ms at 800x600.
+**N64 fails purely on repair cost.** Resolution moves the frame term substantially without moving
+the verdict — both resolutions gave depth 2 — so lowering it is not the lever this file previously
+suggested it might be.
+
+*Also confirmed in passing:* `live` and `frame` track each other within a few percent at both
+resolutions (4.253 vs 5.394, 7.853 vs 7.924), so rendered and unrendered frames really do cost the
+same on Rice. Suppressing video during repair buys nothing on this core, exactly as
+`IEmuAdapter.AdvanceRenderedFrame` records.
+
+## The reasoning that led there (v0.38.1 measured it)
+
+**The savestate was the obvious suspect and it is not obvious why it costs what it does.** With
+elision on and keyframes solved, the model gives N64 a steady budget of 12.48ms (16.639 minus 25%
+headroom) and a repair budget of two frame periods. ~6.1ms for ~16.7MiB is about 2.7GB/s, well under
+what moving those bytes costs. Measured through a `BinaryWriter` over a `MemoryStream`, 16.7MiB:
 
 | core's write pattern | net48 | net10 |
 |---|---|---|
@@ -279,20 +338,10 @@ machine, 16.7MiB through a `BinaryWriter` over a `MemoryStream`:
 | 4KiB+ blocks | 2.4ms | 2.4ms |
 | raw `BlockCopy` (floor) | 1.6ms | — |
 
-6.1ms sits between the 4KiB-block figure and the 64-byte one, so the answer depends entirely on how
-mupen64plus writes — which is not knowable from here. **The Diagnostics tab's "Savestate Cost"
-button settles it**: it times a real save, records the write-size histogram, replays that shape with
-no core involved, and reports the block-copy floor. If ≥90% of bytes arrive in writes ≥4KiB the
-stream is already at the floor and this avenue is closed; otherwise the recoverable milliseconds are
-stated directly.
-
-**Related and more urgent: the depth verdict is inside the noise.** It flips between 3 and 2 at a
-frame cost of ~3.44ms, and N64 at 1400x1050 measures 3.55ms — three consecutive probes of that one
-configuration returned depth 2, 3 and 3. Since the qualifying threshold is 3, whether N64 runs
-rollback at all is currently decided by a 3% margin. The v0.37.0 probe fix removed a 16.7MiB
-allocation from the timed save path, which was both pessimistic and a source of variance, so the
-spread should have tightened — unverified. Pressing the Capability Probe button several times in a
-row is the test.
+Same bytes, twenty-six times the cost — and 6.1ms sat between the 4KiB figure and the 64-byte one,
+so which way it went was genuinely undetermined from here. Hence the Diagnostics tab's **Savestate
+Cost** button, which times a real save, records the write-size histogram, replays that shape with no
+core involved and reports a block-copy floor. The answer, above, was one write.
 
 ## Status
 

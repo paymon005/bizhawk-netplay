@@ -182,28 +182,39 @@ public static class SaveWritePathVerdict
     ///
     /// The difference that matters is <c>replayMs - floorMs</c>: that is what a leaner stream could
     /// recover. <c>actualMs - replayMs</c> is the core's own work and is not ours to take.
+    ///
+    /// <b>The decomposition can fail, and when it does it must say so.</b> If the replay comes out
+    /// at or above the real save, the two are not being separated — the state is essentially one
+    /// memcpy and every figure here is measuring the same thing to within noise. The first run of
+    /// this diagnostic on real N64 hit exactly that and printed "core work ~0.00ms", which reads as
+    /// a finding and is not one. Subtracting to a floor of zero is how a measurement lies quietly.
     /// </summary>
     public static string Describe(WriteSizeHistogram histogram,
         double actualMs, double replayMs, double floorMs)
     {
         double recoverable = Math.Max(0, replayMs - floorMs);
-        double coreWork = Math.Max(0, actualMs - replayMs);
         double largeShare = histogram.ByteShareAtOrAbove(LargeWriteBytes);
+        bool separated = actualMs > replayMs * 1.05;   // the core's share is above the noise
 
         string verdict = largeShare >= 0.90
-            ? "the core writes in large blocks, so the stream is already near the floor — " +
-              "the save cost is the core's and there is nothing here to win"
+            ? "the core writes in large blocks, so the stream is already at the floor — the save " +
+              "cost is the core's own, and no change to the write path can touch it"
             : recoverable >= 1.0
                 ? $"about {recoverable:F1}ms of this is the write path rather than the core, " +
                   "so a leaner stream is worth building"
                 : "the write path costs little even at this shape — the save cost is the core's";
 
+        string split = separated
+            ? $"core work ~{actualMs - replayMs:F2}ms, write path ~{replayMs:F2}ms " +
+              $"(recoverable ~{recoverable:F1}ms)"
+            : "the replay is not cheaper than the real save, so these three are measuring the same " +
+              "memcpy and the core's share cannot be separated from it — which is itself the answer " +
+              "when the state arrives in one write";
+
         return $"save write path: {histogram.Describe()}\n" +
                $"  actual save {actualMs:F2}ms | same pattern, no core {replayMs:F2}ms | " +
                $"block-copy floor {floorMs:F2}ms\n" +
-               $"  {largeShare:P0} of bytes in writes >={LargeWriteBytes / 1024}KiB; " +
-               $"core work ~{coreWork:F2}ms, write path ~{replayMs:F2}ms " +
-               $"(recoverable ~{recoverable:F1}ms)\n" +
+               $"  {largeShare:P0} of bytes in writes >={LargeWriteBytes / 1024}KiB; {split}\n" +
                $"  => {verdict}";
     }
 }

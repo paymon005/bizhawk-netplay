@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.38.0 – v0.38.1 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.38.0 – v0.38.2 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
 | v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
@@ -30,6 +30,42 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.38.2 — the write-path answer, and the measurement that nearly got it wrong (protocol 24, unchanged)
+
+**Mixes freely with v0.38.0 and v0.38.1.** Diagnostics and one UI addition; nothing on the wire.
+
+**The question v0.38.1 was built to answer is answered: there is nothing to win in the savestate
+write path.** On real N64 (Mupen64Plus, Rice), a 16.3 MiB state arrives in **six writes**, one of
+which carries 98% of the bytes:
+
+```
+6 writes, 16.3MiB, largest 16,788,324B | 1-7B: 4 (0%) | 65536-1048575B: 1 (2%) | >=1024KiB: 1 (98%)
+```
+
+The core hands us the whole state in essentially one `memcpy`. No stream can beat that, so the
+`BinaryWriter`/`MemoryStream` overhead this was hunting does not exist here. That avenue is closed —
+which is worth as much as a win, because it stops anyone spending effort on it.
+
+**And the measurement supporting that conclusion was wrong, in a way worth recording.** It reported
+`actual save 4.68ms | same pattern, no core 5.11ms` — the replay *above* the real save, which is
+impossible for the same bytes through strictly less work — and then printed `core work ~0.00ms`,
+which reads as a finding and is not one. Two causes, both fixed:
+
+- The replay and the block-copy floor allocated fresh 16 MiB buffers and paid first-touch page
+  faults inside the timed region, while the real save reuses a warm pooled buffer. **The same
+  mistake the capability probe was making until v0.37.0** — measuring allocation where the shipping
+  path measures reuse — and the third time this class of error has appeared here. Both comparison
+  figures are now medianed after a warm-up pass, and the real save is medianed on the same terms.
+- `Math.Max(0, actual - replay)` turned a broken measurement into a confident zero. When the replay
+  is not meaningfully cheaper than the real save, the output now says the decomposition failed and
+  why, instead of subtracting to a floor. A measurement that cannot lie about failing is worth more
+  than one that always produces a number.
+
+**New: a Copy log button on the Log tab**, next to Open log folder. Copies the selection if there is
+one, the whole box otherwise. The folder button only helps once a session has written a file, and a
+diagnostic run never starts a session — so the common case, pasting a probe result into a chat, had
+no button at all.
 
 ### v0.38.1 — a diagnostic that says where the savestate's cost goes (protocol 24, unchanged)
 

@@ -550,9 +550,19 @@ public sealed partial class NetplayToolForm
         var bar = new Panel { Dock = DockStyle.Top, Height = 30 };
         var openFolder = new Button { Text = "Open log folder", Location = new Point(0, 3), Width = 120 };
         openFolder.Click += (_, __) => OpenLogFolder();
+        // Copying beats the folder for the common case: a probe or a write-path measurement is a
+        // few lines someone wants to paste into a chat right now, and the file only exists once a
+        // session has been started — which a diagnostic run never does.
+        var copyLog = new Button { Text = "Copy log", Location = new Point(128, 3), Width = 90 };
+        copyLog.Click += (_, __) => CopyLogToClipboard();
+        _tips.SetToolTip(copyLog,
+            "Copies everything in this box to the clipboard, ready to paste.\r\n" +
+            "Copies the selection instead if you have highlighted part of it.\r\n" +
+            "For a whole session use the log FILE — this box scrolls old lines away.");
+
         _logFileLabel = new Label
         {
-            AutoSize = true, Location = new Point(128, 8), ForeColor = Color.DimGray,
+            AutoSize = true, Location = new Point(228, 8), ForeColor = Color.DimGray,
             Text = "a file is written once you host or join",
         };
         _tips.SetToolTip(openFolder,
@@ -560,11 +570,35 @@ public sealed partial class NetplayToolForm
             "Send that file to whoever is helping you — it keeps the whole session,\r\n" +
             "including the part this box has already scrolled past.\r\n" +
             "Opening and closing the tool without connecting writes nothing.");
-        bar.Controls.AddRange([openFolder, _logFileLabel]);
+        bar.Controls.AddRange([openFolder, copyLog, _logFileLabel]);
 
         page.Controls.Add(_log);   // added first so Fill takes what the docked bar leaves
         page.Controls.Add(bar);
         return page;
+    }
+
+    /// <summary>
+    /// Put the log on the clipboard — the selection if there is one, the whole box otherwise.
+    ///
+    /// <c>Clipboard.SetText</c> throws on an empty string and can fail outright when another
+    /// process holds the clipboard open, which is common and transient. Neither is worth an
+    /// exception dialog over a copy button, so both are reported in the log itself.
+    /// </summary>
+    private void CopyLogToClipboard()
+    {
+        string text = _log.SelectionLength > 0 ? _log.SelectedText : _log.Text;
+        if (string.IsNullOrEmpty(text)) { Log("nothing to copy yet."); return; }
+        try
+        {
+            Clipboard.SetText(text);
+            Log($"copied {text.Length:N0} characters to the clipboard" +
+                $"{(_log.SelectionLength > 0 ? " (the selection)" : "")}.");
+        }
+        catch (Exception ex)
+        {
+            Log("could not copy to the clipboard (" + ex.Message +
+                "). Another program may be holding it — try again, or use the log file.");
+        }
     }
 
     /// <summary>Show the logs folder in Explorer, selecting this launch's file if there is one.</summary>

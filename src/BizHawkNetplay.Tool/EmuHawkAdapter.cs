@@ -262,23 +262,67 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         // Warm the pool so the timed save reuses a buffer, as a session in steady state does.
         _statePool.Return(_statePool.Take());
 
+        // The shape, from one save through the counting decorator.
         var histogram = new WriteSizeHistogram();
-        var buffer = _statePool.Take();
+        var counted = _statePool.Take();
+        try
+        {
+            using var measuring = new MeasuringStream(counted.Stream, histogram);
+            using var writer = new BinaryWriter(measuring, Encoding.UTF8, leaveOpen: true);
+            _statable.SaveStateBinary(writer);
+            writer.Flush();
+            _statePool.NoteSize(counted.Stream.Length);
+        }
+        finally { _statePool.Return(counted); }
+
+        // The cost, from the undecorated path, medianed on the same terms as the two figures it
+        // will be compared against — otherwise the comparison is between a warm loop and a cold one.
+        var timed = _statePool.Take();
         double actualMs;
         try
         {
-            using var measuring = new MeasuringStream(buffer.Stream, histogram);
-            using var writer = new BinaryWriter(measuring, Encoding.UTF8, leaveOpen: true);
-            var timer = Stopwatch.StartNew();
-            _statable.SaveStateBinary(writer);
-            writer.Flush();
-            actualMs = timer.Elapsed.TotalMilliseconds;
-            _statePool.NoteSize(buffer.Stream.Length);
+            using var writer = new BinaryWriter(timed.Stream, Encoding.UTF8, leaveOpen: true);
+            actualMs = MedianOf(() =>
+            {
+                timed.Stream.SetLength(0);
+                timed.Stream.Position = 0;
+                _statable.SaveStateBinary(writer);
+                writer.Flush();
+            });
         }
-        finally { _statePool.Return(buffer); }
+        finally { _statePool.Return(timed); }
 
         return SaveWritePathVerdict.Describe(histogram, actualMs,
             ReplayWritePattern(histogram), BlockCopyFloorMs(histogram.Bytes));
+    }
+
+    /// <summary>
+    /// Median of several timed runs after a warm-up pass.
+    ///
+    /// <b>Both comparison figures got this wrong on their first outing and it changed the answer.</b>
+    /// A freshly allocated array is committed lazily, so the first pass over sixteen megabytes pays
+    /// page faults the second does not — and the real save being compared against reuses a warm
+    /// pooled buffer, so the comparison charged the alternatives for something the thing they are
+    /// compared to never pays. On real N64 the "replay" came out ABOVE the actual save, which is
+    /// impossible for the same bytes through less work, and the verdict duly reported the core
+    /// doing zero.
+    ///
+    /// Exactly the mistake the capability probe was making until v0.37.0, in the same shape:
+    /// measuring allocation where the shipping path measures reuse. Third time this class of error
+    /// has appeared in this codebase, which is why it is written down here rather than just fixed.
+    /// </summary>
+    private static double MedianOf(Action op, int reps = 7)
+    {
+        op();                                   // warm: commit the pages, JIT the loop
+        var samples = new double[reps];
+        for (int i = 0; i < reps; i++)
+        {
+            var timer = Stopwatch.StartNew();
+            op();
+            samples[i] = timer.Elapsed.TotalMilliseconds;
+        }
+        Array.Sort(samples);
+        return samples[reps / 2];
     }
 
     /// <summary>The same write shape into the same kind of stream, with no core involved — so the
@@ -286,13 +330,18 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     private static double ReplayWritePattern(WriteSizeHistogram histogram)
     {
         var chunk = new byte[Math.Max(1, histogram.LargestWrite)];
+        var plan = histogram.ReplayPlan().ToList();
         using var stream = new MemoryStream((int)Math.Min(int.MaxValue, histogram.Bytes + 4096));
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
-        var timer = Stopwatch.StartNew();
-        foreach (var (size, count) in histogram.ReplayPlan())
-            for (long i = 0; i < count; i++) writer.Write(chunk, 0, size);
-        writer.Flush();
-        return timer.Elapsed.TotalMilliseconds;
+        return MedianOf(() =>
+        {
+            // Rewound rather than reallocated, so the buffer stays warm exactly as the pool's does.
+            stream.SetLength(0);
+            stream.Position = 0;
+            foreach (var (size, count) in plan)
+                for (long i = 0; i < count; i++) writer.Write(chunk, 0, size);
+            writer.Flush();
+        });
     }
 
     /// <summary>One block copy of the same byte count: what merely moving the bytes costs, and
@@ -302,9 +351,7 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
         int size = (int)Math.Min(int.MaxValue, Math.Max(1, bytes));
         var from = new byte[size];
         var to = new byte[size];
-        var timer = Stopwatch.StartNew();
-        Buffer.BlockCopy(from, 0, to, 0, size);
-        return timer.Elapsed.TotalMilliseconds;
+        return MedianOf(() => Buffer.BlockCopy(from, 0, to, 0, size));
     }
 
     public byte[] ExportState()
