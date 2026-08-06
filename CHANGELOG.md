@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.34.0 – v0.37.0 | **23** | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
+| v0.38.0 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
 | v0.31.0 | 20 | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
@@ -29,6 +30,55 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.38.0 — two things that were owed a wire break, taken together (protocol 24 — everyone must update)
+
+**This one breaks compatibility on purpose.** A v0.38.0 peer will refuse a v0.37.0 peer at the
+handshake, with a clear message. Two values that cross the wire changed, and both changes had been
+waiting for a bump they could not justify alone — so they went in the same one rather than costing
+two separate forced updates.
+
+**The desync checksum got about eight times faster.** FNV-1a is `h = (h ^ word) * prime`, and each
+step needs the previous `h` — so a single chain runs at the latency of one 64-bit multiply per eight
+bytes however much the CPU could otherwise overlap. Eight independent lanes, combined once at the
+end, give the processor eight chains to interleave. Over N64's 8 MiB of RDRAM on .NET Framework,
+which is what this ships on:
+
+| | net48 | net10 |
+|---|---|---|
+| v0.36.0 and earlier | 4.8–6.0 ms | 1.5–2.4 ms |
+| v0.37.0 | 1.5–2.0 ms | 1.4–1.5 ms |
+| **v0.38.0** | **0.62–0.65 ms** | **0.67–0.71 ms** |
+
+That is 4–5 ms off every N64 checksum, and double that while divergence learning is running, on a
+core whose steady frame already sits near its whole budget. The lane figure is the stable one across
+runs — it sits near what the memory system will give, which is the sign the dependency chain rather
+than bandwidth was the ceiling. It is also faster than a `memcpy` of the same buffer, which is not a
+contradiction: it reads and does not write.
+
+It produces a different number for the same memory, and that is the whole reason for the bump: a
+v23 peer and a v24 peer would report a desync that is not there at every interval, with nothing in
+the message shape for a version-tolerant handshake to notice.
+
+Detection strength is not the thing being traded. A byte at offset i lands in lane (i/8) mod 8 and
+reaches the output through the combine, so every single-byte difference still moves the hash — which
+is driven over every offset in a buffer rather than argued.
+
+**The password KDF moved off SHA-1, and got faster doing it.** It was PBKDF2-HMAC-SHA1, not by
+choice but because that is what `Rfc2898DeriveBytes`' three-argument constructor defaults to. On
+.NET Framework, SHA-1 is *2.3× slower* than SHA-256 for this — it takes a slow legacy path the
+modern runtime does not — so a join now costs about half a second per side instead of a second, and
+a host spends half as much refusing a stranger who does not know the password.
+
+The derived key is what both sides prove against, so changing it is a wire break: a v23 and a v24
+peer cannot authenticate to each other at all. The loop is written out rather than calling the
+platform, because the overload that selects SHA-256 is not in the netstandard2.0 surface Core
+compiles against; it is checked against .NET's own implementation on both frameworks and against a
+published PBKDF2-HMAC-SHA256 vector.
+
+*Found while writing those tests: .NET Framework's `Rfc2898DeriveBytes` throws on a salt shorter
+than eight bytes and .NET 10 does not. The session's salt is two 16-byte nonces so it never binds,
+but it is the sort of difference worth knowing about before it surprises someone.*
 
 ### v0.37.0 — the probe was measuring the wrong thing, and the stall was blaming the wrong thing (protocol 23, unchanged)
 

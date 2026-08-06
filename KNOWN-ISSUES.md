@@ -162,16 +162,30 @@ assumption found anywhere". Two passes later that had produced eleven. Same less
 domains above, and worth stating twice because it was learned twice: a confident review verdict is
 not evidence.
 
-**Owed at the next protocol bump — move the password KDF from SHA-1 to SHA-256.** Measured
+**DONE in v0.38.0 (protocol 24) — the password KDF moved from SHA-1 to SHA-256.** Kept here rather
+than deleted because the measurement is the reason and it should stay findable. Measured
 2026-08-06, 100,000 iterations, eight cores: on .NET Framework 4.8 (what the tool ships on) SHA-1
 costs 1092ms against SHA-256's 478ms, and on .NET 10 it is 105ms against 46ms. SHA-1 is 2.3x
 *slower* despite doing less work per block, because .NET Framework takes a slow legacy path for it.
-So the swap is faster on both targets and retires a legacy primitive, for nothing but a changed
-derived key — which is a wire break, hence the wait. Two things the measurement settles so nobody
-re-derives them: hand-rolling loses to the platform (518ms against 478), because the built-in
-already sits on the raw-HMAC floor; and nothing below ~478ms is reachable without cutting iterations
-at a count already under the 600,000 current guidance suggests. The figures live beside the constant
-in `SessionAuth`.
+So the swap was faster on both targets and retired a legacy primitive, for nothing but a changed
+derived key — which is a wire break, hence the wait. It shipped at v0.38.0 alongside the checksum's
+lane change, since neither justified a forced update alone.
+
+**What shipped is the hand-rolled loop at 518ms, not the platform's 478ms, and the reason is not
+the one this note originally gave.** The overload of `Rfc2898DeriveBytes` that selects SHA-256
+exists on .NET Framework 4.7.2+ and on .NET 10, but *not in the netstandard2.0 reference surface*
+Core compiles against — so it is unreachable without reflection, which is a poor thing to put in an
+authentication path for 40ms once per join. The loop is checked against the platform's own
+implementation on both frameworks and against a published PBKDF2-HMAC-SHA256 vector.
+
+Nothing below ~478ms is reachable without cutting iterations at a count already under the 600,000
+current guidance suggests; the raw-HMAC floor is 512ms for 100,000 bare calls. The figures live
+beside the constant in `SessionAuth`.
+
+*A framework difference found while writing those tests, recorded because it will surprise someone
+eventually:* .NET Framework's `Rfc2898DeriveBytes` rejects a salt shorter than eight bytes and .NET
+10 accepts it. The session's salt is two 16-byte nonces, so it never binds here — but it means the
+platform call and the loop that replaced it are not quite interchangeable at the edges.
 
 **What the same measurement fixed without a wire change (v0.35.0+).** Verifying a joiner's proof
 costs the host one derivation, and the accept loop is serial — so a stranger who cannot pass the
@@ -212,6 +226,39 @@ as time-sync yields, so a machine too slow to repair inside its budget presented
 problem — the opposite fix. And stalls waiting at the hard prediction cap, the most common kind on a
 lossy link, had no counter at all. Both corrected in v0.37.0; the scheduling was already right and
 did not change.
+
+## 2026-08-06: the checksum's inner loop, and what a dependency chain costs (v0.37.0, v0.38.0)
+
+The desync checksum walks the whole of main memory — 8 MiB on N64 — and the loop doing it turned
+out to be leaving most of the machine idle, in two separate ways.
+
+**The read (v0.37.0, no wire change).** `BitConverter.ToUInt64` in a loop is bounds-checked and
+poorly inlined on .NET Framework specifically. Reading through a fixed pointer produces a
+bit-for-bit identical hash and measured 1.5–2.0ms against 4.8–6.0ms. On .NET 10 the same change is
+worth almost nothing. Same asymmetry as the PBKDF2 finding above: **the framework the tool actually
+ships on is repeatedly the one with the slow path**, and a measurement taken only on the modern
+runtime would have shown nothing worth doing in either case. Worth remembering before dismissing a
+micro-optimization on net10 numbers.
+
+**The dependency chain (v0.38.0, protocol 24).** FNV-1a is `h = (h ^ word) * prime` — each step
+needs the previous `h`, so the loop ran at the latency of one 64-bit multiply per eight bytes no
+matter what else the CPU could have been doing. Eight independent lanes: **0.62–0.65ms**, faster
+than a `memcpy` of the same buffer, and stable across runs in a way the single-chain figures are
+not — which is itself the evidence that the chain rather than memory bandwidth was the ceiling.
+Four lanes measure the same as eight, so the last of it is not there to take.
+
+Two things worth keeping from doing this:
+
+- **The lane seeding was wrong the first time and a test caught it.** Seeding lanes as `h ^ k` looks
+  fine until you notice the combine pairs them with XOR, and `(h^0) ^ (h^1)` cancels `h` completely
+  — so an empty span returned the same constant whatever seed it was given. One FNV step per lane
+  fixes it, because multiplication does not distribute over XOR. The test that found it was the
+  small dull one about empty spans, not any of the interesting ones.
+- **The hash arithmetic was in the untestable half.** It touches no BizHawk type; it was in the
+  adapter only because that is where the bytes were fetched. That put the one function whose output
+  crosses the wire and must be bit-identical on every peer where no test could reach it — and a
+  change there is a silent permanent desync between versions that no protocol check catches, since
+  the protocol number would not have moved on its own. It is in Core now with its values pinned.
 
 ## Status
 

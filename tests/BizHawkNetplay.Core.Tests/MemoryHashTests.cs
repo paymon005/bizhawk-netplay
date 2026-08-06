@@ -20,17 +20,48 @@ namespace BizHawkNetplay.Core.Tests;
 /// </summary>
 public class MemoryHashTests
 {
-    // The loop exactly as it was written before the fixed-pointer read replaced it. Kept as the
-    // oracle rather than deleted: the claim being made is "same value, faster read", and a claim
-    // like that needs the thing it is being compared against to still exist.
+    private const ulong Prime = 1099511628211UL;
+
+    /// <summary>
+    /// The eight-lane fold written the obvious way — indexed reads through BitConverter, an
+    /// explicit lane array, no pointer arithmetic.
+    ///
+    /// This is the oracle, and it is worth being clear about what it does and does not prove. It is
+    /// a transcription of the same algorithm, so it cannot catch a mistake in the DESIGN. What it
+    /// catches is the class of mistake the shipping version is actually exposed to: an off-by-one
+    /// in the 64-byte block bound, a lane read at the wrong offset, a tail that starts in the wrong
+    /// place. Those are pointer-arithmetic slips, and they are invisible on a round-numbered buffer
+    /// — which is why the matrix below is nearly all awkward lengths.
+    /// </summary>
     private static ulong ReferenceFold(ulong h, byte[] data, int from, int to)
     {
-        const ulong prime = 1099511628211UL;
+        var lanes = new ulong[MemoryHash.Lanes];
+        for (int k = 0; k < lanes.Length; k++) lanes[k] = (h ^ (ulong)k) * Prime;
+
+        int i = from;
+        int block = 8 * MemoryHash.Lanes;
+        while (i + block <= to)
+        {
+            for (int k = 0; k < lanes.Length; k++)
+                lanes[k] = (lanes[k] ^ BitConverter.ToUInt64(data, i + 8 * k)) * Prime;
+            i += block;
+        }
+        for (; i < to; i++) lanes[0] = (lanes[0] ^ data[i]) * Prime;
+
+        ulong a = (lanes[0] ^ lanes[1]) * Prime, b = (lanes[2] ^ lanes[3]) * Prime,
+              c = (lanes[4] ^ lanes[5]) * Prime, d = (lanes[6] ^ lanes[7]) * Prime;
+        return (((a ^ b) * Prime) ^ ((c ^ d) * Prime)) * Prime;
+    }
+
+    /// <summary>The single-chain fold protocol 23 and earlier shipped. Kept only to show the two
+    /// disagree, which is the fact that made this a wire break.</summary>
+    private static ulong LegacySingleChainFold(ulong h, byte[] data, int from, int to)
+    {
         int i = from;
         for (int limit = to - 7; i < limit; i += 8)
-            h = (h ^ BitConverter.ToUInt64(data, i)) * prime;
+            h = (h ^ BitConverter.ToUInt64(data, i)) * Prime;
         for (; i < to; i++)
-            h = (h ^ data[i]) * prime;
+            h = (h ^ data[i]) * Prime;
         return h;
     }
 
@@ -42,12 +73,12 @@ public class MemoryHashTests
     }
 
     /// <summary>
-    /// The whole justification for the fixed pointer: identical arithmetic on identical bytes.
+    /// The pointer-arithmetic version agrees with the obvious one, everywhere it is awkward.
     ///
     /// Driven over unaligned starts and odd lengths on purpose. Exclusion ranges cut the buffer at
     /// whatever offsets the divergence learner measured, so the loop is routinely handed a span
-    /// that neither starts nor ends on an eight-byte boundary — and the tail handling is exactly
-    /// where a pointer rewrite would go wrong without showing it on a round-numbered buffer.
+    /// that neither starts nor ends on a 64-byte block boundary — and the tail handling is exactly
+    /// where a pointer rewrite goes wrong without showing it on a round-numbered buffer.
     /// </summary>
     [Fact]
     public void TheFastReadIsBitIdenticalToThePlainOne()
@@ -72,13 +103,57 @@ public class MemoryHashTests
         Assert.True(compared > 100, $"only {compared} spans compared — the matrix collapsed");
     }
 
-    /// <summary>An empty span must be the identity, not a step. A range excluded down to nothing
-    /// is ordinary once a learned mask covers a whole region.</summary>
+    /// <summary>
+    /// The lane fold and the single chain protocol 23 shipped disagree — which is the entire
+    /// reason this needed a protocol bump rather than being a free optimization like the pointer
+    /// read that preceded it.
+    ///
+    /// Stated as a test because it is the fact a future reader is most likely to doubt: two
+    /// versions of this tool computing different numbers for identical memory is exactly the
+    /// failure the version check exists to prevent, and it is silent if the check is ever relaxed.
+    /// </summary>
     [Fact]
-    public void AnEmptySpanChangesNothing()
+    public void TheLaneFoldDisagreesWithTheSingleChainItReplaced()
+    {
+        var data = Noise(4096, 0xB10C);
+        Assert.NotEqual(LegacySingleChainFold(0UL, data, 0, data.Length),
+            MemoryHash.FoldRange(0UL, data, 0, data.Length));
+    }
+
+    /// <summary>
+    /// The property lanes could plausibly have cost, checked rather than assumed: every single-byte
+    /// difference still moves the hash.
+    ///
+    /// With eight lanes a byte at offset i only ever touches lane (i/8) mod 8, so the worry is a
+    /// difference that reaches the output through fewer multiplies and cancels. It does not — but
+    /// "it does not" is a claim, and detecting that two states differ is the whole job here, so it
+    /// gets driven over every offset in a buffer rather than argued.
+    /// </summary>
+    [Fact]
+    public void EverySingleByteDifferenceStillMovesTheHash()
+    {
+        var data = Noise(1024 + 37, 0xD1FF);   // deliberately not a whole number of blocks
+        uint baseline = MemoryHash.Fnv1a64(data, data.Length, MemoryHash.PathPtr, new long[0], 0);
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            data[i] ^= 0x01;                    // the smallest change there is
+            uint moved = MemoryHash.Fnv1a64(data, data.Length, MemoryHash.PathPtr, new long[0], 0);
+            data[i] ^= 0x01;
+            Assert.True(baseline != moved, $"flipping the low bit of byte {i} left the hash at {moved:X8}");
+        }
+    }
+
+    /// <summary>An empty span must be a pure function of the seed, and the same one every time — a
+    /// range excluded down to nothing is ordinary once a learned mask covers a whole region.</summary>
+    [Fact]
+    public void AnEmptySpanIsStableAndSeedDetermined()
     {
         var data = Noise(1024, 7);
-        Assert.Equal(12345UL, MemoryHash.FoldRange(12345UL, data, 500, 500));
+        Assert.Equal(MemoryHash.FoldRange(12345UL, data, 500, 500),
+                     MemoryHash.FoldRange(12345UL, data, 900, 900));
+        Assert.NotEqual(MemoryHash.FoldRange(12345UL, data, 500, 500),
+                        MemoryHash.FoldRange(54321UL, data, 500, 500));
     }
 
     /// <summary>
@@ -186,8 +261,10 @@ public class MemoryHashTests
     /// crosses between machines has to be.
     /// </summary>
     [Theory]
-    [InlineData(0, 161449041u)]
-    [InlineData(1, 2362860795u)]
+    // Protocol 24 values. They differ from protocol 23's (161449041 / 2362860795) because the fold
+    // went to eight lanes, which is the whole reason 24 exists.
+    [InlineData(0, 1761017244u)]
+    [InlineData(1, 2229619052u)]
     public void KnownValuesArePinnedBecauseTheyCrossTheWire(int variant, uint expected)
     {
         var data = new byte[512];

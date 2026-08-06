@@ -103,7 +103,15 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // wait out its donor timeout and fall back — degraded rather than broken, but the disc lines a
     // v22 peer never sends would let a genuinely different disc 2 through, which is the reason to
     // refuse rather than tolerate the mix.
-    private const int Protocol = 23;
+    //
+    // 24: two values that cross the wire changed, neither of them a message. The desync checksum's
+    // fold runs in eight independent lanes now, which is 7.7x on the framework the tool ships on
+    // and a different number for the same memory — a v23 peer would report a desync that is not
+    // there, at every interval, with nothing in the message shape to notice it. And the password
+    // KDF moved off SHA-1 to SHA-256, changing the derived key both sides prove against, so a
+    // mixed pair simply cannot authenticate. Both were owed a bump and neither justified one
+    // alone; spending a single break on the pair is the whole reason they shipped together.
+    private const int Protocol = 24;
     private const int DefaultPort = 47800;
 
     /// <summary>

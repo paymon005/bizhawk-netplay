@@ -55,18 +55,16 @@ same files.
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
 friends usually have to update too — but not always, and the release notes always say which.
 
-**v0.34.0 through v0.37.0 all use protocol 23, so they mix freely** — everything after v0.34.0
-changes no wire format, and you can take it without waiting for anyone else. The last break was at
-v0.34.0, which added per-disc identity and majority-aware recovery; a v22 peer sends neither.
+**v0.38.0 uses protocol 24 and everyone must update together.** It will refuse a v0.37.0 peer at the
+handshake. Two values that cross the wire changed: the desync checksum's hash, which got about eight
+times faster and now produces a different number for the same memory, and the password KDF, which
+moved off SHA-1 and changed the key both sides prove against. Neither is something a peer could
+tolerate or fall back from — an older peer would report desyncs that are not there, and could not
+authenticate at all — which is exactly what the version check is for.
 
-Two caveats for a mixed group. A v0.36.0 or later host defers to the majority on a desync by
-default, and a v0.34.0 peer cannot answer that request — so the host waits out its timeout before
-recovering from its own state instead. Update together, or untick "Defer to the majority on a
-desync" until you have. And on a heavy core, v0.37.0 measures what your machine can afford more
-accurately than earlier builds did; peers negotiate down to whoever reports least, so one player on
-an older build holds the whole group to the older, more pessimistic number. That costs rollback
-depth, never correctness. See [CHANGELOG.md](CHANGELOG.md) for the full table of which release
-changed what and who can play with whom.
+v0.34.0 through v0.37.0 shared protocol 23 and still mix freely with each other. See
+[CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what and who can play with
+whom.
 
 A version mismatch is refused at the handshake with a clear message. That is the intended behaviour,
 not a fault — the alternative is a session that appears to work and silently loses input.

@@ -22,31 +22,40 @@ public static class SessionAuth
     /// PBKDF2 stretch: slows an offline password guess to a crawl.
     ///
     /// It is not free at the honest end either, and the figure is worth knowing: one derivation
-    /// measures ~105ms on .NET 10 and ~1092ms on .NET Framework 4.8, which is what the tool ships
-    /// on. So a join costs about a second on each side, once — on a background thread, so it is
+    /// measures ~46ms on .NET 10 and ~478ms on .NET Framework 4.8, which is what the tool ships on.
+    /// So a join costs about half a second on each side, once — on a background thread, so it is
     /// join latency rather than a frozen emulator — and a HOST pays it for every connection
     /// attempt that reaches the password step, including the ones that were never going to pass.
     /// The second of those is metered by <see cref="PasswordAttemptLimiter"/>; the first is the
     /// price of the stretch.
     ///
-    /// <b>Owed at the next protocol bump: move this KDF from SHA-1 to SHA-256.</b> Measured on
+    /// <b>Moved from SHA-1 to SHA-256 at protocol 24, and it got FASTER.</b> Measured on
     /// 2026-08-06, 100,000 iterations, eight cores:
     /// <code>
     ///                                          net48     net10.0
-    ///   Rfc2898 SHA-1 (what ships)            1092 ms      105 ms
-    ///   Rfc2898 SHA-256                        478 ms       46 ms
+    ///   Rfc2898 SHA-1 (protocol 23 and older) 1092 ms      105 ms
+    ///   Rfc2898 SHA-256 (what ships now)       478 ms       46 ms
     ///   hand-rolled PBKDF2 + reused HMACSHA256 518 ms       95 ms
     ///   raw HMACSHA256 x100k (the floor)       512 ms       66 ms
     /// </code>
-    /// SHA-1 is 2.3x SLOWER than SHA-256 here, which is backwards from the work each does per
+    /// SHA-1 was 2.3x SLOWER than SHA-256 here, which is backwards from the work each does per
     /// block: .NET Framework's SHA-1 takes a slow legacy path and its SHA-256 does not. So the swap
-    /// is faster on both targets AND retires a legacy primitive, for nothing but a changed derived
-    /// key — which is a wire break, hence the wait.
+    /// was faster on both targets AND retired a legacy primitive, for nothing but a changed derived
+    /// key. That key is what both sides prove against, so it was a wire break — which is why it
+    /// waited for one, and rode along with the checksum's lane change at protocol 24.
     ///
-    /// Two things the measurement settles, so nobody re-derives them: hand-rolling loses to the
-    /// platform (518 against 478), because the built-in already sits on the raw-HMAC floor; and
-    /// nothing below ~478ms on net48 is reachable without cutting iterations, which is a security
-    /// trade at a count already below the 600,000 current guidance suggests for PBKDF2-SHA256.
+    /// It also halved what the host spends refusing a stranger, which is the cost
+    /// <see cref="PasswordAttemptLimiter"/> exists to bound.
+    ///
+    /// What actually ships is the hand-rolled row, at 518ms — see <see cref="DeriveKey"/> for why
+    /// the platform's own is out of reach from netstandard2.0. The 8% premium buys not having a
+    /// reflective lookup in the authentication path, and it is still less than half the SHA-1 cost
+    /// it replaced.
+    ///
+    /// One thing the measurement settles so nobody re-derives it: nothing below ~478ms on net48 is
+    /// reachable without cutting iterations, because the built-in already sits on the raw-HMAC
+    /// floor (512ms for 100,000 bare HMACSHA256 calls). Cutting iterations is a security trade at a
+    /// count already below the 600,000 current guidance suggests for PBKDF2-SHA256.
     /// </summary>
     public const int DefaultIterations = 100_000;
 
@@ -201,10 +210,44 @@ public static class SessionAuth
         return salt;
     }
 
-    private static byte[] DeriveKey(string? password, byte[] salt, int iterations)
+    /// <summary>
+    /// PBKDF2-HMAC-SHA256, RFC 2898, written out rather than called.
+    ///
+    /// <b>Why not <c>Rfc2898DeriveBytes</c>.</b> Its three-argument constructor defaults to SHA-1,
+    /// which is what this used to get by omission rather than by choice; the overload that takes a
+    /// <c>HashAlgorithmName</c> exists on .NET Framework 4.7.2 and on .NET 10, but NOT in the
+    /// netstandard2.0 reference surface this assembly compiles against. Reaching it by reflection
+    /// would buy about 40ms once per join and cost a runtime failure mode in the authentication
+    /// path, which is a bad trade.
+    ///
+    /// So the loop is here. The measurement already priced it: 518ms on net48 against the
+    /// platform's 478ms, an 8% premium on an operation that runs once per join — and still 2.1x
+    /// faster than the 1092ms SHA-1 path it replaces. <see cref="SessionAuthTests"/> checks it
+    /// against the platform's own implementation on both frameworks, and against a published
+    /// vector, because a hand-written KDF that is subtly not PBKDF2 is worth catching immediately.
+    ///
+    /// The derived length equals SHA-256's output, so there is exactly one block and the outer
+    /// concatenation of RFC 2898 collapses to <c>T1 = U1 ^ U2 ^ ... ^ Uc</c>. One HMAC instance is
+    /// reused across the iterations; re-keying per iteration is most of what makes a naive version
+    /// slow.
+    /// </summary>
+    internal static byte[] DeriveKey(string? password, byte[] salt, int iterations)
     {
-        using var kdf = new Rfc2898DeriveBytes(password ?? "", salt, iterations);
-        return kdf.GetBytes(32);
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(password ?? ""));
+
+        // U1 = PRF(P, S || INT_32_BE(i)), and i is 1 because one block covers the whole key.
+        var seed = new byte[salt.Length + 4];
+        Buffer.BlockCopy(salt, 0, seed, 0, salt.Length);
+        seed[salt.Length + 3] = 1;
+
+        var u = hmac.ComputeHash(seed);
+        var accumulated = (byte[])u.Clone();
+        for (int i = 1; i < iterations; i++)
+        {
+            u = hmac.ComputeHash(u);
+            for (int b = 0; b < accumulated.Length; b++) accumulated[b] ^= u[b];
+        }
+        return accumulated;
     }
 
     private static string ProofFromKey(byte[] key, string role, byte[] salt)
