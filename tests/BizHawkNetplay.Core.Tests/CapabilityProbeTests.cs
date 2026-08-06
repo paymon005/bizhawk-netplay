@@ -622,4 +622,79 @@ public class CapabilityProbeTests
         Assert.True(emu.SaveCount > 20, $"the repair passes should dominate the saves, got {emu.SaveCount}");
         Assert.Equal(emu.SaveCount, emu.ReleaseCount);
     }
+
+    /// <summary>
+    /// The probe never holds more than a couple of whole-core states at once.
+    ///
+    /// It used to keep every timed save until all four measurement passes had finished. At the 24
+    /// samples a heavy core is given, that is roughly 400 MiB of N64 states held live — felt hardest
+    /// with three or four EmuHawk instances on one machine, which is the case this tool exists for.
+    ///
+    /// The peak is the assertion because the peak is what memory has to be sized for; a running
+    /// total cannot show it.
+    /// </summary>
+    [Fact]
+    public void TheProbeNeverHoldsMoreThanAHandfulOfStatesAtOnce()
+    {
+        var emu = new FakeEmuAdapter();
+        var clock = new ManualClock(Enumerable.Repeat(0.05, 2000));
+        new CapabilityProbe(emu, clock, samples: 24).Run(16.639, 4.0);
+
+        Assert.True(emu.PeakLiveStates <= 4,
+            $"the probe held {emu.PeakLiveStates} whole-core states at once; on N64 that is " +
+            $"~{emu.PeakLiveStates * 17} MiB");
+        Assert.Empty(emu.LiveStates);
+    }
+
+    /// <summary>
+    /// The timed save pass measures reuse, which is what a session actually pays.
+    ///
+    /// This is the same defect as the one above seen from the timing side, and it is the more
+    /// consequential half. Holding every sample kept the pool empty, so each timed save had to
+    /// allocate a fresh whole-core buffer — the probe was measuring allocate-plus-save and charging
+    /// it to a model where the session reuses a buffer the ring just released. Pessimistic in
+    /// exactly the place the verdict is closest, and it under-reported the rollback depth an N64
+    /// can afford.
+    ///
+    /// Asserted as a count of distinct buffers rather than a ratio to the save count: a ratio still
+    /// passed against the broken probe, because the other passes do enough reusing saves to dilute
+    /// twenty-five allocations below half. Allocations can never fall below peak concurrency, so
+    /// bounding them at a handful is the same statement as bounding the peak — said in the units
+    /// the timing actually depends on.
+    /// </summary>
+    [Fact]
+    public void TheTimedSavePassMeasuresReuseRatherThanAllocation()
+    {
+        var emu = new FakeEmuAdapter();
+        var clock = new ManualClock(Enumerable.Repeat(0.05, 2000));
+        new CapabilityProbe(emu, clock, samples: 24).Run(16.639, 4.0);
+
+        Assert.True(emu.StateBuffersAllocated <= 4,
+            $"the probe needed {emu.StateBuffersAllocated} distinct buffers across {emu.SaveCount} " +
+            "saves, so the pool was cold and the timed saves paid for allocation the session never does");
+    }
+
+    /// <summary>
+    /// A core that throws mid-measurement still gets its position back and leaves nothing borrowed.
+    ///
+    /// Every acquisition happens inside a pass that steps the core, and any of them can fail.
+    /// Without one cleanup boundary the exception skipped the release AND the restore — and because
+    /// the tool form wraps the probe in its own save/restore, the game looked recovered while
+    /// whole-core buffers stayed checked out for the rest of the process.
+    /// </summary>
+    [Fact]
+    public void AProbeThatThrowsPartwayReleasesEverythingItBorrowed()
+    {
+        var emu = new FakeEmuAdapter();
+        var clock = new ManualClock(Enumerable.Repeat(0.05, 2000));
+        int saves = 0;
+        emu.SaveFault = () =>
+            ++saves == 5 ? new System.InvalidOperationException("the core could not save") : null;
+
+        Assert.Throws<System.InvalidOperationException>(
+            () => { new CapabilityProbe(emu, clock, samples: 24).Run(16.639, 4.0); });
+
+        Assert.Empty(emu.LiveStates);
+        Assert.Equal(0, emu.ReleasesOfAlreadyReleasedState);
+    }
 }

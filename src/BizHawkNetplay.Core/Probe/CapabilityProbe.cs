@@ -17,6 +17,10 @@ public sealed class CapabilityProbe
     private readonly IMonotonicClock _clock;
     private readonly int _samples;
 
+    /// <summary>The one state handle the timed save pass holds at a time, reachable from
+    /// <see cref="Run"/>'s cleanup so a throw mid-measurement does not strand it.</summary>
+    private sealed class Borrowed { public StateHandle? Handle; }
+
     public CapabilityProbe(IEmuAdapter emu, IMonotonicClock clock, int samples = 100)
     {
         _emu = emu ?? throw new ArgumentNullException(nameof(emu));
@@ -44,13 +48,44 @@ public sealed class CapabilityProbe
 
         // Capture a reference state once so load/advance have something valid to work on.
         var reference = _emu.SaveStateToMemory();
+        // A holder rather than a local, because the measurement below hands it to a lambda and a
+        // `ref` parameter cannot be captured — and the whole point is that the finally can see
+        // whatever was in flight when something threw.
+        var timed = new Borrowed();
+        try
+        {
+            return Measure(frameBudgetMs, headroomMs, elideConfirmedSaves, repairBudgetMs,
+                keyframeInterval, neutral, reference, timed);
+        }
+        finally
+        {
+            // One boundary for everything the probe borrowed.
+            //
+            // Every acquisition above happens inside a measurement that steps a core, and any of
+            // them can throw — a core that cannot export, memory it cannot get. Without this, that
+            // exception skipped the release below and the restore with it: the tool form's own
+            // save/restore made the game LOOK recovered while whole-core buffers stayed checked out
+            // of the pool for the rest of the process.
+            if (timed.Handle != null) { try { _emu.ReleaseState(timed.Handle); } catch { } }
+            // Hand the position back. The timed passes advance the core and the replay check
+            // advances it further, and this runs against whatever the user currently has loaded —
+            // so the probe owes them the frame it started on. (The tool wraps this in its own
+            // save/restore as well; belt and braces, since a probe that quietly moves the game is a
+            // nasty surprise.)
+            try { _emu.LoadStateFromMemory(reference); } catch { }
+            try { _emu.ReleaseState(reference); } catch { }
+        }
+    }
 
+    private ProbeResult Measure(double frameBudgetMs, double headroomMs,
+        bool elideConfirmedSaves, double repairBudgetMs, int keyframeInterval,
+        InputSet neutral, StateHandle reference, Borrowed timed)
+    {
         // Representative serialized state size (the in-memory handle is opaque, so measure
         // the equivalent full binary state once — not on the timed hot path).
         int stateSize = _emu.ExportState().Length;
 
-        // Retain the timed save handles so we can free them afterwards — otherwise every probe
-        // leaks ~samples whole-core states into the emulator's in-memory store (~hundreds of MiB).
+        // ONE timed handle at a time, released between samples.
         //
         // A frame runs between samples, outside the timing. Saving does not advance the core, so
         // without it every sample after the first snapshots memory nothing has touched since the
@@ -58,11 +93,27 @@ public sealed class CapabilityProbe
         // Across six N64 configurations this pass reported 5.6-6.7ms with no pattern, against a
         // steady ~7.0ms (±5%) for the same operation timed inside a repair. A session snapshots
         // after a frame that has just dirtied RAM, so that is what gets timed.
-        var scratch = new List<StateHandle>(_samples);
+        //
+        // This used to hold every sample until the end, which cost twice over. The obvious cost is
+        // memory: 24 samples on a heavy core is ~400MiB of whole-core states held live across three
+        // further measurement passes, and worse with several EmuHawk instances on one machine.
+        //
+        // The cost that actually mattered is that it measured the wrong thing. Holding them all
+        // left the adapter's buffer pool empty, so EVERY timed save allocated a fresh whole-core
+        // buffer — 16.7MiB on N64, off the large object heap — while a session in steady state
+        // reuses one the ring just released. The probe was therefore timing allocate-plus-save and
+        // charging it to a model that only ever pays save, which is pessimistic in exactly the
+        // place the verdict is closest: it under-reports the rollback depth an N64 can afford.
+        // Releasing before the frame advance leaves the pool warm, so every sample but the first
+        // measures what the session will actually run.
         double medianSave = MeasureMedian(
-            () => scratch.Add(_emu.SaveStateToMemory()),
+            () => timed.Handle = _emu.SaveStateToMemory(),
             _samples, out _,
-            between: () => _emu.RunFramesInvisible(1, _ => neutral));
+            between: () =>
+            {
+                if (timed.Handle != null) { _emu.ReleaseState(timed.Handle); timed.Handle = null; }
+                _emu.RunFramesInvisible(1, _ => neutral);
+            });
 
         // Same treatment, so each sample loads a state the core is not already standing on. This
         // pass used to restore the reference from the reference position, over and over: 16.7MiB
@@ -88,8 +139,6 @@ public sealed class CapabilityProbe
         // almost blind to the resolution setting — the one knob a user tuning for performance
         // reaches for first. Measured separately now, and each charged where it belongs.
         double medianLiveFrame = MeasureMedian(() => _emu.AdvanceRenderedFrame(neutral));
-
-        foreach (var h in scratch) _emu.ReleaseState(h);
 
         // What a repair actually costs, timed whole rather than added up from the three figures
         // above. Reported, not yet spent: the depth below is still solved from the isolated terms,
@@ -137,13 +186,8 @@ public sealed class CapabilityProbe
 
         bool replayDeterministic = VerifyReplayDeterminism(neutral, ReplayCheckFrames);
 
-        // Hand the position back. The timed passes advance the core and the replay check advances
-        // it further, and this runs against whatever the user currently has loaded — so the probe
-        // owes them the frame it started on. (The tool wraps this in its own save/restore as well;
-        // belt and braces, since a probe that quietly moves the game is a nasty surprise.)
-        try { _emu.LoadStateFromMemory(reference); } catch { }
-        _emu.ReleaseState(reference);
-
+        // The position is handed back and the reference released in Run's finally, so that it
+        // happens whether or not anything above threw.
         return new ProbeResult(
             _emu.CoreName, stateSize, medianSave, medianLoad, medianFrame,
             frameBudgetMs, headroomMs, depth,

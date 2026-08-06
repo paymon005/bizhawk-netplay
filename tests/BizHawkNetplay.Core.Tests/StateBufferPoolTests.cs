@@ -166,6 +166,53 @@ public class StateBufferPoolTests
         fresh.Writer.Flush();
     }
 
+    /// <summary>
+    /// Retention is bounded by BYTES as well as by count, because the two mean very different
+    /// things per core: sixty-four SNES states is about 32 MiB, and sixty-four N64 states is better
+    /// than a gigabyte. A count alone bounds nothing on the core where bounding it matters.
+    /// </summary>
+    [Fact]
+    public void RetentionIsBoundedByBytesNotJustCount()
+    {
+        const int big = 4 * 1024 * 1024;
+        var pool = new StateBufferPool(cap: 64, initialSizeHint: big, maxRetainedBytes: 10 * 1024 * 1024);
+        var taken = new List<StateBuffer>();
+        for (int i = 0; i < 20; i++) taken.Add(pool.Take());
+        foreach (var buffer in taken) pool.Return(buffer);
+
+        Assert.True(pool.RetainedBytes <= 10 * 1024 * 1024,
+            $"retained {pool.RetainedBytes} bytes against a 10 MiB ceiling");
+        Assert.True(pool.Size < 20, "the byte ceiling never bound");
+        Assert.All(taken, b => Assert.True(b.Retired));
+    }
+
+    /// <summary>Taking a buffer back out gives its bytes back to the budget, so a steady
+    /// take/return cycle does not ratchet the pool shut.</summary>
+    [Fact]
+    public void TakingABufferReleasesItsBytesFromTheBudget()
+    {
+        var pool = new StateBufferPool(initialSizeHint: 1024, maxRetainedBytes: 4096);
+        for (int round = 0; round < 50; round++)
+        {
+            var a = pool.Take();
+            var b = pool.Take();
+            pool.Return(a);
+            pool.Return(b);
+        }
+        Assert.True(pool.Size >= 2, $"the pool shut down to {pool.Size} buffers over repeated cycles");
+        Assert.True(pool.RetainedBytes > 0);
+    }
+
+    [Fact]
+    public void ClearingResetsTheRetainedByteCount()
+    {
+        var pool = new StateBufferPool(initialSizeHint: 2048);
+        pool.Return(pool.Take());
+        Assert.True(pool.RetainedBytes > 0);
+        pool.Clear();
+        Assert.Equal(0, pool.RetainedBytes);
+    }
+
     [Fact]
     public void ReturningNothingIsHarmless()
     {

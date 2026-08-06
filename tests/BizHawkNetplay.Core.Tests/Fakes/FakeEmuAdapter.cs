@@ -37,6 +37,15 @@ public sealed class FakeEmuAdapter : IEmuAdapter
     /// tests can prove the rollback ring stays bounded (no per-frame leak).</summary>
     public HashSet<StateHandle> LiveStates { get; } = new HashSet<StateHandle>();
 
+    /// <summary>
+    /// The most states alive at once over this adapter's life — the pool's peak commitment.
+    ///
+    /// Count is the wrong unit on a real core and the right one here: on N64 each of these is
+    /// ~16.7 MiB, so a routine that quietly holds two dozen is holding four hundred megabytes. A
+    /// running total cannot show that; only the peak can.
+    /// </summary>
+    public int PeakLiveStates { get; private set; }
+
     /// <summary>The inputs last applied to advance each frame, keyed by frame. A rollback re-runs
     /// frames through <see cref="Step"/>, overwriting the earlier prediction — so once every input
     /// is confirmed this holds the corrected (real) input per frame, the rollback correctness oracle.</summary>
@@ -153,6 +162,7 @@ public sealed class FakeEmuAdapter : IEmuAdapter
         Buffer.BlockCopy(_memory, 0, buffer, 0, _memory.Length);
         var handle = new StateHandle(_frame, buffer);
         LiveStates.Add(handle);
+        if (LiveStates.Count > PeakLiveStates) PeakLiveStates = LiveStates.Count;
         return handle;
     }
 

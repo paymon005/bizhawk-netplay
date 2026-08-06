@@ -31,6 +31,11 @@ public sealed class StateBuffer
     /// savestates alias the same bytes and the second silently overwrites the first.
     /// </summary>
     public bool Retired { get; internal set; }
+
+    /// <summary>What this buffer counted toward the pool's retained-byte total when it was taken
+    /// back. Stored rather than re-measured, so the subtraction on the way out is exactly the
+    /// addition on the way in even if the stream has since grown.</summary>
+    internal long RetainedSize { get; set; }
 }
 
 /// <summary>
@@ -62,15 +67,39 @@ public sealed class StateBufferPool
     /// </summary>
     public const int DefaultCap = 64;
 
+    /// <summary>
+    /// Ceiling on RETAINED bytes, which is the cap that actually means something.
+    ///
+    /// Sixty-four buffers is a wildly different commitment per core: about 32 MiB of SNES states,
+    /// and better than a gigabyte of N64 ones. A count alone therefore bounds nothing on the core
+    /// where bounding it matters, and the pool would happily sit on hundreds of megabytes it will
+    /// never hand out again — which is felt hardest when three or four EmuHawk instances share a
+    /// machine, exactly the four-player case this tool exists for.
+    ///
+    /// 256 MiB is comfortably more than a rollback ring needs on any core the probe will grant
+    /// depth to (about fifteen N64 states, against a realistic N64 ring of three to six), and never
+    /// binds at all on lighter cores, where the count cap governs as before. Whichever binds first
+    /// wins.
+    /// </summary>
+    public const long DefaultMaxRetainedBytes = 256L * 1024 * 1024;
+
     private readonly System.Collections.Generic.Stack<StateBuffer> _free = new();
     private readonly int _cap;
+    private readonly long _maxRetainedBytes;
+    private long _retainedBytes;
     private int _sizeHint;
 
-    public StateBufferPool(int cap = DefaultCap, int initialSizeHint = 1 << 16)
+    public StateBufferPool(int cap = DefaultCap, int initialSizeHint = 1 << 16,
+        long maxRetainedBytes = DefaultMaxRetainedBytes)
     {
         _cap = cap < 1 ? 1 : cap;
         _sizeHint = initialSizeHint < 1 ? 1 : initialSizeHint;
+        _maxRetainedBytes = maxRetainedBytes < 1 ? 1 : maxRetainedBytes;
     }
+
+    /// <summary>Bytes currently held in retired buffers. The figure the ceiling is against, and
+    /// the one worth putting in a diagnostics line.</summary>
+    public long RetainedBytes => _retainedBytes;
 
     /// <summary>Buffers currently retired and reusable. Reported so a session can show the pool
     /// reaching steady state — once it stops growing, the save path has stopped allocating.</summary>
@@ -87,7 +116,12 @@ public sealed class StateBufferPool
     public StateBuffer Take()
     {
         StateBuffer buffer;
-        if (_free.Count > 0) buffer = _free.Pop();
+        if (_free.Count > 0)
+        {
+            buffer = _free.Pop();
+            _retainedBytes -= buffer.RetainedSize;   // exactly what Return added, not a re-measure
+            buffer.RetainedSize = 0;
+        }
         else { buffer = new StateBuffer(_sizeHint); Allocated++; }
         buffer.Retired = false;
         buffer.Stream.SetLength(0);
@@ -109,8 +143,15 @@ public sealed class StateBufferPool
     {
         if (buffer == null || buffer.Retired) return;
         buffer.Retired = true;
-        if (_free.Count >= _cap) return;   // over the cap: let the collector have it
+
+        // Whichever ceiling binds first. Over either, the buffer is let go for the collector — it
+        // is still marked retired, because the cap governs whether the POOL keeps it, not whether
+        // its owner gave it up.
+        long size = buffer.Stream.Capacity;
+        if (_free.Count >= _cap || _retainedBytes + size > _maxRetainedBytes) return;
         buffer.Stream.SetLength(0);
+        buffer.RetainedSize = size;
+        _retainedBytes += size;
         _free.Push(buffer);
     }
 
@@ -125,5 +166,6 @@ public sealed class StateBufferPool
     public void Clear()
     {
         while (_free.Count > 0) _free.Pop().Stream.Dispose();
+        _retainedBytes = 0;
     }
 }
