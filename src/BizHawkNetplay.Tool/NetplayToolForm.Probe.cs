@@ -45,6 +45,39 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
+    /// Where the savestate's cost actually goes.
+    ///
+    /// On a heavy core the snapshot is the largest term in the rollback budget — on N64 it measures
+    /// ~6.1ms against a ~3.5ms frame, so at depth 2 it is roughly two thirds of a repair. Whether
+    /// any of that is recoverable depends on something no amount of reasoning settles: how the core
+    /// chooses to write. A core emitting four-byte fields pays BinaryWriter's per-call cost
+    /// millions of times; one emitting whole memory regions pays it a handful, and is already at
+    /// the floor.
+    ///
+    /// So this measures the shape rather than guessing it, and replays that shape without the core
+    /// to say which part is ours. Nothing on the wire changes and the shipping save path is
+    /// untouched — this exists to answer one question, once, on a real core.
+    /// </summary>
+    private void RunSaveWritePathTest()
+    {
+        if (_emulator == null || _apiContainer == null) { Log("No core loaded."); return; }
+        if (_statable == null) { Log("This core has no savestate support — unsupported for netplay."); return; }
+        if (_phase.IsActive) { Log("Can't measure during a session."); return; }
+
+        Log("=== savestate write path ===");
+        try
+        {
+            var adapter = new EmuHawkAdapter(APIs, _emulator, _statable);
+            // Twice: the first save on a cold core can pay for lazily-built state the second does
+            // not, and it is the repeatable figure a session actually lives with.
+            adapter.MeasureSaveWritePath();
+            Log(adapter.MeasureSaveWritePath());
+        }
+        catch (Exception ex) { Log("write-path measurement failed: " + ex.Message); }
+        finally { Log("=== done ==="); }
+    }
+
+    /// <summary>
     /// Dumps what BizHawk sees for input: the controller/binding keys we resolve against, and
     /// the host inputs pressed right now vs how they map to P1. Hold a button and click.
     /// </summary>

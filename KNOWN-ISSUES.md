@@ -260,6 +260,40 @@ Two things worth keeping from doing this:
   change there is a silent permanent desync between versions that no protocol check catches, since
   the protocol number would not have moved on its own. It is in Core now with its values pinned.
 
+## Open question — where the N64 savestate's 6.1ms actually goes (v0.38.1 measures it)
+
+**The savestate is the binding constraint on a heavy core, and it is not obvious why.** With
+confirmed saves elided and keyframes auto-solved, the model gives N64 a steady budget of 12.48ms
+(16.639 minus 25% headroom) and a repair budget of two frame periods. At depth 2 with no keyframe
+spacing, the repair sum is ~7.1ms of frames against ~12.2ms of saves: **the snapshot is roughly two
+thirds of the cost and the emulation a third.** Every lever this tool owns — elision, keyframe
+spacing, the cost cap — is already pulled.
+
+~6.1ms for ~16.7MiB is about 2.7GB/s, well under what moving those bytes costs. Measured on this
+machine, 16.7MiB through a `BinaryWriter` over a `MemoryStream`:
+
+| core's write pattern | net48 | net10 |
+|---|---|---|
+| 4-byte fields | 64.3ms | 42.6ms |
+| 64-byte blocks | 8.0ms | 6.8ms |
+| 4KiB+ blocks | 2.4ms | 2.4ms |
+| raw `BlockCopy` (floor) | 1.6ms | — |
+
+6.1ms sits between the 4KiB-block figure and the 64-byte one, so the answer depends entirely on how
+mupen64plus writes — which is not knowable from here. **The Diagnostics tab's "Savestate Cost"
+button settles it**: it times a real save, records the write-size histogram, replays that shape with
+no core involved, and reports the block-copy floor. If ≥90% of bytes arrive in writes ≥4KiB the
+stream is already at the floor and this avenue is closed; otherwise the recoverable milliseconds are
+stated directly.
+
+**Related and more urgent: the depth verdict is inside the noise.** It flips between 3 and 2 at a
+frame cost of ~3.44ms, and N64 at 1400x1050 measures 3.55ms — three consecutive probes of that one
+configuration returned depth 2, 3 and 3. Since the qualifying threshold is 3, whether N64 runs
+rollback at all is currently decided by a 3% margin. The v0.37.0 probe fix removed a 16.7MiB
+allocation from the timed save path, which was both pessimistic and a source of variance, so the
+spread should have tightened — unverified. Pressing the Capability Probe button several times in a
+row is the test.
+
 ## Status
 
 Entries below are a mix: some are open work (KI-11), some are validation records kept because the

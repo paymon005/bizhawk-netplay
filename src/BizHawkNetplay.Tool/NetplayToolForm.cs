@@ -206,6 +206,7 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private Label _logFileLabel = null!;
     private CheckBox _simUnresponsiveCheck = null!;
     private Button _analogWatchButton = null!;
+    private Button _saveWritePathButton = null!;
     private System.Windows.Forms.Timer? _analogWatchTimer;
     private const int AnalogWatchIntervalMs = 50;
     private const int AnalogWatchSamples = 100;   // 5 seconds

@@ -245,6 +245,68 @@ internal sealed partial class EmuHawkAdapter : IEmuAdapter
     /// pool is being outrun and the allocation this exists to remove is still happening.</summary>
     public int StateBuffersAllocated => _statePool.Allocated;
 
+    /// <summary>
+    /// Time one savestate and record how the core wrote it, then replay that shape without the
+    /// core to separate our cost from its own. See <see cref="SaveWritePathVerdict"/> for what the
+    /// three figures mean and why the question is worth asking at all.
+    ///
+    /// Diagnostics only. The shipping save path is untouched: this wraps the pooled stream in a
+    /// decorator for one call rather than adding a branch to a path that runs every frame.
+    ///
+    /// The buffer is taken from and returned to the same pool the ring uses, so the measured save
+    /// pays exactly what a session's save pays — including reusing a warm buffer rather than
+    /// allocating one, which is the mistake the capability probe was making until v0.37.0.
+    /// </summary>
+    public string MeasureSaveWritePath()
+    {
+        // Warm the pool so the timed save reuses a buffer, as a session in steady state does.
+        _statePool.Return(_statePool.Take());
+
+        var histogram = new WriteSizeHistogram();
+        var buffer = _statePool.Take();
+        double actualMs;
+        try
+        {
+            using var measuring = new MeasuringStream(buffer.Stream, histogram);
+            using var writer = new BinaryWriter(measuring, Encoding.UTF8, leaveOpen: true);
+            var timer = Stopwatch.StartNew();
+            _statable.SaveStateBinary(writer);
+            writer.Flush();
+            actualMs = timer.Elapsed.TotalMilliseconds;
+            _statePool.NoteSize(buffer.Stream.Length);
+        }
+        finally { _statePool.Return(buffer); }
+
+        return SaveWritePathVerdict.Describe(histogram, actualMs,
+            ReplayWritePattern(histogram), BlockCopyFloorMs(histogram.Bytes));
+    }
+
+    /// <summary>The same write shape into the same kind of stream, with no core involved — so the
+    /// difference from the real save is the core's own work.</summary>
+    private static double ReplayWritePattern(WriteSizeHistogram histogram)
+    {
+        var chunk = new byte[Math.Max(1, histogram.LargestWrite)];
+        using var stream = new MemoryStream((int)Math.Min(int.MaxValue, histogram.Bytes + 4096));
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        var timer = Stopwatch.StartNew();
+        foreach (var (size, count) in histogram.ReplayPlan())
+            for (long i = 0; i < count; i++) writer.Write(chunk, 0, size);
+        writer.Flush();
+        return timer.Elapsed.TotalMilliseconds;
+    }
+
+    /// <summary>One block copy of the same byte count: what merely moving the bytes costs, and
+    /// therefore the least any write path could spend.</summary>
+    private static double BlockCopyFloorMs(long bytes)
+    {
+        int size = (int)Math.Min(int.MaxValue, Math.Max(1, bytes));
+        var from = new byte[size];
+        var to = new byte[size];
+        var timer = Stopwatch.StartNew();
+        Buffer.BlockCopy(from, 0, to, 0, size);
+        return timer.Elapsed.TotalMilliseconds;
+    }
+
     public byte[] ExportState()
     {
         // Serialized through the SAME pool the rollback ring uses, then copied out. The caller owns

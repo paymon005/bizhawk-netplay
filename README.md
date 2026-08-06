@@ -55,8 +55,9 @@ same files.
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
 friends usually have to update too — but not always, and the release notes always say which.
 
-**v0.38.0 uses protocol 24 and everyone must update together.** It will refuse a v0.37.0 peer at the
-handshake. Two values that cross the wire changed: the desync checksum's hash, which got about eight
+**v0.38.0 and v0.38.1 use protocol 24 and everyone must update together.** They will refuse a
+v0.37.0 peer at the handshake. (v0.38.1 adds a diagnostic only, so it mixes freely with v0.38.0 —
+just the person running the measurement needs it.) Two values that cross the wire changed: the desync checksum's hash, which got about eight
 times faster and now produces a different number for the same memory, and the password KDF, which
 moved off SHA-1 and changed the key both sides prove against. Neither is something a peer could
 tolerate or fall back from — an older peer would report desyncs that are not there, and could not

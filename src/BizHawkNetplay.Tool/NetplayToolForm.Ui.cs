@@ -342,6 +342,15 @@ public sealed partial class NetplayToolForm
             "Reports every distinct value that actually reached the core, so a stick\r\n" +
             "that jumps from small values straight to full deflection shows the gap.");
 
+        _saveWritePathButton = new Button
+        { Text = "Savestate Cost", Location = new Point(432, 12), Width = 130 };
+        _saveWritePathButton.Click += (_, __) => RunSaveWritePathTest();
+        _tips.SetToolTip(_saveWritePathButton,
+            "Times one savestate and records how the core wrote it, then replays that\r\n" +
+            "shape without the core. On a heavy core the snapshot is the biggest term in\r\n" +
+            "the rollback budget, and this says how much of it is the core gathering\r\n" +
+            "state versus our write path — i.e. whether any of it can be won back.");
+
         _verboseCheck = new CheckBox { Text = "Verbose log", AutoSize = true, Location = new Point(12, 54) };
         _freezeInputCheck = new CheckBox { Text = "Freeze input (diag)", AutoSize = true, Location = new Point(12, 78) };
         _freezeInputCheck.CheckedChanged += (_, __) =>
@@ -437,7 +446,8 @@ public sealed partial class NetplayToolForm
 
         page.Controls.AddRange(
         [
-            _probeButton, _testInputButton, _analogWatchButton, _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
+            _probeButton, _testInputButton, _analogWatchButton, _saveWritePathButton,
+            _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
             simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _unpausedClockCheck,
             _aboveNativeCheck,
         ]);

@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.38.0 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.38.0 – v0.38.1 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
 | v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
@@ -30,6 +30,35 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.38.1 — a diagnostic that says where the savestate's cost goes (protocol 24, unchanged)
+
+**Mixes freely with v0.38.0.** Nothing on the wire changed and the shipping save path is untouched
+— only whoever wants to run the measurement needs this build, not the whole group.
+
+A new **Savestate Cost** button on the Diagnostics tab. On a heavy core the snapshot is the largest
+single term in the rollback budget: N64 measures ~6.1 ms against a ~3.5 ms frame, so at depth 2 the
+saves are roughly two thirds of a repair and the emulation only a third. Whether any of that is
+recoverable turns on something nothing in this codebase can know — how the core chooses to write.
+Through a `BinaryWriter`, four-byte fields run at ~260 MiB/s on .NET Framework and 4 KiB blocks run
+at ~6,900. Same bytes, twenty-six times the cost.
+
+So the button measures the shape instead of guessing it: it times one real savestate, records a
+histogram of the write sizes the core used, then replays that same shape into the same kind of
+stream with no core involved, and block-copies the same byte count for a floor. Three numbers, and
+the differences between them separate our cost from the core's:
+
+```
+save write path: 412 writes, 16.7MiB, largest 4,194,304B | 4096-65535B: 396 (2% of bytes) | >=1024KiB: 16 (98% of bytes)
+  actual save 6.11ms | same pattern, no core 2.34ms | block-copy floor 1.61ms
+  98% of bytes in writes >=4KiB; core work ~3.77ms, write path ~2.34ms (recoverable ~0.7ms)
+  => the core writes in large blocks, so the stream is already near the floor — the save cost is
+     the core's and there is nothing here to win
+```
+
+The verdict is stated in the output rather than left to whoever is reading the log, and it is
+allowed to say there is nothing to do — a diagnostic that always finds something would send someone
+rewriting a path that is already at the memory system.
 
 ### v0.38.0 — two things that were owed a wire break, taken together (protocol 24 — everyone must update)
 
