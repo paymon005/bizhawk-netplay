@@ -142,7 +142,8 @@ public sealed class HostRebuild
     }
 
     /// <summary>
-    /// Join the sequence at distribution, for a rebuild whose baseline was captured elsewhere.
+    /// Join the sequence at distribution, for a rebuild whose baseline was captured elsewhere, and
+    /// arm the barrier in the same step.
     ///
     /// The post-timeout vacate is the case: a peer dropped, the state and the generation were taken
     /// at that moment, and the survivors have been frozen holding that BEGIN ever since. There is
@@ -151,19 +152,38 @@ public sealed class HostRebuild
     /// point. Its phase claim was taken when the peer dropped, so this adopts that claim rather
     /// than making a second one.
     ///
-    /// False when no rebuild is claimed, or when one is already being driven here.
+    /// <b>Adopting and distributing are one call on purpose.</b> They were two, and the caller
+    /// discarded the first one's refusal and then called the second, which throws unless the first
+    /// succeeded — so a state this could merely decline to enter became an unhandled exception in a
+    /// UI timer instead. Splitting a decision from the action that depends on it, and trusting every
+    /// caller to re-join them, is the same shape of mistake as the resync gate that used to sit
+    /// apart from the counter it decided against.
+    ///
+    /// False — never a throw — when there is no rebuild claimed to adopt, when one is already being
+    /// driven here, or when there is nobody to wait for. The caller has a session to end or a
+    /// rebuild to finish, and either is better than a stack trace.
     /// </summary>
-    public bool TryAdopt(SessionGeneration generation, int stateBytes, int attempt)
+    public bool TryAdoptAndDistribute(SessionGeneration generation, int stateBytes, int attempt,
+        IEnumerable<int> seats)
     {
+        if (seats == null) throw new ArgumentNullException(nameof(seats));
         if (!_phase.IsRebuilding || InFlight) return false;
         if (!generation.IsValid) throw new ArgumentException(
             "a rebuild distributes a real generation", nameof(generation));
+
         _attempt = attempt;
         _generation = generation;
         StateBytes = stateBytes < 0 ? 0 : stateBytes;
         IsSettingsChange = false;
         Step = RebuildStep.Distributing;
-        return true;
+
+        if (TryDistribute(seats)) return true;
+        // Nobody to wait on. Leave nothing half-entered: the caller gets the same false it would
+        // have got from the adopt half, and the sequence is back where it started.
+        Step = RebuildStep.Idle;
+        _generation = default;
+        StateBytes = 0;
+        return false;
     }
 
     /// <summary>

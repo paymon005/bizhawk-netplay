@@ -394,9 +394,8 @@ public class HostRebuildTests
         Assert.True(h.Phase.BeginRebuild(RebuildReason.PeerLoss));
         var generation = h.Generation.Next();
 
-        Assert.True(h.Rebuild.TryAdopt(generation, stateBytes: 4096, h.Attempt));
-        Assert.Equal(RebuildStep.Distributing, h.Rebuild.Step);
-        Assert.True(h.Rebuild.TryDistribute(new[] { 1, 2 }));
+        Assert.True(h.Rebuild.TryAdoptAndDistribute(generation, 4096, h.Attempt, new[] { 1, 2 }));
+        Assert.Equal(RebuildStep.AwaitingApply, h.Rebuild.Step);
 
         Assert.Equal(ApplyAck.Recorded, h.Rebuild.Applied(1, generation.Epoch));
         Assert.Equal(ApplyAck.Complete, h.Rebuild.Applied(2, generation.Epoch));
@@ -405,14 +404,55 @@ public class HostRebuildTests
         Assert.False(h.Phase.IsRebuilding);
     }
 
+    /// <summary>
+    /// A refused adopt returns false rather than throwing, and leaves the sequence exactly where it
+    /// was.
+    ///
+    /// This was two calls — adopt, then distribute — and the caller discarded the first one's
+    /// refusal and called the second, which throws unless the first succeeded. So a state the
+    /// sequence could merely decline to enter became an unhandled exception in a WinForms timer
+    /// callback. Joining them is what makes that unrepresentable; these are the three ways the
+    /// answer is no.
+    /// </summary>
     [Fact]
-    public void AdoptingNeedsAClaimAlreadyTakenAndOneNotAlreadyDriven()
+    public void ARefusedAdoptSaysSoInsteadOfThrowing()
     {
         var h = new RebuildHarness(joiners: 1);
-        // No claim: nothing to adopt.
-        Assert.False(h.Rebuild.TryAdopt(h.Generation.Next(), 1024, h.Attempt));
+
+        // No claim to adopt.
+        Assert.False(h.Rebuild.TryAdoptAndDistribute(h.Generation.Next(), 1024, h.Attempt, new[] { 1 }));
+        Assert.Equal(RebuildStep.Idle, h.Rebuild.Step);
+
+        // Nobody to wait for.
+        Assert.True(h.Phase.BeginRebuild(RebuildReason.PeerLoss));
+        Assert.False(h.Rebuild.TryAdoptAndDistribute(h.Generation.Next(), 1024, h.Attempt,
+            Array.Empty<int>()));
+        Assert.Equal(RebuildStep.Idle, h.Rebuild.Step);
+        Assert.False(h.Rebuild.InFlight);
+        h.Phase.EndRebuild();
+
         // A rebuild already being driven here is not adopted on top of.
         h.Begin();
-        Assert.False(h.Rebuild.TryAdopt(h.Generation.Next(), 1024, h.Attempt));
+        Assert.False(h.Rebuild.TryAdoptAndDistribute(h.Generation.Next(), 1024, h.Attempt, new[] { 1 }));
+        Assert.Equal(RebuildStep.Packing, h.Rebuild.Step);   // ...and the one in flight is untouched
+    }
+
+    /// <summary>
+    /// A refused adopt does not leave the barrier armed behind it.
+    ///
+    /// The empty-seats case enters Distributing before it can discover there is nobody to wait on,
+    /// so it has to unwind. A barrier left armed for a rebuild nobody is driving would make the
+    /// next acknowledgement release something that never started.
+    /// </summary>
+    [Fact]
+    public void ARefusedAdoptLeavesNothingArmed()
+    {
+        var h = new RebuildHarness(joiners: 1);
+        h.Phase.BeginRebuild(RebuildReason.PeerLoss);
+        h.Rebuild.TryAdoptAndDistribute(h.Generation.Next(), 1024, h.Attempt, Array.Empty<int>());
+
+        Assert.False(h.Barrier.IsWaiting);
+        Assert.Equal(0, h.Barrier.Epoch);
+        Assert.False(h.Rebuild.TryBeginResume());
     }
 }

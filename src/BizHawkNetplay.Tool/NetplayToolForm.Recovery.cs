@@ -403,7 +403,15 @@ public sealed partial class NetplayToolForm
             }
             BeginInvokeUi(() =>
             {
-                if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive) return;
+                // The generation check is not decoration, and this continuation was the one place
+                // in the file without it. Packing a heavy state takes hundreds of milliseconds, and
+                // the session can move to a new generation while it runs — at which point the host
+                // has stopped waiting and will discard these bytes on arrival. Sending them anyway
+                // spends up to sixteen megabytes of a JOINER'S upload, which is the scarce
+                // direction, on a transfer known to be worthless, while the resync that replaced it
+                // is coming down the same link.
+                if (!IsConnectionAttemptCurrent(attempt) || !_phase.IsActive
+                    || CurrentGeneration != generation) return;
                 QueueControl(link, ControlMessageType.StateOffer, body);
             });
         })

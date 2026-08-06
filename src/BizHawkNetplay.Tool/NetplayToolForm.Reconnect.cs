@@ -136,9 +136,19 @@ public sealed partial class NetplayToolForm
         var stateBody = ReconnectStateBody(packed, generation, state);
         // Nothing left to capture or pack — the baseline was taken when the peer dropped — but the
         // wait for every survivor and the single release afterwards are the ordinary ones, so this
-        // joins that sequence rather than reimplementing its tail. See HostRebuild.TryAdopt.
-        _rebuild.TryAdopt(generation, state.Length, attempt);
-        _rebuild.TryDistribute(SeatsOf(_peers));
+        // joins that sequence rather than reimplementing its tail. See
+        // HostRebuild.TryAdoptAndDistribute, including why the two halves are one call.
+        //
+        // The refusal is unreachable today: a drop during a rebuild ends the session rather than
+        // beginning a rejoin wait, so reaching here means the phase claim is PeerLoss and nothing
+        // else is driving the sequence. It is checked because the alternative to checking is an
+        // unhandled exception in a timer callback, and because the invariant keeping it unreachable
+        // lives in another file.
+        if (!_rebuild.TryAdoptAndDistribute(generation, state.Length, attempt, SeatsOf(_peers)))
+        {
+            EndSession("could not stand the session back up after the rejoin wait expired");
+            return;
+        }
         foreach (var survivor in _peers)
         {
             QueueControl(survivor, ControlMessageType.SeatVacated, vacatedBody);
