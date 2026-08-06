@@ -110,8 +110,29 @@ public sealed class FakeEmuAdapter : IEmuAdapter
     /// vacuous, since a pool that never hands a buffer back tests nothing.</summary>
     public int StateBuffersAllocated { get; private set; }
 
+    /// <summary>
+    /// Set to model a core whose SAVE fails — out of memory on a big state, a core-level error.
+    /// Return null to save normally, or the exception the core would raise.
+    ///
+    /// The load side has had a fault hook and a named exception since the beginning because "the
+    /// core refused" is treated as a real event there. The save side was assumed infallible, which
+    /// is what left the window this exists to test.
+    /// </summary>
+    public Func<Exception?>? SaveFault { get; set; }
+
+    /// <summary>
+    /// Loads of a handle that had already been released — i.e. returned to the pool and possibly
+    /// handed to a later save.
+    ///
+    /// A detector rather than an assertion, so every test in the suite reports it for free. On the
+    /// real adapter this is silent corruption: the pooled buffer has been refilled with a different
+    /// frame's bytes, so the core is restored to a state nobody asked for and nothing raises.
+    /// </summary>
+    public int LoadsOfReleasedState { get; private set; }
+
     public StateHandle SaveStateToMemory()
     {
+        if (SaveFault?.Invoke() is { } saveFault) throw saveFault;
         SaveCount++;
         SavedAtFrames.Add(_frame);
         byte[] buffer;
@@ -136,15 +157,28 @@ public sealed class FakeEmuAdapter : IEmuAdapter
     public void LoadStateFromMemory(StateHandle handle)
     {
         if (LoadFault?.Invoke(handle) is { } fault) throw fault;
+        // Counted, not thrown: a use-after-release is not loud on the real adapter either, and a
+        // detector that ends the test would only report the first one.
+        if (!LiveStates.Contains(handle)) LoadsOfReleasedState++;
         LoadCount++;
         LoadJumps.Add((_frame, handle.Frame));
         _memory = (byte[])((byte[])handle.Token).Clone();
         _frame = handle.Frame;
     }
 
+    /// <summary>
+    /// Releases of a handle that was already released — i.e. something still held a reference to a
+    /// buffer it had given back.
+    ///
+    /// Silent on the real adapter and here, which is the point of counting it: whoever held that
+    /// reference could equally have LOADED it, and by then the pool has refilled the buffer with
+    /// another frame's bytes.
+    /// </summary>
+    public int ReleasesOfAlreadyReleasedState { get; private set; }
+
     public void ReleaseState(StateHandle handle)
     {
-        if (!LiveStates.Remove(handle)) return;
+        if (!LiveStates.Remove(handle)) { ReleasesOfAlreadyReleasedState++; return; }
         ReleaseCount++;
         if (!(handle.Token is byte[] buffer)) return;
         // Poison before retiring. A released buffer holds no meaningful state, so anything that

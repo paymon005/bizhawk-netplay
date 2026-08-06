@@ -568,10 +568,30 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         return frame - 1 - minRemote;
     }
 
+    /// <summary>
+    /// Snapshot the state entering <paramref name="frame"/>, replacing any snapshot already held
+    /// for it — which a repair does routinely, since it re-snapshots every frame it replays.
+    ///
+    /// <b>The entry is dropped BEFORE the old state is released, and that ordering is the whole
+    /// point.</b> Releasing hands the buffer back to the adapter's pool for the next save to refill.
+    /// If the save below then throws — a core that cannot export, memory it cannot get — the
+    /// dictionary would be left pointing at a handle already sitting in that pool, and the next
+    /// successful save pops it and fills it with a DIFFERENT frame's bytes. A later repair choosing
+    /// this frame as its base would restore that, putting the core somewhere nobody asked for, with
+    /// nothing raised and nothing logged.
+    ///
+    /// Dropping the key first makes the failure "no snapshot for this frame", which every reader
+    /// already handles: <see cref="NearestBaseAtOrBefore"/> walks back for an older base, and
+    /// failing that <see cref="ExecutePendingRollback"/> throws by name. Costs one dictionary
+    /// removal, and nothing at all in the pool — the buffer is still released, just afterwards.
+    /// </summary>
     private void SaveStateFor(int frame)
     {
         if (_states.TryGetValue(frame, out var old))
+        {
+            _states.Remove(frame);
             _adapter.ReleaseState(old);
+        }
         _states[frame] = _adapter.SaveStateToMemory();
         SavesTaken++;
     }
@@ -688,8 +708,10 @@ public sealed class RollbackStrategy : ISyncStrategy, IDisposable
         }
         if (_states.TryGetValue(frame, out var stale))
         {
-            _adapter.ReleaseState(stale);
+            // Dropped before released, for the same reason as SaveStateFor: an entry must never
+            // outlive the state it names, and the release is what ends that state's life.
             _states.Remove(frame);
+            _adapter.ReleaseState(stale);
         }
         SavesElided++;
     }
