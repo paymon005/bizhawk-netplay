@@ -18,7 +18,54 @@ namespace BizHawkNetplay.Core.Session;
 /// </summary>
 public static class SessionAuth
 {
-    private const int Iterations = 100_000; // PBKDF2 stretch: slows an offline password guess to a crawl
+    /// <summary>
+    /// PBKDF2 stretch: slows an offline password guess to a crawl.
+    ///
+    /// It is not free at the honest end either, and the figure is worth knowing: one derivation
+    /// measures ~108ms on .NET 10 and ~1043ms on .NET Framework 4.8, which is what the tool ships
+    /// on. So a join costs about a second of CPU on each side, once — and a HOST pays that for
+    /// every connection attempt that reaches the password step, including the ones that were never
+    /// going to pass it.
+    /// </summary>
+    public const int DefaultIterations = 100_000;
+
+    private static int _iterations = DefaultIterations;
+
+    /// <summary>
+    /// The stretch actually used. A seam for tests and nothing else.
+    ///
+    /// The suite runs this derivation about ninety times, and at the shipping cost that is a minute
+    /// and a half of pure CPU on net48 — enough that a five-second handshake budget became a race
+    /// against it, which is what
+    /// <c>TwoPlayerHandshake_WaitsForPostApplyCallbackBeforeReady</c> was losing one run in three.
+    /// The iteration count is a cost parameter; nothing about the protocol's correctness depends on
+    /// its value, so the suite turns it down once at start-up and one test pins the shipping figure
+    /// by passing it explicitly.
+    ///
+    /// <b>Settable once, before anything uses it.</b> This is process-wide state and xUnit runs
+    /// collections in parallel, so a caller that lowered it, did some work and put it back would
+    /// make some other collection's host and joiner derive at different costs and reject each
+    /// other's proof — a race that presents as an unrelated test failing an equality assertion.
+    /// The explicit-cost overload of <see cref="ProofPairWithKey(int, string, string, string,
+    /// byte[], byte[])"/> exists so nobody needs to.
+    /// </summary>
+    internal static int Iterations
+    {
+        get => _iterations;
+        set
+        {
+            if (_lowered)
+                throw new InvalidOperationException(
+                    "the KDF cost is settable once, at start-up. Changing it while a session — or a " +
+                    "parallel test collection — is deriving makes two peers disagree about a proof " +
+                    "neither of them got wrong. Pass the cost explicitly instead.");
+            _lowered = true;
+            _iterations = value < 1 ? 1 : value;
+        }
+    }
+
+    private static bool _lowered;
+
     private const int NonceBytes = 16;
 
     public const string RoleHost = "host";
@@ -60,7 +107,7 @@ public static class SessionAuth
     public static string Proof(string? password, string role, byte[] hostNonce, byte[] joinNonce)
     {
         var salt = Salt(hostNonce, joinNonce);
-        return ProofFromKey(DeriveKey(password, salt), role, salt);
+        return ProofFromKey(DeriveKey(password, salt, Iterations), role, salt);
     }
 
     /// <summary>
@@ -88,10 +135,25 @@ public static class SessionAuth
     /// <see cref="ControlChannel.EnableIntegrity"/>, and should clear its copy afterwards.
     /// </summary>
     public static (string mine, string peers, byte[] key) ProofPairWithKey(
-        string? password, string myRole, string peerRole, byte[] hostNonce, byte[] joinNonce)
+        string? password, string myRole, string peerRole, byte[] hostNonce, byte[] joinNonce) =>
+        ProofPairWithKey(Iterations, password, myRole, peerRole, hostNonce, joinNonce);
+
+    /// <summary>
+    /// The same, at an explicitly named cost.
+    ///
+    /// The one caller is the test that proves the proofs still verify at the SHIPPING iteration
+    /// count while the rest of the suite runs at a cheap one. It exists as a parameter rather than
+    /// as "set the static, do the work, set it back" because that is a race by construction: the
+    /// static is process-wide and xUnit runs collections in parallel, so a test that flipped it
+    /// would make some other collection's host and joiner derive at different costs and fail each
+    /// other's proof. Which is exactly what happened the first time this was written.
+    /// </summary>
+    internal static (string mine, string peers, byte[] key) ProofPairWithKey(
+        int iterations, string? password, string myRole, string peerRole,
+        byte[] hostNonce, byte[] joinNonce)
     {
         var salt = Salt(hostNonce, joinNonce);
-        var key = DeriveKey(password, salt);
+        var key = DeriveKey(password, salt, iterations);
         return (ProofFromKey(key, myRole, salt), ProofFromKey(key, peerRole, salt), key);
     }
 
@@ -118,9 +180,9 @@ public static class SessionAuth
         return salt;
     }
 
-    private static byte[] DeriveKey(string? password, byte[] salt)
+    private static byte[] DeriveKey(string? password, byte[] salt, int iterations)
     {
-        using var kdf = new Rfc2898DeriveBytes(password ?? "", salt, Iterations);
+        using var kdf = new Rfc2898DeriveBytes(password ?? "", salt, iterations);
         return kdf.GetBytes(32);
     }
 

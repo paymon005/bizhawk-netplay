@@ -137,7 +137,20 @@ public class HandshakeTests
                     Assert.True(releaseApply.Wait(TimeSpan.FromSeconds(5)));
                 }));
 
-            Assert.True(callbackEntered.Wait(TimeSpan.FromSeconds(5)));
+            // On a failure, say which side is stuck and what the pool looked like. The 5s budget
+            // here once lost a race against the handshake's own PBKDF2 (see TestProcessSetup), and
+            // the bare Assert.True that reported it named nothing — which is why it was misdiagnosed
+            // as thread starvation twice before anyone measured.
+            if (!callbackEntered.Wait(TimeSpan.FromSeconds(5)))
+            {
+                ThreadPool.GetAvailableThreads(out int freeWorkers, out int freeIo);
+                throw new Xunit.Sdk.XunitException(
+                    "beforeReady never fired within 5s. " +
+                    $"host={host.Status}/{host.Exception?.GetBaseException().Message ?? "no fault"} " +
+                    $"client={client.Status}/{client.Exception?.GetBaseException().Message ?? "no fault"} " +
+                    $"free pool threads={freeWorkers}/{freeIo}, " +
+                    $"kdf iterations={SessionAuth.Iterations}");
+            }
             Assert.False(host.IsCompleted); // host cannot observe READY until application returns
             Assert.False(client.IsCompleted);
 
