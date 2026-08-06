@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.34.0 – v0.35.0 | **23** | *v0.35.0 changes no wire format and mixes freely with v0.34.0 — the first release in this table that shares a protocol with its predecessor, so nobody has to update in step.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
+| v0.34.0 – v0.36.0 | **23** | *v0.35.0 and v0.36.0 change no wire format and mix freely with v0.34.0 — the first releases in this table to share a protocol with their predecessor, so nobody has to update in step. One caveat if your group is mixed: a v0.36.0 host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back. See the v0.36.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
 | v0.31.0 | 20 | A session outlives its players, a dead leg gets relayed live, and every post-auth control frame is authenticated. SeatVacated (23) and InputOutage (24) are new control types, WELCOME carries a `vacated=` line, and every frame after AUTH bears a truncated HMAC bound to its direction and position. A v19 peer sends none of it and would fail every integrity check, so the version refusal is doing exactly its job. |
@@ -30,7 +30,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 ## Notable releases
 
-### Unreleased — deferring to the majority is now the default (protocol 23, unchanged)
+### v0.36.0 — deferring to the majority is the default, and two silent corruptions closed (protocol 23, unchanged)
 
 **A host that gets outvoted on a desync now adopts the majority's state by default**, where it
 previously kept its own unless a checkbox was ticked. The Diagnostics tab still has the switch;
@@ -49,6 +49,32 @@ for.
 the donor timeout before falling back to its own — up to about 90 seconds on N64, playing diverged.
 Everyone on v0.35.0 or later is unaffected. If your group is mixed, either update together or untick
 the box until you have.
+
+**A stranger can no longer hold the lobby door shut.** Checking a joiner's password costs the host a
+PBKDF2 derivation — about a second on the .NET Framework build this ships as — and the accept loop
+is serial, so anyone who could reach the port could keep it busy without ever knowing the password.
+Real players got nothing. Attempts are now metered per address before the check, where a refusal
+costs microseconds: ten back to back, then one every five seconds, and getting in forgives what it
+took. Someone who mistyped four times is a player, not a threat.
+
+**Two windows where a savestate could be silently corrupted.** Both were found by asking what the
+bookkeeping holds after something fails partway, and neither had a reachable trigger — but both
+would have presented as an unexplained desync rather than as an error.
+
+- The rollback ring released the snapshot it was replacing *before* taking the new one, so a save
+  that threw left the ring naming a buffer already back in the pool. The next save refills that
+  buffer with a different frame's bytes.
+- The savestate pool had no guard against the same buffer being returned twice, which would put it
+  in the pool twice and hand it to two owners. The test double had always refused a double return
+  while the shipping pool did not — so the whole suite was exercising something more forgiving than
+  the real thing.
+
+**Documentation that was wrong, not merely stale.** KNOWN-ISSUES said majority recovery was closed
+in v0.34.0; it did not work until v0.35.0, and that has a security half worth stating exactly:
+v0.34.0 and earlier, no host loads a peer's savestate; v0.35.0, only a host that ticked the box;
+v0.36.0 and later, any host that has not unticked it. The README had been telling people
+"v0.32.0 uses protocol 21" for three releases, under a heading promising everyone must run the same
+version — which, since v0.35.0, is no longer even true.
 
 ### v0.35.0 — the feature that could not run, and six behind it (protocol 23, unchanged)
 

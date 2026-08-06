@@ -55,11 +55,15 @@ same files.
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
 friends usually have to update too — but not always, and the release notes always say which.
 
-**v0.34.0 and v0.35.0 both use protocol 23, so they mix freely** — v0.35.0 is a correctness release
-that changes no wire format, and you can take it without waiting for anyone else. The last break was
-at v0.34.0, which added per-disc identity and majority-aware recovery; a v22 peer sends neither. See
-[CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what and who can play with
-whom.
+**v0.34.0, v0.35.0 and v0.36.0 all use protocol 23, so they mix freely** — the last two change no
+wire format, and you can take them without waiting for anyone else. The last break was at v0.34.0,
+which added per-disc identity and majority-aware recovery; a v22 peer sends neither.
+
+One caveat for a mixed group: a v0.36.0 host defers to the majority on a desync by default, and a
+v0.34.0 peer cannot answer that request — so the host waits out its timeout before recovering from
+its own state instead. Update together, or untick "Defer to the majority on a desync" until you
+have. See [CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what and who can
+play with whom.
 
 A version mismatch is refused at the handshake with a clear message. That is the intended behaviour,
 not a fault — the alternative is a session that appears to work and silently loses input.
