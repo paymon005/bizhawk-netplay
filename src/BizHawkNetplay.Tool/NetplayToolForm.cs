@@ -145,8 +145,36 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     /// different decision — whether to START another frame in this tick — and a repair already
     /// running is not gated by it. Clamping this to that would cost N64 rollback entirely, for a
     /// conflict that does not exist.
+    ///
+    /// <b>Adjustable since v0.39.0, and this is the constant a heavy core is short on.</b> Worked
+    /// against terms measured on real N64 hardware (see <c>N64BudgetTests</c>): at two periods the
+    /// verdict is depth 2 at both 320x240 and 800x600, one short of the three rollback needs; at
+    /// three it is depth 4 and 3, and both qualify. Nothing measured has to change — the save is
+    /// already one memcpy, the load and frame are the core's. So the ceiling on N64 rollback is
+    /// this number and not any cost, which is why it is now a control rather than a constant.
+    ///
+    /// It raises <see cref="MaxFramesPerTick"/> with it, because of the invariant above. The price
+    /// is the worst case: a repair may spend a third frame period, so the deepest correction gets
+    /// deeper, and the tick holds the message loop longer while it happens. Whether that trade is
+    /// worth taking is a question about how it sounds and feels, which is why it is a setting
+    /// someone can A/B in one session rather than a value chosen here from arithmetic.
     /// </summary>
-    private const double RepairBudgetFrames = MaxFramesPerTick;
+    private double RepairBudgetFrames => _framePeriodsPerTick;
+
+    /// <summary>
+    /// Frame periods one tick may run and one repair may spend. Read at probe time and at session
+    /// start; changing it mid-session does nothing until the next one, which is why the control
+    /// says so.
+    ///
+    /// Note for a mixed group: the advertised depth is negotiated DOWN to whichever peer reports
+    /// least, so raising this on one machine alone changes nothing about the session. Everyone who
+    /// wants the depth has to raise it.
+    /// </summary>
+    private int _framePeriodsPerTick = DefaultFramePeriodsPerTick;
+
+    /// <summary>What shipped through v0.38.x, and still the default: the conservative choice, since
+    /// raising it trades a deeper worst-case hitch for prediction depth.</summary>
+    private const int DefaultFramePeriodsPerTick = 2;
 
     /// <summary>At or below this ring depth, rollback is working but has little room — worth saying
     /// so once, since the user chose a mode whose whole point is hiding latency.</summary>
@@ -425,11 +453,13 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
 
     private readonly System.Diagnostics.Stopwatch _paceClock = new();
     private double _frameMs = 1000.0 / 60.0; // console frame period, drives real-time pacing
-    private const int MaxFramesPerTick = 2;  // WinForms callbacks can arrive ~25ms apart; one frame caps near 40fps
+    // Frames one callback may run. WinForms callbacks can arrive ~25ms apart, and one frame caps
+    // near 40fps — hence at least two. Now session-scoped rather than constant: see
+    // RepairBudgetFrames, which must move with it.
     private const double FrameTickWorkBudgetMs = 8.0; // floor for fast cores; see TickBudgetMs
     // The pacing clock's arithmetic: due time, catch-up admission, budget, rebase. See FrameSchedule.
     private readonly FrameSchedule _schedule =
-        new(1000.0 / 60.0, FrameTickWorkBudgetMs, MaxFramesPerTick);
+        new(1000.0 / 60.0, FrameTickWorkBudgetMs, DefaultFramePeriodsPerTick);
     // Last seen state of EmuHawk's sound device, so the tick can report the transition rather
     // than the aftermath. Starts true: a session that never stops it should say nothing.
     private bool _audioDevWasUp = true;

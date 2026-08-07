@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.38.0 – v0.38.2 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.38.0 – v0.39.0 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
 | v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
@@ -30,6 +30,48 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.39.0 — the constant that was holding N64 back is now a setting (protocol 24, unchanged)
+
+**Mixes freely with everything on protocol 24.** No wire change. One new control, default unchanged.
+
+Three releases of measuring where N64's frame budget goes ended somewhere unexpected: **the binding
+constraint is not any measured cost. It is a policy constant.**
+
+The savestate is one `memcpy` and cannot be improved. The load and the frame are the core's. But run
+the terms real hardware measured through the depth solver and the answer falls out:
+
+| frame periods per tick / repair | 320×240 | 800×600 |
+|---|---|---|
+| **2** (what shipped through v0.38.x) | depth 2 | depth 2 |
+| **3** | **depth 4** | **depth 3** |
+
+Rollback needs depth 3. **At three frame periods N64 qualifies at both resolutions with nothing
+measured changing.** The Diagnostics tab now has a spinner for it, 1 to 4, defaulting to the 2 that
+has always shipped.
+
+**Why it is one number and not two.** It sets how many frame periods a tick may run *and* how many
+one rollback repair may spend, and those are tied deliberately: a repair spending N periods leaves N
+frames due when it returns, and a tick clears at most the cap. At equality the next tick clears the
+debt exactly; above it the arrears grow until a rebase discards them in a lump, which reads as
+"CPU-bound" for a core comfortably inside its budget. Raising one requires raising the other.
+
+**The cost, plainly.** The worst case gets worse: the deepest repair may spend an extra frame period
+and the window is held that much longer while it runs. How often that bites depends on how often
+predictions are contradicted, which is a property of your link. Whether the trade is worth taking is
+something you hear rather than something arithmetic settles — which is exactly why this is a setting
+you can A/B in one sitting rather than a value chosen here.
+
+**How to use it.** Run the Capability Probe at 2, then at 3, and watch the depth move. Then play
+both. It takes effect on the *next* session, and **every player has to raise it** — the advertised
+depth is negotiated down to whoever reports least, so one machine alone changes nothing.
+
+Two corrections to the record while doing this. The margins on the measured terms are smaller than
+previously claimed: at 320×240, reaching depth 3 needs the save 0.91 ms cheaper (23%), or the frame
+0.91 ms (21%), or the load 2.72 ms (39%). So the earlier "no single term could do it" was wrong —
+what makes them unavailable is their owner, not their size. And the tick budget now scales with the
+cap, because the gate asks whether two more frames fit the remaining budget; a budget fixed at 1.7
+periods would have refused the third frame and quietly undone the raise.
 
 ### v0.38.2 — the write-path answer, and the measurement that nearly got it wrong (protocol 24, unchanged)
 

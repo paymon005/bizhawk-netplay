@@ -388,6 +388,10 @@ public sealed partial class NetplayToolForm
         _pingClock.Restart();
         _paceClock.Restart();
         _schedule.FrameMs = _frameMs;
+        // Taken at session start alongside the frame period, and for the same reason: both are
+        // decided once the core is known and neither may change under a running session. The repair
+        // budget reads the same field, so the invariant they share cannot drift apart.
+        _schedule.MaxFramesPerTick = _framePeriodsPerTick;
         _schedule.Restart(0);
         _lastUiRefreshMs = double.NegativeInfinity;
         _lastSlowTickLogMs = double.NegativeInfinity;

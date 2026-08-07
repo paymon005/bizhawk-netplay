@@ -20,6 +20,7 @@ public sealed partial class NetplayToolForm
     private CheckBox _aboveNativeCheck = null!;
     private CheckBox _deferToMajorityCheck = null!;
     private CheckBox _verboseCheck = null!;
+    private NumericUpDown _framePeriodsBox = null!;
 
     // ------------------------------------------------------------------ persisted settings
 
@@ -41,6 +42,11 @@ public sealed partial class NetplayToolForm
                 _netcodeCombo.SelectedIndex = _settings.Netcode;
             if (_settings.InputSource >= 0 && _settings.InputSource < _inputSourceCombo.Items.Count)
                 _inputSourceCombo.SelectedIndex = _settings.InputSource;
+            _framePeriodsBox.Value = Clamp(_settings.FramePeriodsPerTick,
+                (int)_framePeriodsBox.Minimum, (int)_framePeriodsBox.Maximum);
+            // The box is the record; mirror it into the field the probe and the session read, since
+            // the ValueChanged handler is suppressed while settings are loading.
+            _framePeriodsPerTick = (int)_framePeriodsBox.Value;
             RefreshIpDropdown();
             if (_settings.RecentIps.Count > 0) _ipBox.Text = _settings.RecentIps[0]; // last host, ready to re-join
         }
@@ -100,6 +106,7 @@ public sealed partial class NetplayToolForm
         _settings.AutoDelayMax = (int)_autoDelayMaxBox.Value;
         _settings.Netcode = _netcodeCombo.SelectedIndex;
         _settings.InputSource = _inputSourceCombo.SelectedIndex;
+        _settings.FramePeriodsPerTick = (int)_framePeriodsBox.Value;
         _settings.Save();
     }
 
@@ -342,6 +349,38 @@ public sealed partial class NetplayToolForm
             "Reports every distinct value that actually reached the core, so a stick\r\n" +
             "that jumps from small values straight to full deflection shows the gap.");
 
+        // The one tuning knob a heavy core is actually short on. See RepairBudgetFrames: at two
+        // periods real N64 measures depth 2, one short of qualifying; at three it reaches 3-4 and
+        // qualifies, with nothing measured changing. Put here rather than on Connection because the
+        // right value is found by listening to it, not by choosing it — probe at 2, probe at 3, play
+        // both.
+        var repairLabel = new Label
+        { Text = "Frame periods per tick / repair:", AutoSize = true, Location = new Point(12, 116) };
+        _framePeriodsBox = new NumericUpDown
+        {
+            Minimum = 1, Maximum = 4, Value = DefaultFramePeriodsPerTick,
+            Location = new Point(196, 113), Width = 46,
+        };
+        _framePeriodsBox.ValueChanged += (_, __) =>
+        {
+            _framePeriodsPerTick = (int)_framePeriodsBox.Value;
+            SaveSettingsFromUi();
+        };
+        _tips.SetToolTip(_framePeriodsBox,
+            "How many frame periods one tick may run, and one rollback repair may spend.\r\n" +
+            "\r\n" +
+            "2 is what earlier versions shipped. On N64 that measures a prediction depth of\r\n" +
+            "2 — one short of the 3 rollback needs, so it falls back to lockstep. At 3 the\r\n" +
+            "same machine reaches depth 3-4 and qualifies, with nothing else changed.\r\n" +
+            "\r\n" +
+            "The cost is the worst case: the deepest repair may spend an extra frame period,\r\n" +
+            "and the window is held that much longer while it runs. Whether that is worth it\r\n" +
+            "is something you hear, not something arithmetic decides.\r\n" +
+            "\r\n" +
+            "Run the Capability Probe after changing it to see the depth move. Takes effect\r\n" +
+            "on the NEXT session, and every player has to raise it — the depth is negotiated\r\n" +
+            "down to whoever reports least.");
+
         _saveWritePathButton = new Button
         { Text = "Savestate Cost", Location = new Point(432, 12), Width = 130 };
         _saveWritePathButton.Click += (_, __) => RunSaveWritePathTest();
@@ -447,6 +486,7 @@ public sealed partial class NetplayToolForm
         page.Controls.AddRange(
         [
             _probeButton, _testInputButton, _analogWatchButton, _saveWritePathButton,
+            repairLabel, _framePeriodsBox,
             _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
             simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _unpausedClockCheck,
             _aboveNativeCheck,

@@ -281,6 +281,42 @@ And `Math.Max(0, a - b)` turned a broken measurement into a confident number. Cl
 decomposition at zero is how a measurement lies quietly; it now reports that it could not separate
 the terms, and says why.
 
+## 2026-08-07 — the constraint is a policy constant, and it is now a setting (v0.39.0)
+
+Three sessions of measuring where N64's budget goes ended somewhere none of it predicted. Save,
+load and frame are all at or near their floors — but the depth verdict is not decided by any of
+them. Run the measured terms through `SolveMaxDepth` and the binding constraint is **frame periods
+per tick**, which is a policy choice:
+
+| frame periods | 320x240 | 800x600 |
+|---|---|---|
+| 2 (shipped through v0.38.x) | depth 2 | depth 2 |
+| 3 | **depth 4** | **depth 3** |
+
+Rollback needs 3. At three periods N64 qualifies at both resolutions with nothing measured changing.
+`N64BudgetTests` pins the arithmetic against the measured terms; the Diagnostics tab has the
+control, defaulting to the 2 that always shipped.
+
+**Two things to keep from this.**
+
+*One number, not two.* It is also the repair budget, and the coupling is deliberate rather than
+accidental reuse — I assumed the latter and was wrong. A repair spending N frame periods leaves N
+frames due when it returns and a tick clears at most the cap, so at equality the debt clears exactly
+and above it arrears accumulate until a rebase discards them, presenting as "CPU-bound" for a core
+inside its budget. The tick budget had to be generalised too (`(cap - 0.3) × frameMs`, exactly 1.7
+at a cap of 2), because the gate asks whether two more frames fit the remaining budget and a fixed
+1.7 would have refused the third frame and silently undone the raise.
+
+*The margins were smaller than claimed.* I asserted no single measured term could buy the depth on
+its own. The solver disagreed: at 320x240 it needs the save −0.91ms (23%), the frame −0.91ms (21%),
+or the load −2.72ms (39%). What makes them unavailable is their owner, not their size. Worth
+recording because the wrong version of that claim would have closed off a line of work on a
+misreading — the third time in this file that a confident verdict has needed correcting by
+arithmetic somebody actually ran.
+
+**Untested.** Whether a three-period worst case is audible is the open question, and it is not one
+this repository can answer.
+
 ## ANSWERED 2026-08-06 — the probe is stable now, and the binding term is the LOAD
 
 **Ten consecutive probes returned maxDepth=2 every time**, five at 320x240 and five at 800x600. That

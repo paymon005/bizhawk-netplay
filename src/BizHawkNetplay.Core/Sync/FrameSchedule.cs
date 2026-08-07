@@ -30,7 +30,7 @@ public sealed class FrameSchedule
     private const double LaterFrameToleranceMs = 0.25;
 
     private readonly double _minBudgetMs;
-    private readonly int _maxFramesPerTick;
+    private int _maxFramesPerTick;
     private double _frameMs;
     private double _nextDueMs;
     private double _recentCoreFrameMs;
@@ -51,6 +51,23 @@ public sealed class FrameSchedule
         set { if (value > 0) _frameMs = value; }
     }
 
+    /// <summary>
+    /// Most frames one callback may run, and — because the caller ties the two — how many frame
+    /// periods one rollback repair may spend.
+    ///
+    /// Settable, like <see cref="FrameMs"/>, because it is the same kind of thing: a session-scoped
+    /// figure decided once the core and the machine are known, not a property of the schedule. It
+    /// is the knob a heavy core is short on: a repair spending N periods leaves N frames due when
+    /// it returns and a tick clears at most this many, so the two must move together or the arrears
+    /// grow until a rebase discards them — which reads as "CPU-bound" for a core comfortably inside
+    /// its budget. Raising it buys prediction depth and costs a deeper worst-case hitch.
+    /// </summary>
+    public int MaxFramesPerTick
+    {
+        get => _maxFramesPerTick;
+        set { if (value >= 1) _maxFramesPerTick = value; }
+    }
+
     /// <summary>Wall-clock reading at which the next frame becomes due.</summary>
     public double NextDueMs => _nextDueMs;
 
@@ -67,8 +84,14 @@ public sealed class FrameSchedule
     /// <c>elapsed + 2·coreCost &lt; budget</c>, so a flat 8ms made catch-up unreachable for any core
     /// costing more than ~4ms a frame, and the debt it could not repay accumulated until a rebase
     /// discarded it in a lump — which reads as "CPU-bound" for a core comfortably inside budget.
+    ///
+    /// Scales with <see cref="MaxFramesPerTick"/> too, and must: the gate below asks whether two
+    /// more frames fit the REMAINING budget, so a budget fixed at 1.7 periods would refuse the
+    /// third frame of a three-frame tick and quietly undo the raise. The 0.3 is what keeps this
+    /// exactly 1.7 periods at the cap of two, which is the figure the paragraph above was written
+    /// against — close enough to a frame period that the window never feels unresponsive.
     /// </summary>
-    public double BudgetMs => Math.Max(_minBudgetMs, 1.7 * _frameMs);
+    public double BudgetMs => Math.Max(_minBudgetMs, (_maxFramesPerTick - 0.3) * _frameMs);
 
     /// <summary>
     /// How early the FIRST frame of a callback may run. Against a strict due-time, an irregular

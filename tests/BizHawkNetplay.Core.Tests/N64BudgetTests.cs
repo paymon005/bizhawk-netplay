@@ -55,11 +55,15 @@ public class N64BudgetTests
     /// <b>Allowing a repair three frame periods instead of two qualifies it, at both
     /// resolutions.</b>
     ///
-    /// This is the whole finding. The repair budget is <c>MaxFramesPerTick × frame period</c>, and
-    /// MaxFramesPerTick is a constant chosen for how many frames a catch-up burst may run — it was
-    /// reused as the repair ceiling. Nothing measured has to change for N64 to qualify; the
-    /// question is only whether a deeper worst-case repair is a price worth paying, which is a
-    /// judgement about hitches and not an arithmetic fact.
+    /// This is the whole finding. Nothing measured has to change for N64 to qualify; the question
+    /// is only whether a deeper worst-case repair is a price worth paying, which is a judgement
+    /// about hitches and not an arithmetic fact — hence a setting rather than a new constant.
+    ///
+    /// The repair budget is <c>frame periods per tick × frame period</c>, and the two halves of
+    /// that are tied deliberately rather than by accident: a repair spending N periods leaves N
+    /// frames due when it returns, and a tick clears at most the cap, so at equality the next tick
+    /// clears the debt exactly and above it the arrears grow until a rebase discards them. Raising
+    /// one therefore has to raise the other, which is why the control is one number.
     /// </summary>
     [Fact]
     public void AThreeFrameRepairBudgetWouldQualifyN64AtBothResolutions()

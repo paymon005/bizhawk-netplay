@@ -51,7 +51,7 @@ public sealed partial class NetplayToolForm
     ///
     /// 1.7 frame periods (~28ms at 60Hz) lets exactly one catch-up frame through while staying
     /// close enough to a frame period that the window never feels unresponsive. The hard
-    /// <see cref="MaxFramesPerTick"/> cap, the pessimistic <c>_recentCoreFrameMs</c> estimate and
+    /// per-tick frame cap, the pessimistic <c>_recentCoreFrameMs</c> estimate and
     /// the mid-burst audio pump are what keep that safe; this only stops the budget from
     /// forbidding the burst outright.
     /// </summary>
