@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.38.0 – v0.39.1 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.38.0 – v0.40.0 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
 | v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
@@ -30,6 +30,48 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.40.0 — netplay stops looking slower than single player (protocol 24, unchanged)
+
+**Mixes freely with everything on protocol 24.** No wire change, so a v0.38.x, v0.39.0 or v0.39.1
+peer plays with this build unchanged — but the two machines will present at different rates until
+both update, because the change is entirely local to how each one drives its own frame clock.
+
+**The complaint that netplay "runs slower" was never emulation — it was presentation, and it had an
+exact mechanism.** A session held EmuHawk paused, and BizHawk's `Throttle.Step` opens its paused
+branch with an unconditional `Thread.Sleep(15)`. One picture is presented per stepping tick, so that
+sleep is a hard ceiling near 66 ticks a second against a 60fps console. Real N64 sessions measured
+`tick 40-57/s` and `present 40-57` while `adv` — frames actually emulated — read a healthy 60.
+Nothing was dropping inputs and nothing was out of sync. Frames were being emulated and never shown.
+
+Sessions now run with EmuHawk **unpaused**, which puts the loop on `SpeedThrottle` instead: a
+phase-locked, drift-corrected wait derived from the core's own vsync rate. `BlockFrameAdvance` is
+still what keeps EmuHawk's loop off the core, exactly as before — the pause was never the guard, and
+the drift check still names any frame that slips through by number.
+
+A 2P LAN session on N64 with both peers logging, three back-to-back games with the middle one on the
+old clock:
+
+| | Paused | Unpaused |
+|---|---|---|
+| tick / present | 37-57 / 30-56 | 60 / 60 |
+| judder | 43-100% | 0-13% |
+
+Every checksum agreed in all three games and the drift check never fired.
+
+**`Legacy paused clock`** on the Diagnostics tab is the way back, and it is worth knowing about: the
+mode changes when EmuHawk's own loop runs, which is a large lever, and the longest continuous run on
+the new clock in any log so far is about 75 seconds. If a session ever turns choppy or ends on a
+drift-check message, tick that box first — it bisects the question in one game. The log says which
+clock a session took either way.
+
+**Also: the status bar stopped costing 2ms of every frame budget.** The line under the tabs is
+rewritten four times a second forever, and assigning a WinForms `Label.Text` writes through to
+`SetWindowText`, whose default handling raises an accessibility name-change event to every hooked
+overlay, capture tool and screen reader in the process. Measured at 1.8-3.2ms per refresh on the
+thread that owns the frame clock, worst case 5.0ms. It is owner-drawn now: the text lands in a field
+and the repaint happens when the message loop is idle. Accessibility still reads the line when it
+asks — it is simply no longer pushed a notification four times a second.
 
 ### v0.39.1 — the 7800 was refused for a setting it does not have (protocol 24, unchanged)
 
