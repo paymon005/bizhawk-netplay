@@ -11,7 +11,7 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.38.0 – v0.39.0 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.38.0 – v0.39.1 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
 | v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
@@ -30,6 +30,38 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.39.1 — the 7800 was refused for a setting it does not have (protocol 24, unchanged)
+
+**Mixes freely with everything on protocol 24.** No wire change. A refusal that should never have
+fired stops firing.
+
+Hosting Atari 7800 was refused outright, with a message telling the player to open the core's sync
+settings and turn off "Use Real Time" — **a setting A7800Hawk does not have, on a console with no
+real-time clock to seed.** There was no way out of it: the remedy named did not exist.
+
+The determinism gate was right to exist and wrong about this core. A7800Hawk declares
+`DeterministicEmulation` as an auto-property and never assigns it — not in its constructor, not from
+sync settings, not from EmuHawk — so it sits at C#'s default of `false` for the life of the core
+while nothing ever reads it back. That is the same inert flag Mupen64Plus was already exempted for,
+reached by accident rather than on purpose.
+
+**Six other cores share that signature** and were refused for the same non-reason: `O2Hawk`
+(Odyssey 2, also two-player), `VectrexHawk`, and the `GBHawkLink` / `3x` / `4x` / `GGHawkLink` link
+cores. GBHawk is the tell — it sets the flag true in its constructor and always worked, and the Link
+variants are the same code with that line missing. All seven are exempt now, **listed by name and
+each read against the 2.11.1 source** rather than pattern-matched on "Hawk", so the next core to
+report false still has to be looked at before it is trusted. Libretro and the cores that genuinely
+seed a clock from `DateTime.Now` are refused exactly as before.
+
+`CPCHawk` and `ZXHawk` stay refused, correctly — they really do derive the flag from a sync setting —
+but they were being pointed at the wrong one. Theirs is called **"Deterministic Emulation"** and
+defaults to on, so the refusal names that for them and keeps "Use Real Time" for everyone else.
+
+Worth recording what the gap cost. v0.29.0 taught the tool the 7800's difficulty switch and stopped
+counting its unplugged port as a usable seat; v0.33.0 then made the console unhostable. The seats
+were fixed and the door was shut in the same month, and nothing caught it until someone sat down to
+play.
 
 ### v0.39.0 — the constant that was holding N64 back is now a setting (protocol 24, unchanged)
 
