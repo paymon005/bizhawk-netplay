@@ -651,9 +651,10 @@ path imports unconditionally because by then the states genuinely do differ. Tha
 performance feature wearing a security fix's clothes, bought on the most delicate path in the
 codebase. Worth revisiting on its own merits as an optimisation; not worth claiming as this.
 
-**KI-14 (validation) — divergence learning replaced the VI-register guess; two machines above
-native is what remains.** The v0.30 exclusion read `VI_ORIGIN` and skipped the buffer being
-scanned out — structurally insufficient, since the plugin writes back to the buffer it just
+**KI-14 (validation) — divergence learning replaced the VI-register guess; validated on two
+machines above native 2026-08-09 (v0.39.0), on the no-write-back branch.** The v0.30 exclusion
+read `VI_ORIGIN` and skipped the buffer being scanned out — structurally insufficient, since the
+plugin writes back to the buffer it just
 *rendered* (the other one, in any double-buffered game), and the render target's address lives
 inside the plugin where no register exposes it. v0.32.0 measures instead of guessing: right after
 every rebuild the peers are byte-identical, so buckets of memory that disagree over the next three
@@ -661,14 +662,23 @@ checksum boundaries can only be machine-produced, and the host publishes their u
 (see `DivergenceLearner`; the resync loop is broken by treating learn-window mismatches as the
 measurement). The VI span survives only as the pre-learn default.
 
-None of that is yet a two-machine N64 session at 800×600. *What to read off the first one:*
-- **The learn round's verdict line** — `measured which memory is machine-produced: N% …` is the
-  mechanism firing; `all 256 buckets agreed` above native would mean the write-back never happened
-  (plugin setting); `refused a mask: N%` means something far beyond a framebuffer diverged.
-- **Whether checksums agree after the mask's switch-over frame.** They never did before, at any
+The first two-machine N64 session at 800×600 ran 2026-08-09 on v0.39.0: Mupen64Plus + Rice
+(`InN64Resolution=False`), host at 800×600, ~9 minutes / 33,000+ frames over the internet at
+~24-30ms RTT (lockstep, delay 4). Read against the three things this entry asked of it:
+- **The learn round's verdict line:** `all 256 buckets agreed across 3 boundaries` on every learn
+  round — the write-back never happened with this game/plugin config, so nothing in RDRAM was
+  machine-produced.
+- **Whether checksums agree:** every checksum of the session agreed. They never did before, at any
   point, above native.
-- **The checksum line's `-maskNr/NKiB` tag**, which names how much is being skipped — a framebuffer
-  should read as a few ranges totalling ~2-15% of RDRAM.
+- **The checksum line's mask tag:** only the pre-learn default VI span was ever excluded
+  (`-fb@3946KiB+148KiB`, ~1.8% of RDRAM); no learned mask was published because there was nothing
+  to learn.
+
+Two caveats keep this from a full close. The joiner's resolution is not a sync setting, so only the
+host's 800×600 is known from the log. And the outcome observed was the *no-write-back* branch — a
+game/plugin combo that does resolve its framebuffer into RDRAM, where the learned mask actually has
+to fire and the masked-region trade in [docs/n64-tuning.md](docs/n64-tuning.md) becomes real,
+remains unexercised.
 
 **KI-15 — CLOSED in v0.32.0.** The bucketed divergence map shipped exactly as designed here:
 256-bucket vectors exchanged over the first three boundaries of every generation, the learned mask

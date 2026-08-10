@@ -59,9 +59,12 @@ players must match the setting — a peer that declines keeps hashing everything
 desync against one that does not, with a log line saying so.
 
 **Native resolution is still the setting that needs no trade**, and the one with fifteen thousand
-frames of evidence behind it. Above native with the opt-in has not yet been confirmed on two
-machines at all; KI-14 in [KNOWN-ISSUES.md](../KNOWN-ISSUES.md) lists what to read off the first
-session that tries it.
+frames of evidence behind it. Above native with the opt-in now has its first two-machine
+confirmation (2026-08-09, v0.39.0, Rice at 800×600 on the host: 33,000+ internet frames with every
+checksum agreeing, and every learn round reporting `all 256 buckets agreed` — the write-back never
+happened, so only the small default framebuffer span was excluded). KI-14 in
+[KNOWN-ISSUES.md](../KNOWN-ISSUES.md) records what was read off that session and the caveats that
+remain — chiefly that a game/plugin combo which *does* write back has still not been exercised.
 
 Note also what none of this buys: a higher resolution still costs frame time (see the sweep below),
 and on a heavy core that is the budget rollback depth comes out of. The mask removes a correctness
