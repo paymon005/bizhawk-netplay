@@ -16,7 +16,7 @@ public sealed partial class NetplayToolForm
     private Label _punchInstructions = null!;
     private NetplaySettings _settings = null!;     // persisted UI prefs (UPnP, port, delay, netcode, recent IPs)
     private readonly ToolTip _tips = new(); // owns a native window — disposed with the form
-    private CheckBox _unpausedClockCheck = null!;
+    private CheckBox _pausedClockCheck = null!;
     private CheckBox _aboveNativeCheck = null!;
     private CheckBox _deferToMajorityCheck = null!;
     private CheckBox _verboseCheck = null!;
@@ -411,20 +411,22 @@ public sealed partial class NetplayToolForm
         // where the present is genuinely load-bearing — so ticking it had stopped being a diagnostic
         // and become a way to freeze the picture.
 
-        // Experimental: while a session runs, keep EmuHawk UNPAUSED with only BlockFrameAdvance
-        // standing between its loop and the core. On the other side of the pause branch in
-        // Throttle.Step — which is an unconditional Thread.Sleep(15), the ~66Hz ceiling on the
-        // session's frame clock — sits SpeedThrottle: a phase-locked, drift-corrected wait derived
-        // from the core's own vsync rate. If it works, judder collapses; if a frame is ever stolen,
-        // the drift check ends the session by name. Off by default until measured in real play.
-        _unpausedClockCheck = new CheckBox
+        // The escape hatch, not the feature. Sessions now run with EmuHawk UNPAUSED and only
+        // BlockFrameAdvance between its loop and the core, because the paused branch of
+        // Throttle.Step is an unconditional Thread.Sleep(15) — a ~66Hz ceiling on the frame clock
+        // that costs presented frames against a 60fps console. Ticking this restores the old
+        // paused clock, which is worth having if a core or a machine ever misbehaves under the
+        // new one: the mode changes when EmuHawk's own loop runs, which is a big lever.
+        _pausedClockCheck = new CheckBox
         {
-            Text = "Unpaused clock (experimental)", AutoSize = true, Location = new Point(200, 160),
+            Text = "Legacy paused clock", AutoSize = true, Location = new Point(200, 160),
         };
-        _tips.SetToolTip(_unpausedClockCheck,
-            "Experimental. Runs the session with EmuHawk unpaused (frame stepping still belongs to\r\n" +
-            "netplay via BlockFrameAdvance), which swaps the paused loop's coarse 15ms sleep for\r\n" +
-            "EmuHawk's own phase-locked frame clock. Watch 'judder' and 'gap' in the pacing line.\r\n" +
+        _tips.SetToolTip(_pausedClockCheck,
+            "Off by default, and you should normally leave it off.\r\n\r\n" +
+            "Sessions keep EmuHawk unpaused and take its phase-locked frame clock; netplay still\r\n" +
+            "owns frame stepping via BlockFrameAdvance, and the drift check names any frame that\r\n" +
+            "slips through. Ticking this goes back to the paused loop, whose 15ms sleep caps the\r\n" +
+            "clock near 66 ticks a second — expect 'present' below 'adv' and judder above 0%.\r\n\r\n" +
             "Read at session start; toggling mid-session does nothing until the next session.");
 
         // The N64 above-native opt-in. Deliberately a checkbox with a blunt tooltip rather than a
@@ -488,7 +490,7 @@ public sealed partial class NetplayToolForm
             _probeButton, _testInputButton, _analogWatchButton, _saveWritePathButton,
             repairLabel, _framePeriodsBox,
             _verboseCheck, _freezeInputCheck, _forceDesyncCheck,
-            simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _unpausedClockCheck,
+            simLatencyLabel, _simLatencyBox, _simUnresponsiveCheck, _pausedClockCheck,
             _aboveNativeCheck,
         ]);
         return page;

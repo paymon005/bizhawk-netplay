@@ -601,12 +601,13 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
         tabs.TabPages.Add(BuildDiagnosticsTab());
         tabs.TabPages.Add(BuildLogTab());
 
-        // Status line stays visible under every tab.
-        _status = new Label
+        // Status line stays visible under every tab. Owner-drawn rather than a Label: assigning
+        // Label.Text was measured at 1.8-3.2ms on the frame clock's own thread, and this line is
+        // rewritten four times a second forever. See StatusLine.
+        _status = new StatusLine
         {
             Text = "Idle.", Dock = DockStyle.Bottom, Height = 22, ForeColor = Color.DimGray,
-            TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(6, 0, 0, 0),
-            BorderStyle = BorderStyle.Fixed3D,
+            Padding = new Padding(6, 0, 0, 0),
         };
 
         Controls.Add(tabs);   // fills the area left above the status bar

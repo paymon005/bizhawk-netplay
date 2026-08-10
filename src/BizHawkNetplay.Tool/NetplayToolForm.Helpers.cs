@@ -27,13 +27,13 @@ public sealed partial class NetplayToolForm
     private bool _prevPaused;        // was EmuHawk already paused when we first took the clock?
     private bool _pausedByUs;        // ...and have we actually taken it, so there is something to undo
     private bool _prevRewindEnabled; // the user's rewind preference, to restore on teardown
-    // Experimental unpaused clock (see EngageUnpausedClock). Captured at session start; the
-    // checkbox is only read there, so toggling mid-session does nothing until the next session.
+    // Unpaused clock (see EngageUnpausedClock), the default since v0.40.0. Captured at session
+    // start; the checkbox is only read there, so toggling mid-session does nothing until the next.
     private bool _clockUnpaused;
     private bool _prevClockThrottle;
     private bool _prevUnthrottled;
     private int _prevSpeedPercent;
-    private Label _status = null!;
+    private StatusLine _status = null!;
 
 
     /// <summary>
@@ -165,7 +165,7 @@ public sealed partial class NetplayToolForm
     /// </summary>
     private void ReassertPause()
     {
-        // The experimental clock inverts the assertion: the session RUNS unpaused, with
+        // The unpaused clock inverts the assertion: the session RUNS unpaused, with
         // BlockFrameAdvance alone keeping EmuHawk's loop off the core, because the paused branch of
         // Throttle.Step is an unconditional Thread.Sleep(15) — the ~66Hz ceiling on the frame
         // clock — while the unpaused branch is a phase-locked wait on the core's own vsync rate.
@@ -176,7 +176,7 @@ public sealed partial class NetplayToolForm
             ApplyUnpausedClockThrottle();   // the speed hotkeys would otherwise retune our clock
             if (!APIs.EmuClient.IsPaused()) return;
             APIs.EmuClient.Unpause();
-            if (Verbose) Log("re-unpaused (experimental clock — the session owns frame stepping)");
+            if (Verbose) Log("re-unpaused (the session owns frame stepping, not EmuHawk's loop)");
             return;
         }
         if (APIs.EmuClient.IsPaused()) return;
@@ -185,7 +185,8 @@ public sealed partial class NetplayToolForm
     }
 
     /// <summary>
-    /// Enter the experimental unpaused-clock mode for this session, if the box is ticked.
+    /// Take EmuHawk's own frame clock for this session, unless the player asked for the legacy
+    /// paused one. This is the default as of v0.40.0; see the class comment on the checkbox.
     ///
     /// Two things have to hold for this to be safe, both verified against 2.11.1's source:
     /// BlockFrameAdvance gates the whole of MainForm's core step (input latch aside, nothing in the
@@ -198,7 +199,15 @@ public sealed partial class NetplayToolForm
     private void EngageUnpausedClock()
     {
         if (_clockUnpaused) return;                       // idempotent: never snapshot our own values
-        if (!_unpausedClockCheck.Checked) return;
+        if (_pausedClockCheck.Checked)
+        {
+            // Say so, so a log reporting choppiness carries the reason on its face rather than
+            // needing the reader to notice the absence of the line below.
+            Log("legacy paused clock (opted in on the Diagnostics tab): EmuHawk stays paused and " +
+                "the frame clock rides its run loop, which tops out near 66 ticks a second against " +
+                "a 60fps console. Expect 'present' below 'adv' and judder above 0%.");
+            return;
+        }
         // Without the config we cannot force the throttle, and unpausing anyway is the one outcome
         // worse than not trying: with a vsync or sound throttle configured, Throttle.Step's
         // "paused || ClockThrottle || overrideSecondary" test is all false, SpeedThrottle never
@@ -215,11 +224,11 @@ public sealed partial class NetplayToolForm
         _prevSpeedPercent = _config.SpeedPercent;
         ApplyUnpausedClockThrottle();
         try { APIs.EmuClient.Unpause(); } catch { }
-        Log("EXPERIMENTAL unpaused clock: EmuHawk's loop is running throttled at the core's own " +
-            "rate; BlockFrameAdvance alone prevents stolen frames (the drift check names any that " +
-            "slip through). Speed and Unthrottle are held at 100% for the session, since under this " +
-            "mode they would scale the netplay frame clock itself. Compare judder/gap in the pacing " +
-            "line against a normal session.");
+        Log("frame clock: EmuHawk's loop is running throttled at the core's own rate; " +
+            "BlockFrameAdvance alone prevents stolen frames (the drift check names any that slip " +
+            "through). Speed and Unthrottle are held at 100% for the session, since under this mode " +
+            "they would scale the netplay frame clock itself. Tick 'Legacy paused clock' on the " +
+            "Diagnostics tab to go back to the old behaviour.");
     }
 
     /// <summary>
@@ -239,7 +248,7 @@ public sealed partial class NetplayToolForm
         if (_config.SpeedPercent != 100) _config.SpeedPercent = 100;
     }
 
-    /// <summary>Leave the experimental clock mode. Runs inside RestorePauseState so every teardown
+    /// <summary>Leave the unpaused-clock mode. Runs inside RestorePauseState so every teardown
     /// path — EndSession, FailSession — passes through it exactly once.</summary>
     private void DisengageUnpausedClock()
     {
@@ -292,8 +301,10 @@ public sealed partial class NetplayToolForm
     /// <summary>Undo <see cref="PauseForSession"/>, leaving a deliberately-paused emulator paused.</summary>
     private void RestorePauseState()
     {
-        // Under the experimental clock the emulator is RUNNING at teardown, so the restore points
-        // the other way: a user who had it paused before the session gets their pause back.
+        // Under the unpaused clock the emulator is RUNNING at teardown, so the restore points the
+        // other way: a user who had it paused before the session gets their pause back. Keyed off
+        // _clockUnpaused, not the checkbox, so a session that refused the mode (no Config) still
+        // tears down as the paused one it actually was.
         bool wasUnpausedClock = _clockUnpaused;
         DisengageUnpausedClock();
         bool restoreToRunning = _pausedByUs && !_prevPaused;

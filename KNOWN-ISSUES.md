@@ -17,7 +17,8 @@ confirmed word-for-word, so nobody has to re-verify these:
 - **Run loop**: `Tools.GeneralUpdateActiveExtTools(); StepRunLoop_Core(); Render();` are
   consecutive — the fine clock's placement claim is exact.
 - **Throttle.Step**: the paused branch is an unconditional `Thread.Sleep(15)` — the ~66Hz tick
-  ceiling is real and unreachable from this side of the seam.
+  ceiling is real and unreachable from this side of the seam. *(Still true as written, but no longer
+  binding: sessions stopped taking that branch in v0.40.0. See "The tick ceiling" below.)*
 - **`Joypad.Get`** is exactly `_movieSession.MovieIn.ToDictionary(n)` — capture reads what local
   play feeds the core.
 - **`IEmulator.FrameAdvance`** docs require `GetSamples()` after every advance "even when
@@ -331,6 +332,39 @@ arithmetic somebody actually ran.
 
 **Untested.** Whether a three-period worst case is audible is the open question, and it is not one
 this repository can answer.
+
+## The tick ceiling — measured, then removed as the default (v0.40.0)
+
+**"Netplay feels slower than single player" was presentation, not emulation, and it had a mechanism.**
+A session used to hold EmuHawk paused, and `Throttle.Step`'s paused branch is an unconditional
+`Thread.Sleep(15)`. One picture is presented per stepping tick, so the tick rate is a hard cap on
+presented frames: real N64 sessions measured `tick 40-57/s`, `present 40-57`, `judder 43-100%` while
+`adv` read a healthy 60. Nothing was dropping frames; they were emulated and never shown.
+
+Unpaused, the loop takes `SpeedThrottle` instead — a phase-locked, drift-corrected wait on the
+core's own rate — with `BlockFrameAdvance` still the thing that keeps EmuHawk's loop off the core.
+That mode shipped as an opt-in checkbox and is the default as of v0.40.0.
+
+**The evidence, from a 2P LAN session on 2026-08-10 (N64/Mupen64Plus, 800x600 Rice, both peers
+logging).** The player ran three back-to-back sessions, the middle one on the paused clock:
+
+| | Paused (session 2) | Unpaused (sessions 1 and 3) |
+|---|---|---|
+| tick / present | 37-57 / 30-56 | 60 / 60 |
+| judder | 43-100%, floor to 320% | 0-13% |
+| `clock emuloop X/Y timer Z` | 4-29 of 60, timer 28-57 | 55-61 of 60, timer **0** |
+
+That last row is the mechanism made visible: `Y-X` is the deficit the WM_TIMER fallback had to
+cover, and it goes to zero. At its worst the paused session logged `emuloop 0/0 timer 38` — the fine
+clock contributing nothing at all for several seconds. Every checksum agreed in all three sessions
+and the drift check never fired, so no frame was stolen while EmuHawk's loop ran live.
+
+**KI-23 (validation) — what this evidence does NOT cover.** The promotion criteria written when the
+mode was experimental were: the heavy core, both peers, no drift-check terminations, and an
+hour-long session. The first three are met. **Duration is not** — these were three to five minutes
+each, and the longest run on this clock in any log is about 75 seconds of unbroken 60/60. A slow
+leak between the netplay frame clock and EmuHawk's, or a drift that only accumulates, would not
+have shown up yet. `Legacy paused clock` on the Diagnostics tab is the way back if one appears.
 
 ## ANSWERED 2026-08-06 — the probe is stable now, and the binding term is the LOAD
 

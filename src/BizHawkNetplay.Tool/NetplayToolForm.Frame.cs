@@ -124,14 +124,22 @@ public sealed partial class NetplayToolForm
         // thread, so nothing we could install can fire between two iterations of the loop we are
         // running inside.
         //
-        // It is NOT the ~3200/s this comment used to claim. That figure is the unthrottled loop, and
-        // a session is not unthrottled — it is PAUSED, and BizHawk's Throttle.Step opens with
-        // "if (signal_paused && !signal_continuousFrameAdvancing) { Thread.Sleep(15); return; }",
-        // unconditionally. So the ceiling here is ~66/s, which is what the pacing line's `tick N/s`
-        // has been reporting all along (50-65 in real sessions).
+        // Its rate depends on which clock the session took, and the difference is the whole reason
+        // EngageUnpausedClock exists:
         //
-        // That makes it comparable in RATE to the WM_TIMER fallback, not thirty times better. Its
-        // advantage is placement, not frequency: it runs inside EmuHawk's loop immediately before
+        //   Paused (the legacy opt-in): Throttle.Step opens with "if (signal_paused &&
+        //   !signal_continuousFrameAdvancing) { Thread.Sleep(15); return; }", unconditionally, so
+        //   the ceiling is ~66/s and real sessions measured 40-57. Since one picture is presented
+        //   per stepping tick, `present` sat in the 40s while `adv` read a healthy 60.
+        //
+        //   Unpaused (the default since v0.40.0): the loop takes SpeedThrottle instead, a
+        //   phase-locked wait on the core's own rate, and the same sessions measured tick 60/s,
+        //   present 60, judder 0%. The `clock emuloop X/Y timer Z` term is the tell — Y-X is the
+        //   deficit the WM_TIMER fallback had to cover, and it goes to zero under this clock.
+        //
+        // Either way it is comparable in RATE to the WM_TIMER fallback, not thirty times better
+        // (the ~3200/s this comment once claimed is the UNTHROTTLED loop, which a session never
+        // is). Its advantage is placement, not frequency: it runs inside EmuHawk's loop before
         // StepRunLoop_Core, rather than as a separate message subject to coalescing — which is also
         // why the pause reassertion above happens on every delivery, from the moment we take the
         // clock at the lobby (_pausedByUs is the ownership flag, not _phase.IsActive).

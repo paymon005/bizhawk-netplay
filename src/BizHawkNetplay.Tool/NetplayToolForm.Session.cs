@@ -328,10 +328,12 @@ public sealed partial class NetplayToolForm
         _sessionDriverPrepared = false;
         _phase.Start(); // GO: active, not rebuilding, nobody's seat empty
         _preJoinRestoreState = null; // GO committed the imported baseline
-        EngageUnpausedClock(); // experimental opt-in; after _phase.Start so ReassertPause agrees
+        EngageUnpausedClock(); // default since v0.40.0; after _phase.Start so ReassertPause agrees
 
-        // We own the frame clock (EmuHawk stays paused), so its loop never pumps sound —
-        // hand the adapter EmuHawk's Sound device so it can drive audio after each frame.
+        // We own frame stepping either way — paused, or unpaused behind BlockFrameAdvance, which
+        // gates the whole of MainForm's core step including the only place Sound's attenuation is
+        // assigned. So EmuHawk's loop never pumps sound under either clock: hand the adapter
+        // EmuHawk's Sound device so it can drive audio after each frame.
         _audioStatsLogged = false;
         _adapter!.AttachMainForm(MainForm as BizHawk.Client.EmuHawk.MainForm);
         _adapter.EnableAudio(MainForm as BizHawk.Client.EmuHawk.MainForm);
