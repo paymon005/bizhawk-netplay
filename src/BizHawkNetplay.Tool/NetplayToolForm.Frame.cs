@@ -173,6 +173,22 @@ public sealed partial class NetplayToolForm
     private int _gateSpikesSinceLog;
 
     /// <summary>
+    /// What the <c>ui</c> term of a slow tick was actually spent on.
+    ///
+    /// <c>ui</c> was one bucket over the whole of <see cref="UpdateSessionUi"/>, and a session
+    /// logged a 26.0ms tick with 25.2ms of it in there against a core costing 0.6ms — a hitch a
+    /// player feels, in a term too broad to act on. The four candidates want opposite fixes: the
+    /// pacing arithmetic is ours to make cheaper, the status bar is a string build, the log append
+    /// gets slower as its buffer grows and periodically rewrites the whole control, and the players
+    /// list clears and rebuilds a ListView every quarter second. Splitting them is what turns "the
+    /// UI was slow" into a line naming which one.
+    ///
+    /// Reset at the top of every <see cref="UpdateSessionUi"/>, including the throttled early
+    /// return, so a tick where the UI did no work reports zeros rather than the last run's figures.
+    /// </summary>
+    private double _uiPaceMs, _uiStatusMs, _uiLogMs, _uiListMs;
+
+    /// <summary>
     /// Frame-decision cost above which something unexplained happened. A repair's honest cost is
     /// one state load plus its re-simulated frames plus their snapshots; at the shallow depths a
     /// healthy link produces that is ~1-2ms on Genesis and under ~19ms on N64 even at depth 1 with
@@ -677,9 +693,17 @@ public sealed partial class NetplayToolForm
                 int gcTick2 = GC.CollectionCount(2) - gcTick2Before;
                 string gcStr = $", gc tick {gcTick0}/{gcTick1}/{gcTick2} gate {gcGate0}/{gcGate1}/{gcGate2}";
 
+                // Itemise the UI only when it is worth reading. On most ticks UpdateSessionUi is
+                // throttled out entirely and the four terms are zeros, which would be four columns
+                // of noise on every slow tick that had nothing to do with them.
+                string uiStr = uiMs >= 1.0
+                    ? $" (pace {_uiPaceMs:F1} status {_uiStatusMs:F1} log {_uiLogMs:F1} " +
+                      $"list {_uiListMs:F1})"
+                    : "";
+
                 Log($"slow tick {elapsed:F1}ms at frame {frameForTelemetry}: core {coreMs:F1}, " +
                     $"rollback/gate {gateMs:F1}, hash {_lastHashMs:F1}, present {renderMs:F1}, " +
-                    $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}, other {other:F1}" +
+                    $"audio {audioMs:F1}, emuapi {emuApiMs:F1}, ui {uiMs:F1}{uiStr}, other {other:F1}" +
                     $"{audioState}{gcStr}, " +
                     $"UDP drained {packetsDrained}, pacing rebases {_pacingRebases}{repairStr}");
             }
@@ -691,14 +715,18 @@ public sealed partial class NetplayToolForm
 
     private void UpdateSessionUi(double nowMs)
     {
+        _uiPaceMs = _uiStatusMs = _uiLogMs = _uiListMs = 0;
         if (_driver == null || nowMs - _lastUiRefreshMs < 250) return;
         _lastUiRefreshMs = nowMs;
 
+        long uiPhase = System.Diagnostics.Stopwatch.GetTimestamp();
         double ping = WorstPingMs(out bool udpMeasured);
         double effRttMs = (ping < 0 ? 0 : ping) + 2.0 * _simLatencyMs;
         int advantage = ComputeFrameAdvantage(out bool haveAdvantage, out int revision, out bool freshAdvantage);
         _driver.Strategy.OnPacingReport(new PacingInfo(effRttMs, advantage,
             haveAdvantage && freshAdvantage, revision));
+        _uiPaceMs = ElapsedMs(uiPhase);
+        uiPhase = System.Diagnostics.Stopwatch.GetTimestamp();
 
         string pingStr = ping < 0 ? ""
             : $" — ping {effRttMs:F0}ms{(udpMeasured ? " udp" : "")}" +
@@ -746,10 +774,20 @@ public sealed partial class NetplayToolForm
         string udpStr = _udpWarningActive ? " — UDP recovering" : "";
         Status($"in session — frame {_driver.CurrentFrame}{speedStr}{pingStr}{rbStr}{stallStr}{udpStr}",
             _udpWarningActive || cpuBound || stallPct >= 25 ? Color.DarkOrange : Color.Green);
+        _uiStatusMs = ElapsedMs(uiPhase);
+        uiPhase = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // The hints and the pacing line are grouped as one term because they share the expensive
+        // thing: all three reach Log(), which appends to a Win32 EDIT control whose append cost
+        // grows with its buffer and which rewrites itself whole on a trim.
         MaybeHintStalling(nowMs);
         MaybeHintPresentation(nowMs);
         LogPacingSummary(nowMs);
+        _uiLogMs = ElapsedMs(uiPhase);
+        uiPhase = System.Diagnostics.Stopwatch.GetTimestamp();
+
         RefreshPlayersList();
+        _uiListMs = ElapsedMs(uiPhase);
     }
 
     /// <summary>
