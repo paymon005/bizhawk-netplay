@@ -9,7 +9,6 @@
 # Local release tooling — useful on this machine, nothing anyone downloading the repo needs
 /build-dist.ps1
 /build.bat
-/build-debug.bat
 *.user
 *.suo
 *.userosscache
