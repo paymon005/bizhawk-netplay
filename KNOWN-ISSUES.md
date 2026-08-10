@@ -69,12 +69,27 @@ open is recorded with what it would actually take.
   it cannot do is resist a deliberately-crafted one. Closing it needs the ROM bytes, and nothing in
   the ApiHawk surface hands them over — `IGameInfo` carries the digest, not the file. That is the
   blocker, not the effort.
-- **KI-18 — CLOSED in v0.33.0.** Determinism is read from the core instead of hardcoded `true`,
-  with Mupen64Plus the one named exception. The exception is by name rather than by tolerance for
-  a false flag, and the reason is in `DeterminismPolicy`: reading the 2.11.1 cores shows nearly
-  every one that computes the flag seeds its clock from `DateTime.Now` when it is false, while
-  Mupen declares it a constant and reads it back nowhere in the whole N64 tree. MAME goes further
-  and registers a different set of memory domains when false.
+- **KI-18 — CLOSED in v0.33.0; the exception list corrected after it locked out the 7800.**
+  Determinism is read from the core instead of hardcoded `true`. The exception is by name rather
+  than by tolerance for a false flag, and the reason is in `DeterminismPolicy`: reading the 2.11.1
+  cores shows nearly every one that computes the flag seeds its clock from `DateTime.Now` when it
+  is false, while Mupen declares it a constant and reads it back nowhere in the whole N64 tree.
+  MAME goes further and registers a different set of memory domains when false.
+
+  **Naming only Mupen was too narrow, found in real play.** A player hosting Atari 7800 was refused
+  and told to turn off "Use Real Time" — a setting A7800Hawk does not have, on a console with no
+  RTC to seed, so the refusal had no way out of it. The core declares
+  `DeterministicEmulation { get; set; }` and never assigns it, leaving C#'s default of false while
+  nothing reads it back. Six others share that signature: `O2Hawk`, `VectrexHawk`, `GBHawkLink`,
+  `GBHawkLink3x`, `GBHawkLink4x`, `GGHawkLink`. GBHawk is the tell — it sets the flag true in its
+  constructor and always worked; its Link variants are the same code missing that line. All seven
+  are exempt now, listed by name and each read rather than pattern-matched on "Hawk", so the next
+  core to report false still has to be looked at. Worth noting what this cost: v0.29.0 had done
+  7800-specific input work (the difficulty switch on the console-button stream, unplugged ports not
+  counting as seats), and v0.33.0 then made the console unhostable — the seats were fixed and the
+  door was shut in the same month. Separately, `CPCHawk` and `ZXHawk` are still refused, correctly,
+  but they were being pointed at the wrong setting too: theirs is called "Deterministic Emulation"
+  and defaults to on, so the refusal names that one for them.
 - **KI-19 — CLOSED in v0.33.0.** "No sync settings" and "could not read them" are different
   answers on the wire now, and the second refuses. The old behaviour inverted the check exactly
   when it mattered: both peers failing produced the same empty blob, the same digest, and a pass.

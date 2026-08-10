@@ -316,9 +316,10 @@ internal sealed partial class EmuHawkAdapter
 
     /// <summary>
     /// Whether this core qualifies as deterministic for netplay: its own flag, or a named exception
-    /// to it. See <see cref="DeterminismPolicy"/> — the exception exists because Mupen64Plus reports
-    /// false unconditionally and reads it back nowhere, while nearly every other core that reports
-    /// false is telling you it seeded its clock from the wall.
+    /// to it. See <see cref="DeterminismPolicy"/> — the exceptions exist because a handful of cores
+    /// report false while reading it back nowhere (Mupen64Plus deliberately, the Hawk group by
+    /// never assigning the property), while nearly every other core that reports false is telling
+    /// you it seeded its clock from the wall.
     /// </summary>
     public bool QualifiesDeterministic =>
         DeterminismPolicy.Qualifies(VerifyDeterministicMode(), CoreName);

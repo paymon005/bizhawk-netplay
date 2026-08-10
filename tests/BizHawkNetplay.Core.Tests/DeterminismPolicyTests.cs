@@ -7,7 +7,11 @@ namespace BizHawkNetplay.Core.Tests;
 /// KI-18: the handshake used to be told a flat <c>true</c> for determinism, whatever the core said.
 ///
 /// These tests pin the shape of the replacement, and the shape is the interesting part: the flag
-/// decides, and there is exactly one named exception rather than a general tolerance for false.
+/// decides, and the exceptions are named and read rather than tolerated as a class.
+///
+/// The list grew once, in the way worth guarding against: A7800Hawk reports false because it forgot
+/// to assign the property, and the gate answered a player with "turn off Use Real Time" for a core
+/// that has no such setting and no clock — a refusal with no way out of it.
 /// </summary>
 public class DeterminismPolicyTests
 {
@@ -26,6 +30,46 @@ public class DeterminismPolicyTests
         // whole N64 core — verified against 2.11.1. Nothing is seeded from it, so it is inert.
         Assert.True(DeterminismPolicy.Qualifies(false, "Mupen64Plus"));
         Assert.Null(DeterminismPolicy.Refusal(false, "Mupen64Plus"));
+    }
+
+    [Theory]
+    [InlineData("A7800Hawk")]
+    [InlineData("O2Hawk")]
+    [InlineData("VectrexHawk")]
+    [InlineData("GBHawkLink")]
+    [InlineData("GBHawkLink3x")]
+    [InlineData("GBHawkLink4x")]
+    [InlineData("GGHawkLink")]
+    public void TheNeverAssignedAutoPropertyCoresQualifyToo(string coreName)
+    {
+        // Each of these declares `DeterministicEmulation { get; set; }` and never assigns it, so the
+        // flag is false by C# default while nothing reads it back. None contains a DateTime, an RTC
+        // option, or a "Use Real Time" setting — so refusing them offered the player no way forward.
+        Assert.True(DeterminismPolicy.Qualifies(false, coreName));
+        Assert.Null(DeterminismPolicy.Refusal(false, coreName));
+    }
+
+    [Fact]
+    public void GBHawkIsNotExemptBecauseItDoesNotNeedToBe()
+    {
+        // GBHawk sets the flag true in its constructor; it is the Link variants that drop that line.
+        // If GBHawk ever reports false it means something changed, and that should be read, not
+        // waved through on a family resemblance to the cores next to it.
+        Assert.False(DeterminismPolicy.Qualifies(false, "GBHawk"));
+    }
+
+    [Theory]
+    [InlineData("CPCHawk")]
+    [InlineData("ZXHawk")]
+    public void TheTwoCoresWithTheirOwnSettingAreNamedTheSettingTheyHave(string coreName)
+    {
+        // These two do derive the flag from sync settings — from one called "Deterministic
+        // Emulation" that defaults to on. So they are still refused, but pointing them at "Use Real
+        // Time" would send them hunting for a setting their core does not have.
+        Assert.False(DeterminismPolicy.Qualifies(false, coreName));
+        string refusal = DeterminismPolicy.Refusal(false, coreName)!;
+        Assert.Contains("Deterministic Emulation", refusal);
+        Assert.DoesNotContain("Use Real Time", refusal);
     }
 
     [Theory]
@@ -60,5 +104,11 @@ public class DeterminismPolicyTests
         Assert.False(DeterminismPolicy.Qualifies(false, "mupen64plus"));
         Assert.False(DeterminismPolicy.Qualifies(false, "Mupen64Plus (Next)"));
         Assert.True(DeterminismPolicy.IsInertWhenFalse(DeterminismPolicy.MupenCoreName));
+
+        // Same for the group added alongside it: the list is names, not a "Hawk" pattern, so a core
+        // that merely looks like one of them still has to be read before it is trusted.
+        Assert.False(DeterminismPolicy.Qualifies(false, "a7800hawk"));
+        Assert.False(DeterminismPolicy.Qualifies(false, "A7800Hawk2"));
+        Assert.False(DeterminismPolicy.Qualifies(false, "SubGBHawk"));
     }
 }

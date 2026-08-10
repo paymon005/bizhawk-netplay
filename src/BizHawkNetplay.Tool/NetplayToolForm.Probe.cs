@@ -209,7 +209,7 @@ public sealed partial class NetplayToolForm
         // diverge" — which is exactly right for N64, the core this tool is mostly used with, and
         // wrong for most of the others. Reading the 2.11.1 cores rather than the doc comment shows
         // the majority seed their clock from DateTime.Now when the flag is false, so two peers begin
-        // with different times. DeterminismPolicy holds that finding and its one named exception.
+        // with different times. DeterminismPolicy holds that finding and the cores exempted from it.
         return new PeerIdentity(Protocol, a.RomHash, a.CoreName, a.CoreVersion,
             a.SyncSettingsDigest, layouts, a.QualifiesDeterministic, maxRollbackDepth: depth,
             syncSettingsFields: a.SyncSettingsFields,

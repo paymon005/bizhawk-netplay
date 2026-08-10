@@ -28,6 +28,12 @@ namespace BizHawkNetplay.Core.Emu;
 /// on <c>UseRealTime = true</c> agree on seeding from two different wall clocks.
 ///
 /// Hence: the flag decides, and the exceptions are named.
+///
+/// The exception list is not just N64. A second group reaches false by accident — cores that
+/// declare the flag as an auto-property and never assign it, so it defaults to false and stays
+/// there while nothing reads it. A7800Hawk is the one this was found on, when a player was told to
+/// turn off a setting the 7800 core does not have and had no way forward at all. See
+/// <see cref="InertCores"/> for the group and how each was verified.
 /// </summary>
 public static class DeterminismPolicy
 {
@@ -44,6 +50,43 @@ public static class DeterminismPolicy
     public const string MupenCoreName = "Mupen64Plus";
 
     /// <summary>
+    /// Cores whose false flag drives nothing, each verified by reading the 2.11.1 core rather than
+    /// by assuming false is harmless.
+    ///
+    /// Mupen64Plus declares its false deliberately. The rest reach it by accident, and share one
+    /// signature: they declare <c>public bool DeterministicEmulation { get; set; }</c> and then
+    /// never assign it — not in the constructor, not from sync settings, and not from EmuHawk, whose
+    /// only assignments anywhere are to the CPCHawk and ZXHawk *sync settings* objects. So the
+    /// property sits at C#'s default of false for the life of the core while nothing reads it back.
+    /// The tell is GBHawk, which sets <c>DeterministicEmulation = true</c> in its constructor and is
+    /// therefore fine; its Link variants are the same code with that line missing.
+    ///
+    /// None of these cores contains a <c>DateTime</c>, a real-time-clock option, or a "Use Real
+    /// Time" setting — the 7800 and the Odyssey 2 have no RTC hardware to seed in the first place.
+    ///
+    /// Keeping them listed by name rather than pattern-matching "Hawk" is deliberate: the next core
+    /// to report false should have to be read before it is trusted, which is the whole point.
+    /// </summary>
+    private static readonly string[] InertCores =
+    {
+        MupenCoreName,
+        "A7800Hawk",    // Atari 7800 — two-player, and the console this was first hit on
+        "O2Hawk",       // Odyssey 2 — also two-player
+        "VectrexHawk",
+        "GBHawkLink",   // the Link cores are GBHawk minus its constructor's assignment
+        "GBHawkLink3x",
+        "GBHawkLink4x",
+        "GGHawkLink",
+    };
+
+    /// <summary>
+    /// The two cores that genuinely derive the flag from a sync setting of their own — and call it
+    /// "Deterministic Emulation", defaulting to on. Naming "Use Real Time" at these players sends
+    /// them looking for a setting their core does not have, so they get the remedy that exists.
+    /// </summary>
+    private static readonly string[] DeterminismIsItsOwnSetting = { "CPCHawk", "ZXHawk" };
+
+    /// <summary>
     /// Whether the session may proceed given what the core reports.
     ///
     /// A core that reports true qualifies. A core that reports false qualifies only if it is a named
@@ -55,8 +98,15 @@ public static class DeterminismPolicy
         coreReportsDeterministic || IsInertWhenFalse(coreName);
 
     /// <summary>True for cores whose false flag is known to drive nothing.</summary>
-    public static bool IsInertWhenFalse(string? coreName) =>
-        string.Equals(coreName, MupenCoreName, StringComparison.Ordinal);
+    public static bool IsInertWhenFalse(string? coreName) => Names(InertCores, coreName);
+
+    private static bool Names(string[] cores, string? coreName)
+    {
+        if (string.IsNullOrEmpty(coreName)) return false;
+        foreach (string name in cores)
+            if (string.Equals(coreName, name, StringComparison.Ordinal)) return true;
+        return false;
+    }
 
     /// <summary>
     /// Why the session is being refused, and what to change to make it work — in the player's terms,
@@ -69,10 +119,13 @@ public static class DeterminismPolicy
     {
         if (Qualifies(coreReportsDeterministic, coreName)) return null;
         string core = string.IsNullOrEmpty(coreName) ? "this core" : coreName!;
+        string remedy = Names(DeterminismIsItsOwnSetting, coreName)
+            ? "Open the core's sync settings and turn ON \"Deterministic Emulation\""
+            : "Open the core's sync settings and turn OFF \"Use Real Time\" (some cores call it a " +
+              "real-time clock option)";
         return $"{core} is not running deterministically, which for most cores means its clock is " +
                "seeded from this machine's wall clock — two players would start with different " +
-               "times and any game that reads the clock would drift apart. Open the core's sync " +
-               "settings and turn OFF \"Use Real Time\" (some cores call it a real-time clock " +
-               "option), then reload the ROM and try again. Both players must do it.";
+               $"times and any game that reads the clock would drift apart. {remedy}, then reload " +
+               "the ROM and try again. Both players must do it.";
     }
 }
