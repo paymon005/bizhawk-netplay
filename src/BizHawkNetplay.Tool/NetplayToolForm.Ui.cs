@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Windows.Forms;
 
@@ -42,6 +42,7 @@ public sealed partial class NetplayToolForm
                 _netcodeCombo.SelectedIndex = _settings.Netcode;
             if (_settings.InputSource >= 0 && _settings.InputSource < _inputSourceCombo.Items.Count)
                 _inputSourceCombo.SelectedIndex = _settings.InputSource;
+            _sharedControlsCheck.Checked = _settings.SharedControls;
             _framePeriodsBox.Value = Clamp(_settings.FramePeriodsPerTick,
                 (int)_framePeriodsBox.Minimum, (int)_framePeriodsBox.Maximum);
             // The box is the record; mirror it into the field the probe and the session read, since
@@ -61,6 +62,7 @@ public sealed partial class NetplayToolForm
         _autoDelayMaxBox.ValueChanged += (_, __) => SaveSettingsFromUi();
         _netcodeCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
         _inputSourceCombo.SelectedIndexChanged += (_, __) => SaveSettingsFromUi();
+        _sharedControlsCheck.CheckedChanged += (_, __) => SaveSettingsFromUi();
     }
 
     /// <summary>
@@ -106,6 +108,7 @@ public sealed partial class NetplayToolForm
         _settings.AutoDelayMax = (int)_autoDelayMaxBox.Value;
         _settings.Netcode = _netcodeCombo.SelectedIndex;
         _settings.InputSource = _inputSourceCombo.SelectedIndex;
+        _settings.SharedControls = _sharedControlsCheck.Checked;
         _settings.FramePeriodsPerTick = (int)_framePeriodsBox.Value;
         _settings.Save();
     }
@@ -197,15 +200,31 @@ public sealed partial class NetplayToolForm
 
         _upnpCheck = new CheckBox { Text = "Auto-forward host port (UPnP)", AutoSize = true, Checked = true, Location = new Point(240, 141) };
 
-        _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 172), Width = 150 };
+        // Host-set, and baked into the timeline at WELCOME rather than changeable mid-session: it
+        // decides what the core is fed, so the two peers cannot hold different answers for a frame.
+        _sharedControlsCheck = new CheckBox
+        {
+            Text = "Shared controls — all players drive controller 1", AutoSize = true,
+            Location = new Point(12, 168),
+        };
+        _tips.SetToolTip(_sharedControlsCheck,
+            "Host only. For games where the players TAKE TURNS on one joystick —\r\n" +
+            "Atari 7800 Robotron, and most alternating arcade ports.\r\n" +
+            "Everyone's pad is merged onto controller 1 and the other controllers\r\n" +
+            "are held neutral, so whoever's turn it is has the stick. The host still\r\n" +
+            "holds Reset/Select/Pause.\r\n" +
+            "Leave it OFF for games where each player has their own controller.\r\n" +
+            "It cannot give one player two controllers at once (true twin-stick).");
+
+        _goButton = new Button { Text = "Start Hosting", Location = new Point(12, 196), Width = 150 };
         _goButton.Click += (_, __) => OnGo();
-        _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 172), Width = 110, Enabled = false };
+        _disconnectButton = new Button { Text = "Disconnect", Location = new Point(172, 196), Width = 110, Enabled = false };
         _disconnectButton.Click += (_, __) => EndSession("disconnected by user");
-        _pubAddrButton = new Button { Text = "My public address", Location = new Point(292, 172), Width = 150 };
+        _pubAddrButton = new Button { Text = "My public address", Location = new Point(292, 196), Width = 150 };
         _pubAddrButton.Click += (_, __) => ShowPublicAddress();
         _applyLiveButton = new Button
         {
-            Text = "Apply changes", Location = new Point(452, 172), Width = 104, Enabled = false,
+            Text = "Apply changes", Location = new Point(452, 196), Width = 104, Enabled = false,
         };
         _applyLiveButton.Click += (_, __) => ApplyLiveSettingsAsHost();
         _tips.SetToolTip(_applyLiveButton,
@@ -224,10 +243,10 @@ public sealed partial class NetplayToolForm
         //
         // Two lines in one box: the state on top, and beneath it the netcode and delay the session
         // actually settled on — which is the follow-up question every time the top line changes.
-        var lobbyLabel = new Label { Text = "Lobby status:", AutoSize = true, Location = new Point(12, 348) };
+        var lobbyLabel = new Label { Text = "Lobby status:", AutoSize = true, Location = new Point(12, 372) };
         _lobbyPanel = new Panel
         {
-            Location = new Point(12, 366), Size = new Size(544, 48),
+            Location = new Point(12, 390), Size = new Size(544, 48),
             BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White,
         };
         _lobbyStateLabel = new Label
@@ -243,10 +262,10 @@ public sealed partial class NetplayToolForm
         };
         _lobbyPanel.Controls.AddRange([_lobbyStateLabel, _netcodeLabel]);
 
-        var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 424) };
+        var connLogLabel = new Label { Text = "Connection status:", AutoSize = true, Location = new Point(12, 448) };
         _connLog = new RichTextBox
         {
-            Location = new Point(12, 442), Size = new Size(544, 92),
+            Location = new Point(12, 466), Size = new Size(544, 92),
             ReadOnly = true, BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle,
             ScrollBars = RichTextBoxScrollBars.Vertical, TabStop = false, DetectUrls = false,
         };
@@ -257,6 +276,7 @@ public sealed partial class NetplayToolForm
             passwordLabel, _passwordBox, passwordHint, delayLabel, _delayBox, _autoDelayCheck,
             autoDelayMaxLabel, _autoDelayMaxBox,
             netcodeSelLabel, _netcodeCombo, inputSrcLabel, _inputSourceCombo, _upnpCheck,
+            _sharedControlsCheck,
             _goButton, _disconnectButton, _pubAddrButton, _applyLiveButton,
             lobbyLabel, _lobbyPanel, connLogLabel, _connLog, BuildPunchGroup(),
         ]);
@@ -273,7 +293,7 @@ public sealed partial class NetplayToolForm
         _punchGroup = new GroupBox
         {
             Text = "UDP Punch — play without port-forwarding",
-            Location = new Point(12, 200), Size = new Size(544, 140),
+            Location = new Point(12, 224), Size = new Size(544, 140),
         };
 
         // The group shows only what YOUR role needs (see UpdatePunchUiForRole): a joiner

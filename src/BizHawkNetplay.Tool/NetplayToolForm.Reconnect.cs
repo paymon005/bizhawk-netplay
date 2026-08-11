@@ -574,7 +574,8 @@ public sealed partial class NetplayToolForm
                 {
                     ConfigureStateTransferTimeouts(tcp, state.Length);
                     Handshake.HostSendWelcome(channel, freedPort, _playerCount, _sessionDelay, _mode, state,
-                        generation, meshPeers, rejoinTokens, rejoinVacated, _checksumInterval);
+                        generation, meshPeers, rejoinTokens, rejoinVacated, _checksumInterval,
+                        _sharedControls);
                     Handshake.HostWaitReady(channel, generation);
                     try { tcp.ReceiveTimeout = 0; tcp.SendTimeout = 0; } catch { }
                     BeginInvokeUi(() =>

@@ -170,6 +170,34 @@ public class HandshakeTests
     }
 
     [Fact]
+    public void WelcomeCodec_CarriesSharedControls()
+    {
+        var generation = Generation(9UL, epoch: 2);
+
+        var on = HandshakeCodec.EncodeWelcome(1, 2, 1, SyncMode.Lockstep, generation,
+            sharedControls: true);
+        Assert.True(HandshakeCodec.DecodeSharedControls(on));
+
+        // Off is the absence of the line, not a "0" — a session that does not use the option must
+        // produce the WELCOME bytes it always did.
+        var off = HandshakeCodec.EncodeWelcome(1, 2, 1, SyncMode.Lockstep, generation);
+        Assert.False(HandshakeCodec.DecodeSharedControls(off));
+        Assert.DoesNotContain("sc=", System.Text.Encoding.UTF8.GetString(off), StringComparison.Ordinal);
+
+        // Anything that is not a literal 1 reads as off: an older shape, a hostile body, a typo.
+        foreach (var text in new[] { "port=1\n", "sc=0\n", "sc=yes\n", "sc=\n", "sc=11\n" })
+            Assert.False(HandshakeCodec.DecodeSharedControls(System.Text.Encoding.UTF8.GetBytes(text)));
+
+        // And it does not disturb what DecodeWelcome reads.
+        var (port, players, delay, mode, decoded, _) = HandshakeCodec.DecodeWelcome(on);
+        Assert.Equal(1, port);
+        Assert.Equal(2, players);
+        Assert.Equal(1, delay);
+        Assert.Equal(SyncMode.Lockstep, mode);
+        Assert.Equal(generation, decoded);
+    }
+
+    [Fact]
     public void WelcomeCodec_RoundTripsGenerationAndGroupedRoutes()
     {
         var generation = Generation(ulong.MaxValue, epoch: 17);

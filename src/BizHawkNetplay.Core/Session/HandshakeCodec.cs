@@ -165,7 +165,8 @@ public static class HandshakeCodec
         int assignedPort, int playerCount, int inputDelay, SyncMode mode,
         SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null,
         MeshTokens? tokens = null, IEnumerable<int>? vacatedPorts = null,
-        int checksumInterval = ChecksumCadence.DefaultIntervalFrames)
+        int checksumInterval = ChecksumCadence.DefaultIntervalFrames,
+        bool sharedControls = false)
     {
         if (!generation.IsValid) throw new ArgumentException("A valid session generation is required", nameof(generation));
         var sb = new StringBuilder();
@@ -175,6 +176,9 @@ public static class HandshakeCodec
         // The session's checksum cadence — an agreement, not a preference: peers quantize to
         // interval boundaries, so two peers on different intervals never complete a comparison.
         sb.Append("ckint=").Append(checksumInterval).Append('\n');
+        // Written only when on, so a session that does not use it produces the same WELCOME bytes it
+        // always did. Also an agreement rather than a preference: see SharedControlFold.
+        if (sharedControls) sb.Append("sc=1").Append('\n');
         sb.Append("mode=").Append(mode == SyncMode.Rollback ? "rollback" : "lockstep").Append('\n');
         sb.Append("session=").Append(generation.SessionId.ToString(CultureInfo.InvariantCulture)).Append('\n');
         sb.Append("epoch=").Append(generation.Epoch.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -457,6 +461,16 @@ public static class HandshakeCodec
         var map = ParseLines(body);
         int interval = GetInt(map, "ckint", ChecksumCadence.DefaultIntervalFrames);
         return ChecksumCadence.IsAcceptable(interval) ? interval : ChecksumCadence.DefaultIntervalFrames;
+    }
+
+    /// <summary>Read the <c>sc=</c> line of a WELCOME: whether every seat folds onto controller 1.
+    /// Anything but a literal <c>1</c> — absent, <c>0</c>, malformed, hostile — is off, which is both
+    /// the historical behaviour and the one that cannot surprise a session that never asked for
+    /// it.</summary>
+    public static bool DecodeSharedControls(byte[] body)
+    {
+        var map = ParseLines(body);
+        return Get(map, "sc") == "1";
     }
 
     /// <summary>Read the <c>vacated=</c> line of a WELCOME: the seats that are permanently empty.

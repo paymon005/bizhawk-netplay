@@ -393,6 +393,7 @@ public sealed partial class NetplayToolForm
         _netcodeCombo.Enabled = host;
         _delayBox.Enabled = host;
         _upnpCheck.Enabled = host;
+        _sharedControlsCheck.Enabled = host;
         _goButton.Text = host ? "Start Hosting" : "Join";
         UpdatePunchUiForRole();
     }
@@ -426,6 +427,9 @@ public sealed partial class NetplayToolForm
         _autoDelayCheck.Enabled = !busy && _hostRadio.Checked;
         _autoDelayMaxBox.Enabled = !busy && _hostRadio.Checked && _autoDelayCheck.Checked;
         _netcodeCombo.Enabled = _passwordBox.Enabled = _upnpCheck.Enabled = !busy;
+        // Not live-changeable: it is baked into the timeline at WELCOME, unlike netcode and delay,
+        // which "Apply changes" can push mid-session.
+        _sharedControlsCheck.Enabled = !busy && _hostRadio.Checked;
         _inputSourceCombo.Enabled = !busy;
         _probeButton.Enabled = !busy;
         _punchButton.Enabled = !busy;

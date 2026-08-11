@@ -55,13 +55,18 @@ same files.
 The network protocol is versioned, and the handshake refuses a mismatch. When you update, your
 friends usually have to update too — but not always, and the release notes always say which.
 
-**v0.38.0 and v0.38.1 use protocol 24 and everyone must update together.** They will refuse a
-v0.37.0 peer at the handshake. (v0.38.1 adds a diagnostic only, so it mixes freely with v0.38.0 —
-just the person running the measurement needs it.) Two values that cross the wire changed: the desync checksum's hash, which got about eight
-times faster and now produces a different number for the same memory, and the password KDF, which
-moved off SHA-1 and changed the key both sides prove against. Neither is something a peer could
-tolerate or fall back from — an older peer would report desyncs that are not there, and could not
-authenticate at all — which is exactly what the version check is for.
+**v0.41.0 uses protocol 25 and everyone must update together.** It will refuse a v0.40.0 peer at the
+handshake. WELCOME gained one line, the shared-controls agreement, and it is the first thing on the
+wire that changes *what the core is fed* rather than how a value is computed. An older peer would
+ignore the line it does not know, fold nothing, and run different input on the same frame — every
+message still parsing perfectly while the two machines drift apart. That is exactly the failure the
+version check exists to turn into a clear refusal.
+
+**v0.38.0 through v0.40.0 share protocol 24** and mix freely with each other. The bump at v0.38.0:
+two values that cross the wire changed — the desync checksum's hash, which got about eight times
+faster and now produces a different number for the same memory, and the password KDF, which moved
+off SHA-1 and changed the key both sides prove against. Neither is something a peer could tolerate
+or fall back from.
 
 v0.34.0 through v0.37.0 shared protocol 23 and still mix freely with each other. See
 [CHANGELOG.md](CHANGELOG.md) for the full table of which release changed what and who can play with
@@ -106,13 +111,14 @@ joiner. Their whole session runs over that single punched UDP socket.
 
 ## Session settings
 
-On the Connection tab. Netcode, input delay and UPnP are greyed out when **Join** is selected: those
-are the host's to set.
+On the Connection tab. Netcode, input delay, shared controls and UPnP are greyed out when **Join**
+is selected: those are the host's to set.
 
 | Setting | Who sets it | What it does |
 |---|---|---|
 | **Players** | Host | How many of the core's controller ports to fill. Unused ports read neutral, so you can play 2-player on a 4-port core. Above 4 (a PSX with two multitaps, say) the code supports it and nobody has run it — the host says so in the log and names what gets harder. |
 | **My controls** | Each player | Which of *your* controller-port bindings the tool reads (default *Use P1 pad*), independent of the port you are assigned in-game. |
+| **Shared controls** | Host | Off by default. Merges every player's pad onto **controller 1** and holds the others neutral, for games where the players take turns on one joystick. |
 | **Password** | Host + joiners | Optional; must match. Empty means an open session. |
 | **Netcode** | Host | *Automatic*, *Rollback* (forced) or *Lockstep* (forced). |
 | **Input delay** | Host | Frames of delay applied to your own input. |
@@ -130,6 +136,25 @@ setting — the handshake compares per-port layouts.
 
 Set this so a player assigned P2, P3 or P4 keeps using their normal P1 pad with no rebinding.
 Same-console ports share button order, so the bindings map across by name.
+
+### Shared controls
+
+Some games never gave player 2 a controller. On the Atari 7800, Robotron 2084 reads **controller 1
+as the movement stick and controller 2 as the fire-direction stick** — for both players, because
+two-player is alternating and Atari's manual says player 2 uses the left controller too. Seat 2
+therefore lands on the aim stick: the character turns and shoots but never walks. Most alternating
+arcade ports on the 2600, 7800 and NES have the same shape.
+
+Tick this and every player's pad drives controller 1, with the other controllers held neutral, so
+whoever's turn it is has the stick. Robotron then plays its one-joystick scheme — move with the
+stick, fire with the trigger in the direction you are facing.
+
+Leave it **off** for anything two players play at once; it is not how a normal two-player game is
+meant to work. Two things it will not do: the host keeps Reset, Select, Pause and the difficulty
+switches (on the 7800, Select is how carts pick 1P/2P mode), and it cannot give one player two
+controllers at the same time, so true twin-stick play is still out of reach. If your controllers are
+not the same type on every port — a light gun against a pad — the host is refused in the lobby and
+told which seat.
 
 ### Password
 

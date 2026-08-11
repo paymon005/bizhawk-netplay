@@ -24,6 +24,9 @@ internal sealed class NetplaySettings
     public int AutoDelayMax = 8; // cap automatic increases without overriding an explicit peer request
     public int Netcode = 0;     // index into the netcode dropdown (Automatic/Rollback/Lockstep)
     public int InputSource = 0; // index into the "My controls" dropdown (P1..P4, or Assigned port)
+    // Host: fold every seat onto controller 1, for alternating games where the players take turns on
+    // one joystick. Off by default — it is wrong for anything two-player-simultaneous.
+    public bool SharedControls = false;
     // Frame periods one tick may run and one rollback repair may spend. 2 is what shipped through
     // v0.38.x; 3 is what a heavy core needs to reach a usable prediction depth — see
     // NetplayToolForm.RepairBudgetFrames for the measured arithmetic and the trade.
@@ -58,6 +61,7 @@ internal sealed class NetplaySettings
                     case "autodelaymax": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var adm)) s.AutoDelayMax = adm; break;
                     case "netcode": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)) s.Netcode = n; break;
                     case "inputsrc": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ins)) s.InputSource = ins; break;
+                    case "sharedctl": s.SharedControls = val == "1" || string.Equals(val, "true", StringComparison.OrdinalIgnoreCase); break;
                     case "frameperiods": if (int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var fp)) s.FramePeriodsPerTick = fp; break;
                     case "ip": if (val.Length > 0 && s.RecentIps.Count < MaxRecentIps && !s.RecentIps.Contains(val)) s.RecentIps.Add(val); break;
                 }
@@ -83,6 +87,7 @@ internal sealed class NetplaySettings
                 "autodelaymax=" + AutoDelayMax.ToString(CultureInfo.InvariantCulture),
                 "netcode=" + Netcode.ToString(CultureInfo.InvariantCulture),
                 "inputsrc=" + InputSource.ToString(CultureInfo.InvariantCulture),
+                "sharedctl=" + (SharedControls ? "1" : "0"),
                 "frameperiods=" + FramePeriodsPerTick.ToString(CultureInfo.InvariantCulture),
             };
             foreach (var ip in RecentIps) lines.Add("ip=" + ip);

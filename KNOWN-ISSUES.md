@@ -143,6 +143,23 @@ open is recorded with what it would actually take.
   the permitted range is what the code supports, and crossing between them says so once — naming
   the mesh edge count, the per-frame send count and the host relay load rather than waving at
   "untested". `PlayerCountPolicy`.
+- **KI-23 — one seat drives one controller, and that is a real limit, not an oversight.** Shared
+  controls (v0.41.0) folds every seat onto controller 1 for alternating games, which is the whole of
+  what a fold can do. What it cannot do is give one player two controllers *at the same time* — true
+  twin-stick Atari 7800 Robotron, Space Dungeon — because one seat = one port runs the length of the
+  design: `ReadLocalInput` returns a single `PortInput`, `InputSerializer` sizes exactly one port's
+  payload per seat, and `MeshInputAuthorship` binds one author to one port. No rearrangement of the
+  values already on the wire can synthesise a second independent stick; the data was never captured
+  or sent. Closing it means a seat that owns a set of ports — payload width, serializer, authorship
+  keying and layout digests all move — which is a feature, not a flag. Written down so the next
+  person to hit it does not rediscover the fold and expect it to help.
+- **KI-24 — shared controls can put Up+Down on the core at once.** Each seat's captured value is
+  already past EmuHawk's U+D / L+R policy (capture reads the end of its controller chain), but the
+  OR of two seats can reassert the opposing pair. It is deterministic — identical inputs produce an
+  identical merge on every peer — so it cannot desync, and in the alternating play the option exists
+  for only one player is moving anyway. Cores differ in what they do with it, so it is recorded as a
+  behaviour note rather than filtered: re-imposing the policy here would mean this tool deciding
+  which direction wins, on cores where the hardware itself does not.
 
 The same review produced the v0.31.0/v0.32.0 work and the v0.32.1 hotfixes: vacated seats, live
 relay failover, the control-frame MAC, divergence learning, the measured checksum cadence, and then

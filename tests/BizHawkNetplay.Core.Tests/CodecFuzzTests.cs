@@ -62,6 +62,7 @@ public class CodecFuzzTests
         ("HandshakeRoutes", b => HandshakeCodec.DecodeRoutes(b)),
         ("HandshakeTokens", b => HandshakeCodec.DecodeTokens(b)),
         ("HandshakeChecksumInterval", b => HandshakeCodec.DecodeChecksumInterval(b)),
+        ("HandshakeSharedControls", b => HandshakeCodec.DecodeSharedControls(b)),
         ("HandshakeVacatedSeats", b => HandshakeCodec.DecodeVacatedSeats(b)),
         ("HandshakeEndpoints", b => HandshakeCodec.DecodeEndpoints(b)),
         ("HandshakeGeneration", b => HandshakeCodec.DecodeGeneration(b)),
@@ -91,6 +92,8 @@ public class CodecFuzzTests
             HandshakeCodec.EncodeWelcome(1, 4, 3, SyncMode.Rollback, Gen,
                 new[] { new PeerRoute(2, new[] { new IPEndPoint(IPAddress.Loopback, 4001) }) },
                 MeshTokens.None, new[] { 3 }),
+            HandshakeCodec.EncodeWelcome(1, 2, 1, SyncMode.Lockstep, Gen,
+                checksumInterval: 300, sharedControls: true),
             HandshakeCodec.EncodeRoutes(new[]
             {
                 new PeerRoute(1, new[] { new IPEndPoint(IPAddress.Loopback, 4000) }),

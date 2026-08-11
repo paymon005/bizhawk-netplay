@@ -87,6 +87,17 @@ internal sealed partial class EmuHawkAdapter
     public int InputSourcePort { get; set; } = -1;
 
     /// <summary>
+    /// Fold every seat's input onto controller 1 and hold the rest neutral, for alternating games
+    /// where the players take turns on the same joystick. A session agreement decided by the host
+    /// and carried in WELCOME, not a local taste — see <see cref="SharedControlFold"/> for why a
+    /// peer that disagreed would desync. Lives on the adapter rather than the driver so it survives
+    /// every resync rebuild, which constructs a new driver against the same adapter.
+    /// </summary>
+    public bool SharedControls { get; set; }
+
+    private SharedControlFold? _fold;
+
+    /// <summary>
     /// The controller <c>Joypad.Get</c> reads: the end of EmuHawk's own controller chain, before the
     /// movie layer. Read fresh each time — <c>MovieIn</c> is a settable property and gets re-pointed
     /// when a movie starts — and null whenever the reference is missing, which sends
@@ -255,7 +266,19 @@ internal sealed partial class EmuHawkAdapter
     {
         var definition = _emulator.ControllerDefinition;
         if (_controller == null || !_controller.Matches(definition, _layouts))
+        {
             _controller = new InputSetController(definition, _layouts);
+            _fold = null; // the layouts changed identity, which is what a core reboot does
+        }
+        // The single place a fold can go without any of the sync machinery having to know about it:
+        // everything upstream still stores, sends and compares raw per-seat input, and every path
+        // that steps the core — live frames, a rollback repair's re-simulation, the probe — arrives
+        // here first, so the three cannot disagree about what the core was actually fed.
+        if (SharedControls)
+        {
+            _fold ??= new SharedControlFold(_layouts, _playerButtonCount, _playerAxisCount, _remapCompatible[0]);
+            inputs = _fold.Apply(inputs);
+        }
         _controller.Update(inputs);
         return _controller;
     }
@@ -382,6 +405,29 @@ internal sealed partial class EmuHawkAdapter
             for (int b = 0; b < _layouts.Length; b++) m[a][b] = LayoutsLineUp(_layouts[a], _layouts[b]);
         }
         return m;
+    }
+
+    /// <summary>
+    /// Why shared controls cannot be used with this many seats, or null when it can.
+    ///
+    /// Folding a seat onto controller 1 only means anything if the two ports describe the same
+    /// controls in the same order — otherwise a seat's Trigger lands on controller 1's something
+    /// else, which is the exact failure <see cref="BuildRemapCompatibility"/> was rewritten to stop
+    /// the "My controls" remap making. So the same matrix answers both questions, and this asks it
+    /// in the lobby, where the remedy is still a dropdown away.
+    /// </summary>
+    public string? SharedControlsGap(int players)
+    {
+        int seats = Math.Min(players, _layouts.Length);
+        for (int p = 1; p < seats; p++)
+        {
+            if (_remapCompatible[0][p]) continue;
+            return "shared controls needs every player's controller to be the same shape as " +
+                   $"controller 1, and P{p + 1}'s is not — a light gun, a different pad type, or a " +
+                   "port with fewer controls. Set every port to the same controller type in the " +
+                   "core's settings, or turn shared controls off.";
+        }
+        return null;
     }
 
     private static bool LayoutsLineUp(CoreLayout a, CoreLayout b)

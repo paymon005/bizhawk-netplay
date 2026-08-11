@@ -103,6 +103,18 @@ public sealed partial class NetplayToolForm
                 RefreshPlayerLimit();
             }
 
+            // The host's answer for the whole session — read here, on the UI thread, before the
+            // lobby thread that sends WELCOME exists. A joiner takes it from WELCOME instead, so its
+            // own checkbox never decides anything.
+            _sharedControls = _hostRadio.Checked && _sharedControlsCheck.Checked;
+            if (_sharedControls && _adapter.SharedControlsGap(players) is { } sharedGap)
+            {
+                // Same shape as the refusals above, for the same reason: in the lobby the remedy is
+                // a dropdown in the core's settings, and after GO it would be a desync.
+                ConnLog(sharedGap, Color.Firebrick);
+                SetBusy(false); return;
+            }
+
             // Past the size anything has actually been run at. Said once, by the host, because the
             // host is the only one who chose it — and said rather than prevented: nothing about a
             // fifth player is known to be broken, and capping on suspicion would remove a capability
@@ -541,12 +553,14 @@ public sealed partial class NetplayToolForm
                 // core since exporting it — only the assignment and the routes have changed.
                 Handshake.HostSendAssignment(link.Control, link.RemotePort, players, delay, mode,
                     generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players),
-                    vacatedPorts: null, checksumInterval: _checksumInterval);
+                    vacatedPorts: null, checksumInterval: _checksumInterval,
+                    sharedControls: _sharedControls);
                 return;
             }
             Handshake.HostSendStart(link.Control, link.RemotePort, players, delay, mode, state,
                 generation, RoutesExcept(links, link), TokensFor(link.RemotePort, players),
-                vacatedPorts: null, checksumInterval: _checksumInterval);
+                vacatedPorts: null, checksumInterval: _checksumInterval,
+                sharedControls: _sharedControls);
             link.HoldsState = true;
         });
         if (!DropCasualties(links, casualties, need, attempt)) return false;

@@ -11,7 +11,8 @@ fault — the alternative is a session that appears to work and silently loses i
 
 | Releases | Protocol | Why it changed |
 |---|---|---|
-| v0.38.0 – v0.40.0 | **24** | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
+| v0.41.0 | **25** | WELCOME carries `sc=`, the shared-controls agreement: every seat's input folded onto controller 1, for games where the players take turns on one joystick. It is the first thing on the wire that changes *what the core is fed* rather than how a value is computed, and that is precisely why it cannot be tolerated — a v24 peer ignores the unknown line, folds nothing, and runs different input on the same frame from the first press. Every datagram still parses, every checksum still completes, and the two machines diverge anyway. The line is written only when the option is on, so a session that does not use it produces the same bytes it always did; the refusal has to be unconditional regardless, because the version is compared before the host has said which kind of session it is running. **Everyone must update at the same time.** |
+| v0.38.0 – v0.40.0 | 24 | Two wire-visible values changed, and neither of them is a message — which is exactly why this needed the version check rather than a graceful fallback. The desync checksum's fold now runs in eight independent lanes: about 8x faster on the framework the tool ships on, and a *different number for the same memory*, so a v23 peer would report a desync that is not there at every interval with nothing in the message shape to notice it. And the password KDF moved off SHA-1 to PBKDF2-HMAC-SHA256, which changes the derived key both sides prove against — a mixed pair simply cannot authenticate. Both had been owed a bump and neither justified one alone; spending a single break on the pair is the whole reason they shipped together. **Everyone must update at the same time.** |
 | v0.34.0 – v0.37.0 | 23 | *v0.35.0 through v0.37.0 change no wire format and mix freely with v0.34.0 — the first run of releases in this table to share a protocol with their predecessor, so nobody has to update in step. Two caveats if your group is mixed. A v0.36.0 or later host defers to the majority by default, and a v0.34.0 donor cannot answer, so it waits out the donor timeout before falling back — see the v0.36.0 notes. And the advertised rollback depth is negotiated down to whichever peer reports least, so on a heavy core a pre-v0.37.0 peer's pessimistic measurement still governs the whole group; that costs depth, never correctness. See the v0.37.0 notes.* The bump at v0.34.0: content identity grew a per-disc list (`disc=` lines), and recovery grew a way out of the host-is-always-right rule. StateRequest (27) and StateOffer (28) let an outvoted host adopt the majority's state instead of overwriting three correct machines with its own — a v22 peer has no handler for either, so an outvoted v23 host would wait out its donor timeout and fall back, which is degraded rather than broken. The disc lines are the reason to refuse the mix outright: a v22 peer never sends them, so a genuinely different disc 2 would pass unnoticed, which is the exact failure the lines exist to catch. |
 | v0.33.0 | 22 | Input datagrams name and prove their author. The UDP envelope grew an author byte and an 8-byte HMAC tag under a key shared only by the pair of seats it travels between, so a v21 peer's input is unreadable to a v22 peer and vice versa — total silent input loss rather than a desync, which makes the version refusal matter more here than usual. The handshake also grew build identity (`build=`), firmware (`fw=`), sync-settings readability (`sread=`) and video settings (`video=`), all of which a v21 peer omits. |
 | v0.32.0 | 21 | The checksum's exclusions are measured instead of guessed, and its cadence is sized from what a hash costs. Peers exchange per-bucket memory hashes over the first boundaries of every generation (DivergenceReport, 25) and the host publishes the machine-dependent ranges as an exclusion mask (ExclusionMask, 26); WELCOME carries the session's checksum interval (`ckint=`); and the hash seed changed shape (a range list plus the mask identity). A v20 peer computes different values for identical states, so a mixed pair would report a desync that is not there. |
@@ -30,6 +31,58 @@ fault — the alternative is a session that appears to work and silently loses i
 | v0.8.0 | 4 | Session passwords. |
 
 ## Notable releases
+
+### v0.41.0 — the seat that was holding the wrong joystick (protocol 25)
+
+**Protocol 25 — everyone must update.** A v0.40.0 peer and a v0.41.0 peer refuse each other at the
+handshake. See the table above for why a peer that merely *ignores* the new line is the dangerous
+case rather than the safe one.
+
+**Some games do not give each player a controller, and the tool had no way to say so.** Seat N has
+always meant controller N, all the way down: `ReadLocalInput` returns one port, the serializer sizes
+one port per seat, the mesh binds one author to one port. That is right for anything two players
+play at once, and wrong for the whole class of alternating arcade ports, where both players take
+turns on the *same* joystick.
+
+Atari 7800 Robotron 2084 is the case that found it, and it found it in the most confusing way
+available. Robotron reads controller 1 as the movement stick and controller 2 as the fire-direction
+stick — `M6532` ORs port 1's high nibble and port 2's low nibble into the byte the game reads, and
+Atari's manual says plainly that *"Player 2 uses the left controller for moving."* So the joiner on
+seat 2 was holding the aim stick: their character turned and shot but never walked, on their own
+turn, while the host walked around on both of theirs. Nothing was misbound, nothing was dropped,
+and no diagnostic in the tool could have said which port a game expects to read.
+
+**Shared controls** is a host-set option, off by default, that folds every seat's input onto
+controller 1 and holds the remaining controllers neutral. Buttons merge by OR; an axis takes
+whichever seat is furthest from that axis's own rest position, with the lowest seat breaking a tie.
+Only one player is moving at a time — that is the premise of the option — so the merge is a
+formality rather than a compromise. Robotron then plays its documented one-joystick scheme: the
+stick moves, the ProLine trigger fires in the direction you are facing, and whoever's turn it is has
+the controls. It applies just as well to every alternating 2600/7800/NES cart where player 2 was
+always meant to reach across for the same pad.
+
+Three things it deliberately does not do:
+
+- **It does not give the console buttons away.** Reset, Select, Pause and the difficulty switches
+  ride the tail of port 0's layout (v0.29.0) and stay the host's alone — the merge is bounded by the
+  port's run of real pad controls, not by the array, so a joiner leaning on a direction cannot reach
+  the index where Select lives. On the 7800 that is load-bearing: Select is how most carts pick
+  1P/2P mode in the first place.
+- **It does not let one player drive two controllers at once.** True twin-stick Robotron over
+  netplay would need a seat to capture, send and own two ports, which is a change to the wire and
+  not a flag. Off is still the right setting for anything two-player-simultaneous.
+- **It does not fold ports that do not line up.** A light gun against a pad, or a port with fewer
+  controls, would map one seat's Trigger onto another's something-else. The host is refused in the
+  lobby, naming the seat, while the remedy is still a dropdown in the core's settings.
+
+**Where the fold happens is the part worth recording.** It runs at injection — inside the one
+`Controller(InputSet)` every core-stepping path goes through — and nowhere upstream. The pipeline,
+the retransmit ring, the mesh authorship and rollback's applied-versus-confirmed comparison all go
+on seeing raw per-seat input, unchanged. Because the fold is a pure function of the unfolded set,
+two folded frames can only differ if the raw frames did, so a repair can never be missed by folding
+late; the reverse costs at worst a repair that lands on an identical state. And it hangs on the
+adapter rather than the driver, which is what makes it survive every resync rebuild without anyone
+having to remember to carry it.
 
 ### v0.40.0 — netplay stops looking slower than single player (protocol 24, unchanged)
 

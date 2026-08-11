@@ -111,7 +111,14 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // KDF moved off SHA-1 to SHA-256, changing the derived key both sides prove against, so a
     // mixed pair simply cannot authenticate. Both were owed a bump and neither justified one
     // alone; spending a single break on the pair is the whole reason they shipped together.
-    private const int Protocol = 24;
+    // 25: WELCOME carries sc=, the shared-controls agreement — every seat's input folded onto
+    // controller 1 for alternating games where the players take turns on one joystick. A v24 peer
+    // ignores the unknown line and folds nothing, so it feeds its core different input on the same
+    // frame from the first press: a desync, and one with nothing in the message shape to notice,
+    // since every datagram still parses perfectly. The line is only written when the option is on,
+    // so the bytes of a session that does not use it are unchanged — but the refusal has to be
+    // unconditional, because the version is compared before the host has said which it is running.
+    private const int Protocol = 25;
     private const int DefaultPort = 47800;
 
     /// <summary>
@@ -124,6 +131,15 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     /// thread before the lobby thread starts, and by the joiner when WELCOME lands.
     /// </summary>
     private int _checksumInterval = ChecksumCadence.DefaultIntervalFrames;
+
+    /// <summary>
+    /// Whether every seat's input folds onto controller 1 (see <see cref="SharedControlFold"/>).
+    /// Like the cadence above this is a session AGREEMENT and not a taste: the host reads its own
+    /// checkbox, publishes the answer in WELCOME, and a peer running the other answer would feed its
+    /// core different input on the same frame. Written on the UI thread at OnGo before the lobby
+    /// thread starts, and by the joiner when WELCOME lands.
+    /// </summary>
+    private bool _sharedControls;
 
     /// <summary>
     /// How many frame periods one rollback repair may spend. Requiring it to fit inside a single
@@ -192,7 +208,7 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     // pushed down by the lobby status box above it). Same reasoning as the width: a minimum that
     // does not cover the content it is meant to protect just lets the window clip it.
     private const int DesignClientWidth = 600;
-    private const int DesignClientHeight = 660;
+    private const int DesignClientHeight = 684;
     private const int MinClientWidth = 580;
     private const int MinClientHeight = 600;
 
@@ -239,6 +255,7 @@ public sealed partial class NetplayToolForm : ToolFormBase, IExternalToolForm
     private const int AnalogWatchIntervalMs = 50;
     private const int AnalogWatchSamples = 100;   // 5 seconds
     private CheckBox _upnpCheck = null!;
+    private CheckBox _sharedControlsCheck = null!;
     private TextBox _passwordBox = null!;
     private NumericUpDown _simLatencyBox = null!;
     private Button _punchButton = null!;

@@ -21,8 +21,10 @@ public sealed class SessionParams
         int remoteUdpPort, byte[]? initialState, SessionGeneration generation,
         int playerCount = 2, IReadOnlyList<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null,
         IReadOnlyList<int>? vacatedSeats = null,
-        int checksumInterval = ChecksumCadence.DefaultIntervalFrames)
+        int checksumInterval = ChecksumCadence.DefaultIntervalFrames,
+        bool sharedControls = false)
     {
+        SharedControls = sharedControls;
         Tokens = tokens ?? MeshTokens.None;
         VacatedSeats = vacatedSeats ?? Array.Empty<int>();
         ChecksumInterval = ChecksumCadence.IsAcceptable(checksumInterval)
@@ -57,6 +59,11 @@ public sealed class SessionParams
 
     /// <summary>Total number of players (= controller ports sourced by peers) in this session.</summary>
     public int PlayerCount { get; }
+
+    /// <summary>Whether every seat's input folds onto controller 1 at injection, for alternating
+    /// games where the players take turns on one joystick. The host decides and WELCOME carries it;
+    /// a peer that ran a different answer would feed its core different input on the same frame.</summary>
+    public bool SharedControls { get; }
 
     /// <summary>The peer's UDP port for the input channel (combine with the peer IP from the control socket).</summary>
     public int RemoteUdpPort { get; }
@@ -412,10 +419,11 @@ public static class Handshake
         ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
         SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null,
         IEnumerable<int>? vacatedPorts = null,
-        int checksumInterval = ChecksumCadence.DefaultIntervalFrames)
+        int checksumInterval = ChecksumCadence.DefaultIntervalFrames,
+        bool sharedControls = false)
     {
         HostSendStart(channel, assignedPort, playerCount, inputDelay, mode, state, generation, peerRoutes,
-            tokens, vacatedPorts, checksumInterval);
+            tokens, vacatedPorts, checksumInterval, sharedControls);
         HostRequestReady(channel, generation);
     }
 
@@ -428,10 +436,11 @@ public static class Handshake
         ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode, byte[] state,
         SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null,
         IEnumerable<int>? vacatedPorts = null,
-        int checksumInterval = ChecksumCadence.DefaultIntervalFrames)
+        int checksumInterval = ChecksumCadence.DefaultIntervalFrames,
+        bool sharedControls = false)
     {
         HostSendAssignment(channel, assignedPort, playerCount, inputDelay, mode, generation, peerRoutes,
-            tokens, vacatedPorts, checksumInterval);
+            tokens, vacatedPorts, checksumInterval, sharedControls);
         // Framed and deflated: this is the transfer a joiner sits through before the game starts,
         // and on a heavy core it was the whole savestate raw over whatever link they have.
         channel.Send(ControlMessageType.State, StateCompression.Pack(state ?? []));
@@ -448,10 +457,11 @@ public static class Handshake
         ControlChannel channel, int assignedPort, int playerCount, int inputDelay, SyncMode mode,
         SessionGeneration generation, IEnumerable<PeerRoute>? peerRoutes = null, MeshTokens? tokens = null,
         IEnumerable<int>? vacatedPorts = null,
-        int checksumInterval = ChecksumCadence.DefaultIntervalFrames)
+        int checksumInterval = ChecksumCadence.DefaultIntervalFrames,
+        bool sharedControls = false)
         => channel.Send(ControlMessageType.Welcome,
             HandshakeCodec.EncodeWelcome(assignedPort, playerCount, inputDelay, mode, generation, peerRoutes,
-                tokens, vacatedPorts, checksumInterval));
+                tokens, vacatedPorts, checksumInterval, sharedControls));
 
     /// <summary>Ask this joiner to apply everything it has been sent and acknowledge READY.</summary>
     public static void HostRequestReady(ControlChannel channel, SessionGeneration generation)
@@ -594,6 +604,7 @@ public static class Handshake
         MeshTokens tokens = MeshTokens.None;
         IReadOnlyList<int> vacatedSeats = Array.Empty<int>();
         int checksumInterval = ChecksumCadence.DefaultIntervalFrames;
+        bool sharedControls = false;
         byte[]? initialState = null;
         bool haveWelcome = false;
         bool readySent = false;
@@ -627,6 +638,7 @@ public static class Handshake
                     tokens = HandshakeCodec.DecodeTokens(body);
                     vacatedSeats = HandshakeCodec.DecodeVacatedSeats(body);
                     checksumInterval = HandshakeCodec.DecodeChecksumInterval(body);
+                    sharedControls = HandshakeCodec.DecodeSharedControls(body);
                 }
                 catch (Exception ex) when (ex is FormatException || ex is ArgumentException)
                 {
@@ -683,7 +695,7 @@ public static class Handshake
 
                 session = new SessionParams(mode, delay, localPort: assignedPort, remotePort: 0,
                     remoteUdpPort: hostUdpPort, initialState, generation, playerCount, peerRoutes,
-                    tokens, vacatedSeats, checksumInterval);
+                    tokens, vacatedSeats, checksumInterval, sharedControls);
                 beforeReady?.Invoke(session);
                 channel.Send(ControlMessageType.Ready, HandshakeCodec.EncodeGeneration(generation));
                 readySent = true;

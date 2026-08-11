@@ -53,6 +53,9 @@ public sealed partial class NetplayToolForm
     {
         _peers.Clear(); _peers.AddRange(links);
         _isHost = true; _playerCount = players; _sessionDelay = delay; _localPort = 0;
+        // Set on the adapter rather than the driver: every resync builds a new driver against this
+        // same adapter, so the fold survives a rebuild without anyone having to remember to carry it.
+        _adapter!.SharedControls = _sharedControls;
         _vacatedPorts.Clear(); _vacatedCount = 0; // a fresh lobby always fills every seat
         SetGeneration(generation);
         _mesh?.SetPeerRoutes(RoutesExcept(links, null));
@@ -79,6 +82,17 @@ public sealed partial class NetplayToolForm
             if (seat != sp.LocalPort && seat >= 0 && seat < sp.PlayerCount) _vacatedPorts.Add(seat);
         _vacatedCount = _vacatedPorts.Count;
         _checksumInterval = sp.ChecksumInterval; // the host measured and published; we quantize to it
+        // Assigned unconditionally, so a value left over from a previous session — or from this
+        // machine's own turn as host — can never outlive the WELCOME that should have replaced it.
+        _sharedControls = sp.SharedControls;
+        if (_sharedControls && _adapter!.SharedControlsGap(sp.PlayerCount) is { } gap)
+        {
+            // Defensive: the layout digests the handshake compares already guarantee this machine
+            // answers as the host did. But quietly declining to fold what everyone else folds is a
+            // desync, so the only safe reading of a disagreement is to refuse the join and say why.
+            throw new InvalidOperationException(gap);
+        }
+        _adapter!.SharedControls = _sharedControls;
         SetGeneration(sp.Generation);
         _meshOthers = new List<PeerRoute>(sp.PeerRoutes);
         _mesh?.ApplyTokens(sp.Tokens, sp.LocalPort);
@@ -364,6 +378,24 @@ public sealed partial class NetplayToolForm
             Log($"(note) {_adapter.SeatOrderNote}");
         if (_adapter.ConsoleControlsNote != null)
             Log($"(note) {_adapter.ConsoleControlsNote}");
+
+        // Shared controls changes which port your pad reaches, which is exactly the kind of thing
+        // someone will otherwise diagnose as "my controller is broken". Say it on both sides, since
+        // the joiner never saw the checkbox that turned it on.
+        if (_sharedControls)
+        {
+            ConnLog("shared controls: every player's pad drives controller 1 and the other " +
+                    "controllers are held neutral, for games where you take turns on one joystick. " +
+                    "The host still holds Reset/Select/Pause.", Color.DarkSlateBlue);
+            // The one way this quietly does nothing: your pad is bound to EmuHawk's P1 controls but
+            // the tool was told to read some other port's, which nobody has bound. "Assigned port"
+            // is the easy way in — it reads your seat's own port, and only seat 1 is P1.
+            int source = InputSourceFromCombo();
+            int readPort = source >= 0 ? source : _localPort;
+            if (readPort != 0)
+                ConnLog($"…and 'My controls' is reading your P{readPort + 1} bindings. If nothing " +
+                        "responds, set it to 'Use P1 pad'.", Color.DarkOrange);
+        }
 
         // The digital-stick-override note deliberately does NOT go here. It fires for any N64 setup
         // using BizHawk's default XInput binds, and measurement showed the override usually does not
